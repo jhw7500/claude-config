@@ -9,7 +9,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-scheduled-triage.yml@ffdf5c1ff6237502ac67296ffabb9146d623c7a6
+    uses: jhw7500/automation/.github/workflows/gemini-scheduled-triage.yml@ccd1b6f3e1833c82d73826c1332cc6e3e4841d30
     with:
       repo_write_auth: github_token
     secrets:
