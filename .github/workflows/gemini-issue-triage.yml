@@ -61,7 +61,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-triage.yml@444a7347aee169ed178aae80e8bd8d10eca52e02
+    uses: jhw7500/automation/.github/workflows/gemini-triage.yml@74afc0057c4732993ecd76601590b8856e2a3bb3
     with:
       issue_number: ${{ inputs.issue_number }}
       issue_title: ${{ needs.prepare.outputs.issue_title }}
