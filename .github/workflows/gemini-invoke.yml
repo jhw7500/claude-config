@@ -1,47 +1,47 @@
-name: '▶️ Gemini Invoke'
+name: Gemini Invoke
 
 on:
   workflow_call:
     inputs:
       item_number:
-        type: 'string'
-        description: 'Issue or pull request number'
+        type: string
+        description: Issue or pull request number
         required: true
       item_title:
-        type: 'string'
-        description: 'Issue or pull request title'
+        type: string
+        description: Issue or pull request title
         required: true
       item_body:
-        type: 'string'
-        description: 'Issue or pull request body'
+        type: string
+        description: Issue or pull request body
         required: true
       event_name:
-        type: 'string'
-        description: 'Caller event name'
+        type: string
+        description: Caller event name
         required: true
       is_pull_request:
-        type: 'boolean'
-        description: 'Whether the caller event is for a pull request'
+        type: boolean
+        description: Whether the caller event is for a pull request
         required: true
       additional_context:
-        type: 'string'
-        description: 'Any additional context from the request'
+        type: string
+        description: Any additional context from the request
         required: false
 
 jobs:
   invoke:
     permissions:
-      contents: 'read'
-      id-token: 'write'
-      issues: 'write'
-      pull-requests: 'write'
-    uses: 'jhw7500/automation/.github/workflows/gemini-invoke.yml@v1.39'
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: jhw7500/automation/.github/workflows/gemini-invoke.yml@f1b85510717a681b0db94fd2b764716372c52435
     with:
-      item_number: '${{ inputs.item_number }}'
-      item_title: '${{ inputs.item_title }}'
-      item_body: '${{ inputs.item_body }}'
-      event_name: '${{ inputs.event_name }}'
-      is_pull_request: '${{ inputs.is_pull_request }}'
-      additional_context: '${{ inputs.additional_context }}'
+      item_number: ${{ inputs.item_number }}
+      item_title: ${{ inputs.item_title }}
+      item_body: ${{ inputs.item_body }}
+      event_name: ${{ inputs.event_name }}
+      is_pull_request: ${{ inputs.is_pull_request }}
+      additional_context: ${{ inputs.additional_context }}
+      repo_write_auth: github_token
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

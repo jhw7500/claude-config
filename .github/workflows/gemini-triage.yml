@@ -1,37 +1,37 @@
-name: '🔀 Gemini Triage'
+name: Gemini Triage
 
 on:
   workflow_call:
     inputs:
       issue_number:
-        type: 'string'
-        description: 'Issue number'
+        type: string
+        description: Issue number
         required: true
       issue_title:
-        type: 'string'
-        description: 'Issue title'
+        type: string
+        description: Issue title
         required: true
       issue_body:
-        type: 'string'
-        description: 'Issue body'
+        type: string
+        description: Issue body
         required: true
       additional_context:
-        type: 'string'
-        description: 'Any additional context from the request'
+        type: string
+        description: Any additional context from the request
         required: false
 
 jobs:
   triage:
     permissions:
-      contents: 'read'
-      id-token: 'write'
-      issues: 'read'
-      pull-requests: 'read'
-    uses: 'jhw7500/automation/.github/workflows/gemini-triage.yml@v1.39'
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: jhw7500/automation/.github/workflows/gemini-triage.yml@f1b85510717a681b0db94fd2b764716372c52435
     with:
-      issue_number: '${{ inputs.issue_number }}'
-      issue_title: '${{ inputs.issue_title }}'
-      issue_body: '${{ inputs.issue_body }}'
-      additional_context: '${{ inputs.additional_context }}'
+      issue_number: ${{ inputs.issue_number }}
+      issue_title: ${{ inputs.issue_title }}
+      issue_body: ${{ inputs.issue_body }}
+      additional_context: ${{ inputs.additional_context }}
+      repo_write_auth: github_token
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

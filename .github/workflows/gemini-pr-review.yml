@@ -1,4 +1,4 @@
-name: '🧪 Gemini Manual PR Review'
+name: Gemini Manual PR Review
 
 on:
   workflow_dispatch:
@@ -52,14 +52,14 @@ jobs:
     needs: prepare
     permissions:
       contents: read
-      id-token: write
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-review.yml@v1.39
+    uses: jhw7500/automation/.github/workflows/gemini-review.yml@f1b85510717a681b0db94fd2b764716372c52435
     with:
       pr_number: ${{ inputs.pr_number }}
       issue_title: ${{ needs.prepare.outputs.pr_title }}
       issue_body: ${{ needs.prepare.outputs.pr_body }}
       additional_context: ${{ inputs.additional_context }}
+      repo_write_auth: github_token
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

@@ -1,4 +1,4 @@
-name: '🧹 Gemini Manual Issue Triage'
+name: Gemini Manual Issue Triage
 
 on:
   workflow_dispatch:
@@ -48,13 +48,13 @@ jobs:
     needs: prepare
     permissions:
       contents: read
-      id-token: write
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-triage.yml@v1.39
+    uses: jhw7500/automation/.github/workflows/gemini-triage.yml@f1b85510717a681b0db94fd2b764716372c52435
     with:
       issue_number: ${{ inputs.issue_number }}
       issue_title: ${{ needs.prepare.outputs.issue_title }}
       issue_body: ${{ needs.prepare.outputs.issue_body }}
+      repo_write_auth: github_token
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
