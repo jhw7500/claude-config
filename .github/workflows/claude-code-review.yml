@@ -30,7 +30,7 @@ jobs:
       id-token: write
       issues: read
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/claude-code-review.yml@b18f99256bc2bd41e4fc70c3025805b7682217a0
+    uses: jhw7500/automation/.github/workflows/claude-code-review.yml@3d60f3baaa45820f7260912efea3ffcf45c10b07
     with:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
       force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}
