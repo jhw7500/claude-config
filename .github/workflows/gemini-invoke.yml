@@ -34,7 +34,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-invoke.yml@c1595f277c819c7ccf9ff2ab3ad01e5afabdda45
+    uses: jhw7500/automation/.github/workflows/gemini-invoke.yml@1b98172325533ef6ad37f3d2cfc3870073fac26d
     with:
       item_number: ${{ inputs.item_number }}
       item_title: ${{ inputs.item_title }}
