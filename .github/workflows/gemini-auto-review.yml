@@ -8,12 +8,14 @@ jobs:
   gemini-review:
     if: ${{ github.event.pull_request.head.repo.fork == false && github.event.pull_request.head.repo.full_name == github.repository }}
     permissions:
+      actions: read
       contents: read
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-auto-review.yml@06183ff67c6052489ccac3b7cb37fd93aa3f6307
+    uses: jhw7500/automation/.github/workflows/gemini-auto-review.yml@78cdad332ca85d3a4c3fb51be0a203b988485c86
     with:
       pr_number: ${{ github.event.pull_request.number }}
       repo_write_auth: github_token
+      publisher_app_id: ${{ vars.APP_ID }}
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
