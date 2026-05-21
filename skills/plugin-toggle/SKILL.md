@@ -24,16 +24,11 @@ run `/reload-plugins` to pick up all changes without restarting").
 ## How to run
 
 1. Parse intent: plugin name(s), action (`on`/`off`/`status`), and scope (default project; global if asked).
-2. Resolve each short name to its full `name@marketplace` key by matching the prefix before `@`
-   against keys already present in `~/.claude/settings.json` `enabledPlugins`.
-   **That live file is the source of truth** — the list below is only a fallback. Known keys in this env:
-   `bkit@bkit-marketplace`, `oh-my-claudecode@omc`, `compound-engineering@every-marketplace`,
-   `codex@openai-codex`, `superpowers@superpowers-marketplace`,
-   `document-skills@anthropic-agent-skills`, `clangd-lsp@claude-plugins-official`,
-   `pyright-lsp@claude-plugins-official`, `typescript-lsp@claude-plugins-official`,
-   `playwright@claude-plugins-official`, `serena@claude-plugins-official`,
-   `context7@claude-plugins-official`, `episodic-memory@superpowers-marketplace`.
-   If a name is ambiguous or unknown, ask instead of guessing.
+2. Resolve each short name to its full `name@marketplace` key by reading the **live**
+   `~/.claude/settings.json` `enabledPlugins` (the source of truth — keys differ per host)
+   and matching the prefix before `@`. List this host's available keys with:
+   `python3 -c "import json,os;print('\n'.join(json.load(open(os.path.expanduser('~/.claude/settings.json'))).get('enabledPlugins',{})))"`
+   If a short name matches zero or multiple keys, ask instead of guessing.
 3. Run the matching Python block **verbatim** (it preserves all other settings and creates files/keys as needed).
 4. Report what changed, then tell the user to run **`/reload-plugins`** to apply immediately (no restart).
 

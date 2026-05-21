@@ -3,10 +3,13 @@
 set -e
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 1) plugin-toggle 스킬 심볼릭 링크 (repo pull 시 자동 갱신)
+# 1) 스킬 심볼릭 링크 (skills/ 아래 모든 스킬 자동 링크, repo pull 시 자동 갱신)
 mkdir -p ~/.claude/skills
-ln -sfn "$REPO_DIR/skills/plugin-toggle" ~/.claude/skills/plugin-toggle
-echo "[install] 스킬 링크: ~/.claude/skills/plugin-toggle"
+for d in "$REPO_DIR"/skills/*/; do
+  name="$(basename "$d")"
+  ln -sfn "${d%/}" ~/.claude/skills/"$name"
+  echo "[install] 스킬 링크: ~/.claude/skills/$name"
+done
 
 # 2) plug 함수 source (중복 방지)
 if grep -q "claude-config/shell/plug.sh" ~/.bashrc 2>/dev/null; then
@@ -29,8 +32,6 @@ cp -n "$REPO_DIR/claude-md/RTK.md"          ~/.claude/ 2>/dev/null && echo "[ins
 
 echo ""
 echo "완료. 적용: source ~/.bashrc  +  새 Claude 세션"
-echo ""
 echo "[수동] CLAUDE.md 는 상단 OMC 블록(자동관리)이 있어 자동 복사하지 않음."
-echo "       사용자 지침 부분만 머지하세요:  diff $REPO_DIR/claude-md/CLAUDE.md ~/.claude/CLAUDE.md"
+echo "       사용자 지침 부분만 머지:  diff \$REPO_DIR/claude-md/CLAUDE.md ~/.claude/CLAUDE.md"
 echo "[주의] settings.json / .claude.json 은 호스트별 상태라 동기화 안 함."
-echo "       플러그인 off 는 'plug off <key>' 또는 plugin-toggle 스킬로 이 호스트에서 적용."
