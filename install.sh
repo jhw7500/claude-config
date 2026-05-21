@@ -30,6 +30,42 @@ echo "[install] 스크립트 링크: ~/.claude/scripts/ (5개)"
 cp -n "$REPO_DIR/claude-md/CLAUDE-notion.md" ~/.claude/ 2>/dev/null && echo "[install] CLAUDE-notion.md 복사" || echo "[install] CLAUDE-notion.md 이미 존재(건너뜀)"
 cp -n "$REPO_DIR/claude-md/RTK.md"          ~/.claude/ 2>/dev/null && echo "[install] RTK.md 복사" || echo "[install] RTK.md 이미 존재(건너뜀)"
 
+# 5) 훅 배선 (settings.json) — timestamp-hook + stop-text-required. 멱등·가산·백업.
+#    statusLine(context-bar) 교체와 CLAUDE.md 머지는 별도 검토 대상이라 여기서 다루지 않음.
+SETTINGS="$HOME/.claude/settings.json"
+if [ -f "$SETTINGS" ]; then
+  cp "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d%H%M%S)"
+  python3 - "$SETTINGS" <<'PY'
+import json, sys
+f = sys.argv[1]
+with open(f) as fh:
+    d = json.load(fh)
+hooks = d.setdefault("hooks", {})
+
+def ensure(event, command):
+    groups = hooks.setdefault(event, [])
+    for g in groups:
+        for h in g.get("hooks", []):
+            if h.get("command") == command:
+                return False  # 이미 있음 → 멱등 skip
+    groups.append({"hooks": [{"type": "command", "command": command}]})
+    return True
+
+ts = "python3 $HOME/.claude/scripts/timestamp-hook.py"
+st = "python3 $HOME/.claude/scripts/stop-text-required.py"
+added = []
+if ensure("UserPromptSubmit", ts + " prompt"): added.append("UserPromptSubmit<-timestamp")
+if ensure("Stop", ts + " stop"): added.append("Stop<-timestamp")
+if ensure("Stop", st): added.append("Stop<-stop-text-required")
+with open(f, "w") as fh:
+    json.dump(d, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+print("[install] 훅 배선:", ", ".join(added) if added else "이미 적용됨(변경 없음)")
+PY
+else
+  echo "[install] settings.json 없음 — 훅 배선 건너뜀"
+fi
+
 echo ""
 echo "완료. 적용: source ~/.bashrc  +  새 Claude 세션"
 echo "[수동] CLAUDE.md 는 상단 OMC 블록(자동관리)이 있어 자동 복사하지 않음."

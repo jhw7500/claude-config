@@ -22,7 +22,8 @@ source ~/.bashrc
 
 - `skills/`·`scripts/`는 **심볼릭 링크** → `git pull`만 하면 자동 갱신
 - `CLAUDE-notion.md`·`RTK.md`는 없을 때만 복사
-- `CLAUDE.md`는 상단 OMC 자동관리 블록 충돌 방지를 위해 **수동 머지** (`diff` 안내 출력)
+- **훅 자동 배선**: `timestamp-hook`(프롬프트/완료) + `stop-text-required`(조기종료 방지)를 `settings.json`에 멱등 추가 — 실행 전 `.bak` 백업, `statusLine`·기존 훅은 보존
+- `CLAUDE.md` 머지와 `context-bar`(statusLine 교체)는 **미포함** (호스트별 OMC 충돌 우려로 별도 검토/수동)
 
 ## 토글 메커니즘 — 2종류 (대체 불가, 병행)
 
