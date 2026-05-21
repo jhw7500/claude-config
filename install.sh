@@ -3,10 +3,13 @@
 set -e
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 1) 스킬 심볼릭 링크 (repo pull 시 자동 갱신)
+# 1) 스킬 심볼릭 링크 (repo pull 시 자동 갱신) — skills/ 아래 모든 스킬 자동 링크
 mkdir -p ~/.claude/skills
-ln -sfn "$REPO_DIR/skills/plugin-toggle" ~/.claude/skills/plugin-toggle
-echo "[install] 스킬 링크: ~/.claude/skills/plugin-toggle -> $REPO_DIR/skills/plugin-toggle"
+for d in "$REPO_DIR"/skills/*/; do
+  name="$(basename "$d")"
+  ln -sfn "${d%/}" ~/.claude/skills/"$name"
+  echo "[install] 스킬 링크: ~/.claude/skills/$name -> ${d%/}"
+done
 
 # 2) plug 함수 source (중복 방지)
 if grep -q "claude-config/shell/plug.sh" ~/.bashrc 2>/dev/null; then

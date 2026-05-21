@@ -6,6 +6,8 @@
 
 - `skills/plugin-toggle/` — 플러그인 on/off 스킬. `enabledPlugins`를 토글하고
   **`/reload-plugins`로 재시작 없이 즉시 적용**. 자연어("bkit 전역 꺼줘")로 동작.
+- `skills/gstack-toggle/` — gstack 사용자 스킬(~47개) on/off 토글(디렉토리 이동 방식).
+  gstack 미설치 호스트에선 no-op이라 안전.
 - `shell/plug.sh` — `plug on|off <key>` 셸 함수 (bkit/docs/pw/pyright/compound).
 
 ## 설치 (다른 호스트)
