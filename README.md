@@ -10,7 +10,7 @@
 | `skills/gstack-toggle/` | gstack 사용자 스킬(~47개) on/off 토글(디렉토리 이동 방식). 미설치 호스트선 no-op이라 안전 |
 | `shell/plug.sh` | `plug on\|off <key>` 셸 함수 (bkit/docs/pw/pyright/compound) |
 | `scripts/` | 개인 hook/toggle: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, **apex-toggle.sh** |
-| `claude-md/` | 글로벌 지침: CLAUDE.md, CLAUDE-notion.md, RTK.md |
+| `claude-md/` | 글로벌 지침: **global-guidance.md**(공통·항상) + CLAUDE-notion.md(notion 환경) + RTK.md(rtk 환경) |
 
 ## 설치 (다른 호스트)
 
@@ -21,9 +21,9 @@ source ~/.bashrc
 ```
 
 - `skills/`·`scripts/`는 **심볼릭 링크** → `git pull`만 하면 자동 갱신
-- `CLAUDE-notion.md`·`RTK.md`는 없을 때만 복사
-- **훅 자동 배선**: `timestamp-hook`(프롬프트/완료) + `stop-text-required`(조기종료 방지)를 `settings.json`에 멱등 추가 — 실행 전 `.bak` 백업, `statusLine`·기존 훅은 보존
-- `CLAUDE.md` 머지와 `context-bar`(statusLine 교체)는 **미포함** (호스트별 OMC 충돌 우려로 별도 검토/수동)
+- **CLAUDE.md 전역지침 (env-aware)**: `~/.claude/CLAUDE.md`의 `claude-config:START/END` 블록만 관리 — 항상 `@global-guidance.md`, **notion MCP 있으면** `@CLAUDE-notion.md`, **`rtk` 있으면** `@RTK.md`를 자동 추가. **OMC 블록은 미변경**(inline/file-split 무관), 실행 전 `.bak` 백업
+- **훅 자동 배선**: `timestamp-hook`(프롬프트/완료) + `stop-text-required`(조기종료 방지)를 `settings.json`에 멱등 추가 — `.bak` 백업, `statusLine`·기존 훅 보존
+- `context-bar`(statusLine 교체)는 **미포함** (현재 OMC HUD와 상호배타라 별도 결정 필요)
 
 ## 토글 메커니즘 — 2종류 (대체 불가, 병행)
 
