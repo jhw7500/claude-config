@@ -21,10 +21,10 @@ fi
 
 # 3) 개인 스크립트 심볼릭 링크
 mkdir -p ~/.claude/scripts
-for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py context-bar.sh apex-toggle.sh gstack-toggle.sh; do
+for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py context-bar.sh apex-toggle.sh; do
   [ -f "$REPO_DIR/scripts/$f" ] && ln -sfn "$REPO_DIR/scripts/$f" ~/.claude/scripts/"$f"
 done
-echo "[install] 스크립트 링크: ~/.claude/scripts/ (6개)"
+echo "[install] 스크립트 링크: ~/.claude/scripts/ (5개)"
 
 # 4) 글로벌 지침 — OMC 무관 파일만 자동 복사(없을 때만), CLAUDE.md는 수동 머지
 cp -n "$REPO_DIR/claude-md/CLAUDE-notion.md" ~/.claude/ 2>/dev/null && echo "[install] CLAUDE-notion.md 복사" || echo "[install] CLAUDE-notion.md 이미 존재(건너뜀)"

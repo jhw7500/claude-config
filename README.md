@@ -9,7 +9,7 @@
 | `skills/plugin-toggle/` | 플러그인 on/off 스킬. `enabledPlugins` 토글 + **`/reload-plugins`로 재시작 없이 즉시 적용** |
 | `skills/gstack-toggle/` | gstack 사용자 스킬(~47개) on/off 토글(디렉토리 이동 방식). 미설치 호스트선 no-op이라 안전 |
 | `shell/plug.sh` | `plug on\|off <key>` 셸 함수 (bkit/docs/pw/pyright/compound) |
-| `scripts/` | 개인 hook/toggle: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, **apex-toggle.sh / gstack-toggle.sh** |
+| `scripts/` | 개인 hook/toggle: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, **apex-toggle.sh** |
 | `claude-md/` | 글로벌 지침: CLAUDE.md, CLAUDE-notion.md, RTK.md |
 
 ## 설치 (다른 호스트)
@@ -29,15 +29,17 @@ source ~/.bashrc
 | 대상 | 메커니즘 | 도구 |
 |---|---|---|
 | **마켓플레이스 플러그인** (bkit, document-skills 등) | `enabledPlugins` 부울 토글 + `/reload-plugins` | `plug` / plugin-toggle 스킬 |
-| **스킬 묶음/프레임워크** (gstack 47, apex) | 스킬 디렉토리를 `~/.claude/_disabled/`로 **이동** | `gstack-toggle.sh` / `apex-toggle.sh` / gstack-toggle 스킬 |
+| **스킬 묶음** (gstack ~47) | 스킬 디렉토리를 `~/.claude/skills-disabled/`로 **이동** (gstack 본체·CLI 보존) | gstack-toggle 스킬 |
+| **커맨드 프레임워크** (APEX 7) | `commands/` 그룹을 `~/.claude/_disabled/commands/`로 **이동** | `apex-toggle.sh` |
 
-→ gstack/apex는 플러그인이 아니라 스킬 디렉토리 이동 방식이라 plugin-toggle로 대체되지 않습니다. 각자 전용 토글을 씁니다.
+→ 둘 다 플러그인이 아니라 디렉토리 이동 방식이라 plugin-toggle로 대체되지 않습니다. 각자 전용 토글을 씁니다.
 
 ## 사용
 
 ```bash
 plug off bkit                            # 플러그인 끄기 → 세션에서 /reload-plugins
-~/.claude/scripts/gstack-toggle.sh on    # gstack 스킬셋 활성화 → 새 세션
+# gstack 스킬셋은 Claude 세션에서 "gstack 켜줘/꺼줘" (gstack-toggle 스킬)
+~/.claude/scripts/apex-toggle.sh off     # APEX 커맨드 비활성화 → 새 세션
 ```
 
 ## 동기화하지 않는 것 (중요)
