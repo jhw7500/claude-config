@@ -1,0 +1,59 @@
+name: '🧹 Gemini Manual Issue Triage'
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to triage (e.g. 123)'
+        required: true
+        type: string
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+    outputs:
+      issue_title: ${{ steps.issue.outputs.title }}
+      issue_body: ${{ steps.issue.outputs.body }}
+    steps:
+      - name: Validate issue_number
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          if ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "issue_number must be a positive integer"
+            exit 1
+          fi
+
+      - name: Fetch issue
+        id: issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          title="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json title --jq .title)"
+          body="$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json body --jq .body)"
+
+          echo "title<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$title" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$body" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+  triage:
+    needs: prepare
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+      pull-requests: write
+    uses: jhw7500/automation/.github/workflows/gemini-triage.yml@v1.29
+    with:
+      issue_number: ${{ inputs.issue_number }}
+      issue_title: ${{ needs.prepare.outputs.issue_title }}
+      issue_body: ${{ needs.prepare.outputs.issue_body }}
+    secrets: inherit

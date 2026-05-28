@@ -1,0 +1,62 @@
+name: ShellCheck
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '**.sh'
+      - '.github/workflows/shellcheck.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - '**.sh'
+      - '.github/workflows/shellcheck.yml'
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Run even if disabled'
+        type: boolean
+        default: false
+
+jobs:
+  shellcheck:
+    name: ShellCheck Analysis
+    if: ${{ github.event.inputs.force_run == 'true' || vars.SHELLCHECK_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck
+        run: |
+          set -euo pipefail
+
+          files=(
+            build.sh
+          )
+
+          for dir in tools upgrade_file docker; do
+            if [ -d "$dir" ]; then
+              while IFS= read -r -d '' f; do
+                files+=("$f")
+              done < <(find "$dir" -name '*.sh' -type f -print0)
+            fi
+          done
+
+          echo "Checking ${#files[@]} files..."
+          shellcheck -x -s bash -S error -f gcc "${files[@]}"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## ShellCheck Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "ShellCheck analysis completed." >> $GITHUB_STEP_SUMMARY

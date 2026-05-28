@@ -1,0 +1,45 @@
+name: Commitlint
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Run even if disabled'
+        type: boolean
+        default: false
+
+jobs:
+  commitlint:
+    name: Lint Commit Messages
+    if: ${{ github.event.inputs.force_run == 'true' || vars.COMMITLINT_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run commitlint
+        uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: '.github/commitlint.config.mjs'
+          token: ${{ github.token }}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Commitlint Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Commit message validation completed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Rules" >> $GITHUB_STEP_SUMMARY
+          echo "- Type required: feat, fix, chore, refactor, docs, test, build, ci, perf, style" >> $GITHUB_STEP_SUMMARY
+          echo "- Max header length: 100 characters" >> $GITHUB_STEP_SUMMARY
+          echo "- Korean subjects allowed" >> $GITHUB_STEP_SUMMARY

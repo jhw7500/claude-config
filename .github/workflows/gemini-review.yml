@@ -1,0 +1,36 @@
+name: '🔎 Gemini Review'
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: 'string'
+        description: 'Pull request number'
+        required: true
+      issue_title:
+        type: 'string'
+        description: 'Pull request title'
+        required: true
+      issue_body:
+        type: 'string'
+        description: 'Pull request body'
+        required: true
+      additional_context:
+        type: 'string'
+        description: 'Any additional context from the request'
+        required: false
+
+jobs:
+  review:
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      issues: 'write'
+      pull-requests: 'write'
+    uses: 'jhw7500/automation/.github/workflows/gemini-review.yml@v1.29'
+    with:
+      pr_number: '${{ inputs.pr_number }}'
+      issue_title: '${{ inputs.issue_title }}'
+      issue_body: '${{ inputs.issue_body }}'
+      additional_context: '${{ inputs.additional_context }}'
+    secrets: 'inherit'

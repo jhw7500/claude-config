@@ -1,0 +1,120 @@
+name: Bump automation workflow refs
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '.github/workflow-config.yml'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bump-automation-ref
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine automation_ref change
+        id: ref
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          new_ref="$(grep -E '^automation_ref:' .github/workflow-config.yml | awk '{print $2}')"
+          if [ -z "${new_ref}" ]; then
+            echo "automation_ref missing in .github/workflow-config.yml" >&2
+            exit 1
+          fi
+
+          old_ref=""
+          if git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            old_ref="$(git show "${BEFORE}:.github/workflow-config.yml" 2>/dev/null | grep -E '^automation_ref:' | awk '{print $2}' || true)"
+          fi
+
+          echo "old_ref=${old_ref}" >> "$GITHUB_OUTPUT"
+          echo "new_ref=${new_ref}" >> "$GITHUB_OUTPUT"
+
+          if [ "${old_ref}" = "${new_ref}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop if automation_ref unchanged
+        if: steps.ref.outputs.changed != 'true'
+        run: |
+          echo "automation_ref unchanged; nothing to bump."
+
+      - name: Rewrite workflow refs
+        if: steps.ref.outputs.changed == 'true'
+        env:
+          NEW_REF: ${{ steps.ref.outputs.new_ref }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          new_ref = os.environ["NEW_REF"].strip()
+          if not re.fullmatch(r"v\d+(?:\.\d+)?", new_ref):
+            raise SystemExit(f"NEW_REF must look like v1.9 (got {new_ref!r})")
+
+          root = Path(".github/workflows")
+          pattern = re.compile(
+            r"(jhw7500/automation/\.github/(?:workflows|actions)/[^@\s'\"]+@)v\d+(?:\.\d+)?"
+          )
+
+          changed_files = 0
+          for path in sorted(root.rglob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            new_text, n = pattern.subn(r"\1" + new_ref, text)
+            if n:
+              path.write_text(new_text, encoding="utf-8")
+              changed_files += 1
+
+          print(f"rewrote {changed_files} file(s)")
+          PY
+
+          git status --porcelain
+
+      - name: Create PR
+        if: steps.ref.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_REF: ${{ steps.ref.outputs.new_ref }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet; then
+            echo "No changes after rewrite; skipping PR."
+            exit 0
+          fi
+
+          branch="chore/bump-automation-${NEW_REF}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add .github/workflows
+          git commit -m "chore: bump automation refs to ${NEW_REF}"
+          git push -u origin "$branch"
+
+          gh pr create \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "$branch" \
+            --title "chore: bump automation refs to ${NEW_REF}" \
+            --body "automation_ref updated in .github/workflow-config.yml; this PR rewrites all jhw7500/automation workflow/action refs to ${NEW_REF}."

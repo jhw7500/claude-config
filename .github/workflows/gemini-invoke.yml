@@ -1,0 +1,46 @@
+name: '▶️ Gemini Invoke'
+
+on:
+  workflow_call:
+    inputs:
+      item_number:
+        type: 'string'
+        description: 'Issue or pull request number'
+        required: true
+      item_title:
+        type: 'string'
+        description: 'Issue or pull request title'
+        required: true
+      item_body:
+        type: 'string'
+        description: 'Issue or pull request body'
+        required: true
+      event_name:
+        type: 'string'
+        description: 'Caller event name'
+        required: true
+      is_pull_request:
+        type: 'boolean'
+        description: 'Whether the caller event is for a pull request'
+        required: true
+      additional_context:
+        type: 'string'
+        description: 'Any additional context from the request'
+        required: false
+
+jobs:
+  invoke:
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      issues: 'write'
+      pull-requests: 'write'
+    uses: 'jhw7500/automation/.github/workflows/gemini-invoke.yml@v1.29'
+    with:
+      item_number: '${{ inputs.item_number }}'
+      item_title: '${{ inputs.item_title }}'
+      item_body: '${{ inputs.item_body }}'
+      event_name: '${{ inputs.event_name }}'
+      is_pull_request: '${{ inputs.is_pull_request }}'
+      additional_context: '${{ inputs.additional_context }}'
+    secrets: 'inherit'
