@@ -158,6 +158,34 @@ prompt: |
   - Additional focus areas
 ```
 
+### Changing Claude Model
+
+The Claude model used by `claude-code-review` is read from the consumer
+repository's `.github/workflow-config.yml`. No workflow file edit is required.
+
+Two scopes are supported (per-workflow wins over shared):
+
+```yaml
+# Shared default for all Claude workflows
+claude:
+  model: "claude-sonnet-4-6"
+
+# Or per-workflow override
+workflows:
+  claude-code-review:
+    model: "claude-opus-4-7"
+```
+
+Supported model IDs:
+
+- `claude-opus-4-7` — Opus 4.7 (deepest reasoning, highest cost)
+- `claude-sonnet-4-6` — Sonnet 4.6 (balanced)
+- `claude-haiku-4-5-20251001` — Haiku 4.5 (fastest, cheapest)
+
+If both keys are empty or omitted, the underlying `anthropics/claude-code-action`
+default is used. Available from automation `v1.29` onward — older trampoline
+pins (`@v1.28` and earlier) ignore the setting.
+
 ### Filtering Claude Reviews by Author
 
 Uncomment and modify the `if` condition in `claude-code-review.yml`:
