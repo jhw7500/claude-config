@@ -1,0 +1,12 @@
+{
+  "brave-search": {"command":"npx","args":["-y","@modelcontextprotocol/server-brave-search"],"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}},
+  "morph-mcp": {"command":"npx","args":["-y","@morphllm/morphmcp","--api-key"],"env":{"MORPH_API_KEY":"${MORPH_API_KEY}","ENABLED_TOOLS":"${MORPH_ENABLED_TOOLS}"}},
+  "pdf-reader-mcp": {"command":"npx","args":["@sylphx/pdf-reader-mcp"]},
+  "sequentialthinking": {"command":"npx","args":["-y","@modelcontextprotocol/server-sequential-thinking"]},
+  "filesystem": {"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","${FILESYSTEM_MCP_ROOT}"]},
+  "repowire": {"command":"repowire","args":["mcp"]},
+  "cts-email": {"internal":true,"command":"npx","args":["-y","github:jhw7500/cts-email-mcp-server"],"env":{"EMAIL_USER":"${EMAIL_USER}","EMAIL_PASSWORD":"${EMAIL_PASSWORD}","TLS_REJECT_UNAUTHORIZED":"${TLS_REJECT_UNAUTHORIZED}"}},
+  "cts-ta": {"internal":true,"command":"npx","args":["-y","github:jhw7500/cts-ta-mcp-server"],"env":{"HIWORKS_USER":"${HIWORKS_USER}","HIWORKS_PASSWORD":"${HIWORKS_PASSWORD}"}},
+  "jhw-notion": {"internal":true,"command":"node","args":["${JHW_NOTION_DIST}/index.js"],"env":{"NOTION_API_KEY":"${NOTION_API_KEY}"}},
+  "ssh-mcp": {"internal":true,"command":"npx","args":["ssh-mcp","-y","--"]}
+}
