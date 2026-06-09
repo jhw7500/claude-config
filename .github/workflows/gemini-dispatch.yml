@@ -24,7 +24,7 @@ defaults:
 
 jobs:
   dispatch:
-    uses: 'jhw7500/automation/.github/workflows/gemini-dispatch.yml@v1.29'
+    uses: 'jhw7500/automation/.github/workflows/gemini-dispatch.yml@v1.30'
     permissions:
       contents: 'read'
       id-token: 'write'
