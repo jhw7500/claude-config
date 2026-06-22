@@ -10,7 +10,7 @@ on:
 
 jobs:
   claude:
-    uses: 'jhw7500/automation/.github/workflows/claude.yml@v1.30'
+    uses: 'jhw7500/automation/.github/workflows/claude.yml@v1.31'
     permissions:
       contents: read
       pull-requests: read
