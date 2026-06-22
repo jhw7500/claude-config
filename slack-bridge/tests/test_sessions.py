@@ -67,3 +67,9 @@ def test_find_session_by_prefix(tmp_path):
     ])
     assert sessions.find_session(pd, "abcdef12").session_id == "abcdef12-3456-7890"
     assert sessions.find_session(pd, "nope") is None
+
+
+def test_find_session_rejects_metachars(tmp_path):
+    assert sessions.find_session(str(tmp_path), "../etc/passwd") is None
+    assert sessions.find_session(str(tmp_path), "*") is None
+    assert sessions.find_session(str(tmp_path), "") is None

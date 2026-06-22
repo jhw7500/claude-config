@@ -31,10 +31,23 @@ UNIT="$(sed -e "s|__PATH__|$PATH|g" -e "s|__REPO__|$REPO_DIR|g" "$BRIDGE_DIR/cla
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "[dry-run] venv: $BRIDGE_DIR/.venv ; deps: slack_bolt"
+  echo "[dry-run] would write \$HOME/.config/claude-slack-bridge.env (SLACK_* only, chmod 600)"
   echo "[dry-run] would write $SERVICE_PATH:"; echo "$UNIT"
   echo "[dry-run] systemctl --user enable --now claude-slack-bridge.service"
   exit 0
 fi
+
+ENV_FILE="$HOME/.config/claude-slack-bridge.env"
+mkdir -p "$(dirname "$ENV_FILE")"
+( umask 077
+  {
+    echo "SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN"
+    echo "SLACK_APP_TOKEN=$SLACK_APP_TOKEN"
+    echo "SLACK_CHANNEL_ID=$SLACK_CHANNEL_ID"
+    echo "SLACK_ALLOWED_USER_ID=$SLACK_ALLOWED_USER_ID"
+  } > "$ENV_FILE" )
+chmod 600 "$ENV_FILE"
+echo "[setup] wrote $ENV_FILE (SLACK_* only)"
 
 echo "[setup] creating venv + installing deps"
 # Prefer uv (no ensurepip needed). Fall back to stdlib venv (requires python3-venv).

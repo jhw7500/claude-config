@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from glob import glob
 
@@ -71,7 +72,7 @@ def list_sessions(projects_dir: str, limit: int = 15) -> list[SessionInfo]:
 
 
 def find_session(projects_dir: str, session_id: str) -> SessionInfo | None:
-    if not session_id:
+    if not session_id or not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
         return None
     exact = glob(os.path.join(projects_dir, "*", session_id + ".jsonl"))
     if exact:

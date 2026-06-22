@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=__REPO__/slack-bridge
-EnvironmentFile=__REPO__/secrets.local.env
+EnvironmentFile=%h/.config/claude-slack-bridge.env
 Environment=PATH=__PATH__
 ExecStart=__REPO__/slack-bridge/.venv/bin/python bridge.py
 Restart=always
