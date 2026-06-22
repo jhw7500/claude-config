@@ -698,7 +698,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("claude-slack-bridge")
 
 CFG = config.load_config()
-app = App(token=CFG.bot_token)
+# token_verification_enabled=False: skip slack_bolt's startup auth.test so the App can
+# be built at import with a dummy token (unit tests) and start headless. Token is still
+# used for API calls; a bad token surfaces on first send instead of at startup.
+app = App(token=CFG.bot_token, token_verification_enabled=False)
 
 # channel_id -> selected session_id (sticky)
 _targets: dict[str, str] = {}
