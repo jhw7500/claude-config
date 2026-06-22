@@ -2,3 +2,4 @@ secrets.local.env
 *.local
 .omc/
 slack-bridge/.venv
+.superpowers/

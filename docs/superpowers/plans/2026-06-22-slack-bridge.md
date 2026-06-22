@@ -1015,14 +1015,12 @@ Environment=PATH=__PATH__
 ExecStart=%h/ai/opencode/projects/claude-config/slack-bridge/.venv/bin/python bridge.py
 Restart=always
 RestartSec=5
-StandardOutput=append:%h/.repowire/../.claude-slack-bridge.log
-StandardError=append:%h/.repowire/../.claude-slack-bridge.log
+StandardOutput=append:%h/.claude-slack-bridge.log
+StandardError=append:%h/.claude-slack-bridge.log
 
 [Install]
 WantedBy=default.target
 ```
-
-> The log path resolves to `%h/.claude-slack-bridge.log`. (Using `%h/.claude-slack-bridge.log` directly is fine too; keep whichever the setup script writes.)
 
 - [ ] **Step 2: Write the setup script**
 
@@ -1067,8 +1065,14 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 echo "[setup] creating venv + installing deps"
-python3 -m venv "$BRIDGE_DIR/.venv"
-"$BRIDGE_DIR/.venv/bin/pip" install -q -r "$BRIDGE_DIR/requirements.txt"
+# Prefer uv (no ensurepip needed). Fall back to stdlib venv (requires python3-venv).
+if command -v uv >/dev/null 2>&1; then
+  uv venv "$BRIDGE_DIR/.venv"
+  uv pip install --python "$BRIDGE_DIR/.venv/bin/python" -q -r "$BRIDGE_DIR/requirements.txt"
+else
+  python3 -m venv "$BRIDGE_DIR/.venv"
+  "$BRIDGE_DIR/.venv/bin/pip" install -q -r "$BRIDGE_DIR/requirements.txt"
+fi
 
 mkdir -p "$(dirname "$SERVICE_PATH")"
 [ -f "$SERVICE_PATH" ] && cp "$SERVICE_PATH" "$SERVICE_PATH.bak"
