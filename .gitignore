@@ -3,3 +3,5 @@ secrets.local.env
 .omc/
 slack-bridge/.venv
 .superpowers/
+__pycache__/
+*.pyc
