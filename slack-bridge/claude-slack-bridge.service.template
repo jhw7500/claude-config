@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude Code Slack Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO__/slack-bridge
+EnvironmentFile=%h/.config/claude-slack-bridge.env
+Environment=PATH=__PATH__
+ExecStart=__REPO__/slack-bridge/.venv/bin/python bridge.py
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/.claude-slack-bridge.log
+StandardError=append:%h/.claude-slack-bridge.log
+
+[Install]
+WantedBy=default.target
