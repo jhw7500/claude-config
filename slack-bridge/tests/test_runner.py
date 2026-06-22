@@ -44,3 +44,17 @@ def test_parse_result_error_and_denials():
 def test_is_active_threshold():
     assert runner.is_active(1000.0, now=1000.0 + config.ACTIVE_THRESHOLD_SECONDS - 1)
     assert not runner.is_active(1000.0, now=1000.0 + config.ACTIVE_THRESHOLD_SECONDS + 1)
+
+
+def test_run_turn_extracts_json_from_noisy_stdout(monkeypatch):
+    import subprocess
+    payload = '{"result":"ok","session_id":"s1","is_error":false,"total_cost_usd":0,"permission_denials":[]}'
+
+    class _P:
+        returncode = 0
+        stdout = "WARNING: something\n" + payload
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _P())
+    r = runner.run_turn("s1", "/tmp", "hi")
+    assert r.ok and r.text == "ok" and r.session_id == "s1"

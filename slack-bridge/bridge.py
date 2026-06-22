@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -28,7 +29,7 @@ _last_list: dict[str, dict[int, str]] = {}
 
 _locks_guard = threading.Lock()
 _session_locks: dict[str, threading.Lock] = {}
-_owned: set[str] = set()  # sessions the bridge has successfully run at least one turn on
+_last_bridge_run: dict[str, float] = {}  # session_id -> wall-clock time of last bridge turn
 
 
 def _lock_for(session_id: str) -> threading.Lock:
@@ -107,7 +108,10 @@ def _run_and_reply(channel: str, prompt: str, say, *, fork: bool = False) -> Non
     if info is None:
         say(f":x: 세션 `{sid[:8]}` 이(가) 사라졌습니다. 다시 `sessions`.")
         return
-    if not fork and info.session_id not in _owned and runner.is_active(info.mtime):
+    bridge_ran_recently = (
+        time.time() - _last_bridge_run.get(info.session_id, 0.0)
+    ) < config.ACTIVE_THRESHOLD_SECONDS
+    if not fork and not bridge_ran_recently and runner.is_active(info.mtime):
         say(":warning: 이 세션이 방금 활성 상태였습니다(다른 곳에서 열려 있을 수 있음). "
             "`fork <메시지>` 로 분기하거나 잠시 후 다시 시도하세요.")
         return
@@ -120,9 +124,9 @@ def _run_and_reply(channel: str, prompt: str, say, *, fork: bool = False) -> Non
     def work() -> None:
         try:
             res = runner.run_turn(info.session_id, info.cwd, prompt, fork=fork)
-            _owned.add(info.session_id)
+            _last_bridge_run[info.session_id] = time.time()
             if fork and res.session_id and res.session_id != info.session_id:
-                _owned.add(res.session_id)
+                _last_bridge_run[res.session_id] = time.time()
                 _targets[channel] = res.session_id
                 say(f":twisted_rightwards_arrows: 분기됨 → 새 세션 `{res.session_id[:8]}` (이후 메시지는 여기로)")
             head = "" if res.ok else ":x: (error)\n"

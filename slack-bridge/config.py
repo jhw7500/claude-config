@@ -19,6 +19,8 @@ DENY_TOOLS = [
     "Bash(dd:*)",
     "Bash(shutdown:*)",
     "Bash(reboot:*)",
+    "Bash(sudo:*)",
+    "Bash(/bin/rm:*)",
 ]
 
 # A session whose transcript changed within this window is treated as

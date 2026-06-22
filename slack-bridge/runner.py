@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -62,9 +63,17 @@ def run_turn(session_id: str, cwd: str, prompt: str, *, fork: bool = False,
     proc = subprocess.run(
         cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
     )
-    if not proc.stdout.strip():
+    stdout = proc.stdout.strip()
+    if not stdout:
         raise RuntimeError(
-            f"claude produced no output (exit {proc.returncode}): "
-            f"{proc.stderr.strip()[:500]}"
+            f"claude produced no output (exit {proc.returncode}): {proc.stderr.strip()[:500]}"
         )
-    return parse_result(proc.stdout)
+    try:
+        return parse_result(stdout)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", stdout)
+        if m:
+            return parse_result(m.group())
+        raise RuntimeError(
+            f"claude output not JSON (exit {proc.returncode}): {stdout[:300]}"
+        )
