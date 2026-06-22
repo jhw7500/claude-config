@@ -15,6 +15,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("claude-slack-bridge")
 
 CFG = config.load_config()
+# token_verification_enabled=False: skip slack_bolt's startup auth.test call so the
+# App can be constructed at import time with a dummy token (unit tests) and so a
+# headless start doesn't fail on token verification. The token is still used for all
+# API calls; a bad token surfaces on first send rather than at startup.
 app = App(token=CFG.bot_token, token_verification_enabled=False)
 
 # channel_id -> selected session_id (sticky)
@@ -99,16 +103,21 @@ def _run_and_reply(channel: str, prompt: str, say, *, fork: bool = False) -> Non
     def work() -> None:
         try:
             res = runner.run_turn(info.session_id, info.cwd, prompt, fork=fork)
+            if fork and res.session_id and res.session_id != info.session_id:
+                _targets[channel] = res.session_id
+                say(f":twisted_rightwards_arrows: 분기됨 → 새 세션 `{res.session_id[:8]}` (이후 메시지는 여기로)")
+            head = "" if res.ok else ":x: (error)\n"
+            tail = f"\n:no_entry: 차단된 도구: {', '.join(res.denials)}" if res.denials else ""
+            body = f"{head}{res.text}\n\n_💰 ${res.cost_usd:.4f}_{tail}"
+            if len(body) > 3500:
+                body = body[:3500] + "\n…(잘림)"
+            say(body)
         except Exception as e:  # noqa: BLE001 - surface any failure to Slack
-            log.exception("run_turn failed")
-            say(f":x: 실행 실패: {e}")
-            return
-        if fork and res.session_id and res.session_id != info.session_id:
-            _targets[channel] = res.session_id
-            say(f":twisted_rightwards_arrows: 분기됨 → 새 세션 `{res.session_id[:8]}` (이후 메시지는 여기로)")
-        head = "" if res.ok else ":x: (error)\n"
-        tail = f"\n:no_entry: 차단된 도구: {', '.join(res.denials)}" if res.denials else ""
-        say(f"{head}{res.text}\n\n_💰 ${res.cost_usd:.4f}_{tail}")
+            log.exception("turn failed")
+            try:
+                say(f":x: 실행 실패: {e}")
+            except Exception:
+                log.exception("failed to post error to Slack")
 
     threading.Thread(target=work, daemon=True).start()
 
@@ -148,6 +157,8 @@ def on_select_button(ack, body, say):
     if body.get("user", {}).get("id") != CFG.allowed_user_id:
         return
     channel = body["channel"]["id"]
+    if channel != CFG.channel_id:
+        return
     session_id = body["actions"][0]["value"]
     _select(channel, session_id, say)
 
