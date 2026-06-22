@@ -26,6 +26,19 @@ _targets: dict[str, str] = {}
 # last shown list per channel: index(int) -> session_id
 _last_list: dict[str, dict[int, str]] = {}
 
+_locks_guard = threading.Lock()
+_session_locks: dict[str, threading.Lock] = {}
+_owned: set[str] = set()  # sessions the bridge has successfully run at least one turn on
+
+
+def _lock_for(session_id: str) -> threading.Lock:
+    with _locks_guard:
+        lk = _session_locks.get(session_id)
+        if lk is None:
+            lk = threading.Lock()
+            _session_locks[session_id] = lk
+        return lk
+
 
 def is_authorized(event: dict, channel_id: str, user_id: str) -> bool:
     if event.get("bot_id") or event.get("subtype"):
@@ -94,16 +107,22 @@ def _run_and_reply(channel: str, prompt: str, say, *, fork: bool = False) -> Non
     if info is None:
         say(f":x: 세션 `{sid[:8]}` 이(가) 사라졌습니다. 다시 `sessions`.")
         return
-    if not fork and runner.is_active(info.mtime):
+    if not fork and info.session_id not in _owned and runner.is_active(info.mtime):
         say(":warning: 이 세션이 방금 활성 상태였습니다(다른 곳에서 열려 있을 수 있음). "
             "`fork <메시지>` 로 분기하거나 잠시 후 다시 시도하세요.")
+        return
+    lock = _lock_for(info.session_id)
+    if not lock.acquire(blocking=False):
+        say(":hourglass_flowing_sand: 이 세션은 이미 작업 중입니다. 잠시 후 다시 시도하세요.")
         return
     say(":hourglass_flowing_sand: 작업 중…")
 
     def work() -> None:
         try:
             res = runner.run_turn(info.session_id, info.cwd, prompt, fork=fork)
+            _owned.add(info.session_id)
             if fork and res.session_id and res.session_id != info.session_id:
+                _owned.add(res.session_id)
                 _targets[channel] = res.session_id
                 say(f":twisted_rightwards_arrows: 분기됨 → 새 세션 `{res.session_id[:8]}` (이후 메시지는 여기로)")
             head = "" if res.ok else ":x: (error)\n"
@@ -112,12 +131,14 @@ def _run_and_reply(channel: str, prompt: str, say, *, fork: bool = False) -> Non
             if len(body) > 3500:
                 body = body[:3500] + "\n…(잘림)"
             say(body)
-        except Exception as e:  # noqa: BLE001 - surface any failure to Slack
+        except Exception as e:  # noqa: BLE001
             log.exception("turn failed")
             try:
                 say(f":x: 실행 실패: {e}")
             except Exception:
                 log.exception("failed to post error to Slack")
+        finally:
+            lock.release()
 
     threading.Thread(target=work, daemon=True).start()
 
@@ -146,7 +167,10 @@ def on_message(event, say):
         sid = _targets.get(channel)
         say(f"대상: `{sid[:8]}`  권한: acceptEdits(+deny)" if sid else "대상 없음.")
     elif cmd == "fork":
-        _run_and_reply(channel, arg, say, fork=True)
+        if not arg:
+            say("사용법: `fork <메시지>`")
+        else:
+            _run_and_reply(channel, arg, say, fork=True)
     else:
         _run_and_reply(channel, text, say)
 

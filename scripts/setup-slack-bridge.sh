@@ -22,12 +22,12 @@ set -a; . "$REPO_DIR/secrets.local.env"; set +a
 for v in SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_CHANNEL_ID SLACK_ALLOWED_USER_ID; do
   if [ -z "${!v:-}" ]; then echo "[setup] $v 비어있음 (secrets.local.env)"; exit 1; fi
 done
-echo "[setup] tokens OK (bot ${SLACK_BOT_TOKEN:0:9}…, channel $SLACK_CHANNEL_ID)"
+echo "[setup] SLACK_* 4개 확인됨 (channel $SLACK_CHANNEL_ID)"
 
 CLAUDE_BIN="$(command -v claude || true)"
 if [ -z "$CLAUDE_BIN" ]; then echo "[setup] 'claude' not on PATH"; exit 1; fi
 SERVICE_PATH="$HOME/.config/systemd/user/claude-slack-bridge.service"
-UNIT="$(sed "s|__PATH__|$PATH|g" "$BRIDGE_DIR/claude-slack-bridge.service.template")"
+UNIT="$(sed -e "s|__PATH__|$PATH|g" -e "s|__REPO__|$REPO_DIR|g" "$BRIDGE_DIR/claude-slack-bridge.service.template")"
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "[dry-run] venv: $BRIDGE_DIR/.venv ; deps: slack_bolt"

@@ -71,11 +71,13 @@ def list_sessions(projects_dir: str, limit: int = 15) -> list[SessionInfo]:
 
 
 def find_session(projects_dir: str, session_id: str) -> SessionInfo | None:
-    candidates = list_sessions(projects_dir, limit=100_000)
-    for s in candidates:
-        if s.session_id == session_id:
-            return s
-    for s in candidates:
-        if s.session_id.startswith(session_id):
-            return s
-    return None
+    if not session_id:
+        return None
+    exact = glob(os.path.join(projects_dir, "*", session_id + ".jsonl"))
+    if exact:
+        return _extract(exact[0])
+    matches = glob(os.path.join(projects_dir, "*", session_id + "*.jsonl"))
+    if not matches:
+        return None
+    matches.sort(key=os.path.getmtime, reverse=True)
+    return _extract(matches[0])

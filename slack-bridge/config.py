@@ -6,7 +6,8 @@ from dataclasses import dataclass
 
 # Destructive command patterns blocked even under acceptEdits.
 # Claude Code permission-rule syntax: "Bash(<prefix>:*)".
-# NOTE: exact match semantics are verified live in Task 3, Step 6.
+# Verified live 2026-06-22: `--disallowedTools "Bash(rm:*)"` blocks rm under
+# --permission-mode acceptEdits (permission_denials=['Bash'], target file survived).
 DENY_TOOLS = [
     "Bash(rm:*)",
     "Bash(rmdir:*)",
