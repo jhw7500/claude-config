@@ -26,4 +26,19 @@ def test_parse_command():
     assert bridge.parse_command("clear") == ("clear", "")
     assert bridge.parse_command("status") == ("status", "")
     assert bridge.parse_command("fork add a test") == ("fork", "add a test")
+    assert bridge.parse_command("last") == ("last", "")
+    assert bridge.parse_command("refresh") == ("last", "")
+    # refresh-prefixed real instructions must still run as prompts (not hijacked)
+    assert bridge.parse_command("refresh the cache please") == ("run", "refresh the cache please")
+    assert bridge.parse_command("last thing to do") == ("run", "last thing to do")
     assert bridge.parse_command("just do the thing") == ("run", "just do the thing")
+
+
+def test_thread_map_persistence(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "_STATE_FILE", str(tmp_path / "threads.json"))
+    bridge._thread_session.clear()
+    bridge._thread_session["1700000000.000100"] = "sess-abc"
+    bridge._save_threads()
+    # reload from disk into a fresh dict
+    loaded = bridge._load_threads()
+    assert loaded == {"1700000000.000100": "sess-abc"}
