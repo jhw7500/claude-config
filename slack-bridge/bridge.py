@@ -59,7 +59,9 @@ _last_bridge_run: dict[str, float] = {}  # session_id -> wall-clock time of last
 
 def _save_threads() -> None:
     try:
-        os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
+        d = os.path.dirname(_STATE_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
         tmp = _STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(_thread_session, f)
@@ -90,14 +92,13 @@ def parse_command(text: str) -> tuple[str, str]:
         return ("sessions", "")
     if low in ("clear", "status"):
         return (low, "")
+    # refresh-style keywords are commands ONLY as an exact single word, so a real
+    # instruction like "refresh the cache" still runs as a prompt.
     if low in ("last", "refresh", "recent", "갱신", "최근"):
         return ("last", "")
     for kw in ("select", "fork"):
         if low == kw or low.startswith(kw + " "):
             return (kw, t[len(kw):].strip())
-    for kw in ("last", "refresh", "recent"):
-        if low.startswith(kw + " "):
-            return ("last", t[len(kw):].strip())
     return ("run", t)
 
 
@@ -310,15 +311,7 @@ def on_message(event, say):
     elif cmd == "clear":
         say("스레드 *안에서* `clear` 를 쓰면 그 스레드의 세션 연결이 해제됩니다.")
     elif cmd == "last":
-        target = _resolve_target(channel, arg)
-        if not target:
-            say("사용법: `last <번호|id>` (먼저 `sessions`). 스레드 안에서는 `last` 만 쳐도 됩니다.")
-        else:
-            info = sessions.find_session(CFG.projects_dir, target)
-            if info is None:
-                say(f":x: 세션 `{target[:8]}` 을(를) 찾지 못했습니다.")
-            else:
-                _show_last(info, say)
+        say("`last`(최신 입출력 갱신)는 세션 *스레드 안에서* 사용하세요.")
     else:
         say("여기는 채널 본문입니다. `sessions` 로 목록을 보고 ▶(또는 `select N`)로 세션 *스레드*를 연 뒤, "
             "그 스레드 안에서 지시를 보내세요.")

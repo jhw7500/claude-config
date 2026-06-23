@@ -48,7 +48,8 @@ def _find_repo(cwd: str) -> str:
     """Nearest ancestor dir containing .git (the work repo root name)."""
     d = cwd
     while d and d != os.path.dirname(d):
-        if os.path.isdir(os.path.join(d, ".git")):
+        # .git is a dir in normal repos but a FILE in worktrees/submodules.
+        if os.path.exists(os.path.join(d, ".git")):
             return os.path.basename(d)
         d = os.path.dirname(d)
     return ""
@@ -108,13 +109,20 @@ def _extract(path: str) -> SessionInfo | None:
 
 
 def list_sessions(projects_dir: str, limit: int = 15) -> list[SessionInfo]:
-    infos = []
+    # Sort by file mtime first (cheap stat), then fully parse only the newest `limit`.
+    paths = []
     for p in glob(os.path.join(projects_dir, "*", "*.jsonl")):
+        try:
+            paths.append((os.path.getmtime(p), p))
+        except OSError:
+            continue
+    paths.sort(reverse=True)
+    infos = []
+    for _, p in paths[:limit]:
         info = _extract(p)
         if info is not None:
             infos.append(info)
-    infos.sort(key=lambda s: s.mtime, reverse=True)
-    return infos[:limit]
+    return infos
 
 
 def find_session(projects_dir: str, session_id: str) -> SessionInfo | None:
