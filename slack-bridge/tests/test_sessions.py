@@ -73,3 +73,43 @@ def test_find_session_rejects_metachars(tmp_path):
     assert sessions.find_session(str(tmp_path), "../etc/passwd") is None
     assert sessions.find_session(str(tmp_path), "*") is None
     assert sessions.find_session(str(tmp_path), "") is None
+
+
+def test_last_user_and_assistant(tmp_path):
+    pd = str(tmp_path)
+    _write_session(pd, "-p", "sid-last", "/c", [
+        {"type": "user", "cwd": "/c",
+         "message": {"role": "user", "content": "first msg"}},
+        {"type": "assistant",
+         "message": {"role": "assistant",
+                     "content": [{"type": "text", "text": "first reply"}]}},
+        {"type": "user",
+         "message": {"role": "user",
+                     "content": "<system-reminder>ignore me</system-reminder>"}},
+        {"type": "user",
+         "message": {"role": "user", "content": "latest question"}},
+        {"type": "assistant",
+         "message": {"role": "assistant",
+                     "content": [{"type": "tool_use", "name": "x"},
+                                 {"type": "text", "text": "latest answer"}]}},
+    ])
+    s = sessions.list_sessions(pd)[0]
+    assert s.title == "first msg"
+    assert s.last_user == "latest question"
+    assert s.last_assistant == "latest answer"
+
+
+def test_pending_input_when_no_reply(tmp_path):
+    pd = str(tmp_path)
+    _write_session(pd, "-p", "sid-pending", "/c", [
+        {"type": "user", "cwd": "/c",
+         "message": {"role": "user", "content": "q1"}},
+        {"type": "assistant",
+         "message": {"role": "assistant",
+                     "content": [{"type": "text", "text": "a1"}]}},
+        {"type": "user",
+         "message": {"role": "user", "content": "q2 no reply yet"}},
+    ])
+    s = sessions.list_sessions(pd)[0]
+    assert s.last_user == "q2 no reply yet"  # the actual latest prompt
+    assert s.last_assistant == ""  # no reply to it yet
