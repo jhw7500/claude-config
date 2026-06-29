@@ -27,7 +27,7 @@ jobs:
       id-token: 'write'
       issues: 'read'
       pull-requests: 'read'
-    uses: 'jhw7500/automation/.github/workflows/gemini-triage.yml@v1.32'
+    uses: 'jhw7500/automation/.github/workflows/gemini-triage.yml@v1.33'
     with:
       issue_number: '${{ inputs.issue_number }}'
       issue_title: '${{ inputs.issue_title }}'

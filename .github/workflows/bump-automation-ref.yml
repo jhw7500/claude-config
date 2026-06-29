@@ -20,10 +20,38 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
+      # GITHUB_TOKEN 은 GitHub 정책상 .github/workflows/* 수정 push 가 거부되므로
+      # ("refusing to allow a GitHub App to create or update workflow ... without
+      # workflows permission") workflows:write 권한을 가진 GitHub App 토큰으로
+      # checkout/push 한다. App 미설정 시 GITHUB_TOKEN 으로 폴백(이 경우 push 실패).
+      - name: Mint GitHub App token
+        id: app-token
+        if: ${{ vars.APP_ID != '' }}
+        uses: actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b # ratchet:actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Resolve token
+        id: tok
+        env:
+          MINTED: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MINTED:-}" ]; then
+            printf 'token=%s\n' "$MINTED" >> "$GITHUB_OUTPUT"
+            echo "::notice::Using GitHub App token for workflow push"
+          else
+            printf 'token=%s\n' "${{ github.token }}" >> "$GITHUB_OUTPUT"
+            echo "::warning::APP_ID 미설정 — GITHUB_TOKEN 으로는 .github/workflows push 가 거부됨 (App 에 workflows:write 권한 필요)"
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ steps.tok.outputs.token }}
+          persist-credentials: true
 
       - name: Determine automation_ref change
         id: ref
@@ -95,7 +123,7 @@ jobs:
       - name: Create PR
         if: steps.ref.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.tok.outputs.token }}
           NEW_REF: ${{ steps.ref.outputs.new_ref }}
         run: |
           set -euo pipefail

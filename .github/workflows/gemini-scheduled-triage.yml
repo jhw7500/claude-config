@@ -10,5 +10,5 @@ jobs:
       id-token: 'write'
       issues: 'write'
       pull-requests: 'write'
-    uses: jhw7500/automation/.github/workflows/gemini-scheduled-triage.yml@v1.32
+    uses: jhw7500/automation/.github/workflows/gemini-scheduled-triage.yml@v1.33
     secrets: inherit

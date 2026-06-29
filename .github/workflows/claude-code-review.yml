@@ -12,7 +12,7 @@ jobs:
       pull-requests: write
       issues: read
       id-token: write
-    uses: 'jhw7500/automation/.github/workflows/claude-code-review.yml@v1.32'
+    uses: 'jhw7500/automation/.github/workflows/claude-code-review.yml@v1.33'
     with:
       pr_number: '${{ github.event.pull_request.number }}'
       force_run: false
