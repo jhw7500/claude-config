@@ -135,9 +135,16 @@ def test_scan_live_classifies_processes(tmp_path):
     _fake_proc(proc, 105, ["claude", "bg-spare", "--bg-spare", "/tmp/s.sock"], cwd=str(work))
     _fake_proc(proc, 106, ["python3", "bridge.py"], cwd=str(work))
     _fake_proc(proc, 110, ["claude", "--debug", "mcp", "serve"], cwd=str(work))
+    # npm-style node wrapper: counts as a TUI; daemon under node is still skipped
+    _fake_proc(proc, 111, ["node", "/usr/local/bin/claude", "--foo"], cwd=str(work))
+    _fake_proc(proc, 112, ["node", "/usr/local/bin/claude", "daemon", "run"], cwd=str(work))
+    _fake_proc(proc, 113, ["node", "/usr/lib/other/cli.js"], cwd=str(work))
+    # --resume with an extensionless path still yields the id
+    sid_path = "dddddddd-eeee-ffff-0000-111111111111"
+    _fake_proc(proc, 114, ["claude", "--resume", f"/p2/{sid_path}"], cwd=str(work))
     open_ids, live_cwds = sessions.scan_live(str(proc))
-    assert open_ids == {sid_bg, sid_resume, sid_eq, sid_short}
-    assert live_cwds == {str(work): 2}
+    assert open_ids == {sid_bg, sid_resume, sid_eq, sid_short, sid_path}
+    assert live_cwds == {str(work): 3}
 
 
 def test_list_sessions_live_annotation(tmp_path):
@@ -159,6 +166,28 @@ def test_list_sessions_live_annotation(tmp_path):
     assert [s.live for s in got] == ["open", "maybe", "closed", "closed"]
     found = sessions.find_session(pd, "22222222", live=(set(), {"/w/tui": 1}))
     assert found.live == "maybe"
+
+
+def test_list_live_sessions_full_scan(tmp_path):
+    pd = str(tmp_path / "projects")
+    # newest sessions are all closed noise; the open one is the OLDEST
+    for i in range(20):
+        _write_session(pd, f"-n{i}", f"00000000-{i:04d}", f"/noise/{i}", [
+            {"type": "user", "cwd": f"/noise/{i}",
+             "message": {"role": "user", "content": "n"}},
+        ], mtime=5000 + i)
+    _write_session(pd, "-old", "99999999-aaaa", "/w/old", [
+        {"type": "user", "cwd": "/w/old", "message": {"role": "user", "content": "o"}},
+    ], mtime=100)
+    _write_session(pd, "-tui", "88888888-bbbb", "/w/tui", [
+        {"type": "user", "cwd": "/w/tui", "message": {"role": "user", "content": "t"}},
+    ], mtime=200)
+    got = sessions.list_live_sessions(
+        pd, live=({"99999999-aaaa"}, {"/w/tui": 1}))
+    assert {(s.session_id, s.live) for s in got} == {
+        ("99999999-aaaa", "open"), ("88888888-bbbb", "maybe"),
+    }
+    assert sessions.list_live_sessions(pd, live=(set(), {})) == []
 
 
 def test_pending_input_when_no_reply(tmp_path):

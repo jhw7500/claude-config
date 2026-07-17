@@ -155,9 +155,8 @@ def _show_last(info, say, thread_ts: str | None = None) -> None:
 
 def _cmd_sessions(channel: str, say, mode: str = "") -> None:
     if mode == "live":
-        # scan deeper so an old-mtime open session isn't cut by the default limit
-        items = [s for s in sessions.list_sessions(CFG.projects_dir, limit=60)
-                 if s.live != "closed"][:15]
+        # full-scan candidate matching: an old-mtime open session is not cut
+        items = sessions.list_live_sessions(CFG.projects_dir)
     else:
         items = sessions.list_sessions(CFG.projects_dir)
     if not items:
@@ -376,6 +375,12 @@ def main() -> None:
         "Starting claude-slack-bridge (channel=%s, %d bound threads)",
         CFG.channel_id, len(_thread_session),
     )
+    if config.PERMISSION_MODE == "bypassPermissions":
+        log.warning(
+            "permission mode: bypassPermissions — turns run without permission "
+            "prompts (DENY_TOOLS backstop only). Override with "
+            "CLAUDE_BRIDGE_PERMISSION_MODE if unintended."
+        )
     SocketModeHandler(app, CFG.app_token).start()
 
 
