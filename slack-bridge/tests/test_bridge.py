@@ -41,6 +41,68 @@ def test_parse_command():
     assert bridge.parse_command("just do the thing") == ("run", "just do the thing")
 
 
+def test_thread_for_reverse_lookup():
+    bridge._thread_session.clear()
+    assert bridge._thread_for("sess-a") is None
+    bridge._thread_session.update({
+        "1700000001.000100": "sess-a",
+        "1700000005.000100": "sess-a",   # newer binding wins
+        "1700000003.000100": "sess-b",
+    })
+    assert bridge._thread_for("sess-a") == "1700000005.000100"
+    assert bridge._thread_for("sess-b") == "1700000003.000100"
+    assert bridge._thread_for("sess-x") is None
+    bridge._thread_session.clear()
+
+
+def _info(sid="11111111-aaaa", live="closed", turns=3):
+    import sessions
+    return sessions.SessionInfo(
+        session_id=sid, cwd="/w/x", mtime=1000.0, title="t",
+        branch="main", repo="repo", turns=turns, live=live,
+    )
+
+
+def test_render_sessions_badges_and_buttons():
+    items = [_info(live="open"), _info(sid="22222222-bbbb", live="maybe")]
+    text, blocks = bridge._render_sessions(items)
+    assert "🖥️ 실행중" in text and "🟡 열림후보" in text
+    assert "sessions live" in text  # scope hint in default mode
+    # context header + one section per session, each with a select button
+    assert len(blocks) == 3
+    assert all(b["accessory"]["action_id"] == "select_session" for b in blocks[1:])
+    text_live, _ = bridge._render_sessions(items, mode="live")
+    assert "sessions all" in text_live
+
+
+def test_home_view_structure():
+    view = bridge._home_view([_info()])
+    assert view["type"] == "home"
+    ids = [b.get("type") for b in view["blocks"]]
+    assert ids[0] == "header"
+    refresh = [e for b in view["blocks"] if b.get("type") == "actions"
+               for e in b["elements"]]
+    assert refresh and refresh[0]["action_id"] == "home_refresh"
+    sections = [b for b in view["blocks"] if b.get("type") == "section"]
+    assert sections[0]["accessory"]["action_id"] == "select_session"
+    empty = bridge._home_view([])
+    assert "세션이 없습니다" in str(empty["blocks"][-1])
+    # notice (thread-opened feedback) lands right under the header
+    noticed = bridge._home_view([_info()], notice="🧵 열림 → 링크")
+    assert noticed["blocks"][1]["type"] == "section"
+    assert "🧵 열림" in noticed["blocks"][1]["text"]["text"]
+
+
+def test_home_view_persistent_thread_link(monkeypatch):
+    # a session with a bound thread keeps its link across refreshes
+    monkeypatch.setattr(bridge, "_thread_link",
+                        lambda sid: "https://x.slack.com/archives/C/p1" if sid == "11111111-aaaa" else None)
+    view = bridge._home_view([_info(), _info(sid="22222222-bbbb")])
+    sections = [b for b in view["blocks"] if b.get("type") == "section"]
+    assert "열린 스레드로 가기" in sections[0]["text"]["text"]
+    assert "열린 스레드로 가기" not in sections[1]["text"]["text"]
+
+
 def test_thread_map_persistence(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge, "_STATE_FILE", str(tmp_path / "threads.json"))
     bridge._thread_session.clear()
