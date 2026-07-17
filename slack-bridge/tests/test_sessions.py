@@ -190,6 +190,29 @@ def test_list_live_sessions_full_scan(tmp_path):
     assert sessions.list_live_sessions(pd, live=(set(), {})) == []
 
 
+def test_list_live_sessions_stops_early(tmp_path, monkeypatch):
+    pd = str(tmp_path / "projects")
+    # targets are the NEWEST files; older noise must never be peeked
+    _write_session(pd, "-open", "99999999-aaaa", "/w/open", [
+        {"type": "user", "cwd": "/w/open", "message": {"role": "user", "content": "o"}},
+    ], mtime=9000)
+    _write_session(pd, "-tui", "88888888-bbbb", "/w/tui", [
+        {"type": "user", "cwd": "/w/tui", "message": {"role": "user", "content": "t"}},
+    ], mtime=8000)
+    for i in range(20):
+        _write_session(pd, f"-n{i}", f"00000000-{i:04d}", f"/noise/{i}", [
+            {"type": "user", "cwd": f"/noise/{i}",
+             "message": {"role": "user", "content": "n"}},
+        ], mtime=1000 + i)
+    peeks = []
+    real_peek = sessions._peek_cwd
+    monkeypatch.setattr(sessions, "_peek_cwd",
+                        lambda p: peeks.append(p) or real_peek(p))
+    got = sessions.list_live_sessions(pd, live=({"99999999-aaaa"}, {"/w/tui": 1}))
+    assert len(got) == 2
+    assert len(peeks) == 1  # only the tui candidate; loop broke before the noise
+
+
 def test_pending_input_when_no_reply(tmp_path):
     pd = str(tmp_path)
     _write_session(pd, "-p", "sid-pending", "/c", [

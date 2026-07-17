@@ -284,21 +284,29 @@ def list_live_sessions(
         paths.append((_safe_mtime(p), p))
     paths.sort(reverse=True)
     budget = dict(cwd_counts)
+    budget_left = sum(v for v in budget.values() if v > 0)
+    remaining_ids = set(open_ids)
     out: list[SessionInfo] = []
     for _, p in paths:
-        if len(out) >= cap:
+        # stop as soon as every TUI slot and exact id is accounted for —
+        # avoids peeking the (potentially huge) tail of closed transcripts
+        if len(out) >= cap or (not remaining_ids and budget_left <= 0):
             break
         stem = os.path.splitext(os.path.basename(p))[0]
-        if stem in open_ids:
+        if stem in remaining_ids:
+            remaining_ids.discard(stem)
             info = _extract(p)
             if info is not None:
                 out.append(replace(info, live="open"))
+            continue
+        if budget_left <= 0:
             continue
         cwd = _peek_cwd(p)
         if cwd and budget.get(cwd, 0) > 0:
             info = _extract(p)
             if info is not None:
                 budget[cwd] -= 1
+                budget_left -= 1
                 out.append(replace(info, live="maybe"))
     return out
 
