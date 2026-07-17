@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from glob import glob
 
 
@@ -19,6 +19,10 @@ class SessionInfo:
     branch: str = ""
     repo: str = ""
     turns: int = 0
+    # "open"   = a running claude process names this exact session id
+    # "maybe"  = an interactive TUI is running in this session's cwd (id unknown)
+    # "closed" = no claude process in this session's cwd
+    live: str = "closed"
 
     @property
     def folder(self) -> str:
@@ -53,6 +57,111 @@ def _find_repo(cwd: str) -> str:
             return os.path.basename(d)
         d = os.path.dirname(d)
     return ""
+
+
+# claude subcommands that never host a resumable session transcript.
+_SKIP_SUBCOMMANDS = {
+    "daemon", "bg-spare", "update", "doctor", "mcp", "auth", "agents",
+    "install", "setup-token", "migrate-installer", "plugin",
+}
+
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def _parse_session_ref(args: list[str]) -> str | None:
+    """Exact session id named on a claude cmdline.
+
+    --session-id wins over --resume/-r: a bg-pty-host forked from a
+    transcript carries both, and only the --session-id one is the live
+    session. Accepts both "--flag value" and "--flag=value" forms.
+    """
+    for flag in ("--session-id", "--resume", "-r"):
+        for i, a in enumerate(args):
+            v = None
+            if a == flag:
+                if i + 1 < len(args):
+                    v = args[i + 1]
+            elif a.startswith(flag + "="):
+                v = a[len(flag) + 1:]
+            if v is None:
+                continue
+            # value may be a bare uuid, a /path/to/<uuid>.jsonl, or a path
+            # without extension — basename+splitext handles all three.
+            v = os.path.splitext(os.path.basename(v))[0]
+            if _UUID_RE.fullmatch(v):
+                return v
+    return None
+
+
+def scan_live(proc_root: str = "/proc") -> tuple[set[str], dict[str, int]]:
+    """Best-effort scan of running claude processes.
+
+    Returns (open_ids, live_cwd_counts): session ids named exactly on a
+    claude cmdline, and cwd -> count of interactive TUIs whose session id
+    is unknowable (a fresh `claude` has no id on its cmdline or environ,
+    and holds no fd to its transcript while idle — verified live 2026-07-17).
+    """
+    open_ids: set[str] = set()
+    live_cwds: dict[str, int] = {}
+    try:
+        pids = [p for p in os.listdir(proc_root) if p.isdigit()]
+    except OSError:
+        return open_ids, live_cwds
+    for pid in pids:
+        base = os.path.join(proc_root, pid)
+        try:
+            with open(os.path.join(base, "cmdline"), "rb") as fh:
+                args = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if not args:
+            continue
+        # npm-style installs run as ["node", ".../bin/claude", ...] — unwrap.
+        exe = os.path.basename(args[0])
+        if exe in ("node", "nodejs"):
+            if len(args) > 1 and os.path.basename(args[1]) == "claude":
+                cli_args = args[2:]
+            else:
+                continue
+        elif exe == "claude":
+            cli_args = args[1:]
+        else:
+            continue
+        # one-off print-mode runs (the bridge itself, scripts) are transient
+        if "-p" in cli_args or "--print" in cli_args:
+            continue
+        # first non-flag token is the subcommand, wherever the flags sit
+        sub = next((a for a in cli_args if not a.startswith("-")), "")
+        if sub in _SKIP_SUBCOMMANDS:
+            continue
+        sid = _parse_session_ref(cli_args)
+        if sid:
+            open_ids.add(sid)
+            continue
+        try:
+            cwd = os.readlink(os.path.join(base, "cwd"))
+        except OSError:
+            continue
+        live_cwds[cwd] = live_cwds.get(cwd, 0) + 1
+    return open_ids, live_cwds
+
+
+def _annotate_live(
+    info: SessionInfo, open_ids: set[str], live_cwd_counts: dict[str, int],
+) -> SessionInfo:
+    """Single-session annotation (conservative: any TUI in the cwd -> maybe).
+
+    Intentionally stricter than list_sessions' budgeted assignment: a session
+    the list showed as "closed" (older than the per-cwd TUI budget) may still
+    come back "maybe" here — resume-time warnings prefer false positives.
+    """
+    if info.session_id in open_ids:
+        return replace(info, live="open")
+    if live_cwd_counts.get(info.cwd, 0) > 0:
+        return replace(info, live="maybe")
+    return info
 
 
 def _extract(path: str) -> SessionInfo | None:
@@ -108,7 +217,10 @@ def _extract(path: str) -> SessionInfo | None:
     )
 
 
-def list_sessions(projects_dir: str, limit: int = 15) -> list[SessionInfo]:
+def list_sessions(
+    projects_dir: str, limit: int = 15,
+    live: tuple[set[str], dict[str, int]] | None = None,
+) -> list[SessionInfo]:
     # Sort by file mtime first (cheap stat), then fully parse only the newest `limit`.
     paths = []
     for p in glob(os.path.join(projects_dir, "*", "*.jsonl")):
@@ -117,22 +229,108 @@ def list_sessions(projects_dir: str, limit: int = 15) -> list[SessionInfo]:
         except OSError:
             continue
     paths.sort(reverse=True)
+    open_ids, cwd_counts = scan_live() if live is None else live
+    # Budgeted "maybe": with K unidentified TUIs in a cwd, only the K most
+    # recent sessions there are open candidates — older siblings are closed.
+    budget = dict(cwd_counts)
     infos = []
     for _, p in paths[:limit]:
         info = _extract(p)
-        if info is not None:
-            infos.append(info)
+        if info is None:
+            continue
+        if info.session_id in open_ids:
+            info = replace(info, live="open")
+        elif budget.get(info.cwd, 0) > 0:
+            budget[info.cwd] -= 1
+            info = replace(info, live="maybe")
+        infos.append(info)
     return infos
 
 
-def find_session(projects_dir: str, session_id: str) -> SessionInfo | None:
+def _peek_cwd(path: str, max_lines: int = 50) -> str:
+    """Cheaply read a transcript's cwd from its first few lines."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for _, line in zip(range(max_lines), fh):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("cwd"):
+                    return d["cwd"]
+    except OSError:
+        return ""
+    return ""
+
+
+def list_live_sessions(
+    projects_dir: str, cap: int = 15,
+    live: tuple[set[str], dict[str, int]] | None = None,
+) -> list[SessionInfo]:
+    """Open/maybe sessions across ALL transcripts (no recency cutoff).
+
+    Matches candidates cheaply first (filename stem vs open ids, peeked cwd
+    vs TUI cwds) and fully parses only those, so an open session older than
+    the newest N closed ones is still found.
+    """
+    open_ids, cwd_counts = scan_live() if live is None else live
+    if not open_ids and not cwd_counts:
+        return []
+    paths = []
+    for p in glob(os.path.join(projects_dir, "*", "*.jsonl")):
+        paths.append((_safe_mtime(p), p))
+    paths.sort(reverse=True)
+    budget = dict(cwd_counts)
+    budget_left = sum(v for v in budget.values() if v > 0)
+    remaining_ids = set(open_ids)
+    out: list[SessionInfo] = []
+    for _, p in paths:
+        # stop as soon as every TUI slot and exact id is accounted for —
+        # avoids peeking the (potentially huge) tail of closed transcripts
+        if len(out) >= cap or (not remaining_ids and budget_left <= 0):
+            break
+        stem = os.path.splitext(os.path.basename(p))[0]
+        if stem in remaining_ids:
+            remaining_ids.discard(stem)
+            info = _extract(p)
+            if info is not None:
+                out.append(replace(info, live="open"))
+            continue
+        if budget_left <= 0:
+            continue
+        cwd = _peek_cwd(p)
+        if cwd and budget.get(cwd, 0) > 0:
+            info = _extract(p)
+            if info is not None:
+                budget[cwd] -= 1
+                budget_left -= 1
+                out.append(replace(info, live="maybe"))
+    return out
+
+
+def _safe_mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:  # deleted between glob() and sort()
+        return 0.0
+
+
+def find_session(
+    projects_dir: str, session_id: str,
+    live: tuple[set[str], dict[str, int]] | None = None,
+) -> SessionInfo | None:
     if not session_id or not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
         return None
     exact = glob(os.path.join(projects_dir, "*", session_id + ".jsonl"))
-    if exact:
-        return _extract(exact[0])
-    matches = glob(os.path.join(projects_dir, "*", session_id + "*.jsonl"))
+    matches = exact or glob(os.path.join(projects_dir, "*", session_id + "*.jsonl"))
     if not matches:
         return None
-    matches.sort(key=os.path.getmtime, reverse=True)
-    return _extract(matches[0])
+    matches.sort(key=_safe_mtime, reverse=True)
+    info = _extract(matches[0])
+    if info is None:
+        return None
+    open_ids, cwd_counts = scan_live() if live is None else live
+    return _annotate_live(info, open_ids, cwd_counts)

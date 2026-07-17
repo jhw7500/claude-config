@@ -8,11 +8,16 @@ from dataclasses import dataclass
 # Claude Code permission-rule syntax: "Bash(<prefix>:*)".
 # Verified live 2026-06-22: `--disallowedTools "Bash(rm:*)"` blocks rm under
 # --permission-mode acceptEdits (permission_denials=['Bash'], target file survived).
+# Re-verified 2026-07-17: rm still denied under --permission-mode bypassPermissions.
+# NOTE: prefix rules cannot catch wrapper forms (bash -c "rm ...", find -delete,
+# xargs rm). Accepted risk (user decision 2026-07-17): host TUIs already run with
+# --dangerously-skip-permissions, so the bridge matches the local risk level.
 DENY_TOOLS = [
     "Bash(rm:*)",
     "Bash(rmdir:*)",
     "Bash(git push --force:*)",
     "Bash(git push -f:*)",
+    "Bash(git push --force-with-lease:*)",
     "Bash(git reset --hard:*)",
     "Bash(git clean:*)",
     "Bash(mkfs:*)",
@@ -26,6 +31,21 @@ DENY_TOOLS = [
 # A session whose transcript changed within this window is treated as
 # "active" (possibly open in a TUI) -> require fork/confirm before resuming.
 ACTIVE_THRESHOLD_SECONDS = 90
+
+# Headless permission mode for bridge turns. Host TUIs on this machine run with
+# --dangerously-skip-permissions, so bypassPermissions matches the local risk
+# level; DENY_TOOLS above still hard-blocks destructive patterns.
+_VALID_PERMISSION_MODES = {
+    "default", "manual", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan",
+}
+PERMISSION_MODE = (
+    os.environ.get("CLAUDE_BRIDGE_PERMISSION_MODE", "").strip() or "bypassPermissions"
+)
+if PERMISSION_MODE not in _VALID_PERMISSION_MODES:
+    raise SystemExit(
+        f"Invalid CLAUDE_BRIDGE_PERMISSION_MODE: {PERMISSION_MODE!r} "
+        f"(valid: {', '.join(sorted(_VALID_PERMISSION_MODES))})"
+    )
 
 
 @dataclass(frozen=True)

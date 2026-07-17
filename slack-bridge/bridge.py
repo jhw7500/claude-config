@@ -90,13 +90,20 @@ def parse_command(text: str) -> tuple[str, str]:
     low = t.lower()
     if low in ("sessions", "list"):
         return ("sessions", "")
+    for kw in ("sessions", "list"):
+        # only known filters count as args, so "list the files ..." stays a prompt
+        if low.startswith(kw + " "):
+            arg = low[len(kw):].strip()
+            if arg in ("live", "all"):
+                return ("sessions", arg)
+            break
     if low in ("clear", "status"):
         return (low, "")
     # refresh-style keywords are commands ONLY as an exact single word, so a real
     # instruction like "refresh the cache" still runs as a prompt.
     if low in ("last", "refresh", "recent", "갱신", "최근"):
         return ("last", "")
-    for kw in ("select", "fork"):
+    for kw in ("select", "fork", "force"):
         if low == kw or low.startswith(kw + " "):
             return (kw, t[len(kw):].strip())
     return ("run", t)
@@ -107,6 +114,10 @@ def _resolve_target(channel: str, arg: str) -> str | None:
     if arg.isdigit():
         return _last_list.get(channel, {}).get(int(arg))
     return arg or None
+
+
+# SessionInfo.live -> list badge
+_BADGE = {"open": "🖥️ 실행중", "maybe": "🟡 열림후보", "closed": "💤 종료"}
 
 
 def _ago(ts: float) -> str:
@@ -142,17 +153,23 @@ def _show_last(info, say, thread_ts: str | None = None) -> None:
         say(text=text)
 
 
-def _cmd_sessions(channel: str, say) -> None:
-    items = sessions.list_sessions(CFG.projects_dir)
+def _cmd_sessions(channel: str, say, mode: str = "") -> None:
+    if mode == "live":
+        # full-scan candidate matching: an old-mtime open session is not cut
+        items = sessions.list_live_sessions(CFG.projects_dir)
+    else:
+        items = sessions.list_sessions(CFG.projects_dir)
     if not items:
-        say("세션이 없습니다.")
+        say("열려 있는 세션이 없습니다. `sessions all`로 전체를 보세요." if mode == "live"
+            else "세션이 없습니다.")
         return
     _last_list[channel] = {i: s.session_id for i, s in enumerate(items, 1)}
     blocks, lines = [], []
     for i, s in enumerate(items, 1):
         repo = f"`{s.repo}`" if s.repo else "—"
         branch = f"  ⎇ {s.branch}" if s.branch else ""
-        header = f"*{i}.* {repo}{branch}  _(`{s.session_id[:8]}`)_"
+        badge = _BADGE.get(s.live, "")
+        header = f"*{i}.* {repo}{branch}  {badge}  _(`{s.session_id[:8]}`)_"
         meta = f"📁 `{s.cwd}`"
         title = f"📝 {s.title}" if s.title and s.title != "(no title)" else ""
         summary = f"💬 {s.turns} · ⏱ {_ago(s.mtime)} 전"
@@ -168,7 +185,9 @@ def _cmd_sessions(channel: str, say) -> None:
                 "action_id": "select_session",
             },
         })
-    header = f"🕘 갱신 {time.strftime('%H:%M:%S', time.localtime())} · {len(items)}개 (최신순)"
+    scope = " · 열림 후보만 (`sessions all`=전체)" if mode == "live" else " (`sessions live`=열림만)"
+    header = (f"🕘 갱신 {time.strftime('%H:%M:%S', time.localtime())} · "
+              f"{len(items)}개 (최신순){scope}")
     blocks.insert(0, {"type": "context", "elements": [{"type": "mrkdwn", "text": header}]})
     say(text=header + "\n" + "\n".join(lines), blocks=blocks)
 
@@ -179,8 +198,9 @@ def _open_thread(session_id: str, say) -> None:
     if info is None:
         say(f":x: 세션 `{session_id[:8]}` 을(를) 찾지 못했습니다.")
         return
+    badge = _BADGE.get(info.live, "")
     header = (
-        f"🧵 *{info.repo or info.folder}* 세션 (`{info.session_id[:8]}`) — "
+        f"🧵 *{info.repo or info.folder}* 세션 (`{info.session_id[:8]}`) {badge} — "
         "이 스레드에 *답글*로 이어가세요"
     )
     resp = say(text="\n".join([header, *_last_exchange(info)]))
@@ -195,12 +215,14 @@ def _open_thread(session_id: str, say) -> None:
         _thread_session[str(root_ts)] = info.session_id
         _save_threads()
     say(
-        text="여기에 *답글*로 지시를 보내세요. `fork <메시지>`=분기, `last`=최신 입출력 갱신, `status`/`clear` 가능.",
+        text="여기에 *답글*로 지시를 보내세요. `fork <메시지>`=분기, `force <메시지>`=열림 감지 무시 실행, "
+             "`last`=최신 입출력 갱신, `status`/`clear` 가능.",
         thread_ts=root_ts,
     )
 
 
-def _run_and_reply(say, thread_ts: str, session_id: str, prompt: str, *, fork: bool = False) -> None:
+def _run_and_reply(say, thread_ts: str, session_id: str, prompt: str, *,
+                   fork: bool = False, force: bool = False) -> None:
     info = sessions.find_session(CFG.projects_dir, session_id)
     if info is None:
         say(text=f":x: 세션 `{session_id[:8]}` 이(가) 사라졌습니다. 본문에서 `sessions`.",
@@ -209,9 +231,15 @@ def _run_and_reply(say, thread_ts: str, session_id: str, prompt: str, *, fork: b
     bridge_ran_recently = (
         time.time() - _last_bridge_run.get(info.session_id, 0.0)
     ) < config.ACTIVE_THRESHOLD_SECONDS
-    if not fork and not bridge_ran_recently and runner.is_active(info.mtime):
+    if not fork and not force and info.live == "open":
+        say(text=":no_entry: 이 세션은 지금 호스트에서 열려 있습니다(프로세스 감지). "
+                 "그대로 이어 쓰면 대화가 분기되어 서로의 작업이 보이지 않게 됩니다. "
+                 "`fork <메시지>`=분기, 분기 위험을 감수하려면 `force <메시지>`.",
+            thread_ts=thread_ts)
+        return
+    if not fork and not force and not bridge_ran_recently and runner.is_active(info.mtime):
         say(text=":warning: 이 세션이 방금 활성 상태였습니다(다른 곳에서 열려 있을 수 있음). "
-                 "`fork <메시지>`로 분기하거나 잠시 후 다시 시도하세요.",
+                 "`fork <메시지>`로 분기하거나 잠시 후 다시 시도하세요. 무시하려면 `force <메시지>`.",
             thread_ts=thread_ts)
         return
     lock = _lock_for(info.session_id)
@@ -237,6 +265,9 @@ def _run_and_reply(say, thread_ts: str, session_id: str, prompt: str, *, fork: b
             body = f"{head}{res.text}\n\n_💰 ${res.cost_usd:.4f}_{tail}"
             if len(body) > 3500:
                 body = body[:3500] + "\n…(잘림)"
+            if info.live == "maybe":
+                body += ("\n:warning: 같은 폴더에 열린 호스트 TUI가 있습니다. "
+                         "이 세션이 호스트에 열려 있는 세션이라면 다음부터 `fork <메시지>`를 권장합니다.")
             say(text=body, thread_ts=thread_ts)
         except Exception as e:  # noqa: BLE001
             log.exception("turn failed")
@@ -265,14 +296,19 @@ def on_message(event, say):
     if thread_ts and str(thread_ts) in _thread_session:
         sid = _thread_session[str(thread_ts)]
         if cmd == "status":
-            say(text=f"이 스레드 세션: `{sid[:8]}`  권한: acceptEdits(+deny)", thread_ts=thread_ts)
+            say(text=f"이 스레드 세션: `{sid[:8]}`  권한: {config.PERMISSION_MODE}(+deny)",
+                thread_ts=thread_ts)
         elif cmd == "clear":
             with _state_lock:
                 _thread_session.pop(str(thread_ts), None)
                 _save_threads()
             say(text="이 스레드의 세션 연결을 해제했습니다.", thread_ts=thread_ts)
         elif cmd == "sessions":
-            say(text="목록은 채널 *본문*에서 `sessions` 를 입력하세요.", thread_ts=thread_ts)
+            if arg:
+                # terse real prompts like "list all" must still reach the session
+                _run_and_reply(say, thread_ts, sid, text)
+            else:
+                say(text="목록은 채널 *본문*에서 `sessions` 를 입력하세요.", thread_ts=thread_ts)
         elif cmd == "select":
             say(text="이 스레드는 이미 세션에 연결돼 있습니다. 다른 세션은 본문에서 `sessions`로 여세요.",
                 thread_ts=thread_ts)
@@ -287,6 +323,12 @@ def on_message(event, say):
                 say(text="사용법: `fork <메시지>`", thread_ts=thread_ts)
             else:
                 _run_and_reply(say, thread_ts, sid, arg, fork=True)
+        elif cmd == "force":
+            if not arg:
+                say(text="사용법: `force <메시지>` — 열림/활성 감지를 무시하고 이 세션에 그대로 실행",
+                    thread_ts=thread_ts)
+            else:
+                _run_and_reply(say, thread_ts, sid, arg, force=True)
         else:
             _run_and_reply(say, thread_ts, sid, text)
         return
@@ -299,7 +341,7 @@ def on_message(event, say):
 
     # --- channel body (top level): commands only ---
     if cmd == "sessions":
-        _cmd_sessions(channel, say)
+        _cmd_sessions(channel, say, "" if arg == "all" else arg)
     elif cmd == "select":
         target = _resolve_target(channel, arg)
         if not target:
@@ -333,6 +375,12 @@ def main() -> None:
         "Starting claude-slack-bridge (channel=%s, %d bound threads)",
         CFG.channel_id, len(_thread_session),
     )
+    if config.PERMISSION_MODE == "bypassPermissions":
+        log.warning(
+            "permission mode: bypassPermissions — turns run without permission "
+            "prompts (DENY_TOOLS backstop only). Override with "
+            "CLAUDE_BRIDGE_PERMISSION_MODE if unintended."
+        )
     SocketModeHandler(app, CFG.app_token).start()
 
 
