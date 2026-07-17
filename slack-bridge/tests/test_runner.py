@@ -1,4 +1,7 @@
+import importlib
 import json
+
+import pytest
 
 import config
 import runner
@@ -9,7 +12,7 @@ def test_build_command_basics():
     assert cmd[:3] == ["claude", "-p", "do a thing"]
     assert "--resume" in cmd and cmd[cmd.index("--resume") + 1] == "SID"
     assert cmd[cmd.index("--output-format") + 1] == "json"
-    assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
+    assert cmd[cmd.index("--permission-mode") + 1] == config.PERMISSION_MODE
     # every deny rule present
     for rule in config.DENY_TOOLS:
         assert rule in cmd
@@ -18,6 +21,26 @@ def test_build_command_basics():
 
 def test_build_command_fork():
     assert "--fork-session" in runner.build_command("SID", "x", fork=True)
+
+
+def test_permission_mode_env_parsing(monkeypatch):
+    monkeypatch.setenv("CLAUDE_BRIDGE_PERMISSION_MODE", "  acceptEdits  ")
+    importlib.reload(config)
+    assert config.PERMISSION_MODE == "acceptEdits"
+    monkeypatch.setenv("CLAUDE_BRIDGE_PERMISSION_MODE", "")
+    importlib.reload(config)
+    assert config.PERMISSION_MODE == "bypassPermissions"  # empty -> default
+    monkeypatch.setenv("CLAUDE_BRIDGE_PERMISSION_MODE", "bypasspermissions")  # case typo
+    with pytest.raises(SystemExit):
+        importlib.reload(config)
+    monkeypatch.delenv("CLAUDE_BRIDGE_PERMISSION_MODE")
+    importlib.reload(config)  # restore module state for other tests
+
+
+def test_build_command_honors_permission_mode(monkeypatch):
+    monkeypatch.setattr(config, "PERMISSION_MODE", "acceptEdits")
+    cmd = runner.build_command("SID", "x")
+    assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
 
 
 def test_parse_result_success():

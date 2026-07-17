@@ -7,6 +7,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
+import config
 from config import ACTIVE_THRESHOLD_SECONDS, DENY_TOOLS
 
 
@@ -25,7 +26,7 @@ def build_command(session_id: str, prompt: str, *, fork: bool = False) -> list[s
         "claude", "-p", prompt,
         "--resume", session_id,
         "--output-format", "json",
-        "--permission-mode", "acceptEdits",
+        "--permission-mode", config.PERMISSION_MODE,
     ]
     for rule in DENY_TOOLS:
         cmd += ["--disallowedTools", rule]
