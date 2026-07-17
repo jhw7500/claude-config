@@ -56,10 +56,44 @@ def _load_threads() -> dict[str, str]:
 
 _thread_session: dict[str, str] = _load_threads()
 _state_lock = threading.Lock()
+# serializes thread check-and-create so a double-click can't bind twice
+_bind_lock = threading.Lock()
+# serializes the list delete->post->store cycle
+_ui_lock = threading.Lock()
 # last shown list per channel: index -> session_id (for `select N`)
 _last_list: dict[str, dict[int, str]] = {}
-# channel -> ts of the single sessions-list message (delete+repost keeps one)
-_list_msg: dict[str, str] = {}
+
+# channel -> ts of the single sessions-list message (delete+repost keeps one).
+# Persisted so a restart can still delete the previous list message.
+_UI_STATE_FILE = os.path.expanduser(
+    os.environ.get("CLAUDE_BRIDGE_UI_STATE_FILE", "~/.config/claude-slack-bridge-ui.json")
+)
+
+
+def _load_list_msg() -> dict[str, str]:
+    try:
+        with open(_UI_STATE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        lm = d.get("list_msg") if isinstance(d, dict) else None
+        return {str(k): str(v) for k, v in lm.items()} if isinstance(lm, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+_list_msg: dict[str, str] = _load_list_msg()
+
+
+def _save_list_msg() -> None:
+    try:
+        d = os.path.dirname(_UI_STATE_FILE)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = _UI_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"list_msg": _list_msg}, f)
+        os.replace(tmp, _UI_STATE_FILE)
+    except OSError:
+        log.exception("failed to persist ui state")
 
 _locks_guard = threading.Lock()
 _session_locks: dict[str, threading.Lock] = {}
@@ -230,24 +264,30 @@ def _list_items(mode: str = ""):
 
 def _cmd_sessions(channel: str, mode: str = "") -> None:
     items = _list_items(mode)
-    if not items:
-        _post(channel, "열려 있는 세션이 없습니다. `sessions all`로 전체를 보세요." if mode == "live"
-              else "세션이 없습니다.")
-        return
-    _last_list[channel] = {i: s.session_id for i, s in enumerate(items, 1)}
-    text, blocks = _render_sessions(items, mode)
+    if items:
+        _last_list[channel] = {i: s.session_id for i, s in enumerate(items, 1)}
+        text, blocks = _render_sessions(items, mode)
+    else:
+        # the empty-state message replaces the list (and is tracked as it),
+        # so a stale interactive list never lingers next to "세션이 없습니다"
+        _last_list.pop(channel, None)
+        text = ("열려 있는 세션이 없습니다. `sessions all`로 전체를 보세요." if mode == "live"
+                else "세션이 없습니다.")
+        blocks = None
     # keep exactly one list message, always at the bottom: delete old, repost
-    old = _list_msg.get(channel)
-    if old:
+    with _ui_lock:
+        old = _list_msg.get(channel)
+        if old:
+            try:
+                app.client.chat_delete(channel=channel, ts=old)
+            except Exception:  # noqa: BLE001 — already deleted / too old
+                pass
+        resp = _post(channel, text, blocks=blocks)
         try:
-            app.client.chat_delete(channel=channel, ts=old)
-        except Exception:  # noqa: BLE001 — already deleted / too old
+            _list_msg[channel] = str(resp["ts"])
+            _save_list_msg()
+        except (KeyError, TypeError):
             pass
-    resp = _post(channel, text, blocks=blocks)
-    try:
-        _list_msg[channel] = str(resp["ts"])
-    except (KeyError, TypeError):
-        pass
 
 
 _permalink_cache: dict[str, str] = {}  # message ts -> permalink (never changes)
@@ -261,6 +301,8 @@ def _permalink(channel: str, ts: str) -> str | None:
         link = app.client.chat_getPermalink(channel=channel, message_ts=ts)["permalink"]
     except Exception:  # noqa: BLE001
         return None
+    if len(_permalink_cache) > 256:  # bound the cache; entries re-fetch cheaply
+        _permalink_cache.clear()
     _permalink_cache[ts] = link
     return link
 
@@ -276,30 +318,37 @@ def _thread_link(session_id: str) -> str | None:
 def _ensure_thread(session_id: str, channel: str) -> tuple[str | None, bool, str | None]:
     """Bind a session to a thread, reusing an existing binding.
 
-    Returns (thread_ts, created, error_text).
+    Returns (thread_ts, created, error_text). The whole check-and-create is
+    serialized so concurrent selects (double-click, Home+channel) can't bind
+    the same session to two threads.
     """
     info = sessions.find_session(CFG.projects_dir, session_id)
     if info is None:
         return None, False, f":x: 세션 `{session_id[:8]}` 을(를) 찾지 못했습니다."
-    existing = _thread_for(info.session_id)
-    if existing:
-        return existing, False, None
-    badge = _BADGE.get(info.live, "")
-    resp = _post(
-        channel,
-        f"🧵 *{info.repo or info.folder}* (`{info.session_id[:8]}`) {badge} — "
-        "이 스레드에 *답글*로 이어가세요 · `fork <메시지>` `force <메시지>` `last` `status` `clear`",
-    )
-    try:
-        root_ts = resp["ts"]
-    except (KeyError, TypeError):
-        root_ts = None
-    if not root_ts:
-        return None, False, ":x: 스레드 생성 실패(메시지 ts를 받지 못함)."
-    with _state_lock:
-        _thread_session[str(root_ts)] = info.session_id
-        _save_threads()
-    return str(root_ts), True, None
+    with _bind_lock:
+        existing = _thread_for(info.session_id)
+        if existing:
+            return existing, False, None
+        badge = _BADGE.get(info.live, "")
+        try:
+            resp = _post(
+                channel,
+                f"🧵 *{info.repo or info.folder}* (`{info.session_id[:8]}`) {badge} — "
+                "이 스레드에 *답글*로 이어가세요 · `fork <메시지>` `force <메시지>` `last` `status` `clear`",
+            )
+        except Exception:  # noqa: BLE001 — Slack API/network error
+            log.exception("failed to post thread root")
+            return None, False, ":x: 스레드 생성 실패(메시지 전송 오류)."
+        try:
+            root_ts = resp["ts"]
+        except (KeyError, TypeError):
+            root_ts = None
+        if not root_ts:
+            return None, False, ":x: 스레드 생성 실패(메시지 ts를 받지 못함)."
+        with _state_lock:
+            _thread_session[str(root_ts)] = info.session_id
+            _save_threads()
+        return str(root_ts), True, None
 
 
 def _open_thread(session_id: str, channel: str, user: str | None = None) -> None:
@@ -309,7 +358,7 @@ def _open_thread(session_id: str, channel: str, user: str | None = None) -> None
         _notice(channel, user, err)
         return
     if not created:
-        link = _permalink(channel, ts)
+        link = _permalink(channel, ts) if ts else None
         tail = f" → {link}" if link else " — 기존 스레드에 답글로 이어가세요."
         _notice(channel, user, f":thread: `{session_id[:8]}` 이미 열린 스레드가 있습니다{tail}")
 
@@ -416,8 +465,10 @@ def on_message(event):
     cmd, arg = parse_command(text)
 
     # --- inside a session-bound thread: run / manage that session ---
-    if thread_ts and str(thread_ts) in _thread_session:
-        sid = _thread_session[str(thread_ts)]
+    # atomic .get(): `clear` in another handler thread may drop the key between
+    # a membership check and the lookup
+    sid = _thread_session.get(str(thread_ts)) if thread_ts else None
+    if sid:
         if cmd == "status":
             _post(channel, f"이 스레드 세션: `{sid[:8]}`  권한: {config.PERMISSION_MODE}(+deny)",
                   thread_ts)
@@ -556,9 +607,10 @@ def on_home_opened(event):
 @app.action("home_refresh")
 def on_home_refresh(ack, body):
     ack()
-    if body.get("user", {}).get("id") != CFG.allowed_user_id:
+    user_id = body.get("user", {}).get("id")
+    if user_id != CFG.allowed_user_id:
         return
-    _publish_home(body["user"]["id"])
+    _publish_home(user_id)
 
 
 def main() -> None:
