@@ -9,6 +9,10 @@
 display_information:
   name: claude-bridge
 features:
+  app_home:
+    home_tab_enabled: true
+    messages_tab_enabled: false
+    messages_tab_read_only_enabled: true
   bot_user:
     display_name: claude-bridge
     always_online: true
@@ -21,6 +25,7 @@ settings:
   event_subscriptions:
     bot_events:
       - message.groups
+      - app_home_opened
   interactivity:
     is_enabled: true
   socket_mode_enabled: true
