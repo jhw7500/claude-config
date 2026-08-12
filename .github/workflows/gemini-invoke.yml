@@ -35,7 +35,7 @@ jobs:
       id-token: 'write'
       issues: 'write'
       pull-requests: 'write'
-    uses: 'jhw7500/automation/.github/workflows/gemini-invoke.yml@v1.33'
+    uses: 'jhw7500/automation/.github/workflows/gemini-invoke.yml@v1.35'
     with:
       item_number: '${{ inputs.item_number }}'
       item_title: '${{ inputs.item_title }}'
@@ -43,4 +43,5 @@ jobs:
       event_name: '${{ inputs.event_name }}'
       is_pull_request: '${{ inputs.is_pull_request }}'
       additional_context: '${{ inputs.additional_context }}'
-    secrets: 'inherit'
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

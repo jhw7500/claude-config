@@ -12,7 +12,8 @@ jobs:
       pull-requests: 'write'
       issues: 'write'
       id-token: 'write'
-    uses: 'jhw7500/automation/.github/workflows/gemini-auto-review.yml@v1.33'
+    uses: 'jhw7500/automation/.github/workflows/gemini-auto-review.yml@v1.35'
     with:
       pr_number: '${{ github.event.pull_request.number }}'
-    secrets: 'inherit'
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

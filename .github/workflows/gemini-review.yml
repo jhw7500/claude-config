@@ -27,10 +27,11 @@ jobs:
       id-token: 'write'
       issues: 'write'
       pull-requests: 'write'
-    uses: 'jhw7500/automation/.github/workflows/gemini-review.yml@v1.33'
+    uses: 'jhw7500/automation/.github/workflows/gemini-review.yml@v1.35'
     with:
       pr_number: '${{ inputs.pr_number }}'
       issue_title: '${{ inputs.issue_title }}'
       issue_body: '${{ inputs.issue_body }}'
       additional_context: '${{ inputs.additional_context }}'
-    secrets: 'inherit'
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
