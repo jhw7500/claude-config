@@ -35,7 +35,7 @@ jobs:
       id-token: 'write'
       issues: 'write'
       pull-requests: 'write'
-    uses: 'jhw7500/automation/.github/workflows/gemini-invoke.yml@v1.36'
+    uses: 'jhw7500/automation/.github/workflows/gemini-invoke.yml@v1.39'
     with:
       item_number: '${{ inputs.item_number }}'
       item_title: '${{ inputs.item_title }}'
