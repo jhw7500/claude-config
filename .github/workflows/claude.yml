@@ -10,12 +10,12 @@ on:
 
 jobs:
   claude:
-    uses: 'jhw7500/automation/.github/workflows/claude.yml@v1.39'
     permissions:
+      actions: read
       contents: read
-      pull-requests: read
-      issues: read
       id-token: write
-      actions: read # Required for Claude to read CI results on PRs
+      issues: read
+      pull-requests: read
+    uses: jhw7500/automation/.github/workflows/claude.yml@d3b102e2c1f62f6abf5a9a5a37da810e6ba3e7f5
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

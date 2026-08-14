@@ -1,4 +1,4 @@
-name: '🧪 Gemini Manual PR Review'
+name: Gemini Manual PR Review
 
 on:
   workflow_dispatch:
@@ -22,6 +22,7 @@ jobs:
       pr_body: ${{ steps.pr.outputs.body }}
     steps:
       - name: Validate pr_number
+        shell: bash
         env:
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
@@ -32,6 +33,7 @@ jobs:
 
       - name: Fetch PR
         id: pr
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -40,26 +42,35 @@ jobs:
           title="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json title --jq .title)"
           body="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body --jq .body)"
 
-          echo "title<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$title" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          write_output() {
+            local name="$1"
+            local value="$2"
+            local delimiter='__AUTOMATION_OUTPUT__'
+            while [[ "$value" == *"$delimiter"* ]]; do
+              delimiter="${delimiter}_X"
+            done
+            {
+              printf '%s<<%s\n' "$name" "$delimiter"
+              printf '%s\n' "$value"
+              printf '%s\n' "$delimiter"
+            } >> "$GITHUB_OUTPUT"
+          }
 
-          echo "body<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$body" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          write_output title "$title"
+          write_output body "$body"
 
   review:
     needs: prepare
     permissions:
       contents: read
-      id-token: write
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-review.yml@v1.39
+    uses: jhw7500/automation/.github/workflows/gemini-review.yml@d3b102e2c1f62f6abf5a9a5a37da810e6ba3e7f5
     with:
       pr_number: ${{ inputs.pr_number }}
       issue_title: ${{ needs.prepare.outputs.pr_title }}
       issue_body: ${{ needs.prepare.outputs.pr_body }}
       additional_context: ${{ inputs.additional_context }}
+      repo_write_auth: github_token
     secrets:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
