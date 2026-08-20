@@ -2,6 +2,8 @@
 
 이 파일(`~/.claude/global-guidance.md`)은 `~/.claude/CLAUDE.md`에서 `@global-guidance.md`로 import되어 **모든 프로젝트 세션에 전역 적용**된다. 프로젝트별 지침은 각 프로젝트의 `CLAUDE.md` / `AGENTS.md`에 둔다.
 
+> 아래 사용자 지침이 OMC 기본 동작보다 우선한다.
+
 ---
 
 > Notion 작업 전용 지침은 `@CLAUDE-notion.md` 참조 — `/jhw:*` 스킬과 `mcp__notion__*` / `mcp__jhw-notion__*` 도구 호출 시 적용. (notion이 없는 호스트에서는 import되지 않음)
@@ -17,6 +19,7 @@
 5. **테스트 먼저 확인** — 수정 전 기존 테스트 실행하여 현재 상태 파악.
 6. **롤백 가능한 변경 우선** — 되돌릴 수 없는 작업(force push, drop table 등)은 사전 확인.
 7. **한국어 응답** — 모든 응답과 설명은 한국어로 작성.
+8. **Task handoff 단일화** — jhw-control Project Control Task(`/jhw:task`) 작업 중에는 `session-handoff:handoff`/`resume` 스킬을 쓰지 않는다(이중 기록·drift 방지). 세션 이관은 `task finish --status handoff` → 새 세션 `/jhw:task resume <tsk-id>`가 정본 경로다. `session-handoff`는 Task가 아닌 작업이나 jhw-control 없는 도구로 넘길 때만 사용. `.ai/handoff.md`는 도구가 만드는 로컬 사본이므로 직접 쓰거나 편집하지 않는다.
 
 ---
 
@@ -52,20 +55,34 @@
 - 다단계 답변(중간에 추가 조회 필요)이라도 마지막 action까지 같은 응답에서 마친다.
 - "답변 잘 받았습니다" 류 보고만 하고 종료하는 패턴 금지.
 
-**일반 위반 사례**:
-- 2026-05-07: AskUserQuestion 3건 답변 수신 후 .gitignore Edit/파일 삭제/커밋 action을 이어가지 않고 응답 종료 (사용자가 "멈춘것같은데"라고 재촉)
-- 2026-05-08: 단일 도구(Bash) 결과 수신 직후 **텍스트 응답 0줄로 turn 종료** → 사용자 인터럽트. **방지**: 도구 결과 수신 직후 응답 종료 직전 자가점검 — "텍스트 1줄 이상 + (다단계면) 후속 action 포함?" 미충족 시 즉시 이어가기. Stop hook으로 보강 (`~/.claude/scripts/stop-text-required.py`).
-- 2026-05-14: `AskUserQuestion` 답변 수신 직후 **텍스트 0줄·후속 action 0개로 turn 종료** → 사용자 인터럽트. **방지**: stop-text-required.py에 "직전 user turn이 AskUserQuestion tool_result이고 현재 assistant turn이 비어있음" 검출. 답 수신 후엔 같은 응답에서 (a) 다음 질문 또는 (b) 설계/액션 중 하나를 반드시 출력.
+> 위반 사례 누적(일반·외부비동기·Notion)은 `~/.claude/archive/violations.md` 참조 — 방지 규칙은 위 자가점검에 코드화되어 있음. 새 사례는 규칙 1줄만 여기에, 서사는 아카이브에 추가.
 
-> Notion 작업 도메인 위반 사례 누적은 `@CLAUDE-notion.md` 참조.
+---
+
+## 인과 주장 전 반증 확인 (전역)
+
+**트리거**: "원인은 X다", "X 때문이다", "X가 문제다" 류의 진단을 보고하려 할 때.
+
+**필수 자가 점검 (보고 직전)**:
+1. X를 **반증할 단일 사실**이 무엇인가? (함수 시그니처, 호출 경로, 반환값 전파,
+   릴리스/머지 상태, 설정 실제값 등)
+2. 그 사실을 **직접 확인**했는가? 로그 숫자 일치·시간 근접·정황 일치는 확인이 아니다.
+3. **이미 손에 있는 출력을 끝까지 읽었는가?** 특히 실패를 보고한 것이 내가 만든
+   도구·스크립트라면, 대상을 의심하기 전에 **그 도구가 주장한 동작을 실제로 수행했는지**
+   먼저 확인한다 (자체 출력에 "건너뜀/미실행/조기 return/관측 불가"가 찍혀 있지 않은지).
+4. 확인하지 못한 것은 **"추정"으로 표시**했는가? 확인된 사실과 섞어 쓰지 않았는가?
+
+**하나라도 아니오면 보고하지 말고 확인부터 한다.** 반증 사실 확인은 대개 grep/읽기
+1회로 끝난다 — 그 비용이 오진 보고의 비용보다 항상 싸다.
+
+**적용 안 함**: 사용자가 원인을 **단정**하고 그에 따른 실행만 요청한 경우, 단일 명령의
+즉시 확인 가능한 결과.
 
 ---
 
 ## 외부 비동기 작업 자동 알림 (필수 규칙)
 
-**문제**: GitHub Actions, gh workflows, 사내 CI 등 **외부 비동기 작업**은 Claude Code의
-`task-notification`이 자동으로 잡지 못함. 사용자가 직접 "결과 확인해줘"를 입력해야 알 수
-있는 패턴이 반복되어 매우 불편하다.
+GitHub Actions, gh workflows, 사내 CI 등 **외부 비동기 작업**은 Claude Code의 `task-notification`이 자동으로 잡지 못한다.
 
 **필수 동작**:
 사용자에게 "끝나면 알려드릴게요/보고드릴게요/모니터링할게요" 라고 약속하는 순간, 다음 중
@@ -92,6 +109,20 @@
 
 ---
 
+## 서브에이전트 보고 유실 방지 (필수 규칙)
+
+`Agent` 도구에 **`name`을 붙이면 메일박스 모드**로 뜬다. 이 모드는 완료 시
+`idle_notification`만 발생시키고 **에이전트의 최종 보고 텍스트를 유실**한다 —
+에이전트는 일을 정상적으로 끝낸 상태이므로 작업 실패가 아니라 전달 실패다.
+
+- **기본값: `name`을 붙이지 않는다.** 그래야 완료 알림이 최종 메시지를 담아 자동 도착한다.
+- 실행 중 `SendMessage`로 지시를 보내야 해서 `name`이 꼭 필요한 경우에만 붙이고,
+  그때는 프롬프트에 "최종 보고는 반드시 SendMessage로 main에 보내라"를 **명시**한다.
+- 결과를 받아야 하는 리뷰·검증·조사 에이전트에는 `name`을 붙이지 않는다.
+- `PreToolUse` 훅 `agent-name-delivery-hook.py`가 이 조건을 자동 검사한다.
+
+---
+
 ## BG 완료 알림 자동 반영 (수동 호출 규칙)
 
 Claude Code가 Bash `run_in_background=true` 완료 시 전달하는
@@ -99,7 +130,7 @@ Claude Code가 Bash `run_in_background=true` 완료 시 전달하는
 persist되지 않음). 따라서 수신 즉시 아래 스크립트로 HUD state에 반영한다:
 
 ```bash
-python3 ~/.claude/scripts/bg-hud-complete.py <tool_use_id> <status>
+python3 /home/jhw/.claude/scripts/bg-hud-complete.py <tool_use_id> <status>
 ```
 
 - `<tool_use_id>`: notification의 `<tool-use-id>` 값 (예: `toolu_01AF...`)

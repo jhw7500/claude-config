@@ -35,6 +35,7 @@ INFO_TOOL_SUBSTRINGS = (
     "mcp__jhw-notion__jhw_context",
     "mcp__jhw-notion__jhw_history",
     "mcp__jhw-notion__jhw_status",
+    "mcp__jhw-notion__jhw_retrieve",
     # context7 docs
     "mcp__plugin_context7_context7__query-docs",
     "mcp__plugin_context7_context7__resolve-library-id",
