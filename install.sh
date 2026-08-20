@@ -5,14 +5,15 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 1) 스킬 심볼릭 링크 (skills/ 아래 모든 스킬 자동 링크, repo pull 시 자동 갱신)
 mkdir -p ~/.claude/skills
-mkdir -p ~/.claude/archive/skills-replaced
+SKILL_ARCHIVE=~/.claude/archive/skills-replaced/"$(date +%Y%m%d%H%M%S)-$$"
 for d in "$REPO_DIR"/skills/*/; do
   name="$(basename "$d")"
   # 목적지가 실디렉터리면 ln -sfn 은 실패하지 않고 그 "안에" 중첩 링크를 만든다(조용한 미배포).
   # 심볼릭이 아닐 때만 아카이브로 옮기고 링크한다.
   if [ -e ~/.claude/skills/"$name" ] && [ ! -L ~/.claude/skills/"$name" ]; then
-    mv ~/.claude/skills/"$name" ~/.claude/archive/skills-replaced/"$name.$(date +%Y%m%d%H%M%S)"
-    echo "[install] 기존 실디렉터리 백업 -> ~/.claude/archive/skills-replaced/$name.*"
+    mkdir -p "$SKILL_ARCHIVE"
+    mv ~/.claude/skills/"$name" "$SKILL_ARCHIVE"/"$name"
+    echo "[install] 기존 실디렉터리 백업 -> $SKILL_ARCHIVE/$name"
   fi
   ln -sfn "${d%/}" ~/.claude/skills/"$name"
   echo "[install] 스킬 링크: ~/.claude/skills/$name"
@@ -82,12 +83,25 @@ else:
     # 그대로 두고 블록만 덧붙이면 지침이 2벌이 되므로, 인라인 구간을 블록으로 치환한다.
     # 구간 끝 = 이후 첫 외부 블록 주석(<!-- ... -->) 또는 EOF. OMC 블록은 앞쪽이라 무관.
     i = text.find(LEGACY_H)
+    # 구간 끝을 잘못 잡으면 CLAUDE.md 의 엉뚱한 부분이 지워지므로, 삭제 전에 구간을 검증한다.
+    # 구간 중간에 일반 HTML 주석이 있으면 조기 종료되어 뒷부분이 잔류하는데,
+    # 그 경우 잔류분에 지침 헤딩이 남는 것으로 탐지된다. 확신이 없으면 삭제하지 않는다.
+    GUIDE_ANCHORS = ("## 공통 작업 규칙", "## 진행상황 보고", "## BG 완료 알림")
     if i != -1:
         m = re.compile(r"^<!--", re.M).search(text, i + len(LEGACY_H))
         j = m.start() if m else len(text)
-        n = text.count("\n", i, j)
-        text = text[:i] + block + ("\n" if j < len(text) else "") + text[j:]
-        print("[install] 레거시 인라인 전역지침 %d줄 제거 → @global-guidance.md import 로 대체" % n)
+        region, tail = text[i:j], text[j:]
+        safe = ("## 공통 작업 규칙" in region) and not any(a in tail for a in GUIDE_ANCHORS)
+        if safe:
+            n = text.count("\n", i, j)
+            text = text[:i] + block + ("\n" if j < len(text) else "") + text[j:]
+            print("[install] 레거시 인라인 전역지침 %d줄 제거 → @global-guidance.md import 로 대체" % n)
+        else:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += "\n" + block
+            print("[install] 경고: 레거시 인라인 구간을 안전하게 특정하지 못해 삭제하지 않았다.")
+            print("[install]       CLAUDE.md 에 전역지침이 인라인/import 두 벌로 남는다 — 인라인 부분을 직접 지워라.")
     else:
         if text and not text.endswith("\n"):
             text += "\n"

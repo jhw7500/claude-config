@@ -130,7 +130,7 @@ Claude Code가 Bash `run_in_background=true` 완료 시 전달하는
 persist되지 않음). 따라서 수신 즉시 아래 스크립트로 HUD state에 반영한다:
 
 ```bash
-python3 /home/jhw/.claude/scripts/bg-hud-complete.py <tool_use_id> <status>
+python3 ~/.claude/scripts/bg-hud-complete.py <tool_use_id> <status>
 ```
 
 - `<tool_use_id>`: notification의 `<tool-use-id>` 값 (예: `toolu_01AF...`)
