@@ -1,5 +1,7 @@
 # claude-config
 
+<!-- reviewer-canary: automation v1.45.2; intentionally unmerged -->
+
 개인 Claude Code 설정 동기화 (스킬 + 셸 함수 + 스크립트 + 글로벌 지침). 여러 호스트에서 공유.
 
 ## 포함
