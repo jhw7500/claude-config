@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -160,3 +161,115 @@ def test_ignores_non_primary_text_record_after_primary_tool_only(
 
     assert result.returncode == 2
     assert "STOP_HOOK_BLOCK" in result.stderr
+
+
+def turn_with_trailing_tool_use() -> list[dict]:
+    """도입 text 뒤 tool_use로 끝나는 turn — 마무리 보고가 없다."""
+    return [
+        {"role": "user", "content": "계속"},
+        {"role": "assistant", "content": [{"type": "text", "text": "확인하겠습니다."}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tool-1", "name": "Read", "input": {}}],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool-1"}]},
+    ]
+
+
+def test_blocks_when_text_precedes_last_tool_use(tmp_path: Path) -> None:
+    """도입 text만으로는 통과하지 않는다 — 마지막 tool_use 이후 text가 필요하다."""
+    transcript = write_jsonl_transcript(tmp_path, turn_with_trailing_tool_use())
+
+    result = run_hook({"transcript_path": str(transcript)})
+
+    assert result.returncode == 2
+    assert "STOP_HOOK_BLOCK" in result.stderr
+
+
+def test_allows_text_after_last_tool_use(tmp_path: Path) -> None:
+    messages = [
+        *turn_with_trailing_tool_use(),
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": "..."}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "결과를 보고합니다."}]},
+    ]
+    transcript = write_jsonl_transcript(tmp_path, messages)
+
+    result = run_hook({"transcript_path": str(transcript)})
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_blocks_when_only_thinking_follows_tool_use(tmp_path: Path) -> None:
+    messages = [
+        *turn_with_trailing_tool_use(),
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": "..."}]},
+    ]
+    transcript = write_jsonl_transcript(tmp_path, messages)
+
+    result = run_hook({"transcript_path": str(transcript)})
+
+    assert result.returncode == 2
+    assert "텍스트 응답이 0줄" in result.stderr
+
+
+def test_blocks_silent_end_and_names_the_tool(tmp_path: Path) -> None:
+    messages = [
+        {"role": "user", "content": "계속"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tool-1", "name": "AskUserQuestion", "input": {}},
+            ],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool-1"}]},
+    ]
+    transcript = write_jsonl_transcript(tmp_path, messages)
+
+    result = run_hook({"transcript_path": str(transcript)})
+
+    assert result.returncode == 2
+    assert "AskUserQuestion" in result.stderr
+
+
+def test_previous_turn_text_does_not_satisfy_current_turn(tmp_path: Path) -> None:
+    """turn 경계: 이전 turn의 보고가 이번 turn의 침묵을 면제하지 않는다."""
+    messages = [
+        {"role": "user", "content": "첫 요청"},
+        {"role": "assistant", "content": [{"type": "text", "text": "첫 턴 보고입니다."}]},
+        {"role": "user", "content": "두 번째 요청"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tool-2", "name": "Read", "input": {}}],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool-2"}]},
+    ]
+    transcript = write_jsonl_transcript(tmp_path, messages)
+
+    result = run_hook({"transcript_path": str(transcript)})
+
+    assert result.returncode == 2
+    assert "STOP_HOOK_BLOCK" in result.stderr
+
+
+def test_settle_retry_allows_late_flushed_text(tmp_path: Path) -> None:
+    """transcript는 content block 단위로 append된다 — 늦게 도착한 최종 text를 기다린다."""
+    transcript = write_jsonl_transcript(tmp_path, turn_with_trailing_tool_use())
+    late_record = {
+        "type": "assistant",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "늦게 도착한 보고."}]},
+    }
+
+    def append_late() -> None:
+        with transcript.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(late_record, ensure_ascii=False) + "\n")
+
+    timer = threading.Timer(0.2, append_late)
+    timer.start()
+    try:
+        result = run_hook({"transcript_path": str(transcript)})
+    finally:
+        timer.cancel()
+
+    assert result.returncode == 0
+    assert result.stderr == ""
