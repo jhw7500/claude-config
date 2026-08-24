@@ -10,6 +10,7 @@ import pytest
 
 SOURCE_ROOT = Path(__file__).parents[1]
 READER = SOURCE_ROOT / "scripts" / "lib" / "secure_env_reader.py"
+LOADER = SOURCE_ROOT / "scripts" / "lib" / "secure-env-file.sh"
 CANARY = "CANARY_SECRET_MUST_NOT_APPEAR"
 SECRET_CONTENT = "\n".join(
     [
@@ -88,6 +89,23 @@ def run_setup(
     return subprocess.run(args, text=True, capture_output=True, check=False, env=env)
 
 
+def run_loader(secret_file: Path, body: str) -> subprocess.CompletedProcess[str]:
+    command = "\n".join(
+        [
+            "set -e",
+            '. "$1"',
+            'load_private_env_file "$2"',
+            body,
+        ]
+    )
+    return subprocess.run(
+        ["bash", "-c", command, "loader-test", str(LOADER), str(secret_file)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 @pytest.mark.parametrize("script_name", ["setup-mcp.sh", "setup-slack-bridge.sh"])
 def test_setup_rejects_group_or_world_readable_secret_file(tmp_path, script_name):
     repo, env = make_fixture(tmp_path, script_name)
@@ -163,6 +181,29 @@ def test_reader_pins_open_file_when_path_is_replaced(tmp_path, monkeypatch):
     monkeypatch.setattr(reader.os, "read", replace_then_read)
 
     assert reader.read_private_env(secret_file) == original
+
+
+def test_loader_preserves_trailing_backslash_at_eof(tmp_path):
+    secret_file = tmp_path / "secrets.env"
+    secret_file.write_bytes(b"TRAILING_VALUE=abc\\")
+    secret_file.chmod(0o600)
+
+    result = run_loader(secret_file, "printf '%s' \"$TRAILING_VALUE\"")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "abc\\"
+
+
+def test_loader_preserves_errexit_inside_sourced_payload(tmp_path):
+    secret_file = tmp_path / "secrets.env"
+    secret_file.write_bytes(b"false\nprintf 'SHOULD_NOT_RUN\\n'\n")
+    secret_file.chmod(0o600)
+
+    result = run_loader(secret_file, "printf 'LOADER_COMPLETED\\n'")
+
+    assert result.returncode != 0
+    assert "SHOULD_NOT_RUN" not in result.stdout
+    assert "LOADER_COMPLETED" not in result.stdout
 
 
 def test_setup_mcp_dry_run_redacts_expanded_secret_values(tmp_path):
