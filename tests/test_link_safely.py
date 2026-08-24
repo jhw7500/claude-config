@@ -92,3 +92,47 @@ def test_skips_and_reports_when_backup_impossible(tmp_path: Path, src: Path) -> 
     assert "건너뛴다" in result.stderr
     assert not dest.is_symlink()
     assert dest.read_text(encoding="utf-8") == "건드리면 안 되는 파일\n"
+
+
+INSTALL = Path(__file__).parents[1] / "install.sh"
+
+
+def test_install_never_ends_an_and_list_with_link_safely() -> None:
+    """set -e 아래에서 link_safely 가 && 목록의 마지막이면 실패 시 설치가 중단된다.
+
+    루프의 `link_safely ... && COUNTER=...` 처럼 앞쪽에 오는 것은 안전하다.
+    뒤쪽에 오는 형태만 문제이므로 그 패턴이 남아 있지 않은지 확인한다.
+    """
+    offenders = [
+        (num, line.rstrip())
+        for num, line in enumerate(INSTALL.read_text(encoding="utf-8").splitlines(), 1)
+        if "&& link_safely" in line and "|| true" not in line
+    ]
+
+    assert offenders == [], f"set -e 중단 위험: {offenders}"
+
+
+def test_install_aborts_without_the_guard(tmp_path: Path) -> None:
+    """가드가 없으면 실제로 중단된다는 것을 최소 재현으로 고정한다."""
+    unguarded = tmp_path / "unguarded.sh"
+    unguarded.write_text(
+        f'set -e\n. "{LIB}"\n'
+        f'[ -f "{LIB}" ] && link_safely /nonexistent/src /proc/1/cannot-write\n'
+        'echo REACHED\n',
+        encoding="utf-8",
+    )
+    guarded = tmp_path / "guarded.sh"
+    guarded.write_text(
+        f'set -e\n. "{LIB}"\n'
+        f'if [ -f "{LIB}" ]; then\n'
+        '  link_safely /nonexistent/src /proc/1/cannot-write || true\n'
+        'fi\n'
+        'echo REACHED\n',
+        encoding="utf-8",
+    )
+
+    bad = subprocess.run(["bash", str(unguarded)], text=True, capture_output=True, check=False)
+    good = subprocess.run(["bash", str(guarded)], text=True, capture_output=True, check=False)
+
+    assert "REACHED" not in bad.stdout      # 가드 없으면 중단
+    assert "REACHED" in good.stdout          # 가드 있으면 계속

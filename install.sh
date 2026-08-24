@@ -45,7 +45,11 @@ for f in "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.sh; do
   [ -f "$f" ] || continue
   link_safely "$f" ~/.claude/hooks/"$(basename "$f")" && HOOK_LINKS=$((HOOK_LINKS + 1))
 done
-[ -f "$REPO_DIR/hooks/README.md" ] && link_safely "$REPO_DIR/hooks/README.md" ~/.claude/hooks/README.md
+# set -e 아래에서 link_safely 가 && 목록의 마지막 명령이면 실패 시 스크립트가
+# 중단된다. 여기서는 경고 후 계속 진행하는 게 의도다.
+if [ -f "$REPO_DIR/hooks/README.md" ]; then
+  link_safely "$REPO_DIR/hooks/README.md" ~/.claude/hooks/README.md || true
+fi
 echo "[install] 훅 링크: ~/.claude/hooks/ (${HOOK_LINKS}개)"
 
 # 4) 전역 지침 머지 (env-aware) — 항상 global-guidance, 환경에 있는 것만 추가 import.
