@@ -56,6 +56,7 @@ fi
 | `bg-task-progress-hook.py` | PreToolUse + PostToolUse | Agent / Bash `run_in_background=true` 시작·완료 알림 강제 + statusLine 카운터 관리 |
 | `control-char-guard-hook.py` | PostToolUse | Edit/Write/MultiEdit/NotebookEdit 로 **기록한 내용**에 raw 제어문자(C0/DEL)가 섞이면 위치와 함께 경고 |
 | `task-nudge.sh` | PreToolUse | 세션 첫 프로젝트 파일 수정 직전 Task 등록 권유 리마인더를 세션당 1회 주입 |
+| `delegate-nudge-hook.py` | UserPromptSubmit | 직전 턴 메인 스레드 탐색성 호출·tool_result 바이트가 임계(기본 10회/100KB) 초과 시 위임 넛지 주입 — 세션당 최대 3회, 발화마다 임계 2배, 발화/억제를 `state/delegate-nudge/log.jsonl`에 기록 |
 | `precompact-handoff.sh` | PreCompact | HANDOFF 파일이 없거나 낡았으면 auto compaction 을 막고 /handoff 를 요구 (manual 은 경고만) |
 
 ## 동작 원칙
@@ -140,5 +141,6 @@ rm ~/.claude/logs/hook-debug.on   # 또는 unset CLAUDE_HOOK_DEBUG
 | notion-continuous | JSON 파싱 실패 | reminder 주입 안 됨 (조용히 스킵) |
 | general-continuation | 정규식 오류 | 동일 — 조용히 스킵 |
 | bg-task-progress | payload 키 불일치 | 카운터 증감/알림 누락, 도구 실행 자체는 정상 |
+| delegate-nudge | transcript 파싱/상태 기록 실패 | 넛지 미주입 (조용히 스킵), 본 동작 정상 |
 
 **모든 훅은 exit 0을 반환**하도록 설계되어 Claude Code의 UserPromptSubmit / PreToolUse / PostToolUse 흐름을 중단시키지 않는다.
