@@ -14,10 +14,18 @@
 동작:
 - stdin으로 Claude Code가 hook payload(JSON) 전달
 - payload.transcript_path 또는 payload.messages 에서 마지막 assistant turn 추출
+- turn 단위 판정: transcript는 content block 하나당 JSONL record 하나로 기록되므로
+  (thinking / text / tool_use 분리) 마지막 record 하나가 아니라 마지막 실제 user
+  prompt 이후의 assistant record 전부를 하나의 turn으로 합쳐 본다.
+- 통과 조건: turn의 **마지막 tool_use 이후**에 비어 있지 않은 text block이 있을 것.
+  도입 텍스트만 내고 도구 호출로 끝내는 turn은 통과하지 않는다 (결과 보고 강제).
 - 차단 조건 (둘 중 하나):
-  (A) 마지막 assistant turn에 tool_use는 있지만 text content가 없음
-  (B) 마지막 assistant turn이 완전히 비어 있고 직전 user turn이 도구 결과
-      (특히 AskUserQuestion)인 경우
+  (A) 마지막 tool_use 뒤에 thinking 등은 있으나 text가 0줄
+  (B) 마지막 tool_use 뒤에 assistant 산출이 전혀 없음
+      (도구 결과 수신 후 침묵 — 특히 AskUserQuestion)
+- settle-retry: 차단 조건이 성립해도 transcript를 다시 읽어 재판정한다. Stop 훅이
+  마지막 text block record보다 먼저 파일을 읽으면 직전 tool_use record가 turn의
+  끝으로 보이기 때문이다 (2026-08-24 실측 오탐 2건).
 - 차단 시 exit 2 + stderr 경고 → 모델 컨텍스트에 system-reminder로 노출
 
 설치 위치: ~/.claude/settings.json hooks.Stop.[].hooks
@@ -26,6 +34,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -183,6 +192,119 @@ def assistant_has_tool_use(turn: dict) -> bool:
     return False
 
 
+SETTLE_ATTEMPTS = 8
+SETTLE_DELAY_SEC = 0.1
+
+
+def current_assistant_turn(messages: list) -> tuple[list, dict | None]:
+    """마지막 실제 user prompt 이후의 assistant record 전부와 마지막 message를 반환.
+
+    turn 경계는 tool_result를 담지 않은 user message로 끊는다. tool_result user
+    record는 같은 turn의 일부다.
+    """
+    start = 0
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and user_tool_result_id(msg) is None
+        ):
+            start = i + 1
+            break
+    turn = [m for m in messages[start:] if isinstance(m, dict) and m.get("role") == "assistant"]
+    return turn, (messages[-1] if messages else None)
+
+
+def turn_blocks(turn: list) -> list:
+    """turn의 assistant record들을 순서 그대로 content block 리스트로 편다."""
+    blocks: list = []
+    for msg in turn:
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                blocks.append({"type": "text", "text": content})
+            continue
+        if isinstance(content, list):
+            blocks.extend(b for b in content if isinstance(b, dict))
+    return blocks
+
+
+def has_nonempty_text(blocks: list) -> bool:
+    for b in blocks:
+        if b.get("type") in ("text", "output_text"):
+            text = b.get("text")
+            if isinstance(text, str) and text.strip():
+                return True
+    return False
+
+
+def evaluate(messages: list) -> tuple[str, str]:
+    """('ok' | 'tool_only' | 'empty', tool_use_id) 판정.
+
+    통과하려면 turn의 마지막 tool_use **이후**에 비어 있지 않은 text가 있어야 한다.
+    """
+    turn, last = current_assistant_turn(messages)
+    blocks = turn_blocks(turn)
+
+    last_tool = -1
+    tool_id = ""
+    for i, b in enumerate(blocks):
+        if b.get("type") in ("tool_use", "server_tool_use"):
+            last_tool = i
+            tool_id = b.get("id") if isinstance(b.get("id"), str) else ""
+
+    if last_tool >= 0:
+        after = blocks[last_tool + 1:]
+        if has_nonempty_text(after):
+            return "ok", ""
+        # 산출이 전혀 없으면 '침묵' 분기, thinking 등만 있으면 'text 0줄' 분기
+        return ("empty", tool_id) if not after else ("tool_only", "")
+
+    # turn에 tool_use가 없는 경우 — 기존 분기 B 조건 유지
+    if not has_nonempty_text(blocks):
+        if isinstance(last, dict) and last.get("role") == "user":
+            result_id = user_tool_result_id(last)
+            if result_id:
+                return "empty", result_id
+    return "ok", ""
+
+
+def settle(
+    read_messages: Any,
+    messages: list,
+    verdict: str,
+    tool_id: str,
+    attempts: int = SETTLE_ATTEMPTS,
+    delay: float = SETTLE_DELAY_SEC,
+    sleep: Any = time.sleep,
+) -> tuple[str, str, list]:
+    """차단 판정을 transcript 재읽기로 확정한다.
+
+    Stop 훅이 마지막 text block record보다 먼저 파일을 읽을 수 있으므로 차단
+    조건이 성립해도 곧바로 확정하지 않는다. read_messages/sleep을 주입받아
+    타이밍에 의존하지 않고 재시도 경로를 단위 테스트할 수 있게 한다.
+    """
+    readable = True
+    for _ in range(attempts):
+        sleep(delay)
+        retry = read_messages()
+        if not retry:
+            # 최종 record를 쓰는 도중이면 마지막 줄이 부분 JSON이라 파싱에 실패한다.
+            # 일시적 상태이므로 남은 시도를 계속한다.
+            readable = False
+            continue
+        readable = True
+        messages = retry
+        verdict, tool_id = evaluate(retry)
+        if verdict == "ok":
+            return "ok", "", messages
+    if not readable:
+        # 끝까지 읽지 못했다 — malformed transcript와 동일하게 fail-open
+        return "ok", "", messages
+    return verdict, tool_id, messages
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
@@ -204,15 +326,16 @@ def main() -> int:
     if any(hint in user_text for hint in EXPLICIT_STOP_HINTS):
         return 0  # 사용자가 명시적으로 종료 요청 — 통과
 
-    turn_idx = last_assistant_index(messages)
-    if turn_idx < 0:
-        return 0
-    turn = messages[turn_idx]
+    verdict, tool_id = evaluate(messages)
 
-    has_tool = assistant_has_tool_use(turn)
-    has_text = assistant_has_text(turn)
+    # transcript는 content block 단위로 append되므로 마지막 text block이 아직
+    # 기록되지 않았을 수 있다. 파일 기반일 때만 재읽기로 확정한다.
+    if verdict != "ok" and not isinstance(payload.get("messages"), list):
+        verdict, tool_id, messages = settle(
+            lambda: read_transcript_messages(payload), messages, verdict, tool_id
+        )
 
-    if has_tool and not has_text:
+    if verdict == "tool_only":
         sys.stderr.write(
             "STOP_HOOK_BLOCK: 마지막 assistant turn에 tool_use는 있고 텍스트 응답이 0줄입니다.\n"
             "도구 결과 수신 후 응답 종료 직전 자가점검을 통과하지 못했습니다.\n"
@@ -221,24 +344,19 @@ def main() -> int:
         )
         return 2  # 차단
 
-    # 추가 분기 (2026-05-14): 마지막 assistant turn이 완전히 비어 있고
+    # 추가 분기 (2026-05-14): turn에 assistant 산출이 전혀 없고
     # 직전 user turn이 도구 결과(특히 AskUserQuestion)인 경우 차단.
-    if not has_tool and not has_text and turn_idx > 0:
-        prev = messages[turn_idx - 1]
-        if isinstance(prev, dict) and prev.get("role") == "user":
-            tool_id = user_tool_result_id(prev)
-            if tool_id:
-                tool_name = find_tool_use_name(messages, tool_id)
-                tool_label = tool_name or "previous tool"
-                sys.stderr.write(
-                    f"STOP_HOOK_BLOCK: 직전 도구({tool_label}) 결과 수신 후 "
-                    "assistant turn이 텍스트 0줄, action 0개로 비어 있습니다.\n"
-                    "AskUserQuestion 답변/도구 결과를 받았으면 같은 흐름에서 "
-                    "(a) 다음 질문, (b) 분석/액션 텍스트, (c) 후속 도구 호출 "
-                    "중 하나 이상을 출력해야 합니다.\n"
-                    "참조: ~/.claude/CLAUDE.md '정보 수집 → 조기 종료 방지' 2026-05-14 사례.\n"
-                )
-                return 2
+    if verdict == "empty":
+        tool_label = find_tool_use_name(messages, tool_id) or "previous tool"
+        sys.stderr.write(
+            f"STOP_HOOK_BLOCK: 마지막 도구({tool_label}) 호출 이후 assistant 산출이 "
+            "전혀 없습니다 — 결과 보고 없이 turn이 끝났습니다.\n"
+            "AskUserQuestion 답변/도구 결과를 받았으면 같은 흐름에서 "
+            "(a) 다음 질문, (b) 분석/액션 텍스트, (c) 후속 도구 호출 "
+            "중 하나 이상을 출력해야 합니다.\n"
+            "참조: ~/.claude/CLAUDE.md '정보 수집 → 조기 종료 방지' 2026-05-14 사례.\n"
+        )
+        return 2
 
     return 0
 
