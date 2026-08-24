@@ -27,8 +27,9 @@ import time
 
 DEBUG_LOG = os.path.expanduser("~/.claude/logs/hook-debug.log")
 
-# 2차 필터 — matcher 정규식이 변경/오인 매칭해도 여기서 차단
-EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+# 새로 기록되는 텍스트가 담기는 필드. 도구명이 아니라 **필드 유무**로 판정하므로
+# matcher 에 새 편집 도구를 추가하면 훅 수정 없이 그대로 커버된다(도구명 하드코딩 회피).
+TEXT_FIELDS = ("content", "new_string", "new_source")
 
 FORBIDDEN = frozenset(
     [chr(c) for c in range(0x00, 0x09)]
@@ -72,26 +73,27 @@ def debug_log(tag: str, info: "dict[str, object]") -> None:
         pass
 
 
-def written_texts(tool_name: str, tool_input: dict) -> "list[str]":
-    """이번 호출이 새로 기록한 텍스트만 모은다 (기존 파일 내용은 보지 않는다)."""
+def written_texts(tool_input: dict) -> "list[str]":
+    """이번 호출이 새로 기록한 텍스트만 모은다 (기존 파일 내용은 보지 않는다).
+
+    도구명으로 분기하지 않고 **텍스트 필드 유무**로 판정한다. old_string 처럼
+    지워지는 쪽은 대상이 아니므로 TEXT_FIELDS 에 넣지 않는다.
+    """
     out = []
 
-    def take(value):
-        if isinstance(value, str):
-            out.append(value)
+    def take(source):
+        if not isinstance(source, dict):
+            return
+        for key in TEXT_FIELDS:
+            value = source.get(key)
+            if isinstance(value, str):
+                out.append(value)
 
-    if tool_name == "Write":
-        take(tool_input.get("content"))
-    elif tool_name == "Edit":
-        take(tool_input.get("new_string"))
-    elif tool_name == "MultiEdit":
-        edits = tool_input.get("edits")
-        if isinstance(edits, list):
-            for edit in edits:
-                if isinstance(edit, dict):
-                    take(edit.get("new_string"))
-    elif tool_name == "NotebookEdit":
-        take(tool_input.get("new_source"))
+    take(tool_input)
+    edits = tool_input.get("edits")
+    if isinstance(edits, list):
+        for edit in edits:
+            take(edit)
     return out
 
 
@@ -117,17 +119,32 @@ def read_file(path: str) -> "str | None":
         return None
 
 
+def unique_offset(content: str, text: str) -> int:
+    """content 안에서 text 가 정확히 한 번 나오면 그 오프셋, 아니면 -1.
+
+    두 번째 일치를 찾는 즉시 멈추므로 전체 count 보다 싸다.
+    """
+    first = content.find(text)
+    if first < 0:
+        return -1
+    if content.find(text, first + 1) >= 0:
+        return -1
+    return first
+
+
 def locate(path: str, texts: "list[str]") -> "list[tuple[int, int, str, bool]]":
     """**새로 기록한 텍스트 안의** 제어문자 위치만 돌려준다.
 
-    파일에서 그 텍스트를 찾으면 파일 좌표(absolute=True)로, 못 찾으면 작성 텍스트
-    기준 상대 좌표(absolute=False)로 보고한다. 어느 경우든 기존 파일에만 있던
-    제어문자는 절대 섞이지 않는다 — 트리거 로직과 위치 보고가 같은 범위를 본다.
+    파일에서 그 텍스트가 **정확히 한 번** 나올 때만 파일 좌표(absolute=True)로
+    보고한다. 없거나 여러 번 나오면 어느 것이 이번 편집인지 알 수 없으므로 작성
+    텍스트 기준 상대 좌표(absolute=False)로 폴백한다 — 틀린 절대 줄 번호를 주면
+    사용자가 이번 편집과 무관한 줄을 고치게 된다. 어느 경우든 기존 파일에만 있던
+    제어문자는 섞이지 않는다 — 트리거 로직과 위치 보고가 같은 범위를 본다.
     """
     content = read_file(path) if path else None
     hits = []
     for text in texts:
-        base = content.find(text) if content else -1
+        base = unique_offset(content, text) if content else -1
         for offset, ch in enumerate(text):
             if ch not in FORBIDDEN:
                 continue
@@ -153,7 +170,7 @@ def format_where(path: str, texts: "list[str]") -> str:
             lines.append("  %s:%d  (열 %d) %s" % (name, lineno, col, repr(ch)))
         else:
             lines.append(
-                "  %s  작성 텍스트 %d번째 줄 (열 %d) %s — 파일에서 해당 텍스트를 찾지 못해 상대 위치"
+                "  %s  작성 텍스트 %d번째 줄 (열 %d) %s — 파일에서 위치를 특정하지 못해(미발견 또는 중복) 상대 위치"
                 % (name, lineno, col, repr(ch))
             )
     if len(hits) >= MAX_REPORT:
@@ -175,14 +192,14 @@ def main() -> int:
         return 0
 
     tool_name = payload.get("tool_name", "")
-    if not isinstance(tool_name, str) or tool_name not in EDIT_TOOLS:
+    if not isinstance(tool_name, str) or not tool_name:
         return 0
 
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return 0
 
-    texts = written_texts(tool_name, tool_input)
+    texts = written_texts(tool_input)
     chars = found_chars(texts)
     debug_log("ctrl-char-guard", {"tool": tool_name, "hits": len(chars)})
     if not chars:

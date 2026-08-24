@@ -118,12 +118,72 @@ def test_notebook_new_source_is_scanned(tmp_path):
     assert "CTRL-CHAR-GUARD" in context_of(run_hook(payload))
 
 
-def test_other_tools_are_ignored(tmp_path):
+def test_tool_without_text_field_is_ignored(tmp_path):
+    """텍스트 필드가 없는 도구는 검사 대상이 아니다 (Bash 의 command 등)."""
     payload = {
         "tool_name": "Bash",
         "tool_input": {"command": "echo '\x01'"},
     }
     assert run_hook(payload).stdout.strip() == ""
+
+
+def test_unknown_tool_with_text_field_is_scanned(tmp_path):
+    """도구명이 아니라 텍스트 필드로 판정한다.
+
+    회귀: PR #27 리뷰 [MEDIUM] — 도구명 하드코딩 시 새 편집 도구가 누락된다.
+    matcher 를 넓히기만 하면 훅 수정 없이 커버되어야 한다.
+    """
+    target = tmp_path / "future.ts"
+    target.write_text("x\n", encoding="utf-8")
+    payload = {
+        "tool_name": "SomeFutureEditTool",
+        "tool_input": {"file_path": str(target), "content": "y = /[\x01]/"},
+    }
+    assert "CTRL-CHAR-GUARD" in context_of(run_hook(payload))
+
+
+def test_duplicate_text_falls_back_to_relative(tmp_path):
+    """같은 텍스트가 파일에 여러 번 있으면 절대 좌표를 단정하지 않는다.
+
+    회귀: PR #27 리뷰 [MEDIUM] + Codex P2 — find() 가 첫 일치를 반환해 이번
+    편집과 무관한 줄을 가리키면, 사용자가 기존의 의도된 문자를 지우고 새로 들어온
+    제어문자는 그대로 두게 된다.
+    """
+    target = tmp_path / "dup.ts"
+    dup = "bad = /[\x01]/\n"
+    target.write_text(dup + "filler\n" + dup, encoding="utf-8")
+    payload = {
+        "tool_name": "Edit",
+        "tool_input": {"file_path": str(target), "old_string": "x", "new_string": dup},
+    }
+    context = context_of(run_hook(payload))
+    assert "상대 위치" in context
+    assert "dup.ts:1" not in context
+    assert "dup.ts:3" not in context
+
+
+def test_path_with_braces_does_not_crash(tmp_path):
+    """경로에 중괄호가 있어도 포매팅이 깨지지 않는다.
+
+    회귀: PR #27 리뷰 [MEDIUM] 은 str.format 이 치환된 값 안의 {} 를 재귀
+    해석해 KeyError 를 낸다고 봤으나, 실제로는 해석하지 않는다. 이후 % 포매팅
+    등으로 바꾸다 실제로 깨지는 것을 막기 위해 고정한다.
+    """
+    directory = tmp_path / "{monorepo}"
+    directory.mkdir()
+    target = directory / "a.ts"
+    content = "x = /[\x01]/"
+    target.write_text(content, encoding="utf-8")
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(target), "content": content},
+    }
+    result = run_hook(payload)
+    assert result.returncode == 0, result.stderr
+    assert result.stderr.strip() == ""
+    context = context_of(result)
+    assert "CTRL-CHAR-GUARD" in context
+    assert "{monorepo}" in context
 
 
 def test_kill_switch(tmp_path):
