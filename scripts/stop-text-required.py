@@ -296,15 +296,22 @@ def main() -> int:
     # transcript는 content block 단위로 append되므로 마지막 text block이 아직
     # 기록되지 않았을 수 있다. 파일 기반일 때만 재읽기로 확정한다.
     if verdict != "ok" and not isinstance(payload.get("messages"), list):
+        readable = True
         for _ in range(SETTLE_ATTEMPTS):
             time.sleep(SETTLE_DELAY_SEC)
             retry = read_transcript_messages(payload)
             if not retry:
-                break
+                # 최종 record를 쓰는 도중이면 마지막 줄이 부분 JSON이라 파싱에 실패한다.
+                # 일시적 상태이므로 남은 시도를 계속한다.
+                readable = False
+                continue
+            readable = True
             messages = retry
             verdict, tool_id = evaluate(retry)
             if verdict == "ok":
                 return 0
+        if not readable:
+            return 0  # 끝까지 읽지 못했다 — malformed transcript와 동일하게 fail-open
 
     if verdict == "tool_only":
         sys.stderr.write(
@@ -320,8 +327,8 @@ def main() -> int:
     if verdict == "empty":
         tool_label = find_tool_use_name(messages, tool_id) or "previous tool"
         sys.stderr.write(
-            f"STOP_HOOK_BLOCK: 직전 도구({tool_label}) 결과 수신 후 "
-            "assistant turn이 텍스트 0줄, action 0개로 비어 있습니다.\n"
+            f"STOP_HOOK_BLOCK: 마지막 도구({tool_label}) 호출 이후 assistant 산출이 "
+            "전혀 없습니다 — 결과 보고 없이 turn이 끝났습니다.\n"
             "AskUserQuestion 답변/도구 결과를 받았으면 같은 흐름에서 "
             "(a) 다음 질문, (b) 분석/액션 텍스트, (c) 후속 도구 호출 "
             "중 하나 이상을 출력해야 합니다.\n"

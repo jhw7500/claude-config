@@ -230,6 +230,8 @@ def test_blocks_silent_end_and_names_the_tool(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "AskUserQuestion" in result.stderr
+    # turn에 tool_use가 있었으므로 "action 0개"는 사실과 다르다
+    assert "action 0개" not in result.stderr
 
 
 def test_previous_turn_text_does_not_satisfy_current_turn(tmp_path: Path) -> None:
@@ -270,6 +272,39 @@ def test_settle_retry_allows_late_flushed_text(tmp_path: Path) -> None:
         result = run_hook({"transcript_path": str(transcript)})
     finally:
         timer.cancel()
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_settle_retry_survives_partially_written_record(tmp_path: Path) -> None:
+    """최종 record를 쓰는 도중의 부분 JSON은 일시적 상태다 — 포기하지 않고 계속 기다린다."""
+    transcript = write_jsonl_transcript(tmp_path, turn_with_trailing_tool_use())
+    record = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "최종 보고."}]},
+        },
+        ensure_ascii=False,
+    )
+    head, tail = record[:20], record[20:]
+
+    def write_head() -> None:
+        with transcript.open("a", encoding="utf-8") as file:
+            file.write(head)
+
+    def write_tail() -> None:
+        with transcript.open("a", encoding="utf-8") as file:
+            file.write(tail + "\n")
+
+    timers = [threading.Timer(0.15, write_head), threading.Timer(0.35, write_tail)]
+    for timer in timers:
+        timer.start()
+    try:
+        result = run_hook({"transcript_path": str(transcript)})
+    finally:
+        for timer in timers:
+            timer.cancel()
 
     assert result.returncode == 0
     assert result.stderr == ""
