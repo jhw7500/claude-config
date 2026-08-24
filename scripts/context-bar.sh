@@ -39,7 +39,7 @@ if [[ -n "$cwd" && -d "$cwd" ]]; then
 
         # Check sync status with upstream
         sync_status=""
-        upstream=$(git -C "$cwd" rev-parse --abbrev-ref @{upstream} 2>/dev/null)
+        upstream=$(git -C "$cwd" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)
         if [[ -n "$upstream" ]]; then
             # Get last fetch time
             fetch_head="$cwd/.git/FETCH_HEAD"
@@ -61,7 +61,7 @@ if [[ -n "$cwd" && -d "$cwd" ]]; then
                 fi
             fi
 
-            counts=$(git -C "$cwd" rev-list --left-right --count HEAD...@{upstream} 2>/dev/null)
+            counts=$(git -C "$cwd" rev-list --left-right --count 'HEAD...@{upstream}' 2>/dev/null)
             ahead=$(echo "$counts" | cut -f1)
             behind=$(echo "$counts" | cut -f2)
             if [[ "$ahead" -eq 0 && "$behind" -eq 0 ]]; then
