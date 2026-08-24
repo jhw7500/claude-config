@@ -3,6 +3,31 @@
 이 디렉토리는 **전체 Claude Code 세션에 적용**되는 사용자 훅을 담는다.
 훅은 `~/.claude/settings.json` 의 `hooks` 섹션에 등록되어 있다.
 
+
+## 발화 하트비트
+
+훅은 대부분 조건부 출력이다 — 조건을 만족할 때만 reminder 를 주입한다. 그래서
+transcript 에 마커가 없다는 사실만으로는 **조건 미충족으로 조용한 것**과
+**훅이 아예 돌지 않는 것**을 구분할 수 없다. `scripts/stop-text-required.py` 가
+배선된 채 약 3개월간 무동작이었는데도 아무도 알아채지 못한 이유가 이것이다.
+
+이를 구분하려면 훅이 매 호출마다 하트비트를 남긴다.
+
+```bash
+HEARTBEAT_DIR="${CLAUDE_HOOK_HEARTBEAT_DIR:-$HOME/.claude/hook-heartbeat}"
+if mkdir -p "$HEARTBEAT_DIR" 2>/dev/null; then
+  date -Iseconds > "$HEARTBEAT_DIR/<훅 파일명>" 2>/dev/null || true
+fi
+```
+
+- 훅 본연의 로직보다 **먼저**, 조건 분기 이전에 남긴다.
+- 실패해도 훅 동작을 막지 않는다 (`|| true`).
+- `scripts/hook-selfcheck.py` 가 이 파일의 mtime 을 관측 창과 대조해 발화 증거로 읽는다.
+  마커가 찍혔으면 마커가 우선이고, 없으면 하트비트를 본다.
+
+현재 적용: `precompact-handoff.sh`. 마커를 낼 수 없거나(사용자 노출 텍스트에만
+출력하는 경우) 조건부 출력 빈도가 낮은 훅에 우선 적용한다.
+
 ## 파일 개요
 
 | 파일 | 트리거 | 역할 |
