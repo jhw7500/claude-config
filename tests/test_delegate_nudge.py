@@ -117,6 +117,17 @@ def test_fires_on_bytes_threshold(env):
     assert log_of(home)[0]["action"] == "fired"
 
 
+def test_multibyte_delta_counts_utf8_bytes(env):
+    """회귀: Codex P2 + Gemini HIGH (PR #44) — 한글 40k자 ≈ 120KB.
+    코드포인트로 재거나(40KB로 과소) 텍스트 모드 문자 창으로 읽으면 깨진다."""
+    home, transcript, payload = env
+    cold_start(home, transcript, payload)
+    append(transcript, [tool_result("한" * 40 * 1024)])
+    r = run_hook(payload, home)
+    assert "[DELEGATE-NUDGE]" in r.stdout
+    assert log_of(home)[0]["bytes"] > 100 * 1024
+
+
 def test_no_fire_below_thresholds(env):
     home, transcript, payload = env
     cold_start(home, transcript, payload)
@@ -253,6 +264,33 @@ def test_path_traversal_session_id_rejected(env):
     assert r.returncode == 0
     assert r.stdout == ""
     assert not (home / ".claude/state/delegate-nudge").exists()
+
+
+def test_non_dict_message_skipped_not_crash(env):
+    """회귀: PR #44 Codex P2 — message 가 비객체인 레코드가 훅을 exit 1 루프에 빠뜨리면 안 된다."""
+    home, transcript, payload = env
+    cold_start(home, transcript, payload)
+    bad = json.dumps({"type": "assistant",
+                      "message": 'marker "tool_use" 포함 문자열'})
+    append(transcript, [bad] + [tool_use("Bash")] * 10)
+    r = run_hook(payload, home)
+    assert r.returncode == 0, r.stderr
+    assert "[DELEGATE-NUDGE]" in r.stdout  # 손상 레코드는 스킵, 나머지는 정상 집계
+
+
+def test_corrupt_fires_field_reseeds_not_crash(env):
+    """회귀: PR #44 Claude 리뷰 [MEDIUM] — fires 비정수면 << 연산 TypeError 로 exit 1."""
+    home, transcript, payload = env
+    cold_start(home, transcript, payload)
+    state_path = home / ".claude/state/delegate-nudge" / SESSION
+    st = json.loads(state_path.read_text())
+    st["fires"] = None  # 손상 시뮬레이션
+    state_path.write_text(json.dumps(st))
+    append(transcript, [tool_use("Bash")] * 30)
+    r = run_hook(payload, home)
+    assert r.returncode == 0, r.stderr  # 재시딩 (그 턴 무발화)
+    assert r.stdout == ""
+    assert state_of(home)["fires"] == 0
 
 
 def test_missing_transcript_exits_quietly(env):

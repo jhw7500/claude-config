@@ -29,6 +29,7 @@
   (escape prefix 동일). 멈춘 동안의 델타가 재개 시 낡은 넛지로 발화하는 것을 막는다.
 """
 import fcntl
+import io
 import json
 import os
 import re
@@ -76,43 +77,53 @@ def env_int(key: str, default: int) -> int:
 
 
 def count_delta(path: str, offset: int, limit: int):
-    """transcript[offset:] 의 메인 스레드 탐색성 호출·바이트·위임 호출을 집계."""
+    """transcript[offset:] 의 메인 스레드 탐색성 호출·바이트·위임 호출을 집계.
+
+    바이너리 모드로 정확히 limit 바이트만 읽는다 — 텍스트 모드 read(n)은 문자 수
+    기준이라 멀티바이트 델타에서 창 경계를 넘어 읽고(동시 append 시 다음 턴과
+    이중 집계), 바이트 오프셋 seek 도 텍스트 모드에선 미정의 동작이다
+    (Gemini 리뷰 HIGH, PR #44). BytesIO 순회로 줄 리스트 중복 점유도 피한다.
+    """
     calls = agent_calls = result_bytes = 0
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with open(path, "rb") as fh:
         fh.seek(offset)
-        for line in fh.read(limit).splitlines():
-            if not any(m in line for m in _TOOL_MARKERS):
+        data = fh.read(limit)
+    for raw in io.BytesIO(data):
+        line = raw.decode("utf-8", errors="replace")
+        if not any(m in line for m in _TOOL_MARKERS):
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # 델타 경계의 잘린 줄 포함
+        if rec.get("isSidechain") is True:
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict):  # 문자열 등 비객체 message — 스킵 (Codex P2)
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        rtype = rec.get("type")
+        for item in content:
+            if not isinstance(item, dict):
                 continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # 델타 경계의 잘린 줄 포함
-            if rec.get("isSidechain") is True:
-                continue
-            msg = rec.get("message") or {}
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            rtype = rec.get("type")
-            for item in content:
-                if not isinstance(item, dict):
+            if rtype == "assistant" and item.get("type") == "tool_use":
+                name = item.get("name") or ""
+                if name in DELEGATE_TOOLS:
+                    agent_calls += 1
+                elif (name in DIRECT_EXPLORE or name in DIRECT_INFO
+                      or is_mcp_info(name)):
+                    calls += 1
+            elif rtype == "user" and item.get("type") == "tool_result":
+                try:
+                    # UTF-8 인코딩 후 길이 — 코드포인트 수로 재면 한글 등
+                    # 비ASCII 출력이 1/3로 과소집계된다 (Codex 리뷰 P2)
+                    result_bytes += len(json.dumps(
+                        item.get("content", ""), ensure_ascii=False
+                    ).encode("utf-8"))
+                except (TypeError, ValueError):
                     continue
-                if rtype == "assistant" and item.get("type") == "tool_use":
-                    name = item.get("name") or ""
-                    if name in DELEGATE_TOOLS:
-                        agent_calls += 1
-                    elif (name in DIRECT_EXPLORE or name in DIRECT_INFO
-                          or is_mcp_info(name)):
-                        calls += 1
-                elif rtype == "user" and item.get("type") == "tool_result":
-                    try:
-                        # UTF-8 인코딩 후 길이 — 코드포인트 수로 재면 한글 등
-                        # 비ASCII 출력이 1/3로 과소집계된다 (Codex 리뷰 P2)
-                        result_bytes += len(json.dumps(
-                            item.get("content", ""), ensure_ascii=False
-                        ).encode("utf-8"))
-                    except (TypeError, ValueError):
-                        continue
     return calls, agent_calls, result_bytes
 
 
@@ -195,6 +206,11 @@ def main() -> int:
             or not isinstance(state.get("offset"), int)
             or state["offset"] < 0
             or state["offset"] > size  # 파일 축소/교체 — 재시딩
+            # fires 가 비정수면 아래 << 연산이 TypeError 로 exit 1 — 훅 규약
+            # (모든 경로 exit 0) 위반이므로 재시딩한다 (PR #44 Claude 리뷰 [MEDIUM])
+            or not isinstance(state.get("fires", 0), int)
+            or isinstance(state.get("fires", 0), bool)
+            or state.get("fires", 0) < 0
         )
         if cold_start:
             # 오프셋을 현재 크기로 시딩하고 이 턴은 판정하지 않는다 (오발화 방지)

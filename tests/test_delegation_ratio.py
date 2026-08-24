@@ -221,9 +221,13 @@ def test_malformed_lines_are_skipped(tmp_path):
                         "message": {"content": [{"type": "tool_use", "name": "Bash"}]}})
     str_content = json.dumps({"type": "assistant", "timestamp": TS,
                               "message": {"content": "tool_use 아님"}})
+    # 회귀: Codex P2 (PR #44) — message 자체가 비객체면 AttributeError 없이 스킵
+    str_message = json.dumps({"type": "assistant", "timestamp": TS,
+                              "message": 'marker "tool_use" 포함 문자열'})
     root = make_tree(
         tmp_path,
-        main_lines=['{broken json "tool_use"', no_ts, str_content, tool_use("Bash", TS)],
+        main_lines=['{broken json "tool_use"', no_ts, str_content, str_message,
+                    tool_use("Bash", TS)],
     )
     o = overall(["--since", "2026-08-20"], root)["overall"]
     assert o["direct"] == 1

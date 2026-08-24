@@ -104,7 +104,9 @@ def scan_file(path, kind, session, days, since_dt):
             row["sessions"].add(session)
 
             rtype = rec.get("type")
-            msg = rec.get("message") or {}
+            msg = rec.get("message")
+            if not isinstance(msg, dict):  # 비객체 message — 스킵 (Codex P2)
+                continue
             content = msg.get("content")
             if not isinstance(content, list):
                 continue
