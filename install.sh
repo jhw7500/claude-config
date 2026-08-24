@@ -160,6 +160,7 @@ nc = "python3 %s/notion-continuous-exec-hook.py" % H
 pa = "python3 %s/post-action-tool-report-hook.py" % H
 an = "python3 %s/agent-name-delivery-hook.py" % H
 nr = "python3 %s/notion-recall-trigger-hook.py" % H
+hc = "python3 %s/handoff-checkpoint-hook.py" % H
 PI_MATCH = ("ToolSearch|WebSearch|WebFetch|mcp__notion__notion-search|mcp__notion__notion-fetch|"
             "mcp__notion__notion-get-comments|mcp__jhw-notion__jhw_search|mcp__jhw-notion__jhw_context|"
             "mcp__jhw-notion__jhw_history|mcp__jhw-notion__jhw_status|mcp__jhw-notion__jhw_retrieve|"
@@ -180,6 +181,7 @@ if ensure("PostToolUse", bt, "Agent|Bash"): added.append("Post<-bg-task")
 if ensure("SubagentStop", bt, "*"): added.append("SubagentStop<-bg-task")
 if ensure("PostToolUse", pi, PI_MATCH): added.append("Post<-post-info")
 if ensure("PreToolUse", an, "Agent"): added.append("Pre<-agent-name-delivery")
+if ensure("UserPromptSubmit", hc): added.append("UPS<-handoff-checkpoint")
 # 흡수 — notion 환경만
 if notion:
     if ensure("UserPromptSubmit", nc): added.append("UPS<-notion-continuous")
