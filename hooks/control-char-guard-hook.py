@@ -102,32 +102,60 @@ def found_chars(texts: "list[str]") -> "list[str]":
     return sorted(hits)
 
 
-def locate(path: str) -> "list[tuple[int, int, str]]":
-    """파일에서 제어문자의 (줄, 열)을 찾는다. 실패하면 빈 목록 — 경고 자체는 유지된다."""
-    hits = []
+def line_col(text: str, offset: int) -> "tuple[int, int]":
+    head = text[:offset]
+    return head.count("\n") + 1, offset - (head.rfind("\n") + 1) + 1
+
+
+def read_file(path: str) -> "str | None":
     try:
         if os.path.getsize(path) > MAX_LOCATE_BYTES:
-            return hits
+            return None
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for lineno, line in enumerate(f, 1):
-                for col, ch in enumerate(line, 1):
-                    if ch in FORBIDDEN:
-                        hits.append((lineno, col, ch))
-                        if len(hits) >= MAX_REPORT:
-                            return hits
+            return f.read()
     except OSError:
-        pass
+        return None
+
+
+def locate(path: str, texts: "list[str]") -> "list[tuple[int, int, str, bool]]":
+    """**새로 기록한 텍스트 안의** 제어문자 위치만 돌려준다.
+
+    파일에서 그 텍스트를 찾으면 파일 좌표(absolute=True)로, 못 찾으면 작성 텍스트
+    기준 상대 좌표(absolute=False)로 보고한다. 어느 경우든 기존 파일에만 있던
+    제어문자는 절대 섞이지 않는다 — 트리거 로직과 위치 보고가 같은 범위를 본다.
+    """
+    content = read_file(path) if path else None
+    hits = []
+    for text in texts:
+        base = content.find(text) if content else -1
+        for offset, ch in enumerate(text):
+            if ch not in FORBIDDEN:
+                continue
+            if base >= 0:
+                lineno, col = line_col(content, base + offset)
+                hits.append((lineno, col, ch, True))
+            else:
+                lineno, col = line_col(text, offset)
+                hits.append((lineno, col, ch, False))
+            if len(hits) >= MAX_REPORT:
+                return hits
     return hits
 
 
-def format_where(path: str) -> str:
-    hits = locate(path)
+def format_where(path: str, texts: "list[str]") -> str:
+    hits = locate(path, texts)
     if not hits:
-        return "위치: 파일에서 특정하지 못함 (읽기 실패·크기 초과). 위 grep 으로 직접 확인하라."
-    lines = [
-        "  %s:%d  (열 %d) %s" % (os.path.basename(path), lineno, col, repr(ch))
-        for lineno, col, ch in hits
-    ]
+        return "위치: 특정하지 못함. 위 grep 으로 직접 확인하라."
+    name = os.path.basename(path) if path else "(경로 불명)"
+    lines = []
+    for lineno, col, ch, absolute in hits:
+        if absolute:
+            lines.append("  %s:%d  (열 %d) %s" % (name, lineno, col, repr(ch)))
+        else:
+            lines.append(
+                "  %s  작성 텍스트 %d번째 줄 (열 %d) %s — 파일에서 해당 텍스트를 찾지 못해 상대 위치"
+                % (name, lineno, col, repr(ch))
+            )
     if len(hits) >= MAX_REPORT:
         lines.append("  ... (%d개까지만 표시)" % MAX_REPORT)
     return "위치:\n" + "\n".join(lines)
@@ -154,7 +182,8 @@ def main() -> int:
     if not isinstance(tool_input, dict):
         return 0
 
-    chars = found_chars(written_texts(tool_name, tool_input))
+    texts = written_texts(tool_name, tool_input)
+    chars = found_chars(texts)
     debug_log("ctrl-char-guard", {"tool": tool_name, "hits": len(chars)})
     if not chars:
         return 0
@@ -170,7 +199,7 @@ def main() -> int:
                 tool=tool_name,
                 chars=", ".join(repr(c) for c in chars),
                 path=path or "(경로 불명)",
-                where=format_where(path) if path else "",
+                where=format_where(path, texts),
             ),
         }
     }

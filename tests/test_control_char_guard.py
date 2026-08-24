@@ -134,8 +134,8 @@ def test_kill_switch(tmp_path):
     assert result.stdout.strip() == ""
 
 
-def test_missing_file_still_warns(tmp_path):
-    """위치 특정에 실패해도 경고 자체는 남아야 한다."""
+def test_missing_file_falls_back_to_relative_position(tmp_path):
+    """파일을 읽지 못해도 작성 텍스트 기준 상대 위치는 보고한다."""
     payload = {
         "tool_name": "Write",
         "tool_input": {
@@ -145,7 +145,46 @@ def test_missing_file_still_warns(tmp_path):
     }
     context = context_of(run_hook(payload))
     assert "CTRL-CHAR-GUARD" in context
-    assert "특정하지 못함" in context
+    assert "상대 위치" in context
+
+
+def test_preexisting_control_char_is_not_reported(tmp_path):
+    """기존 파일에 있던 제어문자는 위치 보고에 섞이면 안 된다.
+
+    회귀: PR #26 Claude 리뷰 [MEDIUM] — 트리거는 새 텍스트만 보는데 위치 보고가
+    파일 전체를 스캔해, 이번 편집과 무관한 줄을 함께 보고하던 결함.
+    """
+    target = tmp_path / "test.ts"
+    lines = ["line%d" % i for i in range(1, 101)]
+    lines[4] = "old = /[\x01]/"      # 5번째 줄 — 편집 전부터 있던 것
+    lines[99] = "new = /[\x07]/"     # 100번째 줄 — 이번 편집이 넣은 것
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    payload = {
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": str(target),
+            "old_string": "line100",
+            "new_string": "new = /[\x07]/",
+        },
+    }
+    context = context_of(run_hook(payload))
+    assert "test.ts:100" in context
+    assert repr("\x07") in context
+    assert repr("\x01") not in context
+    assert "test.ts:5 " not in context
+
+
+def test_write_reports_absolute_file_position(tmp_path):
+    target = tmp_path / "abs.ts"
+    content = "a\nb\nc = /[\x01]/\n"
+    target.write_text(content, encoding="utf-8")
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(target), "content": content},
+    }
+    context = context_of(run_hook(payload))
+    assert "abs.ts:3" in context
+    assert "(열 7)" in context
 
 
 @pytest.mark.parametrize("payload", [None, {"tool_name": "Write"}, {"tool_name": 3}])
