@@ -302,3 +302,50 @@ def test_heartbeat_filename_follows_invoked_script_name(tmp_path: Path) -> None:
 
     assert (beats / hook.name).is_file()
     assert (beats / alias.name).is_file()
+
+
+# --- HOOK-OBSERVABLE 선언 --------------------------------------------------
+# 출력이 이미 고유하지만 마커 형태가 아닌 훅(예: systemMessage 를 내는 훅)은
+# 사용자 노출 텍스트를 바꾸지 않고 관측 문자열을 소스에 선언한다.
+
+def test_declared_string_is_used_as_marker(env) -> None:
+    hook = env.add_hook(
+        "declared-hook.py",
+        '# HOOK-OBSERVABLE: 🕐 prompt @\nprint("🕐 prompt @ 2026-08-24")\n',
+    )
+
+    assert HS.extract_markers(hook) == {"🕐 prompt @"}
+
+
+def test_declaration_keyword_is_not_a_marker(env) -> None:
+    """HOOK-OBSERVABLE 자체는 마커 형태에 맞아서 그냥 두면 영구 SILENT 가 된다."""
+    hook = env.add_hook("declared-hook.py", "# HOOK-OBSERVABLE: 🕐 prompt @\n")
+
+    assert HS.DECLARE_KEYWORD not in HS.extract_markers(hook)
+
+
+def test_declared_marker_detected_in_transcript(env) -> None:
+    hook = env.add_hook(
+        "declared-hook.py",
+        '# HOOK-OBSERVABLE: 🕐 prompt @\nprint("🕐 prompt @ x")\n',
+    )
+    settings = env.wire([("UserPromptSubmit", "*", f"python3 {hook}")])
+    env.transcript([
+        {"type": "attachment", "attachment": {"stdout": "🕐 prompt @ 2026-08-24 17:00:00"},
+         "timestamp": "2026-08-24T08:00:00Z"},
+    ])
+
+    result = env.run(settings)
+    row = next(r for r in result["rows"] if r["script"].endswith("declared-hook.py"))
+    assert row["status"] == "ok"
+    assert row["evidence"] == "marker"
+    assert row["fired"] == 1
+
+
+def test_multiple_declarations_all_counted(env) -> None:
+    hook = env.add_hook(
+        "declared-hook.py",
+        '# HOOK-OBSERVABLE: 🕐 prompt @\n# HOOK-OBSERVABLE: ✅ done @\nprint("x")\n',
+    )
+
+    assert HS.extract_markers(hook) == {"🕐 prompt @", "✅ done @"}

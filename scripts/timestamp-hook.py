@@ -10,6 +10,10 @@ in the UI.
 
 State: /tmp/claude-ts-<session_id> stores epoch float of prompt arrival.
 """
+# 출력이 systemMessage 라 [MARKER] 형태를 쓰면 사용자 UI 에 그대로 노출된다.
+# 대신 이미 고유한 출력 접두어를 관측 문자열로 선언한다 (scripts/hook-selfcheck.py).
+# HOOK-OBSERVABLE: 🕐 prompt @
+# HOOK-OBSERVABLE: ✅ done @
 import json
 import sys
 import time

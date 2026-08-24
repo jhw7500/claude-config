@@ -28,6 +28,24 @@ fi
 현재 적용: `precompact-handoff.sh`. 마커를 낼 수 없거나(사용자 노출 텍스트에만
 출력하는 경우) 조건부 출력 빈도가 낮은 훅에 우선 적용한다.
 
+
+## 관측 문자열 선언 (HOOK-OBSERVABLE)
+
+마커(`[NAME]`) 형태를 쓸 수 없지만 출력이 이미 고유한 훅은 관측 문자열을 소스에
+선언한다. `scripts/hook-selfcheck.py` 가 이 선언을 마커처럼 취급한다.
+
+```python
+# HOOK-OBSERVABLE: 🕐 prompt @
+# HOOK-OBSERVABLE: ✅ done @
+```
+
+`scripts/timestamp-hook.py` 가 이 방식을 쓴다 — 출력이 `systemMessage` 라
+`[MARKER]` 를 넣으면 사용자 UI 에 그대로 노출되기 때문이다. 선언은 사용자에게
+보이는 출력을 전혀 바꾸지 않는다.
+
+선언 문자열은 transcript 에서 그대로 찾을 수 있을 만큼 **고유하고 안정적인**
+접두어여야 한다. 매 호출 값이 달라지는 부분(타임스탬프 등)은 제외한다.
+
 ## 파일 개요
 
 | 파일 | 트리거 | 역할 |
