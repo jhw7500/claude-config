@@ -3,6 +3,49 @@
 이 디렉토리는 **전체 Claude Code 세션에 적용**되는 사용자 훅을 담는다.
 훅은 `~/.claude/settings.json` 의 `hooks` 섹션에 등록되어 있다.
 
+
+## 발화 하트비트
+
+훅은 대부분 조건부 출력이다 — 조건을 만족할 때만 reminder 를 주입한다. 그래서
+transcript 에 마커가 없다는 사실만으로는 **조건 미충족으로 조용한 것**과
+**훅이 아예 돌지 않는 것**을 구분할 수 없다. `scripts/stop-text-required.py` 가
+배선된 채 약 3개월간 무동작이었는데도 아무도 알아채지 못한 이유가 이것이다.
+
+이를 구분하려면 훅이 매 호출마다 하트비트를 남긴다.
+
+```bash
+HEARTBEAT_DIR="${CLAUDE_HOOK_HEARTBEAT_DIR:-$HOME/.claude/hook-heartbeat}"
+if mkdir -p "$HEARTBEAT_DIR" 2>/dev/null; then
+  date -Iseconds > "$HEARTBEAT_DIR/<훅 파일명>" 2>/dev/null || true
+fi
+```
+
+- 훅 본연의 로직보다 **먼저**, 조건 분기 이전에 남긴다.
+- 실패해도 훅 동작을 막지 않는다 (`|| true`).
+- `scripts/hook-selfcheck.py` 가 이 파일의 mtime 을 관측 창과 대조해 발화 증거로 읽는다.
+  마커가 찍혔으면 마커가 우선이고, 없으면 하트비트를 본다.
+
+현재 적용: `precompact-handoff.sh`. 마커를 낼 수 없거나(사용자 노출 텍스트에만
+출력하는 경우) 조건부 출력 빈도가 낮은 훅에 우선 적용한다.
+
+
+## 관측 문자열 선언 (HOOK-OBSERVABLE)
+
+마커(`[NAME]`) 형태를 쓸 수 없지만 출력이 이미 고유한 훅은 관측 문자열을 소스에
+선언한다. `scripts/hook-selfcheck.py` 가 이 선언을 마커처럼 취급한다.
+
+```python
+# HOOK-OBSERVABLE: 🕐 prompt @
+# HOOK-OBSERVABLE: ✅ done @
+```
+
+`scripts/timestamp-hook.py` 가 이 방식을 쓴다 — 출력이 `systemMessage` 라
+`[MARKER]` 를 넣으면 사용자 UI 에 그대로 노출되기 때문이다. 선언은 사용자에게
+보이는 출력을 전혀 바꾸지 않는다.
+
+선언 문자열은 transcript 에서 그대로 찾을 수 있을 만큼 **고유하고 안정적인**
+접두어여야 한다. 매 호출 값이 달라지는 부분(타임스탬프 등)은 제외한다.
+
 ## 파일 개요
 
 | 파일 | 트리거 | 역할 |
@@ -12,6 +55,9 @@
 | `general-continuation-hook.py` | UserPromptSubmit | "한번에/끝까지/연속으로" 등 사용자의 연속 실행 의도 감지 시 reminder 주입 |
 | `bg-task-progress-hook.py` | PreToolUse + PostToolUse | Agent / Bash `run_in_background=true` 시작·완료 알림 강제 + statusLine 카운터 관리 |
 | `control-char-guard-hook.py` | PostToolUse | Edit/Write/MultiEdit/NotebookEdit 로 **기록한 내용**에 raw 제어문자(C0/DEL)가 섞이면 위치와 함께 경고 |
+| `task-nudge.sh` | PreToolUse | 세션 첫 프로젝트 파일 수정 직전 Task 등록 권유 리마인더를 세션당 1회 주입 |
+| `delegate-nudge-hook.py` | UserPromptSubmit | 직전 턴 메인 스레드 탐색성 호출·tool_result 바이트가 임계(기본 10회/100KB) 초과 시 위임 넛지 주입 — 세션당 최대 3회, 발화마다 임계 2배, 발화/억제를 `state/delegate-nudge/log.jsonl`에 기록 |
+| `precompact-handoff.sh` | PreCompact | HANDOFF 파일이 없거나 낡았으면 auto compaction 을 막고 /handoff 를 요구 (manual 은 경고만) |
 
 ## 동작 원칙
 
@@ -95,5 +141,6 @@ rm ~/.claude/logs/hook-debug.on   # 또는 unset CLAUDE_HOOK_DEBUG
 | notion-continuous | JSON 파싱 실패 | reminder 주입 안 됨 (조용히 스킵) |
 | general-continuation | 정규식 오류 | 동일 — 조용히 스킵 |
 | bg-task-progress | payload 키 불일치 | 카운터 증감/알림 누락, 도구 실행 자체는 정상 |
+| delegate-nudge | transcript 파싱/상태 기록 실패 | 넛지 미주입 (조용히 스킵), 본 동작 정상 |
 
 **모든 훅은 exit 0을 반환**하도록 설계되어 Claude Code의 UserPromptSubmit / PreToolUse / PostToolUse 흐름을 중단시키지 않는다.

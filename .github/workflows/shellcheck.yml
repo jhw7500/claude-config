@@ -39,19 +39,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          files=(
-            build.sh
-          )
+          # 추적 중인 셸 스크립트를 대상으로 삼는다. 목록을 하드코딩하면 파일이
+          # 늘어도 검사에 들어오지 않고, 그 사실이 초록불에 가려진다.
+          mapfile -t files < <(git ls-files '*.sh')
 
-          for dir in tools upgrade_file docker; do
-            if [ -d "$dir" ]; then
-              while IFS= read -r -d '' f; do
-                files+=("$f")
-              done < <(find "$dir" -name '*.sh' -type f -print0)
-            fi
-          done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "검사할 .sh 파일이 없다" >&2
+            exit 1
+          fi
 
           echo "Checking ${#files[@]} files..."
+          printf '  %s\n' "${files[@]}"
           shellcheck -x -s bash -S error -f gcc "${files[@]}"
 
       - name: Summary

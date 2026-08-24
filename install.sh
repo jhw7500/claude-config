@@ -2,6 +2,8 @@
 # 다른 호스트에서 실행: 개인 Claude Code 자산 설치 (스킬 + 셸 함수 + 스크립트 + 지침)
 set -e
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/link-safely.sh
+. "$REPO_DIR/scripts/lib/link-safely.sh"
 
 # 1) 스킬 심볼릭 링크 (skills/ 아래 모든 스킬 자동 링크, repo pull 시 자동 갱신)
 mkdir -p ~/.claude/skills
@@ -29,18 +31,26 @@ fi
 
 # 3) 개인 스크립트 심볼릭 링크
 mkdir -p ~/.claude/scripts
-for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py context-bar.sh apex-toggle.sh; do
-  [ -f "$REPO_DIR/scripts/$f" ] && ln -sfn "$REPO_DIR/scripts/$f" ~/.claude/scripts/"$f"
+SCRIPT_LINKS=0
+for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py hook-selfcheck.py delegation-ratio.py context-bar.sh apex-toggle.sh; do
+  [ -f "$REPO_DIR/scripts/$f" ] || continue
+  link_safely "$REPO_DIR/scripts/$f" ~/.claude/scripts/"$f" && SCRIPT_LINKS=$((SCRIPT_LINKS + 1))
 done
-echo "[install] 스크립트 링크: ~/.claude/scripts/ (5개)"
+echo "[install] 스크립트 링크: ~/.claude/scripts/ (${SCRIPT_LINKS}개)"
 
 # 3.5) 커스텀 훅 심볼릭 링크 (hooks/ 전체 — repo pull 시 자동 갱신)
 mkdir -p ~/.claude/hooks
-for f in "$REPO_DIR"/hooks/*.py; do
-  ln -sfn "$f" ~/.claude/hooks/"$(basename "$f")"
+HOOK_LINKS=0
+for f in "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.sh; do
+  [ -f "$f" ] || continue
+  link_safely "$f" ~/.claude/hooks/"$(basename "$f")" && HOOK_LINKS=$((HOOK_LINKS + 1))
 done
-[ -f "$REPO_DIR/hooks/README.md" ] && ln -sfn "$REPO_DIR/hooks/README.md" ~/.claude/hooks/README.md
-echo "[install] 훅 링크: ~/.claude/hooks/ ($(ls "$REPO_DIR"/hooks/*.py 2>/dev/null | wc -l)개)"
+# set -e 아래에서 link_safely 가 && 목록의 마지막 명령이면 실패 시 스크립트가
+# 중단된다. 여기서는 경고 후 계속 진행하는 게 의도다.
+if [ -f "$REPO_DIR/hooks/README.md" ]; then
+  link_safely "$REPO_DIR/hooks/README.md" ~/.claude/hooks/README.md || true
+fi
+echo "[install] 훅 링크: ~/.claude/hooks/ (${HOOK_LINKS}개)"
 
 # 4) 전역 지침 머지 (env-aware) — 항상 global-guidance, 환경에 있는 것만 추가 import.
 #    OMC 블록(inline/file-split 무관)은 절대 건드리지 않고 claude-config:START/END 블록만 관리.
@@ -158,15 +168,20 @@ bt = "python3 %s/bg-task-progress-hook.py" % H
 pi = "python3 %s/post-info-tool-continuation-hook.py" % H
 nc = "python3 %s/notion-continuous-exec-hook.py" % H
 pa = "python3 %s/post-action-tool-report-hook.py" % H
+dn = "python3 %s/delegate-nudge-hook.py" % H
 an = "python3 %s/agent-name-delivery-hook.py" % H
 nr = "python3 %s/notion-recall-trigger-hook.py" % H
 hc = "python3 %s/handoff-checkpoint-hook.py" % H
 cg = "python3 %s/control-char-guard-hook.py" % H
+# shell 훅은 기존 배선이 bash 접두어 없는 경로 표기라 같은 형태로 등록한다 (norm() 중복 방지)
+tn = "%s/task-nudge.sh" % H
+ph = "%s/precompact-handoff.sh" % H
 PI_MATCH = ("ToolSearch|WebSearch|WebFetch|mcp__notion__notion-search|mcp__notion__notion-fetch|"
             "mcp__notion__notion-get-comments|mcp__jhw-notion__jhw_search|mcp__jhw-notion__jhw_context|"
             "mcp__jhw-notion__jhw_history|mcp__jhw-notion__jhw_status|mcp__jhw-notion__jhw_retrieve|"
             "mcp__plugin_context7_context7__query-docs|mcp__plugin_context7_context7__resolve-library-id")
 CG_MATCH = "Edit|Write|MultiEdit|NotebookEdit"
+TN_MATCH = "Edit|Write|NotebookEdit"
 PA_MATCH = ("mcp__jhw-notion__jhw_(record|note|delete|start|close|report_export)|"
             "mcp__notion__notion-(create-pages|update-page|create-database|update-data-source|"
             "create-comment|duplicate-page|move-pages)")
@@ -181,10 +196,13 @@ if ensure("UserPromptSubmit", gc): added.append("UPS<-general-continuation")
 if ensure("PreToolUse", bt, "Agent|Bash"): added.append("Pre<-bg-task")
 if ensure("PostToolUse", bt, "Agent|Bash"): added.append("Post<-bg-task")
 if ensure("SubagentStop", bt, "*"): added.append("SubagentStop<-bg-task")
+if ensure("UserPromptSubmit", dn): added.append("UPS<-delegate-nudge")
 if ensure("PostToolUse", pi, PI_MATCH): added.append("Post<-post-info")
 if ensure("PreToolUse", an, "Agent"): added.append("Pre<-agent-name-delivery")
 if ensure("UserPromptSubmit", hc): added.append("UPS<-handoff-checkpoint")
 if ensure("PostToolUse", cg, CG_MATCH): added.append("Post<-ctrl-char-guard")
+if ensure("PreToolUse", tn, TN_MATCH): added.append("Pre<-task-nudge")
+if ensure("PreCompact", ph, "*"): added.append("PreCompact<-handoff-gate")
 # 흡수 — notion 환경만
 if notion:
     if ensure("UserPromptSubmit", nc): added.append("UPS<-notion-continuous")
