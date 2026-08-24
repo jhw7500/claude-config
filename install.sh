@@ -29,18 +29,19 @@ fi
 
 # 3) 개인 스크립트 심볼릭 링크
 mkdir -p ~/.claude/scripts
-for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py context-bar.sh apex-toggle.sh; do
+for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py hook-selfcheck.py context-bar.sh apex-toggle.sh; do
   [ -f "$REPO_DIR/scripts/$f" ] && ln -sfn "$REPO_DIR/scripts/$f" ~/.claude/scripts/"$f"
 done
-echo "[install] 스크립트 링크: ~/.claude/scripts/ (5개)"
+echo "[install] 스크립트 링크: ~/.claude/scripts/ (6개)"
 
 # 3.5) 커스텀 훅 심볼릭 링크 (hooks/ 전체 — repo pull 시 자동 갱신)
 mkdir -p ~/.claude/hooks
-for f in "$REPO_DIR"/hooks/*.py; do
+for f in "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.sh; do
+  [ -f "$f" ] || continue
   ln -sfn "$f" ~/.claude/hooks/"$(basename "$f")"
 done
 [ -f "$REPO_DIR/hooks/README.md" ] && ln -sfn "$REPO_DIR/hooks/README.md" ~/.claude/hooks/README.md
-echo "[install] 훅 링크: ~/.claude/hooks/ ($(ls "$REPO_DIR"/hooks/*.py 2>/dev/null | wc -l)개)"
+echo "[install] 훅 링크: ~/.claude/hooks/ ($(ls "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.sh 2>/dev/null | wc -l)개)"
 
 # 4) 전역 지침 머지 (env-aware) — 항상 global-guidance, 환경에 있는 것만 추가 import.
 #    OMC 블록(inline/file-split 무관)은 절대 건드리지 않고 claude-config:START/END 블록만 관리.
@@ -162,11 +163,15 @@ an = "python3 %s/agent-name-delivery-hook.py" % H
 nr = "python3 %s/notion-recall-trigger-hook.py" % H
 hc = "python3 %s/handoff-checkpoint-hook.py" % H
 cg = "python3 %s/control-char-guard-hook.py" % H
+# shell 훅은 기존 배선이 bash 접두어 없는 경로 표기라 같은 형태로 등록한다 (norm() 중복 방지)
+tn = "%s/task-nudge.sh" % H
+ph = "%s/precompact-handoff.sh" % H
 PI_MATCH = ("ToolSearch|WebSearch|WebFetch|mcp__notion__notion-search|mcp__notion__notion-fetch|"
             "mcp__notion__notion-get-comments|mcp__jhw-notion__jhw_search|mcp__jhw-notion__jhw_context|"
             "mcp__jhw-notion__jhw_history|mcp__jhw-notion__jhw_status|mcp__jhw-notion__jhw_retrieve|"
             "mcp__plugin_context7_context7__query-docs|mcp__plugin_context7_context7__resolve-library-id")
 CG_MATCH = "Edit|Write|MultiEdit|NotebookEdit"
+TN_MATCH = "Edit|Write|NotebookEdit"
 PA_MATCH = ("mcp__jhw-notion__jhw_(record|note|delete|start|close|report_export)|"
             "mcp__notion__notion-(create-pages|update-page|create-database|update-data-source|"
             "create-comment|duplicate-page|move-pages)")
@@ -185,6 +190,8 @@ if ensure("PostToolUse", pi, PI_MATCH): added.append("Post<-post-info")
 if ensure("PreToolUse", an, "Agent"): added.append("Pre<-agent-name-delivery")
 if ensure("UserPromptSubmit", hc): added.append("UPS<-handoff-checkpoint")
 if ensure("PostToolUse", cg, CG_MATCH): added.append("Post<-ctrl-char-guard")
+if ensure("PreToolUse", tn, TN_MATCH): added.append("Pre<-task-nudge")
+if ensure("PreCompact", ph, "*"): added.append("PreCompact<-handoff-gate")
 # 흡수 — notion 환경만
 if notion:
     if ensure("UserPromptSubmit", nc): added.append("UPS<-notion-continuous")
