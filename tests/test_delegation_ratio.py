@@ -160,6 +160,32 @@ def test_utf8_bytes_not_codepoints(tmp_path):
     assert o["main_bytes"] > 300  # 인코딩 전 len 은 102
 
 
+def test_server_tool_use_counted(tmp_path):
+    """회귀: Codex P2 (PR #44 R2) — WebSearch 류 server_tool_use 블록도 direct."""
+    stu = json.dumps({
+        "type": "assistant", "timestamp": TS, "isSidechain": False,
+        "message": {"content": [{"type": "server_tool_use", "id": "t",
+                                 "name": "WebSearch"}]},
+    })
+    root = make_tree(tmp_path, main_lines=[stu, tool_use("Bash", TS)])
+    o = overall(["--since", "2026-08-20"], root)["overall"]
+    assert o["direct"] == 2
+
+
+def test_subagent_mtime_independent_of_parent(tmp_path):
+    """회귀: Codex P2 (PR #44 R2) — 부모 mtime 이 창 밖이어도 서브 파일은 독립 판정."""
+    import os
+    root = make_tree(
+        tmp_path,
+        main_lines=[tool_use("Bash", local_iso(2026, 8, 1))],   # 창 밖 기록
+        sub_lines=[tool_result("s" * 100, TS)],                 # 창 안 기록
+    )
+    old = datetime(2026, 8, 1).timestamp()
+    os.utime(root / "proj1" / "sess1.jsonl", (old, old))        # 부모 mtime 을 창 밖으로
+    o = overall(["--since", "2026-08-20"], root)["overall"]
+    assert o["sub_bytes"] == result_bytes("s" * 100)
+
+
 def test_naive_timestamp_skipped_not_crash(tmp_path):
     """회귀: Codex 리뷰 P2 — offset 없는 naive timestamp 레코드가 리포트를 죽이면 안 된다."""
     naive = json.dumps({

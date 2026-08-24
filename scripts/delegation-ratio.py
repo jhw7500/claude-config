@@ -47,8 +47,10 @@ DIRECT_INFO = {"WebSearch", "WebFetch", "ToolSearch"}
 MCP_INFO_VERB_RE = re.compile(r"(search|fetch|retrieve|recall|query)", re.IGNORECASE)
 DELEGATE_TOOLS = {"Agent", "Task"}  # Task 는 구버전 위임 도구명
 
-# json.loads 전에 싸게 거르기 위한 문자열 마커
-_TOOL_MARKERS = ('"tool_use"', '"tool_result"')
+# json.loads 전에 싸게 거르기 위한 문자열 마커. server_tool_use 는 서버측
+# 도구(WebSearch 등) — tool_use 와 등가 (stop-text-required.py:141, Codex P2)
+_TOOL_MARKERS = ('"tool_use"', '"server_tool_use"', '"tool_result"')
+_TOOL_USE_TYPES = ("tool_use", "server_tool_use")
 
 
 def is_direct(name):
@@ -113,7 +115,7 @@ def scan_file(path, kind, session, days, since_dt):
 
             if rtype == "assistant":
                 for item in content:
-                    if not isinstance(item, dict) or item.get("type") != "tool_use":
+                    if not isinstance(item, dict) or item.get("type") not in _TOOL_USE_TYPES:
                         continue
                     name = item.get("name") or ""
                     if eff_kind != "main":
@@ -149,17 +151,22 @@ def collect(root, since_dt):
     days = defaultdict(new_bucket)
     since_ts = since_dt.timestamp() if since_dt else None
 
+    def fresh(path):
+        """창 밖(mtime < since) 파일 스킵 최적화 — 파일별로 독립 판정한다.
+        부모 mtime 으로 세션 트리 전체를 건너뛰면 부모가 멈춘 뒤에도 기록 중인
+        서브에이전트 파일이 누락된다 (Codex P2, PR #44 라운드 2)."""
+        try:
+            return since_ts is None or os.path.getmtime(path) >= since_ts
+        except OSError:
+            return False
+
     for main in glob.glob(os.path.join(root, "*", "*.jsonl")):
         session = os.path.splitext(os.path.basename(main))[0]
-        # 창 밖 파일은 통째로 건너뛴다 (mtime = 마지막 기록 시각)
-        try:
-            if since_ts is not None and os.path.getmtime(main) < since_ts:
-                continue
-        except OSError:
-            continue
-        scan_file(main, "main", session, days, since_dt)
+        if fresh(main):
+            scan_file(main, "main", session, days, since_dt)
         for sub in glob.glob(os.path.join(root, "*", session, "subagents", "agent-*.jsonl")):
-            scan_file(sub, "sub", session, days, since_dt)
+            if fresh(sub):
+                scan_file(sub, "sub", session, days, since_dt)
     return days
 
 

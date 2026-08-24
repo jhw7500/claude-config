@@ -266,6 +266,21 @@ def test_path_traversal_session_id_rejected(env):
     assert not (home / ".claude/state/delegate-nudge").exists()
 
 
+def test_server_tool_use_counted(env):
+    """회귀: Codex P2 (PR #44 R2) — server_tool_use(WebSearch 류)도 탐색성 집계."""
+    home, transcript, payload = env
+    cold_start(home, transcript, payload)
+    stu = json.dumps({
+        "type": "assistant", "isSidechain": False,
+        "message": {"content": [{"type": "server_tool_use", "id": "t",
+                                 "name": "WebSearch"}]},
+    })
+    append(transcript, [stu] * 10)
+    r = run_hook(payload, home)
+    assert "[DELEGATE-NUDGE]" in r.stdout
+    assert log_of(home)[0]["calls"] == 10
+
+
 def test_non_dict_message_skipped_not_crash(env):
     """회귀: PR #44 Codex P2 — message 가 비객체인 레코드가 훅을 exit 1 루프에 빠뜨리면 안 된다."""
     home, transcript, payload = env

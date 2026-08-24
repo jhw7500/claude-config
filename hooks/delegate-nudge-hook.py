@@ -56,7 +56,10 @@ def is_mcp_info(name: str) -> bool:
         return False
     return bool(MCP_INFO_VERB_RE.search(name.rsplit("__", 1)[-1]))
 
-_TOOL_MARKERS = ('"tool_use"', '"tool_result"')
+# server_tool_use 는 서버측 도구(WebSearch 등) 블록 — stop-text-required.py:141 과
+# 동일하게 tool_use 와 등가 취급한다 (Codex P2, PR #44 라운드 2)
+_TOOL_MARKERS = ('"tool_use"', '"server_tool_use"', '"tool_result"')
+_TOOL_USE_TYPES = ("tool_use", "server_tool_use")
 
 REMINDER = """<system-reminder>
 [DELEGATE-NUDGE] 지난 턴에서 탐색성 호출 {calls}회 · tool_result {kb}KB가 메인 컨텍스트에 들어왔다.
@@ -108,7 +111,7 @@ def count_delta(path: str, offset: int, limit: int):
         for item in content:
             if not isinstance(item, dict):
                 continue
-            if rtype == "assistant" and item.get("type") == "tool_use":
+            if rtype == "assistant" and item.get("type") in _TOOL_USE_TYPES:
                 name = item.get("name") or ""
                 if name in DELEGATE_TOOLS:
                     agent_calls += 1
