@@ -45,7 +45,10 @@ if [[ -n "$cwd" && -d "$cwd" ]]; then
             fetch_head="$cwd/.git/FETCH_HEAD"
             fetch_ago=""
             if [[ -f "$fetch_head" ]]; then
-                fetch_time=$(stat -f %m "$fetch_head" 2>/dev/null || stat -c %Y "$fetch_head" 2>/dev/null)
+                # GNU 먼저, BSD 폴백. 순서가 뒤집히면 Linux 에서 stat -f 가 파일시스템 정보를
+# 뱉어 fetch_time 이 오염되고 이후 산술이 깨진다 (hooks/precompact-handoff.sh
+# 의 mtime_of() 와 같은 순서).
+fetch_time=$(stat -c %Y "$fetch_head" 2>/dev/null || stat -f %m "$fetch_head" 2>/dev/null)
                 if [[ -n "$fetch_time" ]]; then
                     now=$(date +%s)
                     diff=$((now - fetch_time))
