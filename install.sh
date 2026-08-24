@@ -2,6 +2,8 @@
 # 다른 호스트에서 실행: 개인 Claude Code 자산 설치 (스킬 + 셸 함수 + 스크립트 + 지침)
 set -e
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/link-safely.sh
+. "$REPO_DIR/scripts/lib/link-safely.sh"
 
 # 1) 스킬 심볼릭 링크 (skills/ 아래 모든 스킬 자동 링크, repo pull 시 자동 갱신)
 mkdir -p ~/.claude/skills
@@ -29,19 +31,26 @@ fi
 
 # 3) 개인 스크립트 심볼릭 링크
 mkdir -p ~/.claude/scripts
+SCRIPT_LINKS=0
 for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py hook-selfcheck.py context-bar.sh apex-toggle.sh; do
-  [ -f "$REPO_DIR/scripts/$f" ] && ln -sfn "$REPO_DIR/scripts/$f" ~/.claude/scripts/"$f"
+  [ -f "$REPO_DIR/scripts/$f" ] || continue
+  link_safely "$REPO_DIR/scripts/$f" ~/.claude/scripts/"$f" && SCRIPT_LINKS=$((SCRIPT_LINKS + 1))
 done
-echo "[install] 스크립트 링크: ~/.claude/scripts/ (6개)"
+echo "[install] 스크립트 링크: ~/.claude/scripts/ (${SCRIPT_LINKS}개)"
 
 # 3.5) 커스텀 훅 심볼릭 링크 (hooks/ 전체 — repo pull 시 자동 갱신)
 mkdir -p ~/.claude/hooks
+HOOK_LINKS=0
 for f in "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.sh; do
   [ -f "$f" ] || continue
-  ln -sfn "$f" ~/.claude/hooks/"$(basename "$f")"
+  link_safely "$f" ~/.claude/hooks/"$(basename "$f")" && HOOK_LINKS=$((HOOK_LINKS + 1))
 done
-[ -f "$REPO_DIR/hooks/README.md" ] && ln -sfn "$REPO_DIR/hooks/README.md" ~/.claude/hooks/README.md
-echo "[install] 훅 링크: ~/.claude/hooks/ ($(ls "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.sh 2>/dev/null | wc -l)개)"
+# set -e 아래에서 link_safely 가 && 목록의 마지막 명령이면 실패 시 스크립트가
+# 중단된다. 여기서는 경고 후 계속 진행하는 게 의도다.
+if [ -f "$REPO_DIR/hooks/README.md" ]; then
+  link_safely "$REPO_DIR/hooks/README.md" ~/.claude/hooks/README.md || true
+fi
+echo "[install] 훅 링크: ~/.claude/hooks/ (${HOOK_LINKS}개)"
 
 # 4) 전역 지침 머지 (env-aware) — 항상 global-guidance, 환경에 있는 것만 추가 import.
 #    OMC 블록(inline/file-split 무관)은 절대 건드리지 않고 claude-config:START/END 블록만 관리.
