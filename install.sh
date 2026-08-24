@@ -32,7 +32,7 @@ fi
 # 3) 개인 스크립트 심볼릭 링크
 mkdir -p ~/.claude/scripts
 SCRIPT_LINKS=0
-for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py hook-selfcheck.py context-bar.sh apex-toggle.sh; do
+for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py hook-selfcheck.py delegation-ratio.py context-bar.sh apex-toggle.sh; do
   [ -f "$REPO_DIR/scripts/$f" ] || continue
   link_safely "$REPO_DIR/scripts/$f" ~/.claude/scripts/"$f" && SCRIPT_LINKS=$((SCRIPT_LINKS + 1))
 done
@@ -168,6 +168,7 @@ bt = "python3 %s/bg-task-progress-hook.py" % H
 pi = "python3 %s/post-info-tool-continuation-hook.py" % H
 nc = "python3 %s/notion-continuous-exec-hook.py" % H
 pa = "python3 %s/post-action-tool-report-hook.py" % H
+dn = "python3 %s/delegate-nudge-hook.py" % H
 an = "python3 %s/agent-name-delivery-hook.py" % H
 nr = "python3 %s/notion-recall-trigger-hook.py" % H
 hc = "python3 %s/handoff-checkpoint-hook.py" % H
@@ -195,6 +196,7 @@ if ensure("UserPromptSubmit", gc): added.append("UPS<-general-continuation")
 if ensure("PreToolUse", bt, "Agent|Bash"): added.append("Pre<-bg-task")
 if ensure("PostToolUse", bt, "Agent|Bash"): added.append("Post<-bg-task")
 if ensure("SubagentStop", bt, "*"): added.append("SubagentStop<-bg-task")
+if ensure("UserPromptSubmit", dn): added.append("UPS<-delegate-nudge")
 if ensure("PostToolUse", pi, PI_MATCH): added.append("Post<-post-info")
 if ensure("PreToolUse", an, "Agent"): added.append("Pre<-agent-name-delivery")
 if ensure("UserPromptSubmit", hc): added.append("UPS<-handoff-checkpoint")
