@@ -12,8 +12,11 @@ set -u
 # 않는다 — scripts/hook-selfcheck.py 가 이 파일의 mtime 을 발화 증거로 읽는다.
 # 실패해도 훅 본연의 동작을 막지 않는다.
 HEARTBEAT_DIR="${CLAUDE_HOOK_HEARTBEAT_DIR:-$HOME/.claude/hook-heartbeat}"
+# 파일명은 스크립트 자신에서 도출한다. 하드코딩하면 이름을 바꿨을 때 자가진단이
+# 조용히 하트비트를 못 찾고, 그게 바로 이 장치가 막으려던 실패 양식이다
+# (hook-selfcheck.py 는 배선된 경로의 basename 으로 찾는다).
 if mkdir -p "$HEARTBEAT_DIR" 2>/dev/null; then
-  date -Iseconds > "$HEARTBEAT_DIR/precompact-handoff.sh" 2>/dev/null || true
+  date -Iseconds > "$HEARTBEAT_DIR/$(basename "${BASH_SOURCE[0]}")" 2>/dev/null || true
 fi
 
 STALE_SECONDS=${HANDOFF_STALE_SECONDS:-600}   # 10 minutes default
