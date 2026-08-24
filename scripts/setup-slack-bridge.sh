@@ -20,11 +20,7 @@ done
 if [ ! -e "$SECRET_FILE" ] && [ ! -L "$SECRET_FILE" ]; then
   echo "[setup] secrets.local.env 없음 — install -m 600 secrets.example.env secrets.local.env 후 SLACK_* 채우기"; exit 1
 fi
-require_private_env_file "$SECRET_FILE"
-set -a
-# shellcheck disable=SC1090
-. "$SECRET_FILE"
-set +a
+load_private_env_file "$SECRET_FILE"
 for v in SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_CHANNEL_ID SLACK_ALLOWED_USER_ID; do
   if [ -z "${!v:-}" ]; then echo "[setup] $v 비어있음 (secrets.local.env)"; exit 1; fi
 done

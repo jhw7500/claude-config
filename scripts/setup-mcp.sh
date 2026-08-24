@@ -23,11 +23,7 @@ for a in "$@"; do
 done
 
 if [ -e "$SECRET_FILE" ] || [ -L "$SECRET_FILE" ]; then
-  require_private_env_file "$SECRET_FILE"
-  set -a
-  # shellcheck disable=SC1090
-  . "$SECRET_FILE"
-  set +a
+  load_private_env_file "$SECRET_FILE"
 else
   echo "[setup-mcp] secrets.local.env 없음 — 키 placeholder로 진행 (install -m 600 secrets.example.env secrets.local.env)"
 fi
