@@ -7,6 +7,15 @@
 
 set -u
 
+# 발화 하트비트. 이 훅은 handoff 가 없거나 낡았을 때만 출력하므로 "출력 없음"이
+# 정상 상태다. 따라서 transcript 마커만으로는 조건 미충족과 무동작이 구분되지
+# 않는다 — scripts/hook-selfcheck.py 가 이 파일의 mtime 을 발화 증거로 읽는다.
+# 실패해도 훅 본연의 동작을 막지 않는다.
+HEARTBEAT_DIR="${CLAUDE_HOOK_HEARTBEAT_DIR:-$HOME/.claude/hook-heartbeat}"
+if mkdir -p "$HEARTBEAT_DIR" 2>/dev/null; then
+  date -Iseconds > "$HEARTBEAT_DIR/precompact-handoff.sh" 2>/dev/null || true
+fi
+
 STALE_SECONDS=${HANDOFF_STALE_SECONDS:-600}   # 10 minutes default
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 

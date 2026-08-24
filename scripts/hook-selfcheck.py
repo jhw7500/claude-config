@@ -8,6 +8,10 @@ transcript 를 JSONL 로 파싱하지 못해 매번 fail-open 으로 통과했�
 
 이 스크립트는 배선 목록과 실제 발화 이력을 대조해 그 간극을 드러낸다.
 
+훅 대부분은 조건부 출력이라 "출력 없음"이 정상 상태일 수 있다. 그래서 마커만
+보면 조건 미충족과 무동작이 구분되지 않는다. 훅이 매 호출마다 하트비트 파일을
+남기면(hooks/precompact-handoff.sh 참고) 그 mtime 을 발화 증거로 함께 읽는다.
+
 발견 항목:
   MISSING       배선됐지만 스크립트 파일이 없음
   UNMANAGED     저장소 심링크가 아님 — 다른 호스트에서 재현되지 않음
@@ -30,6 +34,7 @@ import time
 from pathlib import Path
 
 DEFAULT_REPO = Path(__file__).resolve().parents[1]
+DEFAULT_HEARTBEATS = Path(os.path.expanduser("~/.claude/hook-heartbeat"))
 MARKER_RE = re.compile(r"\[([A-Z][A-Z0-9_-]{3,})\]")
 # 대괄호 없는 마커는 문자열 리터럴의 "MARKER: ..." 형태만 인정한다.
 # 그냥 대문자 상수(SETTLE_ATTEMPTS 등)까지 잡으면 허위 SILENT 가 쏟아진다.
@@ -130,7 +135,20 @@ def scan_transcripts(root: Path, markers: set[str], days: int) -> dict:
     return {"hits": hits, "last_seen": last_seen, "files": files}
 
 
-def audit(settings: Path, repo: Path, transcripts: Path, days: int) -> dict:
+def heartbeat_seen(heartbeats: Path, name: str, days: int) -> str:
+    """관측 창 안의 하트비트면 날짜(YYYY-MM-DD)를, 아니면 빈 문자열을 반환한다."""
+    path = heartbeats / name
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return ""
+    if mtime < time.time() - days * 86400:
+        return ""
+    return time.strftime("%Y-%m-%d", time.localtime(mtime))
+
+
+def audit(settings: Path, repo: Path, transcripts: Path, days: int,
+          heartbeats: Path = DEFAULT_HEARTBEATS) -> dict:
     entries = wired_hooks(settings)
     repo_root = str(repo.resolve())
     rows, all_markers = [], set()
@@ -159,13 +177,20 @@ def audit(settings: Path, repo: Path, transcripts: Path, days: int) -> dict:
 
     scan = scan_transcripts(transcripts, all_markers, days)
     for row in rows:
-        if not row["markers"]:
+        if row["status"] in ("inline", "MISSING"):
             continue
+        beat = heartbeat_seen(heartbeats, os.path.basename(row["script"]), days)
+        row["heartbeat"] = beat
         fired = sum(scan["hits"].get(m, 0) for m in row["markers"])
-        row["fired"] = fired
-        row["last_seen"] = max((scan["last_seen"].get(m, "") for m in row["markers"]),
-                               default="")
-        if fired == 0 and row["status"] == "ok":
+        row["fired"] = fired if row["markers"] else 0
+        row["last_seen"] = max(
+            [scan["last_seen"].get(m, "") for m in row["markers"]] + [beat], default="")
+        row["evidence"] = "marker" if fired else ("heartbeat" if beat else "")
+        if beat:
+            # 하트비트가 있으면 조건 미충족으로 조용한 것이지 무동작이 아니다.
+            if row["status"] in ("SILENT", "UNOBSERVABLE"):
+                row["status"] = "ok"
+        elif row["markers"] and fired == 0 and row["status"] == "ok":
             row["status"] = "SILENT"
     return {"days": days, "files_scanned": scan["files"], "rows": rows,
             "marker_hits": scan["hits"]}
@@ -173,13 +198,13 @@ def audit(settings: Path, repo: Path, transcripts: Path, days: int) -> dict:
 
 def render(result: dict) -> str:
     lines = [f"훅 자가진단 — 최근 {result['days']}일 / transcript {result['files_scanned']}파일", ""]
-    lines.append(f"  {'상태':<13} {'이벤트':<17} {'스크립트':<34} {'발화':>6}  마지막")
+    lines.append(f"  {'상태':<13} {'이벤트':<17} {'스크립트':<34} {'발화':>6} {'근거':<10} 마지막")
     order = {"MISSING": 0, "SILENT": 1, "UNMANAGED": 2, "UNOBSERVABLE": 3, "ok": 4, "inline": 5}
     for row in sorted(result["rows"], key=lambda r: (order.get(r["status"], 9), r["event"])):
         name = os.path.basename(row["script"]) if row["script"] else row["command"][:34]
         fired = row.get("fired", "")
         lines.append(f"  {row['status']:<13} {row['event']:<17} {name:<34} "
-                     f"{fired:>6}  {row.get('last_seen', '')}")
+                     f"{fired:>6} {row.get('evidence', ''):<10} {row.get('last_seen', '')}")
     problems = [r for r in result["rows"]
                 if r["status"] in ("MISSING", "SILENT", "UNMANAGED", "UNOBSERVABLE")]
     lines += ["", f"발견 {len(problems)}건"]
@@ -189,7 +214,7 @@ def render(result: dict) -> str:
             "MISSING": "배선됐지만 파일이 없다 — 배선을 지우거나 파일을 복구한다",
             "SILENT": "마커가 있는데 관측 창에서 한 번도 발화하지 않았다 — 무동작 의심",
             "UNMANAGED": "저장소 심링크가 아니다 — 다른 호스트에서 재현되지 않는다",
-            "UNOBSERVABLE": "마커를 주입하지 않아 발화를 관측할 수 없다",
+            "UNOBSERVABLE": "마커도 하트비트도 없어 발화를 관측할 수 없다",
         }[row["status"]]
         lines.append(f"  [{row['status']}] {name} ({row['event']}) — {hint}")
     return "\n".join(lines)
@@ -204,12 +229,15 @@ def main(argv: list[str] | None = None) -> int:
              "줘야 한다 — worktree 경로를 주면 본 체크아웃 배포분이 전부 UNMANAGED 로 보인다")
     parser.add_argument("--transcripts", default=os.path.expanduser("~/.claude/projects"))
     parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--heartbeats", default=str(DEFAULT_HEARTBEATS),
+                        help="훅이 남기는 발화 하트비트 디렉터리")
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--strict", action="store_true",
                         help="MISSING/SILENT 발견 시 exit 1")
     args = parser.parse_args(argv)
 
-    result = audit(Path(args.settings), Path(args.repo), Path(args.transcripts), args.days)
+    result = audit(Path(args.settings), Path(args.repo), Path(args.transcripts), args.days,
+                   Path(args.heartbeats))
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.as_json else render(result))
     if args.strict and any(r["status"] in ("MISSING", "SILENT") for r in result["rows"]):
         return 1

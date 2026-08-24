@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -49,12 +51,24 @@ def env(tmp_path: Path):
         )
         return path
 
+    heartbeats = tmp_path / "heartbeat"
+    heartbeats.mkdir()
+
+    def beat(name: str, age_days: float = 0) -> Path:
+        path = heartbeats / name
+        path.write_text("x", encoding="utf-8")
+        if age_days:
+            stamp = time.time() - age_days * 86400
+            os.utime(path, (stamp, stamp))
+        return path
+
     def run(settings: Path, days: int = 7):
-        return HS.audit(settings, repo, transcripts, days)
+        return HS.audit(settings, repo, transcripts, days, heartbeats)
 
     ns = type("Env", (), {})()
     ns.repo, ns.transcripts, ns.tmp = repo, transcripts, tmp_path
     ns.add_hook, ns.wire, ns.transcript, ns.run = add_hook, wire, transcript, run
+    ns.beat, ns.heartbeats = beat, heartbeats
     return ns
 
 
@@ -198,3 +212,61 @@ def test_rejects_regex_character_class_fragment(env) -> None:
     )
 
     assert HS.extract_markers(hook) == {"REAL-MARKER"}
+
+
+# --- 발화 하트비트 ---------------------------------------------------------
+# 훅 대부분은 조건부 출력이라 "출력 없음"이 정상일 수 있다. 마커만 보면
+# 조건 미충족과 무동작이 구분되지 않는다 — 하트비트가 그 구멍을 막는다.
+
+def test_heartbeat_clears_silent(env) -> None:
+    hook = env.add_hook("demo-hook.py", MARKED)
+    settings = env.wire([("Stop", "*", f"python3 {hook}")])
+    env.transcript([{"type": "user", "message": {"role": "user", "content": "안녕"}}])
+    env.beat("demo-hook.py")
+
+    result = env.run(settings)
+
+    assert status_of(result, "demo-hook.py") == "ok"
+    row = next(r for r in result["rows"] if r["script"].endswith("demo-hook.py"))
+    assert row["evidence"] == "heartbeat"
+
+
+def test_stale_heartbeat_stays_silent(env) -> None:
+    """관측 창 밖의 하트비트는 발화 증거가 아니다."""
+    hook = env.add_hook("demo-hook.py", MARKED)
+    settings = env.wire([("Stop", "*", f"python3 {hook}")])
+    env.transcript([{"type": "user", "message": {"role": "user", "content": "안녕"}}])
+    env.beat("demo-hook.py", age_days=30)
+
+    assert status_of(env.run(settings, days=7), "demo-hook.py") == "SILENT"
+
+
+def test_heartbeat_makes_markerless_hook_observable(env) -> None:
+    """마커를 낼 수 없는 훅도 하트비트가 있으면 관측 가능하다 (issue #33)."""
+    hook = env.add_hook("quiet-hook.py", "import sys\nsys.exit(0)\n")
+    settings = env.wire([("PreCompact", "*", f"python3 {hook}")])
+    env.transcript([{"type": "user", "message": {"role": "user", "content": "x"}}])
+    env.beat("quiet-hook.py")
+
+    assert status_of(env.run(settings), "quiet-hook.py") == "ok"
+
+
+def test_marker_takes_precedence_over_heartbeat(env) -> None:
+    hook = env.add_hook("demo-hook.py", MARKED)
+    settings = env.wire([("Stop", "*", f"python3 {hook}")])
+    env.transcript([{"type": "attachment", "attachment": {"stdout": "[DEMO-MARKER] hi"},
+                     "timestamp": "2026-08-24T01:00:00Z"}])
+    env.beat("demo-hook.py")
+
+    row = next(r for r in env.run(settings)["rows"] if r["script"].endswith("demo-hook.py"))
+    assert row["evidence"] == "marker"
+    assert row["fired"] == 1
+
+
+def test_missing_script_not_rescued_by_heartbeat(env) -> None:
+    """파일이 없는 배선은 하트비트가 있어도 MISSING 이다."""
+    settings = env.wire([("Stop", "*", f"python3 {env.repo}/hooks/gone.py")])
+    env.transcript([{"type": "user", "message": {"role": "user", "content": "x"}}])
+    env.beat("gone.py")
+
+    assert status_of(env.run(settings), "gone.py") == "MISSING"
