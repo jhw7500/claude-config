@@ -38,17 +38,44 @@ def read_transcript_messages(payload: dict) -> list | None:
     if isinstance(msgs, list):
         return msgs
     transcript_path = payload.get("transcript_path") or payload.get("transcriptPath")
-    if transcript_path and Path(str(transcript_path)).is_file():
-        try:
-            data = json.loads(Path(str(transcript_path)).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            inner = data.get("messages")
-            if isinstance(inner, list):
-                return inner
+    if not transcript_path:
+        return None
+
+    path = Path(str(transcript_path))
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        messages: list[dict] = []
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(record, dict):
+                continue
+            message = record.get("message")
+            if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
+                messages.append(message)
+        return messages or None
+
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        inner = data.get("messages")
+        if isinstance(inner, list):
+            return inner
+        message = data.get("message")
+        if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
+            return [message]
     return None
 
 
