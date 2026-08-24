@@ -11,13 +11,16 @@ system-reminder를 1회 주입해, phase 경계에서 HANDOFF.<세션>.md 체크
   (session_id, transcript_path, prompt 사용)
 - 출력(stdout): 임계 도달 시 reminder 텍스트. 미도달/판단 불가 시 빈 출력.
 - 상태: ~/.claude/state/handoff-checkpoint/<session_id> 에 마지막 알림 시점의
-  transcript 크기를 기록. 상태 오류는 조용히 무시 (알림 1회 손실이 최악).
+  transcript 크기를 기록. flock으로 동시 인스턴스를 직렬화하고(중복 알림 방지),
+  상태 기록 실패 시 알림을 내지 않되 stderr에 1줄 경고를 남긴다.
 - 임계: 최초 HANDOFF_CHECKPOINT_FIRST_MB(기본 3), 이후 HANDOFF_CHECKPOINT_STEP_MB
   (기본 3) 성장마다. transcript 크기는 현재 컨텍스트가 아니라 누적 작업량의
   근사치다 — compact 후에도 계속 자라므로 "phase 경계 리마인더" 용도로만 쓴다.
 """
+import fcntl
 import json
 import os
+import re
 import sys
 
 ESCAPE_PREFIXES = ("#noreminder", "#nr", "#raw", "#silent", "#조용히")
@@ -59,9 +62,14 @@ def main() -> int:
     ):
         return 0
 
-    session_id = payload.get("session_id") or ""
+    # session_id는 상태 파일명에 그대로 쓰이므로 경로 탐색을 차단한다 (PR #25 리뷰).
+    # basename 정규화 대신 raw id를 검증해 비정상 id는 아예 거부한다 ('/' 포함 시 탈락,
+    # 영숫자 최소 1자 요구로 '..' 류도 탈락).
+    session_id = str(payload.get("session_id") or "")
     transcript = payload.get("transcript_path") or ""
-    if not session_id or not transcript or not os.path.isfile(transcript):
+    if not re.fullmatch(r"(?=.*[A-Za-z0-9])[A-Za-z0-9._-]{1,128}", session_id):
+        return 0
+    if not transcript or not os.path.isfile(transcript):
         return 0
 
     try:
@@ -74,24 +82,42 @@ def main() -> int:
 
     state_dir = os.path.expanduser("~/.claude/state/handoff-checkpoint")
     state_file = os.path.join(state_dir, session_id)
-    last = -1.0
-    try:
-        with open(state_file) as fh:
-            last = float(fh.read().strip())
-    except (OSError, ValueError):
-        pass
 
-    # last < 0: 아직 알림 없음 → first 임계. 이후에는 마지막 알림 크기 + step.
-    threshold = first if last < 0 else last + step
-    if size < threshold:
+    # 읽기→판단→쓰기를 flock으로 직렬화해 동시 인스턴스의 중복 리마인더를 막고,
+    # 상태 기록이 불가능한 환경(디스크 풀/권한)은 stderr로 1줄 경고를 남긴다 (PR #25 리뷰).
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        fd = os.open(state_file, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as e:
+        sys.stderr.write("[handoff-checkpoint-hook] state open failed: %s\n" % e)
         return 0
 
     try:
-        os.makedirs(state_dir, exist_ok=True)
-        with open(state_file, "w") as fh:
-            fh.write(str(size))
-    except OSError:
-        return 0  # 상태를 못 쓰면 알림도 내지 않는다 (매 턴 반복 알림 방지)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0  # 다른 인스턴스가 처리 중 — 중복 알림 방지
+
+        data = os.read(fd, 64).decode("ascii", errors="replace").strip()
+        try:
+            last = float(data) if data else -1.0
+        except ValueError:
+            last = -1.0
+
+        # last < 0: 아직 알림 없음 → first 임계. 이후에는 마지막 알림 크기 + step.
+        threshold = first if last < 0 else last + step
+        if size < threshold:
+            return 0
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(size).encode("ascii"))
+    except OSError as e:
+        # 상태를 못 쓰면 알림도 내지 않는다 (매 턴 반복 알림 방지)
+        sys.stderr.write("[handoff-checkpoint-hook] state write failed: %s\n" % e)
+        return 0
+    finally:
+        os.close(fd)
 
     sys.stdout.write(REMINDER)
     sys.stdout.flush()
