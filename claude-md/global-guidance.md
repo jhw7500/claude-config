@@ -19,7 +19,11 @@
 5. **테스트 먼저 확인** — 수정 전 기존 테스트 실행하여 현재 상태 파악.
 6. **롤백 가능한 변경 우선** — 되돌릴 수 없는 작업(force push, drop table 등)은 사전 확인.
 7. **한국어 응답** — 모든 응답과 설명은 한국어로 작성.
-8. **Task handoff 단일화** — jhw-control Project Control Task(`/jhw:task`) 작업 중에는 `session-handoff:handoff`/`resume` 스킬을 쓰지 않는다(이중 기록·drift 방지). 세션 이관은 `task finish --status handoff` → 새 세션 `/jhw:task resume <tsk-id>`가 정본 경로다. `session-handoff`는 Task가 아닌 작업이나 jhw-control 없는 도구로 넘길 때만 사용. `.ai/handoff.md`는 도구가 만드는 로컬 사본이므로 직접 쓰거나 편집하지 않는다.
+8. **Handoff 층위 분리** — 두 handoff는 산출물과 목적이 달라 함께 쓴다 (개정 2026-08-22, 구 "단일화" 규칙 폐기):
+   - **Task Handoff (정본)**: jhw-control Project Control Task(`/jhw:task`)의 작업 이관 정본 경로는 `task finish --status handoff` → 새 세션 `/jhw:task resume <tsk-id>`다. Task 상태·증거·다음 단계는 jhw-control 기록(Registry)이 정본이다. `.ai/handoff.md`는 도구가 만드는 로컬 사본이므로 직접 쓰거나 편집하지 않는다.
+   - **세션 스냅샷 (보호막)**: `session-handoff:handoff`/`resume`(repo root `HANDOFF.<세션>.md`)은 크래시·compact 대비 세션 컨텍스트 보호막이다. **Task 작업 중에도 사용한다** — auto-compact(PreCompact 훅) 시점과 긴 작업의 마일스톤에서 권장. Task 작업 중 작성 시 본문에 tsk-/clm-id를 남겨 두 기록을 연결하고, Task 세션 대화에서는 "체크포인트"로 지칭해 Task Handoff와 혼동을 막는다. 내장 `/resume`(transcript 세션 picker, `claude --resume`과 동일 역할)과 session-handoff계 `/resume`(HANDOFF 파일 기반 — 플러그인은 비활성이고 `~/.claude/commands/`에 사용자 소유화된 커맨드)은 동명 충돌이므로, transcript 복원은 항상 셸에서 `claude --resume`/`--continue`로 부른다. `/resume <세션명>`은 이 환경에서 HANDOFF 파일 흐름으로 동작한다(2026-08-22 실측; 네임스페이스형 `/session-handoff:resume`은 미지원 — 플러그인 커맨드가 아니므로).
+   - **재개 우선순위**: Task 세션 재개는 `/jhw:task resume <tsk-id>`가 1순위다. 강제종료 등으로 task handoff가 없으면 `HANDOFF.<세션>.md`를 보조 컨텍스트로 읽되, 두 기록이 어긋나면 jhw-control 기록을 따른다.
+9. **Task 등록 권유 (넛지)** — PreToolUse 훅의 `[TASK-NUDGE]` 리마인더(세션 첫 프로젝트 파일 수정 직전, 세션당 1회)를 받으면: 이 세션에서 아직 task start를 하지 않았고, cwd가 Project Control 포트폴리오 등록 저장소이며, 실질 작업(코드 수정·기능 변경·디버깅)이면 **작업 착수 전에 AskUserQuestion으로 1회 권유**한다 — ① Formal Issue Task(기존 Issue URL 또는 `gh issue create` 후 start) ② Temporary Task(goal/done/scope는 대화의 요청문에서 도출해 확인 후 start) ③ Task 없이 진행. 등록 선택 시 `/jhw:task` 규격 그대로 실행한다(좌표 추측 금지, repo-id 불확실하면 `portfolio status`로 확인, env는 `~/.config/jhw-control/control.env` 소싱). 조회·Q&A·문서/설정만 만지는 세션과 서브에이전트는 권유 없이 진행하고, "Task 없이"를 선택한 세션에서는 다시 묻지 않는다.
 
 ---
 
@@ -77,6 +81,45 @@
 
 **적용 안 함**: 사용자가 원인을 **단정**하고 그에 따른 실행만 요청한 경우, 단일 명령의
 즉시 확인 가능한 결과.
+
+---
+
+## 검증 명령 위생 (전역)
+
+**트리거**: 사실 확인 목적의 **모든** 명령·도구 호출 직전 — `grep`/`rg`/`find`/`git`/`jq`/`readelf`/스크립트 등 형태 무관.
+
+1. **명령에 결론을 심지 않는다.** `|| echo "없음 → X 뿐"` 형태 금지. 도구가 못 찾으면
+   셸이 **내가 미리 써넣은 가정**을 출력하고, 그것을 도구의 발견으로 되읽게 된다.
+   반증이 구조적으로 불가능한 명령이다. 중립 표기만 쓴다 — `|| echo "(no match)"`.
+
+2. **부정 주장에는 검색 범위를 붙인다.** "X가 유일하다"가 아니라 "내가 검색한 A/B에서는
+   X뿐". 전역 명제를 하려면 전역 검색을 한다(대상 디렉터리를 명시해 `grep -rn`).
+   *검색 범위 안에서의 부재*를 *존재하지 않음*으로 승격시키지 않는다.
+
+3. **"유일 / 전부 / 항상 / 반드시"는 정지 신호.** 그 단어를 쓰려면 exhaustive 검색 결과를
+   같이 제시할 수 있어야 한다. 못 하면 단어를 뺀다.
+
+4. **값싼 결정적 실험을 정적 추론보다 먼저.** 추론을 시작하기 전에 "지금 돌려볼 수 있나?"를
+   묻는다. 대개 수 초다.
+
+   | 질문 | 결정적 실험 |
+   |---|---|
+   | 빌드 설정이 어떻게 되나 | 설정을 바꿔 실제로 재생성 (예: 커널 `olddefconfig`) |
+   | 실기가 어떤 상태인가 | 해당 장비에 직접 조회 |
+   | 바이너리 의존이 있나 | `readelf -sW ... \| awk '$7=="UND"'` |
+
+5. **관측 ≠ 함의.** 단일 관측이 가설과 *양립한다*는 것과 가설을 *함의한다*는 것은 다르다.
+   그럴듯한 메커니즘 + 부합하는 관측 하나면 이야기가 매끄러워지고, 매끄러움을 증거로
+   착각하게 된다. 관측 하나로 일반 명제를 세우지 않는다.
+
+6. **사용자 반문은 재검증 트리거.** "근거는?" / "정말?" / "확실한가?"가 오면 기존 근거를
+   다시 설명하지 말고 **처음부터 다시 확인**한다.
+
+**영속 산출물 전파 금지**: 위 절차로 확인되지 않은 주장은 커밋 메시지·문서·메일·이슈 등
+영속 산출물에 쓰지 않는다. 추론이면 "추정"으로 표시한다. 한번 산출물에 들어간 주장은
+출처가 세탁되어 재검토 대상에서 빠지고, 이후 같은 파일을 다시 읽어도 반증 줄을 지나치게 된다.
+
+**적용 안 함**: 사용자가 사실을 단정하고 실행만 요청한 경우, 단일 명령의 즉시 확인 가능한 결과.
 
 ---
 
@@ -148,3 +191,18 @@ python3 ~/.claude/scripts/bg-hud-complete.py <tool_use_id> <status>
 ### 적용 범위
 - Bash BG만 해당 (Agent BG는 SubagentStop 훅이 즉시 처리).
 - 한 notification에 여러 태그가 있으면 각각 개별 호출.
+
+---
+
+## Task Observer 스킬 활성화 (전역)
+
+> 전제: `~/.claude/skills/task-observer` 설치됨 (claude-config `install.sh`가 배포).
+> 미설치 호스트에서는 이 절을 무시한다.
+
+- **작업 지향 세션 시작 시** — 도구를 사용해 산출물을 만들 세션이면 — 작업 착수 전에
+  `task-observer` 스킬을 먼저 호출한다. 세션 전반에서 스킬 개선 기회(반복 패턴, 사용자
+  교정, 워크플로우 인사이트)를 관찰 로그에 수집하기 위함이다.
+- **다른 스킬을 로드할 때** 관찰 로그(observation log)에서 그 스킬에 태깅된 OPEN 관찰을
+  확인하고, 스킬 파일이 아직 갱신되지 않았어도 해당 인사이트를 현재 작업에 적용한다.
+- 조회·Q&A만 하는 세션과 서브에이전트는 호출하지 않는다.
+- 활성화를 다른 스킬 경유로 체이닝하지 않는다 — 체인이 끊기면 관찰 활동 전체가 침묵한다.
