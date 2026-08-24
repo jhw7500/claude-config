@@ -161,10 +161,12 @@ pa = "python3 %s/post-action-tool-report-hook.py" % H
 an = "python3 %s/agent-name-delivery-hook.py" % H
 nr = "python3 %s/notion-recall-trigger-hook.py" % H
 hc = "python3 %s/handoff-checkpoint-hook.py" % H
+cg = "python3 %s/control-char-guard-hook.py" % H
 PI_MATCH = ("ToolSearch|WebSearch|WebFetch|mcp__notion__notion-search|mcp__notion__notion-fetch|"
             "mcp__notion__notion-get-comments|mcp__jhw-notion__jhw_search|mcp__jhw-notion__jhw_context|"
             "mcp__jhw-notion__jhw_history|mcp__jhw-notion__jhw_status|mcp__jhw-notion__jhw_retrieve|"
             "mcp__plugin_context7_context7__query-docs|mcp__plugin_context7_context7__resolve-library-id")
+CG_MATCH = "Edit|Write|MultiEdit|NotebookEdit"
 PA_MATCH = ("mcp__jhw-notion__jhw_(record|note|delete|start|close|report_export)|"
             "mcp__notion__notion-(create-pages|update-page|create-database|update-data-source|"
             "create-comment|duplicate-page|move-pages)")
@@ -182,6 +184,7 @@ if ensure("SubagentStop", bt, "*"): added.append("SubagentStop<-bg-task")
 if ensure("PostToolUse", pi, PI_MATCH): added.append("Post<-post-info")
 if ensure("PreToolUse", an, "Agent"): added.append("Pre<-agent-name-delivery")
 if ensure("UserPromptSubmit", hc): added.append("UPS<-handoff-checkpoint")
+if ensure("PostToolUse", cg, CG_MATCH): added.append("Post<-ctrl-char-guard")
 # 흡수 — notion 환경만
 if notion:
     if ensure("UserPromptSubmit", nc): added.append("UPS<-notion-continuous")

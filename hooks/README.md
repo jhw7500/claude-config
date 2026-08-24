@@ -11,6 +11,7 @@
 | `notion-continuous-exec-hook.py` | UserPromptSubmit | Notion 저장/불러오기 스킬 승인 응답 감지 시 "연속 실행" reminder 주입 |
 | `general-continuation-hook.py` | UserPromptSubmit | "한번에/끝까지/연속으로" 등 사용자의 연속 실행 의도 감지 시 reminder 주입 |
 | `bg-task-progress-hook.py` | PreToolUse + PostToolUse | Agent / Bash `run_in_background=true` 시작·완료 알림 강제 + statusLine 카운터 관리 |
+| `control-char-guard-hook.py` | PostToolUse | Edit/Write/MultiEdit/NotebookEdit 로 **기록한 내용**에 raw 제어문자(C0/DEL)가 섞이면 위치와 함께 경고 |
 
 ## 동작 원칙
 
