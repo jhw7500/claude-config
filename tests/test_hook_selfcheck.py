@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -270,3 +271,34 @@ def test_missing_script_not_rescued_by_heartbeat(env) -> None:
     env.beat("gone.py")
 
     assert status_of(env.run(settings), "gone.py") == "MISSING"
+
+
+def test_heartbeat_filename_follows_invoked_script_name(tmp_path: Path) -> None:
+    """하트비트 파일명은 호출 경로의 basename 이어야 한다.
+
+    hook-selfcheck 는 settings.json 에 배선된 경로의 basename 으로 하트비트를
+    찾는다. 훅이 파일명을 하드코딩하면 이름을 바꿨을 때 자가진단이 조용히
+    하트비트를 못 찾고, 그게 이 장치가 막으려던 실패 양식이다.
+    """
+    hook = Path(__file__).parents[1] / "hooks" / "precompact-handoff.sh"
+    beats = tmp_path / "beats"
+    project = tmp_path / "project"
+    project.mkdir()
+    # 다른 이름으로 호출해도 그 이름으로 남아야 한다.
+    alias = tmp_path / "renamed-gate.sh"
+    alias.symlink_to(hook)
+
+    for target in (hook, alias):
+        subprocess.run(
+            ["bash", str(target)],
+            input='{"trigger":"manual"}',
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**os.environ,
+                 "CLAUDE_HOOK_HEARTBEAT_DIR": str(beats),
+                 "CLAUDE_PROJECT_DIR": str(project)},
+        )
+
+    assert (beats / hook.name).is_file()
+    assert (beats / alias.name).is_file()
