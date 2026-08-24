@@ -8,6 +8,9 @@ transcript 를 JSONL 로 파싱하지 못해 매번 fail-open 으로 통과했�
 
 이 스크립트는 배선 목록과 실제 발화 이력을 대조해 그 간극을 드러낸다.
 
+마커 형태가 아니어도 출력이 이미 고유하면 소스에 `# HOOK-OBSERVABLE: <문자열>`
+로 선언해 관측 대상으로 삼는다 (scripts/timestamp-hook.py 참고).
+
 훅 대부분은 조건부 출력이라 "출력 없음"이 정상 상태일 수 있다. 그래서 마커만
 보면 조건 미충족과 무동작이 구분되지 않는다. 훅이 매 호출마다 하트비트 파일을
 남기면(hooks/precompact-handoff.sh 참고) 그 mtime 을 발화 증거로 함께 읽는다.
@@ -42,6 +45,11 @@ BARE_MARKER_RE = re.compile(r"""["']([A-Z][A-Z0-9_]{5,}):""")
 # 마커는 구분자로 이어진 두 글자 이상 토막이어야 한다 (TASK-NUDGE, STOP_HOOK_BLOCK).
 # 구분자 없는 낱말(CRITICAL, MANDATORY, TODO)과 정규식 문자클래스 조각(A-Z0-9)을 배제한다.
 MARKER_SHAPE_RE = re.compile(r"^[A-Z][A-Z0-9]+(?:[_-][A-Z0-9]{2,})+$")
+# 마커 형태가 아니지만 출력이 이미 고유한 훅은 관측 문자열을 소스에 선언한다.
+#   # HOOK-OBSERVABLE: 🕐 prompt @
+# 사용자에게 보이는 출력을 바꾸지 않고 관측 가능하게 만드는 경로다.
+DECLARE_KEYWORD = "HOOK-OBSERVABLE"
+DECLARE_RE = re.compile(rf"{DECLARE_KEYWORD}:[ \t]*(\S.*?)[ \t]*$", re.MULTILINE)
 SCRIPT_RE = re.compile(r"(?:\$HOME|~)?[\w./$-]*\.(?:py|sh)")
 
 
@@ -76,12 +84,16 @@ def extract_markers(path: Path) -> set[str]:
         src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return set()
+    # 선언은 주석에 쓰므로 주석 제거 전에 뽑는다.
+    declared = {d.strip() for d in DECLARE_RE.findall(src) if d.strip()}
     # 주석 전용 줄의 [TODO] 같은 표기는 주입되지 않는다 — 세면 영구 SILENT 소음이 된다.
     body = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
     markers = set(MARKER_RE.findall(body))
     # STOP_HOOK_BLOCK 처럼 대괄호 없이 쓰는 마커도 잡는다.
     markers |= set(BARE_MARKER_RE.findall(body))
-    return {m for m in markers if MARKER_SHAPE_RE.match(m)}
+    markers = {m for m in markers if MARKER_SHAPE_RE.match(m)}
+    markers.discard(DECLARE_KEYWORD)  # 선언 키워드 자체는 마커가 아니다
+    return markers | declared
 
 
 def record_is_assistant(record: dict) -> bool:
