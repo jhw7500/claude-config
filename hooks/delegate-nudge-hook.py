@@ -99,6 +99,8 @@ def count_delta(path: str, offset: int, limit: int):
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue  # 델타 경계의 잘린 줄 포함
+        if not isinstance(rec, dict):  # ["tool_use"] 류 비객체 JSON — 스킵 (Codex P2 R3)
+            continue
         if rec.get("isSidechain") is True:
             continue
         msg = rec.get("message")
