@@ -10,6 +10,13 @@ SID=$(printf '%s' "$IN" | jq -r '.session_id // empty' 2>/dev/null)
 FP=$(printf '%s' "$IN" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null)
 [ -z "$SID" ] && exit 0
 
+# session_id 는 신뢰할 수 없는 입력이며 그대로 상태 파일 경로 조각이 된다.
+# basename 으로 정규화하면 악의적 입력이 "의도치 않지만 안전한" 이름으로 조용히
+# 바뀌어 흔적이 남지 않는다. 정규식으로 아예 거부한다 (handoff-checkpoint-hook.py 와 동일 정책).
+case "$SID" in
+  *[!A-Za-z0-9_-]*) exit 0 ;;
+esac
+
 # 스크래치·설정·메모리·세션상태 수정은 "작업 시작"으로 치지 않는다.
 # (state 파일을 남기지 않으므로 이후 첫 실제 프로젝트 수정에서 정상 발화)
 case "$FP" in

@@ -171,3 +171,30 @@ def test_strict_exit_code(env, capsys) -> None:
     assert HS.main(args) == 0            # 기본은 보고만
     assert HS.main(args + ["--strict"]) == 1
     assert "SILENT" in capsys.readouterr().out
+
+
+def test_ignores_marker_in_comment_only_line(env) -> None:
+    """주석의 [TODO] 같은 표기는 주입되지 않는다 — 세면 영구 SILENT 소음이 된다."""
+    hook = env.add_hook("commented-hook.py", "# [TODO-LATER] 나중에 처리\nprint('hi')\n")
+
+    assert HS.extract_markers(hook) == set()
+
+
+def test_rejects_tokens_without_separator(env) -> None:
+    """CRITICAL / MANDATORY 처럼 구분자 없는 낱말은 마커가 아니다."""
+    hook = env.add_hook(
+        "wordy-hook.py",
+        'print("CRITICAL: 위험")\nprint("MANDATORY: 필수")\nprint("REAL_HOOK_MARKER: 진짜")\n',
+    )
+
+    assert HS.extract_markers(hook) == {"REAL_HOOK_MARKER"}
+
+
+def test_rejects_regex_character_class_fragment(env) -> None:
+    """소스에 정규식이 들어 있으면 [A-Z0-9] 같은 조각이 마커로 잡힌다."""
+    hook = env.add_hook(
+        "regexy-hook.py",
+        'import re\nPAT = re.compile(r"[A-Z0-9]+")\nprint("<x>[REAL-MARKER] hi</x>")\n',
+    )
+
+    assert HS.extract_markers(hook) == {"REAL-MARKER"}

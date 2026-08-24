@@ -34,6 +34,9 @@ MARKER_RE = re.compile(r"\[([A-Z][A-Z0-9_-]{3,})\]")
 # 대괄호 없는 마커는 문자열 리터럴의 "MARKER: ..." 형태만 인정한다.
 # 그냥 대문자 상수(SETTLE_ATTEMPTS 등)까지 잡으면 허위 SILENT 가 쏟아진다.
 BARE_MARKER_RE = re.compile(r"""["']([A-Z][A-Z0-9_]{5,}):""")
+# 마커는 구분자로 이어진 두 글자 이상 토막이어야 한다 (TASK-NUDGE, STOP_HOOK_BLOCK).
+# 구분자 없는 낱말(CRITICAL, MANDATORY, TODO)과 정규식 문자클래스 조각(A-Z0-9)을 배제한다.
+MARKER_SHAPE_RE = re.compile(r"^[A-Z][A-Z0-9]+(?:[_-][A-Z0-9]{2,})+$")
 SCRIPT_RE = re.compile(r"(?:\$HOME|~)?[\w./$-]*\.(?:py|sh)")
 
 
@@ -68,10 +71,12 @@ def extract_markers(path: Path) -> set[str]:
         src = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return set()
-    markers = set(MARKER_RE.findall(src))
+    # 주석 전용 줄의 [TODO] 같은 표기는 주입되지 않는다 — 세면 영구 SILENT 소음이 된다.
+    body = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    markers = set(MARKER_RE.findall(body))
     # STOP_HOOK_BLOCK 처럼 대괄호 없이 쓰는 마커도 잡는다.
-    markers |= set(BARE_MARKER_RE.findall(src))
-    return {m for m in markers if not m.isdigit()}
+    markers |= set(BARE_MARKER_RE.findall(body))
+    return {m for m in markers if MARKER_SHAPE_RE.match(m)}
 
 
 def record_is_assistant(record: dict) -> bool:
