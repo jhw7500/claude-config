@@ -191,3 +191,18 @@ python3 ~/.claude/scripts/bg-hud-complete.py <tool_use_id> <status>
 ### 적용 범위
 - Bash BG만 해당 (Agent BG는 SubagentStop 훅이 즉시 처리).
 - 한 notification에 여러 태그가 있으면 각각 개별 호출.
+
+---
+
+## Task Observer 스킬 활성화 (전역)
+
+> 전제: `~/.claude/skills/task-observer` 설치됨 (claude-config `install.sh`가 배포).
+> 미설치 호스트에서는 이 절을 무시한다.
+
+- **작업 지향 세션 시작 시** — 도구를 사용해 산출물을 만들 세션이면 — 작업 착수 전에
+  `task-observer` 스킬을 먼저 호출한다. 세션 전반에서 스킬 개선 기회(반복 패턴, 사용자
+  교정, 워크플로우 인사이트)를 관찰 로그에 수집하기 위함이다.
+- **다른 스킬을 로드할 때** 관찰 로그(observation log)에서 그 스킬에 태깅된 OPEN 관찰을
+  확인하고, 스킬 파일이 아직 갱신되지 않았어도 해당 인사이트를 현재 작업에 적용한다.
+- 조회·Q&A만 하는 세션과 서브에이전트는 호출하지 않는다.
+- 활성화를 다른 스킬 경유로 체이닝하지 않는다 — 체인이 끊기면 관찰 활동 전체가 침묵한다.
