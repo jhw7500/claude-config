@@ -32,6 +32,18 @@ from typing import Any
 EXPLICIT_STOP_HINTS = ("종료", "exit", "quit", "그만", "끝", "stop session")
 
 
+def transcript_record_message(record: Any) -> dict | None:
+    """JSONL envelope에서 주 대화의 user/assistant 메시지만 반환한다."""
+    if not isinstance(record, dict):
+        return None
+    if record.get("isSidechain") is True or record.get("isApiErrorMessage") is True:
+        return None
+    message = record.get("message")
+    if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
+        return message
+    return None
+
+
 def read_transcript_messages(payload: dict) -> list | None:
     """payload에서 messages 리스트를 끄집어낸다. 여러 스키마 호환."""
     msgs = payload.get("messages")
@@ -60,10 +72,8 @@ def read_transcript_messages(payload: dict) -> list | None:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 return None
-            if not isinstance(record, dict):
-                continue
-            message = record.get("message")
-            if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
+            message = transcript_record_message(record)
+            if message is not None:
                 messages.append(message)
         return messages or None
 
@@ -73,8 +83,8 @@ def read_transcript_messages(payload: dict) -> list | None:
         inner = data.get("messages")
         if isinstance(inner, list):
             return inner
-        message = data.get("message")
-        if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
+        message = transcript_record_message(data)
+        if message is not None:
             return [message]
     return None
 
