@@ -55,9 +55,12 @@ MCP 서버는 호스트별 상태(설치·키·경로)라 `install.sh` 본체에
 필요한 호스트에서만:
 
 ```bash
-cp secrets.example.env secrets.local.env   # 키·경로 채우기 (.gitignore로 제외됨)
+install -m 600 secrets.example.env secrets.local.env  # 키·경로 채우기 (.gitignore로 제외됨)
 bash scripts/setup-mcp.sh                   # 사내 포함 (또는 --no-internal / --dry-run)
 ```
+
+두 setup 스크립트는 `secrets.local.env`가 현재 사용자 소유의 regular file, mode `0600`,
+hard-link 1개인지 확인하고 symlink 또는 unsafe metadata이면 실행을 중단합니다.
 
 `manifest/mcp.json`의 서버를 `claude mcp add <name> -e KEY=val -- <cmd>` 로 멱등 등록합니다(이미 있으면 skip).
 공개 6개(brave/morph/pdf/sequentialthinking/filesystem/repowire) + 사내 4개(cts-email/cts-ta/jhw-notion/ssh-mcp).

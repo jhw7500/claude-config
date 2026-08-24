@@ -5,6 +5,9 @@
 set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE_DIR="$REPO_DIR/slack-bridge"
+SECRET_FILE="$REPO_DIR/secrets.local.env"
+# shellcheck source=scripts/lib/secure-env-file.sh
+. "$REPO_DIR/scripts/lib/secure-env-file.sh"
 DRY_RUN=0
 for a in "$@"; do
   case "$a" in
@@ -14,15 +17,18 @@ for a in "$@"; do
   esac
 done
 
-if [ ! -f "$REPO_DIR/secrets.local.env" ]; then
-  echo "[setup] secrets.local.env 없음 — cp secrets.example.env secrets.local.env 후 SLACK_* 채우기"; exit 1
+if [ ! -e "$SECRET_FILE" ] && [ ! -L "$SECRET_FILE" ]; then
+  echo "[setup] secrets.local.env 없음 — install -m 600 secrets.example.env secrets.local.env 후 SLACK_* 채우기"; exit 1
 fi
-# shellcheck source=/dev/null
-set -a; . "$REPO_DIR/secrets.local.env"; set +a
+require_private_env_file "$SECRET_FILE"
+set -a
+# shellcheck disable=SC1090
+. "$SECRET_FILE"
+set +a
 for v in SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_CHANNEL_ID SLACK_ALLOWED_USER_ID; do
   if [ -z "${!v:-}" ]; then echo "[setup] $v 비어있음 (secrets.local.env)"; exit 1; fi
 done
-echo "[setup] SLACK_* 4개 확인됨 (channel $SLACK_CHANNEL_ID)"
+echo "[setup] SLACK_* 4개 확인됨"
 
 CLAUDE_BIN="$(command -v claude || true)"
 if [ -z "$CLAUDE_BIN" ]; then echo "[setup] 'claude' not on PATH"; exit 1; fi

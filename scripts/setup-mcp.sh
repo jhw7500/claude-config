@@ -7,6 +7,9 @@
 # 키/경로는 secrets.local.env 에서 읽는다 (없으면 placeholder).
 set -e
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SECRET_FILE="$REPO_DIR/secrets.local.env"
+# shellcheck source=scripts/lib/secure-env-file.sh
+. "$REPO_DIR/scripts/lib/secure-env-file.sh"
 WITH_INTERNAL=1
 DRY_RUN="${DRY_RUN:-0}"
 for a in "$@"; do
@@ -19,10 +22,14 @@ for a in "$@"; do
   esac
 done
 
-if [ -f "$REPO_DIR/secrets.local.env" ]; then
-  set -a; . "$REPO_DIR/secrets.local.env"; set +a
+if [ -e "$SECRET_FILE" ] || [ -L "$SECRET_FILE" ]; then
+  require_private_env_file "$SECRET_FILE"
+  set -a
+  # shellcheck disable=SC1090
+  . "$SECRET_FILE"
+  set +a
 else
-  echo "[setup-mcp] secrets.local.env 없음 — 키 placeholder로 진행 (cp secrets.example.env secrets.local.env)"
+  echo "[setup-mcp] secrets.local.env 없음 — 키 placeholder로 진행 (install -m 600 secrets.example.env secrets.local.env)"
 fi
 
 existing="$(claude mcp list 2>/dev/null || true)"
@@ -37,17 +44,19 @@ while IFS=$'\t' read -r name rest; do
     echo "[setup-mcp] 등록: $name"
     claude mcp add "$name" "${tokens[@]}"
   fi
-done < <(python3 - "$REPO_DIR/manifest/mcp.json" "$WITH_INTERNAL" <<'PY'
+done < <(python3 - "$REPO_DIR/manifest/mcp.json" "$WITH_INTERNAL" "$DRY_RUN" <<'PY'
 import json, sys, os
 mcp = json.load(open(sys.argv[1]))
 with_internal = sys.argv[2] == "1"
+dry_run = sys.argv[3] == "1"
 for name, c in mcp.items():
     if c.get("internal") and not with_internal:
         continue
     tokens = []
     # 실제 문법: claude mcp add <name> -e KEY=val -- <command> <args...>
     for k, v in c.get("env", {}).items():
-        tokens += ["-e", "%s=%s" % (k, os.path.expandvars(v))]
+        value = "<redacted>" if dry_run else os.path.expandvars(v)
+        tokens += ["-e", "%s=%s" % (k, value)]
     tokens.append("--")
     tokens.append(os.path.expandvars(c["command"]))
     for a in c.get("args", []):
