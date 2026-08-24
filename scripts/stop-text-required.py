@@ -270,6 +270,41 @@ def evaluate(messages: list) -> tuple[str, str]:
     return "ok", ""
 
 
+def settle(
+    read_messages: Any,
+    messages: list,
+    verdict: str,
+    tool_id: str,
+    attempts: int = SETTLE_ATTEMPTS,
+    delay: float = SETTLE_DELAY_SEC,
+    sleep: Any = time.sleep,
+) -> tuple[str, str, list]:
+    """차단 판정을 transcript 재읽기로 확정한다.
+
+    Stop 훅이 마지막 text block record보다 먼저 파일을 읽을 수 있으므로 차단
+    조건이 성립해도 곧바로 확정하지 않는다. read_messages/sleep을 주입받아
+    타이밍에 의존하지 않고 재시도 경로를 단위 테스트할 수 있게 한다.
+    """
+    readable = True
+    for _ in range(attempts):
+        sleep(delay)
+        retry = read_messages()
+        if not retry:
+            # 최종 record를 쓰는 도중이면 마지막 줄이 부분 JSON이라 파싱에 실패한다.
+            # 일시적 상태이므로 남은 시도를 계속한다.
+            readable = False
+            continue
+        readable = True
+        messages = retry
+        verdict, tool_id = evaluate(retry)
+        if verdict == "ok":
+            return "ok", "", messages
+    if not readable:
+        # 끝까지 읽지 못했다 — malformed transcript와 동일하게 fail-open
+        return "ok", "", messages
+    return verdict, tool_id, messages
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
@@ -296,22 +331,9 @@ def main() -> int:
     # transcript는 content block 단위로 append되므로 마지막 text block이 아직
     # 기록되지 않았을 수 있다. 파일 기반일 때만 재읽기로 확정한다.
     if verdict != "ok" and not isinstance(payload.get("messages"), list):
-        readable = True
-        for _ in range(SETTLE_ATTEMPTS):
-            time.sleep(SETTLE_DELAY_SEC)
-            retry = read_transcript_messages(payload)
-            if not retry:
-                # 최종 record를 쓰는 도중이면 마지막 줄이 부분 JSON이라 파싱에 실패한다.
-                # 일시적 상태이므로 남은 시도를 계속한다.
-                readable = False
-                continue
-            readable = True
-            messages = retry
-            verdict, tool_id = evaluate(retry)
-            if verdict == "ok":
-                return 0
-        if not readable:
-            return 0  # 끝까지 읽지 못했다 — malformed transcript와 동일하게 fail-open
+        verdict, tool_id, messages = settle(
+            lambda: read_transcript_messages(payload), messages, verdict, tool_id
+        )
 
     if verdict == "tool_only":
         sys.stderr.write(

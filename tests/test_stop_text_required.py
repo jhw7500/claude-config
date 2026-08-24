@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import subprocess
 import sys
@@ -8,6 +9,18 @@ import pytest
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "stop-text-required.py"
+
+
+def load_hook_module():
+    """하이픈이 들어간 훅 스크립트를 모듈로 로드한다 (단위 테스트용)."""
+    spec = importlib.util.spec_from_file_location("stop_text_required", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+HOOK = load_hook_module()
+NO_SLEEP = lambda _delay: None
 
 
 def run_hook(payload: dict) -> subprocess.CompletedProcess[str]:
@@ -308,3 +321,59 @@ def test_settle_retry_survives_partially_written_record(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     assert result.stderr == ""
+
+
+# --- settle() 단위 테스트 --------------------------------------------------
+# 아래 테스트는 read_messages/sleep을 주입해 재시도 경로를 타이밍 없이 검증한다.
+# 위쪽의 subprocess+Timer 기반 테스트는 실제 배선을 훑는 smoke 테스트이며,
+# 느린 CI에서는 최초 읽기만으로 통과해 재시도 경로를 안 거칠 수 있다.
+
+def resolved_messages() -> list[dict]:
+    return [
+        *turn_with_trailing_tool_use(),
+        {"role": "assistant", "content": [{"type": "text", "text": "최종 보고."}]},
+    ]
+
+
+def test_settle_passes_when_retry_sees_final_text() -> None:
+    reads = [resolved_messages()]
+
+    verdict, _tool_id, _messages = HOOK.settle(
+        reads.pop, turn_with_trailing_tool_use(), "empty", "tool-1",
+        attempts=3, delay=0, sleep=NO_SLEEP,
+    )
+
+    assert verdict == "ok"
+    assert reads == []
+
+
+def test_settle_skips_unreadable_reads_and_keeps_trying() -> None:
+    reads = [None, None, resolved_messages()]
+
+    verdict, _tool_id, _messages = HOOK.settle(
+        lambda: reads.pop(0), turn_with_trailing_tool_use(), "empty", "tool-1",
+        attempts=5, delay=0, sleep=NO_SLEEP,
+    )
+
+    assert verdict == "ok"
+    assert reads == []  # 부분 JSON 회차에서 포기하지 않았다
+
+
+def test_settle_fails_open_when_transcript_never_readable() -> None:
+    verdict, _tool_id, _messages = HOOK.settle(
+        lambda: None, turn_with_trailing_tool_use(), "empty", "tool-1",
+        attempts=3, delay=0, sleep=NO_SLEEP,
+    )
+
+    assert verdict == "ok"
+
+
+def test_settle_keeps_blocking_when_text_never_arrives() -> None:
+    blocking = turn_with_trailing_tool_use()
+
+    verdict, _tool_id, _messages = HOOK.settle(
+        lambda: blocking, blocking, "empty", "tool-1",
+        attempts=3, delay=0, sleep=NO_SLEEP,
+    )
+
+    assert verdict in ("empty", "tool_only")
