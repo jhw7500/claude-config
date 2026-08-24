@@ -287,7 +287,7 @@ def test_non_dict_message_skipped_not_crash(env):
     cold_start(home, transcript, payload)
     bad = json.dumps({"type": "assistant",
                       "message": 'marker "tool_use" 포함 문자열'})
-    append(transcript, [bad] + [tool_use("Bash")] * 10)
+    append(transcript, [bad, '["tool_use"]'] + [tool_use("Bash")] * 10)  # 배열형 JSON 포함 (Codex P2 R3)
     r = run_hook(payload, home)
     assert r.returncode == 0, r.stderr
     assert "[DELEGATE-NUDGE]" in r.stdout  # 손상 레코드는 스킵, 나머지는 정상 집계

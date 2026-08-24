@@ -94,6 +94,8 @@ def scan_file(path, kind, session, days, since_dt):
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(rec, dict):  # 비객체 JSON 레코드 — 스킵 (Codex P2 R3)
+                continue
             ts = parse_ts(rec.get("timestamp"))
             if ts is None:
                 continue
