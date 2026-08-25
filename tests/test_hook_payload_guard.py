@@ -11,7 +11,11 @@ from pathlib import Path
 
 import pytest
 
-HOOKS_DIR = Path(__file__).parents[1] / "hooks"
+REPO_ROOT = Path(__file__).parents[1]
+HOOKS_DIR = REPO_ROOT / "hooks"
+
+# scripts/ 훅 — 인자 필요 (timestamp-hook 은 mode 인자를 받음)
+SCRIPT_HOOKS = [("scripts/timestamp-hook.py", ["prompt"]), ("scripts/timestamp-hook.py", ["stop"])]
 
 STDIN_JSON_HOOKS = [
     "general-continuation-hook.py",
@@ -40,3 +44,14 @@ def test_non_dict_top_level_json_exits_quietly(hook, raw):
     )
     assert result.returncode == 0, f"{hook}: {result.stderr}"
     assert result.stdout.strip() == ""
+
+
+@pytest.mark.parametrize("script, args", SCRIPT_HOOKS)
+@pytest.mark.parametrize("raw", NON_DICT_PAYLOADS)
+def test_script_hooks_non_dict_json_exit_zero(script, args, raw):
+    """회귀: PR #48 R2 Codex P2 — scripts/ 의 상시 배선 훅도 동일 가드."""
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / script), *args],
+        input=raw, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, f"{script} {args}: {result.stderr}"

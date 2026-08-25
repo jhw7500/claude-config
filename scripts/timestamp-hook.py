@@ -30,7 +30,9 @@ def read_payload() -> dict:
         if sys.stdin.isatty():
             return {}
         data = sys.stdin.read()
-        return json.loads(data) if data.strip() else {}
+        payload = json.loads(data) if data.strip() else {}
+        # 비객체 top-level JSON — 빈 dict 로 대체 (훅 규약: 모든 경로 exit 0)
+        return payload if isinstance(payload, dict) else {}
     except Exception:
         return {}
 
