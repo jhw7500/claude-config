@@ -23,6 +23,9 @@ STDIN_JSON_HOOKS = [
     "delegate-nudge-hook.py",
     "control-char-guard-hook.py",
     "bg-task-progress-hook.py",
+    # json.load(sys.stdin) 계열 — PR #48 리뷰(Claude MEDIUM·Codex P2)에서 누락 지적
+    "agent-name-delivery-hook.py",
+    "carl-hook.py",
 ]
 
 NON_DICT_PAYLOADS = ["[1,2,3]", '"문자열"', "42", "null", "true"]

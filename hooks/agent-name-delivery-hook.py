@@ -29,6 +29,8 @@ def main() -> int:
         payload = json.load(sys.stdin)
     except Exception:
         return 0
+    if not isinstance(payload, dict):  # 비객체 top-level JSON — 조용히 무시 (훅 규약: 모든 경로 exit 0)
+        return 0
 
     if payload.get("tool_name") != "Agent":
         return 0
