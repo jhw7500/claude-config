@@ -4,9 +4,12 @@ set -e
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/link-safely.sh
 . "$REPO_DIR/scripts/lib/link-safely.sh"
+# shellcheck source=scripts/lib/private-file.sh
+. "$REPO_DIR/scripts/lib/private-file.sh"
+private_dir "$HOME/.claude"
 
 # 1) 스킬 심볼릭 링크 (skills/ 아래 모든 스킬 자동 링크, repo pull 시 자동 갱신)
-mkdir -p ~/.claude/skills
+private_dir ~/.claude/skills
 SKILL_ARCHIVE=~/.claude/archive/skills-replaced/"$(date +%Y%m%d%H%M%S)-$$"
 for d in "$REPO_DIR"/skills/*/; do
   name="$(basename "$d")"
@@ -26,7 +29,7 @@ else
 fi
 
 # 3) 개인 스크립트 심볼릭 링크
-mkdir -p ~/.claude/scripts
+private_dir ~/.claude/scripts
 SCRIPT_LINKS=0
 for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py hook-selfcheck.py delegation-ratio.py context-bar.sh apex-toggle.sh; do
   [ -f "$REPO_DIR/scripts/$f" ] || continue
@@ -35,7 +38,7 @@ done
 echo "[install] 스크립트 링크: ~/.claude/scripts/ (${SCRIPT_LINKS}개)"
 
 # 3.5) 커스텀 훅 심볼릭 링크 (hooks/ 전체 — repo pull 시 자동 갱신)
-mkdir -p ~/.claude/hooks
+private_dir ~/.claude/hooks
 HOOK_LINKS=0
 for f in "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.sh; do
   [ -f "$f" ] || continue
@@ -51,35 +54,35 @@ echo "[install] 훅 링크: ~/.claude/hooks/ (${HOOK_LINKS}개)"
 # 4) 전역 지침 머지 (env-aware) — 항상 global-guidance, 환경에 있는 것만 추가 import.
 #    OMC 블록(inline/file-split 무관)은 절대 건드리지 않고 claude-config:START/END 블록만 관리.
 CLAUDE_MD="$HOME/.claude/CLAUDE.md"
-cp -f "$REPO_DIR/claude-md/global-guidance.md" ~/.claude/global-guidance.md
+install_doc "$REPO_DIR/claude-md/global-guidance.md" ~/.claude/global-guidance.md
 # 위반 사례 아카이브: append-only 로그라 cp 로 덮으면 로컬 추가분이 유실된다.
 # 심볼릭 링크로 저장소 파일을 직접 가리켜 드리프트 자체를 없앤다.
-mkdir -p ~/.claude/archive
+private_dir ~/.claude/archive
 ln -sfn "$REPO_DIR/claude-md/archive/violations.md" ~/.claude/archive/violations.md
 IMPORTS="@global-guidance.md"
 if grep -qi "notion" "$HOME/.claude.json" 2>/dev/null; then
-  cp -f "$REPO_DIR/claude-md/CLAUDE-notion.md" ~/.claude/CLAUDE-notion.md
+  install_doc "$REPO_DIR/claude-md/CLAUDE-notion.md" ~/.claude/CLAUDE-notion.md
   IMPORTS="$IMPORTS
 @CLAUDE-notion.md"; NOTION="있음"
 else
   rm -f ~/.claude/CLAUDE-notion.md 2>/dev/null; NOTION="없음(skip)"
 fi
 if command -v rtk >/dev/null 2>&1; then
-  cp -f "$REPO_DIR/claude-md/RTK.md" ~/.claude/RTK.md
+  install_doc "$REPO_DIR/claude-md/RTK.md" ~/.claude/RTK.md
   IMPORTS="$IMPORTS
 @RTK.md"; RTK="있음"
 else
   rm -f ~/.claude/RTK.md 2>/dev/null; RTK="없음(skip)"
 fi
-python3 - "$CLAUDE_MD" "$IMPORTS" <<'PY'
-import sys, os, re, datetime, shutil
-f, imports = sys.argv[1], sys.argv[2]
+python3 - "$CLAUDE_MD" "$IMPORTS" "$REPO_DIR/scripts/lib" <<'PY'
+import sys, os, re
+f, imports, libdir = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, libdir)
+from private_config import write_private
 START = "<!-- claude-config:START (managed by install.sh — do not edit between markers) -->"
 END = "<!-- claude-config:END -->"
 block = START + "\n" + imports + "\n" + END + "\n"
 text = open(f).read() if os.path.exists(f) else ""
-if os.path.exists(f):
-    shutil.copy(f, f + ".bak." + datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
 LEGACY_H = "# 전역 지침 (모든 Claude Code 세션 공통)"
 if START in text and END in text:
     text = re.sub(re.escape(START) + r".*?" + re.escape(END) + r"\n?", block, text, flags=re.S)
@@ -113,7 +116,8 @@ else:
             text += "\n"
         text += "\n" + block
         print("[install] CLAUDE.md 전역지침 블록 신규 추가")
-open(f, "w").write(text)
+if write_private(f, text) == "unchanged":
+    print("[install] CLAUDE.md 변경 없음 — 백업 생성 안 함")
 PY
 echo "[install] 전역지침 머지 — notion: $NOTION, rtk: $RTK (OMC 블록 미변경)"
 
@@ -121,11 +125,12 @@ echo "[install] 전역지침 머지 — notion: $NOTION, rtk: $RTK (OMC 블록 �
 #    statusLine(context-bar) 교체와 CLAUDE.md 머지는 별도 검토 대상이라 여기서 다루지 않음.
 SETTINGS="$HOME/.claude/settings.json"
 if [ -f "$SETTINGS" ]; then
-  cp "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d%H%M%S)"
-  python3 - "$SETTINGS" "$NOTION" <<'PY'
+  python3 - "$SETTINGS" "$NOTION" "$REPO_DIR/scripts/lib" <<'PY'
 import json, sys
 f = sys.argv[1]
 notion = (len(sys.argv) > 2 and sys.argv[2] == "있음")
+sys.path.insert(0, sys.argv[3])
+from private_config import write_private
 with open(f) as fh:
     d = json.load(fh)
 hooks = d.setdefault("hooks", {})
@@ -205,10 +210,10 @@ if notion:
     if ensure("PostToolUse", pa, PA_MATCH): added.append("Post<-post-action")
     if ensure("UserPromptSubmit", nr): added.append("UPS<-notion-recall")
 # 주: carl-hook 은 파일만 동기화하고 자동 배선하지 않음 (APEX/CARL 사용 시 수동 배선)
-with open(f, "w") as fh:
-    json.dump(d, fh, indent=2, ensure_ascii=False)
-    fh.write("\n")
+state = write_private(f, json.dumps(d, indent=2, ensure_ascii=False) + "\n")
 print("[install] 훅 배선:", ", ".join(added) if added else "이미 적용됨(변경 없음)")
+if state == "unchanged":
+    print("[install] settings.json 변경 없음 — 백업 생성 안 함")
 if changed:
     print("[install] 훅 matcher 갱신:", ", ".join(changed))
 PY
