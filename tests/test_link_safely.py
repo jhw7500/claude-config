@@ -188,7 +188,9 @@ def test_archive_dir_failure_skips_link(tmp_path: Path, src: Path) -> None:
     result = run_link(src, dest, blocked / "archive")
 
     assert result.returncode == 1
-    assert "건너뛴다" in result.stderr
+    # 공통어 "건너뛴다" 만 보면 mv 실패 경로와 구분되지 않아, 가드를 빼도 통과한다.
+    # 아카이브 생성 실패 경로임을 메시지로 특정한다.
+    assert "백업 디렉터리" in result.stderr
     assert not dest.is_symlink()
     assert (dest / "keep.txt").is_file()       # 원본 보존
 
