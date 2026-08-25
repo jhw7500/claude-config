@@ -20,6 +20,7 @@ transcript 를 JSONL 로 파싱하지 못해 매번 fail-open 으로 통과했�
   UNMANAGED     저장소 심링크가 아님 — 다른 호스트에서 재현되지 않음
   UNOBSERVABLE  마커를 주입하지 않아 발화 여부를 관측할 수 없음
   SILENT        마커가 있는데 관측 창에서 한 번도 발화하지 않음
+  UNKNOWN       hook 증거 schema/event가 불명확해 안전하게 판정할 수 없음
 
 사용:
   python3 hook-selfcheck.py                 # 최근 7일
@@ -51,6 +52,18 @@ MARKER_SHAPE_RE = re.compile(r"^[A-Z][A-Z0-9]+(?:[_-][A-Z0-9]{2,})+$")
 DECLARE_KEYWORD = "HOOK-OBSERVABLE"
 DECLARE_RE = re.compile(rf"{DECLARE_KEYWORD}:[ \t]*(\S.*?)[ \t]*$", re.MULTILINE)
 SCRIPT_RE = re.compile(r"(?:\$HOME|~)?[\w./$-]*\.(?:py|sh)")
+
+# Claude Code transcript에서 실제 hook 결과로 확인된 attachment schema와
+# marker가 실리는 필드만 허용한다. 레코드 전체를 검색하면 사용자 원문,
+# tool_result, 첨부한 소스 파일의 marker까지 발화로 오인한다.
+HOOK_ATTACHMENT_FIELDS = {
+    "hook_success": ("stdout", "stderr", "content"),
+    "hook_system_message": ("content",),
+    "hook_additional_context": ("content",),
+    "async_hook_response": ("stdout", "stderr"),
+    "hook_non_blocking_error": ("stdout", "stderr"),
+    "hook_blocking_error": (),
+}
 
 
 def wired_hooks(settings_path: Path) -> list[dict]:
@@ -96,25 +109,163 @@ def extract_markers(path: Path) -> set[str]:
     return markers | declared
 
 
-def record_is_assistant(record: dict) -> bool:
-    """모델 자신이 마커를 언급한 레코드인지. 발화로 세면 과대계상된다."""
-    if record.get("type") == "assistant":
-        return True
-    message = record.get("message")
-    return isinstance(message, dict) and message.get("role") == "assistant"
+def payload_text(value: object) -> str:
+    """허용된 payload 값만 marker 검색 가능한 문자열로 바꾼다."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return ""
 
 
-def scan_transcripts(root: Path, markers: set[str], days: int) -> dict:
-    """마커별 발화 횟수와 마지막 발화일.
+def command_script(command: object) -> Path | None:
+    """hook 증거의 command에서 실행 스크립트 힌트를 뽑는다."""
+    if not isinstance(command, str):
+        return None
+    match = SCRIPT_RE.search(command)
+    if not match:
+        return None
+    raw = os.path.expandvars(match.group(0))
+    raw = raw.replace("~", os.path.expanduser("~"))
+    return Path(raw).resolve()
 
-    훅 출력은 한 형태로 저장되지 않는다 — attachment.stdout, message.content,
-    중첩 content[0].content, system 레코드에 흩어진다. 따라서 레코드 전체를
-    문자열로 훑되 assistant 레코드만 제외한다.
+
+def attachment_payload(schema: str, attachment: dict) -> str:
+    """schema별 출력 payload만 읽고 command/response provenance는 제외한다."""
+    if schema == "hook_blocking_error":
+        blocking = attachment.get("blockingError")
+        if isinstance(blocking, dict):
+            blocking = blocking.get("blockingError")
+        return payload_text(blocking)
+    return "\n".join(
+        payload_text(attachment.get(name))
+        for name in HOOK_ATTACHMENT_FIELDS[schema]
+    )
+
+
+def hook_evidence(record: dict) -> dict | None:
+    """신뢰 가능한 hook payload 또는 판정 불가 hook-like payload를 반환한다.
+
+    ``trusted``가 참일 때만 실제 발화로 센다. 미래 schema나 event가 빠진
+    hook 레코드는 marker를 포함하더라도 정상으로 추정하지 않고 UNKNOWN 후보가
+    된다. 일반 user/system/file attachment는 None으로 버린다.
     """
-    hits = {m: 0 for m in markers}
-    last_seen: dict[str, str] = {}
+    record_type = record.get("type")
+    if record_type == "attachment":
+        attachment = record.get("attachment")
+        if not isinstance(attachment, dict):
+            return None
+        schema = attachment.get("type")
+        if isinstance(schema, str) and schema in HOOK_ATTACHMENT_FIELDS:
+            event = attachment.get("hookEvent")
+            return {
+                "trusted": isinstance(event, str) and bool(event),
+                "event": event if isinstance(event, str) and event else None,
+                "text": attachment_payload(schema, attachment),
+                "script": command_script(attachment.get("command")),
+                "attachment": attachment,
+            }
+        if isinstance(schema, str) and (
+            schema.startswith("hook_") or schema == "async_hook_response"
+        ):
+            event = attachment.get("hookEvent")
+            return {
+                "trusted": False,
+                "event": event if isinstance(event, str) and event else None,
+                "text": payload_text(attachment),
+                "script": command_script(attachment.get("command")),
+                "attachment": attachment,
+            }
+        return None
+
+    subtype = record.get("subtype")
+    if record_type == "system" and subtype == "stop_hook_summary":
+        # hookInfos에는 command 등 payload가 아닌 provenance도 있으므로 제외한다.
+        text = "\n".join((
+            payload_text(record.get("hookErrors")),
+            payload_text(record.get("hookAdditionalContext")),
+        ))
+        return {
+            "trusted": True,
+            "event": "Stop",
+            "text": text,
+            "script": None,
+            "attachment": record,
+        }
+    if record_type == "system" and isinstance(subtype, str) and subtype.startswith("hook_"):
+        return {
+            "trusted": False,
+            "event": None,
+            "text": payload_text(record),
+            "script": None,
+            "attachment": record,
+        }
+    return None
+
+
+def evidence_signature(record: dict, evidence: dict, path: Path, line_number: int) -> tuple:
+    """동일 hook 호출의 여러 transcript 표현을 한 번만 세기 위한 서명."""
+    attachment = evidence["attachment"]
+    session = record.get("sessionId") or record.get("session_id")
+    hook_id = (
+        attachment.get("toolUseID")
+        or record.get("toolUseID")
+        or attachment.get("processId")
+        or record.get("processId")
+    )
+    event = evidence.get("event") or ""
+    if session and hook_id:
+        return ("hook", str(session), str(hook_id), event)
+    uuid = record.get("uuid")
+    if uuid:
+        return ("uuid", str(uuid), event)
+    return ("line", str(path), line_number, event)
+
+
+def script_matches(target: tuple[str, str], hint: Path) -> bool:
+    """실경로가 우선이며, 존재하지 않는 fixture/과거 경로는 basename으로 좁힌다."""
+    target_path = Path(target[0])
+    return target_path == hint or (not hint.exists() and target_path.name == hint.name)
+
+
+def scan_transcripts(
+    root: Path, targets: dict[tuple[str, str], set[str]], days: int
+) -> dict:
+    """실제 hook 증거를 ``(실제 script, event)``별로 집계한다."""
+    hits = {target: 0 for target in targets}
+    unknown = {target: 0 for target in targets}
+    last_seen: dict[tuple[str, str], str] = {}
+    unknown_last_seen: dict[tuple[str, str], str] = {}
+    markers = set().union(*targets.values()) if targets else set()
+    marker_hits = {marker: 0 for marker in markers}
     if not markers or not root.is_dir():
-        return {"hits": hits, "last_seen": last_seen, "files": 0}
+        return {
+            "hits": hits,
+            "unknown": unknown,
+            "last_seen": last_seen,
+            "unknown_last_seen": unknown_last_seen,
+            "marker_hits": marker_hits,
+            "files": 0,
+        }
+
+    by_event_marker: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    by_marker: dict[str, set[tuple[str, str]]] = {}
+    for target, target_markers in targets.items():
+        for marker in target_markers:
+            by_event_marker.setdefault((target[1], marker), set()).add(target)
+            by_marker.setdefault(marker, set()).add(target)
+
+    # JSON이 non-ASCII marker를 \u escape한 경우에도 파싱 대상을 놓치지 않는다.
+    line_needles = {
+        marker: (marker, json.dumps(marker, ensure_ascii=True)[1:-1])
+        for marker in markers
+    }
+    seen: dict[tuple[str, str], set[tuple]] = {target: set() for target in targets}
+    unknown_seen: dict[tuple[str, str], set[tuple]] = {target: set() for target in targets}
+    marker_seen: dict[str, set[tuple]] = {marker: set() for marker in markers}
     cutoff = time.time() - days * 86400
     files = 0
     for path in root.rglob("*.jsonl"):
@@ -129,22 +280,74 @@ def scan_transcripts(root: Path, markers: set[str], days: int) -> dict:
         except OSError:
             continue
         with handle:
-            for line in handle:
-                present = [m for m in markers if m in line]
+            for line_number, line in enumerate(handle, 1):
+                present = {
+                    marker for marker, needles in line_needles.items()
+                    if any(needle in line for needle in needles)
+                }
                 if not present:
                     continue  # 대부분의 줄은 여기서 끝난다 (파싱 회피)
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if record_is_assistant(record):
+                evidence = hook_evidence(record)
+                if evidence is None:
                     continue
+                present = {marker for marker in present if marker in evidence["text"]}
+                if not present:
+                    continue
+
                 day = (record.get("timestamp") or "")[:10]
+                signature = evidence_signature(record, evidence, path, line_number)
+                valid_targets: set[tuple[str, str]] = set()
+                uncertain_targets: set[tuple[str, str]] = set()
                 for marker in present:
-                    hits[marker] += 1
-                    if day and day > last_seen.get(marker, ""):
-                        last_seen[marker] = day
-    return {"hits": hits, "last_seen": last_seen, "files": files}
+                    event = evidence.get("event")
+                    candidates = (
+                        set(by_event_marker.get((event, marker), set()))
+                        if event else set(by_marker.get(marker, set()))
+                    )
+                    if not candidates:
+                        continue
+                    hint = evidence.get("script")
+                    if hint is not None:
+                        matched = {target for target in candidates if script_matches(target, hint)}
+                        if not matched:
+                            uncertain_targets |= candidates
+                            continue
+                        candidates = matched
+
+                    if evidence["trusted"] and len(candidates) == 1:
+                        target = next(iter(candidates))
+                        valid_targets.add(target)
+                        marker_key = signature + (target,)
+                        if marker_key not in marker_seen[marker]:
+                            marker_seen[marker].add(marker_key)
+                            marker_hits[marker] += 1
+                    else:
+                        uncertain_targets |= candidates
+
+                for target in valid_targets:
+                    if signature not in seen[target]:
+                        seen[target].add(signature)
+                        hits[target] += 1
+                    if day and day > last_seen.get(target, ""):
+                        last_seen[target] = day
+                for target in uncertain_targets:
+                    if signature not in unknown_seen[target]:
+                        unknown_seen[target].add(signature)
+                        unknown[target] += 1
+                    if day and day > unknown_last_seen.get(target, ""):
+                        unknown_last_seen[target] = day
+    return {
+        "hits": hits,
+        "unknown": unknown,
+        "last_seen": last_seen,
+        "unknown_last_seen": unknown_last_seen,
+        "marker_hits": marker_hits,
+        "files": files,
+    }
 
 
 def heartbeat_seen(heartbeats: Path, name: str, days: int) -> str:
@@ -163,7 +366,7 @@ def audit(settings: Path, repo: Path, transcripts: Path, days: int,
           heartbeats: Path = DEFAULT_HEARTBEATS) -> dict:
     entries = wired_hooks(settings)
     repo_root = str(repo.resolve())
-    rows, all_markers = [], set()
+    rows = []
     for entry in entries:
         script = entry["script"]
         row = dict(entry, status="ok", markers=[], real=None)
@@ -182,49 +385,107 @@ def audit(settings: Path, repo: Path, transcripts: Path, days: int,
             row["status"] = "UNMANAGED"
         markers = extract_markers(real)
         row["markers"] = sorted(markers)
-        all_markers |= markers
         if row["status"] == "ok" and not markers:
             row["status"] = "UNOBSERVABLE"
         rows.append(row)
 
-    scan = scan_transcripts(transcripts, all_markers, days)
+    targets: dict[tuple[str, str], set[str]] = {}
+    script_events: dict[str, set[str]] = {}
+    for row in rows:
+        if not row["real"]:
+            continue
+        key = (row["real"], row["event"])
+        targets.setdefault(key, set()).update(row["markers"])
+        script_events.setdefault(row["real"], set()).add(row["event"])
+
+    scan = scan_transcripts(transcripts, targets, days)
     for row in rows:
         if row["status"] in ("inline", "MISSING"):
             continue
+        key = (row["real"], row["event"])
         beat = heartbeat_seen(heartbeats, os.path.basename(row["script"]), days)
         row["heartbeat"] = beat
-        fired = sum(scan["hits"].get(m, 0) for m in row["markers"])
-        row["fired"] = fired if row["markers"] else 0
+        fired = scan["hits"].get(key, 0)
+        unknown = scan["unknown"].get(key, 0)
+        multi_event = len(script_events.get(row["real"], set())) > 1
+        row["fired"] = fired
+        row["unknown"] = unknown
+        row["heartbeat_ambiguous"] = bool(beat and multi_event)
         row["last_seen"] = max(
-            [scan["last_seen"].get(m, "") for m in row["markers"]] + [beat], default="")
-        row["evidence"] = "marker" if fired else ("heartbeat" if beat else "")
-        if beat:
-            # 하트비트가 있으면 조건 미충족으로 조용한 것이지 무동작이 아니다.
-            if row["status"] in ("SILENT", "UNOBSERVABLE"):
-                row["status"] = "ok"
-        elif row["markers"] and fired == 0 and row["status"] == "ok":
+            scan["last_seen"].get(key, ""),
+            scan["unknown_last_seen"].get(key, ""),
+            beat,
+        )
+
+        if fired:
+            row["evidence"] = "marker"
+        elif beat and not multi_event:
+            row["evidence"] = "heartbeat"
+        elif unknown:
+            row["evidence"] = "unknown-schema"
+        elif beat and multi_event:
+            row["evidence"] = "ambiguous-heartbeat"
+        else:
+            row["evidence"] = ""
+
+        if row["status"] == "UNMANAGED":
+            continue
+        if fired or (beat and not multi_event):
+            row["status"] = "ok"
+        elif unknown or (beat and multi_event):
+            row["status"] = "UNKNOWN"
+        elif row["markers"]:
             row["status"] = "SILENT"
-    return {"days": days, "files_scanned": scan["files"], "rows": rows,
-            "marker_hits": scan["hits"]}
+        else:
+            row["status"] = "UNOBSERVABLE"
+
+    target_hits = [
+        {
+            "script": script,
+            "event": event,
+            "hits": scan["hits"].get((script, event), 0),
+            "unknown": scan["unknown"].get((script, event), 0),
+            "last_seen": scan["last_seen"].get((script, event), ""),
+        }
+        for script, event in sorted(targets)
+    ]
+    return {
+        "days": days,
+        "files_scanned": scan["files"],
+        "rows": rows,
+        "marker_hits": scan["marker_hits"],
+        "target_hits": target_hits,
+    }
 
 
 def render(result: dict) -> str:
     lines = [f"훅 자가진단 — 최근 {result['days']}일 / transcript {result['files_scanned']}파일", ""]
     lines.append(f"  {'상태':<13} {'이벤트':<17} {'스크립트':<34} {'발화':>6} {'근거':<10} 마지막")
-    order = {"MISSING": 0, "SILENT": 1, "UNMANAGED": 2, "UNOBSERVABLE": 3, "ok": 4, "inline": 5}
+    order = {
+        "MISSING": 0,
+        "SILENT": 1,
+        "UNKNOWN": 2,
+        "UNMANAGED": 3,
+        "UNOBSERVABLE": 4,
+        "ok": 5,
+        "inline": 6,
+    }
     for row in sorted(result["rows"], key=lambda r: (order.get(r["status"], 9), r["event"])):
         name = os.path.basename(row["script"]) if row["script"] else row["command"][:34]
         fired = row.get("fired", "")
         lines.append(f"  {row['status']:<13} {row['event']:<17} {name:<34} "
                      f"{fired:>6} {row.get('evidence', ''):<10} {row.get('last_seen', '')}")
     problems = [r for r in result["rows"]
-                if r["status"] in ("MISSING", "SILENT", "UNMANAGED", "UNOBSERVABLE")]
+                if r["status"] in (
+                    "MISSING", "SILENT", "UNKNOWN", "UNMANAGED", "UNOBSERVABLE"
+                )]
     lines += ["", f"발견 {len(problems)}건"]
     for row in problems:
         name = os.path.basename(row["script"]) if row["script"] else row["command"]
         hint = {
             "MISSING": "배선됐지만 파일이 없다 — 배선을 지우거나 파일을 복구한다",
             "SILENT": "마커가 있는데 관측 창에서 한 번도 발화하지 않았다 — 무동작 의심",
+            "UNKNOWN": "hook 증거 schema/event 귀속이 불명확하다 — 검증 규칙 갱신 필요",
             "UNMANAGED": "저장소 심링크가 아니다 — 다른 호스트에서 재현되지 않는다",
             "UNOBSERVABLE": "마커도 하트비트도 없어 발화를 관측할 수 없다",
         }[row["status"]]
@@ -245,13 +506,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="훅이 남기는 발화 하트비트 디렉터리")
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--strict", action="store_true",
-                        help="MISSING/SILENT 발견 시 exit 1")
+                        help="MISSING/SILENT/UNKNOWN 발견 시 exit 1")
     args = parser.parse_args(argv)
 
     result = audit(Path(args.settings), Path(args.repo), Path(args.transcripts), args.days,
                    Path(args.heartbeats))
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.as_json else render(result))
-    if args.strict and any(r["status"] in ("MISSING", "SILENT") for r in result["rows"]):
+    if args.strict and any(
+        r["status"] in ("MISSING", "SILENT", "UNKNOWN") for r in result["rows"]
+    ):
         return 1
     return 0
 
