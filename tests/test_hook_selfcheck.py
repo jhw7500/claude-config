@@ -31,6 +31,7 @@ def env(tmp_path: Path):
 
     def add_hook(name: str, body: str) -> Path:
         path = repo / "hooks" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")
         return path
 
@@ -112,10 +113,10 @@ def hook_attachment(attachment: dict, timestamp: str = "2026-08-24T01:00:00Z") -
     }
 
 
-def hook_success(event: str, stdout: str) -> dict:
+def hook_success(event: str, stdout: str, script: Path) -> dict:
     """실제 hook_success attachment: marker payload는 stdout에 저장된다."""
     return hook_attachment({
-        "command": "python3 /tmp/project/hooks/demo-hook.py",
+        "command": f"python3 {script}",
         "content": "",
         "durationMs": 12,
         "exitCode": 0,
@@ -179,7 +180,7 @@ def test_counts_marker_in_hook_success_stdout(env) -> None:
     """Mutation: hook_success.stdout 경로를 빼면 실제 hook 발화를 SILENT로 오진한다."""
     hook = env.add_hook("demo-hook.py", MARKED)
     settings = env.wire([("Stop", "*", f"python3 {hook}")])
-    env.transcript([hook_success("Stop", "[DEMO-MARKER] hi")])
+    env.transcript([hook_success("Stop", "[DEMO-MARKER] hi", hook)])
 
     result = env.run(settings)
     assert status_of(result, "demo-hook.py") == "ok"
@@ -422,7 +423,7 @@ def test_marker_evidence_is_scoped_to_script_event(env) -> None:
         ("UserPromptSubmit", "*", f"python3 {hook}"),
         ("Stop", "*", f"python3 {hook}"),
     ])
-    env.transcript([hook_success("Stop", "[DEMO-MARKER] hi")])
+    env.transcript([hook_success("Stop", "[DEMO-MARKER] hi", hook)])
 
     result = env.run(settings)
     assert row_of(result, "demo-hook.py", "Stop")["status"] == "ok"
@@ -433,8 +434,8 @@ def test_hook_command_mismatch_is_unknown(env) -> None:
     """Mutation: 명시된 command가 다른데 marker만 같다고 해당 script에 귀속하면 실패한다."""
     hook = env.add_hook("demo-hook.py", MARKED)
     settings = env.wire([("Stop", "*", f"python3 {hook}")])
-    record = hook_success("Stop", "[DEMO-MARKER] hi")
-    record["attachment"]["command"] = "python3 /tmp/project/hooks/other-hook.py"
+    record = hook_success("Stop", "[DEMO-MARKER] hi", hook)
+    record["attachment"]["command"] = "python3 /old/deleted/demo-hook.py"
     env.transcript([record])
 
     assert status_of(env.run(settings), "demo-hook.py") == "UNKNOWN"
@@ -445,7 +446,7 @@ def test_duplicate_hook_envelopes_count_once(env) -> None:
     hook = env.add_hook("demo-hook.py", MARKED)
     settings = env.wire([("Stop", "*", f"python3 {hook}")])
     env.transcript([
-        hook_success("Stop", "[DEMO-MARKER] hi"),
+        hook_success("Stop", "[DEMO-MARKER] hi", hook),
         hook_system_message("Stop", "[DEMO-MARKER] hi"),
     ])
 
@@ -637,10 +638,39 @@ def test_basename_heartbeat_is_unknown_for_multi_event_script(env) -> None:
     assert row_of(result, "quiet-hook.py", "PostToolUse")["status"] == "UNKNOWN"
 
 
+def test_basename_heartbeat_is_unknown_for_distinct_scripts_with_same_name(env) -> None:
+    """같은 heartbeat 파일명을 공유하는 두 script에는 발화를 안전하게 귀속할 수 없다."""
+    first = env.add_hook("first/shared-hook.py", "import sys\nsys.exit(0)\n")
+    second = env.add_hook("second/shared-hook.py", "import sys\nsys.exit(0)\n")
+    settings = env.wire([
+        ("PreToolUse", "*", f"python3 {first}"),
+        ("PostToolUse", "*", f"python3 {second}"),
+    ])
+    env.transcript([{"type": "user", "message": {"role": "user", "content": "x"}}])
+    env.beat("shared-hook.py")
+
+    rows = [row for row in env.run(settings)["rows"] if row["script"]]
+    assert [row["status"] for row in rows] == ["UNKNOWN", "UNKNOWN"]
+
+
+def test_duplicate_matchers_share_one_unambiguous_heartbeat_owner(env) -> None:
+    """같은 script/event의 matcher 여러 개는 heartbeat 귀속 모호성이 아니다."""
+    hook = env.add_hook("quiet-hook.py", "import sys\nsys.exit(0)\n")
+    settings = env.wire([
+        ("PreToolUse", "Bash", f"python3 {hook}"),
+        ("PreToolUse", "Edit", f"python3 {hook}"),
+    ])
+    env.transcript([{"type": "user", "message": {"role": "user", "content": "x"}}])
+    env.beat("quiet-hook.py")
+
+    rows = [row for row in env.run(settings)["rows"] if row["script"]]
+    assert [row["status"] for row in rows] == ["ok", "ok"]
+
+
 def test_marker_takes_precedence_over_heartbeat(env) -> None:
     hook = env.add_hook("demo-hook.py", MARKED)
     settings = env.wire([("Stop", "*", f"python3 {hook}")])
-    env.transcript([hook_success("Stop", "[DEMO-MARKER] hi")])
+    env.transcript([hook_success("Stop", "[DEMO-MARKER] hi", hook)])
     env.beat("demo-hook.py")
 
     row = next(r for r in env.run(settings)["rows"] if r["script"].endswith("demo-hook.py"))

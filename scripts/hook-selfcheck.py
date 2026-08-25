@@ -226,9 +226,8 @@ def evidence_signature(record: dict, evidence: dict, path: Path, line_number: in
 
 
 def script_matches(target: tuple[str, str], hint: Path) -> bool:
-    """실경로가 우선이며, 존재하지 않는 fixture/과거 경로는 basename으로 좁힌다."""
-    target_path = Path(target[0])
-    return target_path == hint or (not hint.exists() and target_path.name == hint.name)
+    """command의 해석된 실경로가 설정 target과 정확히 같은지 확인한다."""
+    return Path(target[0]) == hint
 
 
 def scan_transcripts(
@@ -391,12 +390,14 @@ def audit(settings: Path, repo: Path, transcripts: Path, days: int,
 
     targets: dict[tuple[str, str], set[str]] = {}
     script_events: dict[str, set[str]] = {}
+    heartbeat_owners: dict[str, set[tuple[str, str]]] = {}
     for row in rows:
         if not row["real"]:
             continue
         key = (row["real"], row["event"])
         targets.setdefault(key, set()).update(row["markers"])
         script_events.setdefault(row["real"], set()).add(row["event"])
+        heartbeat_owners.setdefault(os.path.basename(row["script"]), set()).add(key)
 
     scan = scan_transcripts(transcripts, targets, days)
     for row in rows:
@@ -408,9 +409,13 @@ def audit(settings: Path, repo: Path, transcripts: Path, days: int,
         fired = scan["hits"].get(key, 0)
         unknown = scan["unknown"].get(key, 0)
         multi_event = len(script_events.get(row["real"], set())) > 1
+        shared_heartbeat = len(
+            heartbeat_owners.get(os.path.basename(row["script"]), set())
+        ) > 1
+        ambiguous_heartbeat = bool(beat and (multi_event or shared_heartbeat))
         row["fired"] = fired
         row["unknown"] = unknown
-        row["heartbeat_ambiguous"] = bool(beat and multi_event)
+        row["heartbeat_ambiguous"] = ambiguous_heartbeat
         row["last_seen"] = max(
             scan["last_seen"].get(key, ""),
             scan["unknown_last_seen"].get(key, ""),
@@ -419,20 +424,20 @@ def audit(settings: Path, repo: Path, transcripts: Path, days: int,
 
         if fired:
             row["evidence"] = "marker"
-        elif beat and not multi_event:
+        elif beat and not ambiguous_heartbeat:
             row["evidence"] = "heartbeat"
         elif unknown:
             row["evidence"] = "unknown-schema"
-        elif beat and multi_event:
+        elif ambiguous_heartbeat:
             row["evidence"] = "ambiguous-heartbeat"
         else:
             row["evidence"] = ""
 
         if row["status"] == "UNMANAGED":
             continue
-        if fired or (beat and not multi_event):
+        if fired or (beat and not ambiguous_heartbeat):
             row["status"] = "ok"
-        elif unknown or (beat and multi_event):
+        elif unknown or ambiguous_heartbeat:
             row["status"] = "UNKNOWN"
         elif row["markers"]:
             row["status"] = "SILENT"
