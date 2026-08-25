@@ -92,3 +92,36 @@ def test_replace_failure_preserves_existing_file(tmp_path: Path, monkeypatch) ->
     assert list(tmp_path.glob(".tmp-*")) == []
     # 백업은 교체 실패 전에 이미 만들어졌을 수 있으나, 원본은 그대로다
     assert len(backups(target)) >= len(before)
+
+
+# --- 심링크 취급 -----------------------------------------------------------
+# os.replace 는 심링크 경로에 쓰면 링크를 일반 파일로 갈아치우고 타깃을 그대로
+# 둔다. dotfiles 저장소로 링크해 둔 설정이 조용히 끊기므로 타깃을 갱신한다.
+
+def test_symlink_dest_updates_target_and_keeps_link(tmp_path: Path) -> None:
+    target = tmp_path / "repo" / "CLAUDE.md"
+    target.parent.mkdir()
+    target.write_text("이전\n", encoding="utf-8")
+    link = tmp_path / "CLAUDE.md"
+    link.symlink_to(target)
+
+    assert PC.write_private(str(link), "이후\n") == "updated"
+
+    assert link.is_symlink()                              # 링크가 살아 있다
+    assert target.read_text(encoding="utf-8") == "이후\n"  # 타깃이 갱신됐다
+    assert mode_of(target) == 0o600
+    assert backups(target) == [] or len(backups(target)) == 1
+
+
+def test_symlink_dest_unchanged_keeps_link(tmp_path: Path) -> None:
+    target = tmp_path / "repo" / "settings.json"
+    target.parent.mkdir()
+    target.write_text("같음\n", encoding="utf-8")
+    target.chmod(0o644)
+    link = tmp_path / "settings.json"
+    link.symlink_to(target)
+
+    assert PC.write_private(str(link), "같음\n") == "unchanged"
+
+    assert link.is_symlink()
+    assert mode_of(target) == 0o600                       # 타깃에 mode 가 적용된다

@@ -47,7 +47,14 @@ def _write_new(path: str, data: bytes, mode: int) -> None:
 
 
 def write_private(path: str, text: str, mode: int = PRIVATE_MODE, now=None) -> str:
-    """'unchanged' | 'created' | 'updated' 를 반환한다."""
+    """'unchanged' | 'created' | 'updated' 를 반환한다.
+
+    path 가 심링크면 타깃을 갱신한다. os.replace 는 심링크 경로에 쓰면 링크를 일반
+    파일로 갈아치우고 타깃은 그대로 두는데(실측 확인), 그러면 dotfiles 저장소로
+    링크해 둔 설정이 조용히 끊긴다. 수정 전 install.sh 의 open(f, "w") 는 링크를
+    통해 썼으므로 그 동작을 유지한다. install_doc 의 cp -f 도 같은 의미다.
+    """
+    path = os.path.realpath(path)
     data = text.encode("utf-8")
     current = _read(path)
 
