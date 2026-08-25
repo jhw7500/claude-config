@@ -13,10 +13,20 @@ import pytest
 LIB = Path(__file__).parents[1] / "scripts" / "lib" / "link-safely.sh"
 
 
-def run_link(src: Path, dest: Path, archive: Path | None = None) -> subprocess.CompletedProcess[str]:
+def run_link(
+    src: Path,
+    dest: Path,
+    archive: Path | None = None,
+    max_backups: int | None = None,
+) -> subprocess.CompletedProcess[str]:
     args = f'"{src}" "{dest}"' + (f' "{archive}"' if archive else "")
     script = f'. "{LIB}"\nlink_safely {args}\n'
-    return subprocess.run(["bash", "-c", script], text=True, capture_output=True, check=False)
+    env = dict(os.environ)
+    if max_backups is not None:
+        env["LINK_SAFELY_MAX_BACKUPS"] = str(max_backups)
+    return subprocess.run(
+        ["bash", "-c", script], text=True, capture_output=True, check=False, env=env
+    )
 
 
 @pytest.fixture
@@ -221,3 +231,22 @@ def test_archive_dir_reuse_does_not_clobber_existing_backup(tmp_path: Path, src:
     saved = sorted(p.read_text(encoding="utf-8") for p in archive.iterdir())
     assert saved == ["두 번째\n", "첫 번째\n"]      # 둘 다 살아 있다
     assert first.is_symlink() and second.is_symlink()
+
+
+def test_backup_suffix_search_is_bounded(tmp_path: Path, src: Path) -> None:
+    """번호 탐색에 상한이 없으면 비정상 환경에서 프로세스가 hang 된다."""
+    dest = tmp_path / "dest.sh"
+    dest.write_text("원본 보존\n", encoding="utf-8")
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    taken = archive / dest.name
+    taken.write_text("x", encoding="utf-8")
+    for i in range(1, 4):                       # .1 .2 .3 까지 선점
+        (archive / f"{dest.name}.{i}").write_text("x", encoding="utf-8")
+
+    result = run_link(src, dest, archive, max_backups=3)
+
+    assert result.returncode == 1
+    assert "백업 번호가 3 를 넘어" in result.stderr
+    assert not dest.is_symlink()
+    assert dest.read_text(encoding="utf-8") == "원본 보존\n"
