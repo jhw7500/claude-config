@@ -615,8 +615,8 @@ def on_home_refresh(ack, body):
 
 def main() -> None:
     log.info(
-        "Starting claude-slack-bridge (channel=%s, %d bound threads)",
-        CFG.channel_id, len(_thread_session),
+        "Starting claude-slack-bridge (%d bound threads)",
+        len(_thread_session),
     )
     if config.PERMISSION_MODE == "bypassPermissions":
         log.warning(

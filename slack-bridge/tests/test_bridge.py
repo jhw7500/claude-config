@@ -1,4 +1,5 @@
 import os
+import logging
 
 # bridge.py builds the slack App at import time from env -> set dummy env first.
 os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test")
@@ -7,6 +8,23 @@ os.environ.setdefault("SLACK_CHANNEL_ID", "C_TEST")
 os.environ.setdefault("SLACK_ALLOWED_USER_ID", "U_TEST")
 
 import bridge
+
+
+def test_main_does_not_log_channel_id(monkeypatch, caplog):
+    class FakeSocketModeHandler:
+        def __init__(self, *_args):
+            pass
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(bridge, "SocketModeHandler", FakeSocketModeHandler)
+    caplog.set_level(logging.INFO, logger="claude-slack-bridge")
+
+    bridge.main()
+
+    assert "Starting claude-slack-bridge" in caplog.text
+    assert bridge.CFG.channel_id not in caplog.text
 
 
 def test_is_authorized():
