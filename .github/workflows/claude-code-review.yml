@@ -12,7 +12,7 @@ jobs:
       id-token: write
       issues: read
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/claude-code-review.yml@abf5e65cf6188277d9984be062d0b069c82cf25f
+    uses: jhw7500/automation/.github/workflows/claude-code-review.yml@06183ff67c6052489ccac3b7cb37fd93aa3f6307
     with:
       pr_number: ${{ github.event.pull_request.number }}
     secrets:
