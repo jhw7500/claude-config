@@ -124,15 +124,17 @@ echo "[install] 전역지침 머지 — notion: $NOTION, rtk: $RTK (OMC 블록 �
 # 5) 훅 배선 (settings.json) — timestamp-hook + stop-text-required. 멱등·가산·백업.
 #    statusLine(context-bar) 교체와 CLAUDE.md 머지는 별도 검토 대상이라 여기서 다루지 않음.
 SETTINGS="$HOME/.claude/settings.json"
-if [ -f "$SETTINGS" ]; then
-  python3 - "$SETTINGS" "$NOTION" "$REPO_DIR/scripts/lib" <<'PY'
+python3 - "$SETTINGS" "$NOTION" "$REPO_DIR/scripts/lib" <<'PY'
 import json, sys
 f = sys.argv[1]
 notion = (len(sys.argv) > 2 and sys.argv[2] == "있음")
 sys.path.insert(0, sys.argv[3])
 from private_config import write_private
-with open(f) as fh:
-    d = json.load(fh)
+try:
+    with open(f) as fh:
+        d = json.load(fh)
+except FileNotFoundError:
+    d = {}
 hooks = d.setdefault("hooks", {})
 
 import os
@@ -212,14 +214,13 @@ if notion:
 # 주: carl-hook 은 파일만 동기화하고 자동 배선하지 않음 (APEX/CARL 사용 시 수동 배선)
 state = write_private(f, json.dumps(d, indent=2, ensure_ascii=False) + "\n")
 print("[install] 훅 배선:", ", ".join(added) if added else "이미 적용됨(변경 없음)")
-if state == "unchanged":
+if state == "created":
+    print("[install] settings.json 신규 생성 (0600, 백업 없음)")
+elif state == "unchanged":
     print("[install] settings.json 변경 없음 — 백업 생성 안 함")
 if changed:
     print("[install] 훅 matcher 갱신:", ", ".join(changed))
 PY
-else
-  echo "[install] settings.json 없음 — 훅 배선 건너뜀"
-fi
 
 echo ""
 echo "완료. 적용: source ~/.bashrc  +  새 Claude 세션"
