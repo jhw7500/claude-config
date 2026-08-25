@@ -10,15 +10,11 @@ mkdir -p ~/.claude/skills
 SKILL_ARCHIVE=~/.claude/archive/skills-replaced/"$(date +%Y%m%d%H%M%S)-$$"
 for d in "$REPO_DIR"/skills/*/; do
   name="$(basename "$d")"
-  # 목적지가 실디렉터리면 ln -sfn 은 실패하지 않고 그 "안에" 중첩 링크를 만든다(조용한 미배포).
-  # 심볼릭이 아닐 때만 아카이브로 옮기고 링크한다.
-  if [ -e ~/.claude/skills/"$name" ] && [ ! -L ~/.claude/skills/"$name" ]; then
-    mkdir -p "$SKILL_ARCHIVE"
-    mv ~/.claude/skills/"$name" "$SKILL_ARCHIVE"/"$name"
-    echo "[install] 기존 실디렉터리 백업 -> $SKILL_ARCHIVE/$name"
+  # 백업을 ~/.claude/skills/ 밖(아카이브)으로 빼는 게 핵심이다. 옆에 두면 사본에
+  # SKILL.md 가 남아 중복 스킬로 로드된다 — scripts/lib/link-safely.sh 주석 참조.
+  if link_safely "${d%/}" ~/.claude/skills/"$name" "$SKILL_ARCHIVE"; then
+    echo "[install] 스킬 링크: ~/.claude/skills/$name"
   fi
-  ln -sfn "${d%/}" ~/.claude/skills/"$name"
-  echo "[install] 스킬 링크: ~/.claude/skills/$name"
 done
 
 # 2) plug 함수 source (중복 방지)

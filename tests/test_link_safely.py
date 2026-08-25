@@ -3,6 +3,7 @@
 ln -sfn 은 목적지가 실디렉터리일 때 실패하지 않고 그 안에 링크를 만든다.
 배포는 조용히 실패하고, 훅은 안 도는 것과 정상인 것이 겉으로 같아 오래 숨는다.
 """
+import os
 import subprocess
 from pathlib import Path
 
@@ -12,8 +13,9 @@ import pytest
 LIB = Path(__file__).parents[1] / "scripts" / "lib" / "link-safely.sh"
 
 
-def run_link(src: Path, dest: Path) -> subprocess.CompletedProcess[str]:
-    script = f'. "{LIB}"\nlink_safely "{src}" "{dest}"\n'
+def run_link(src: Path, dest: Path, archive: Path | None = None) -> subprocess.CompletedProcess[str]:
+    args = f'"{src}" "{dest}"' + (f' "{archive}"' if archive else "")
+    script = f'. "{LIB}"\nlink_safely {args}\n'
     return subprocess.run(["bash", "-c", script], text=True, capture_output=True, check=False)
 
 
@@ -76,6 +78,7 @@ def test_existing_symlink_replaced_without_backup(tmp_path: Path, src: Path) -> 
     assert list(tmp_path.glob("dest.sh.replaced.*")) == []
 
 
+@pytest.mark.skipif(os.getuid() == 0, reason="root 는 chmod 권한 차단을 무시한다")
 def test_skips_and_reports_when_backup_impossible(tmp_path: Path, src: Path) -> None:
     """치우지 못하면 조용히 덮지 않고 건너뛴다."""
     parent = tmp_path / "locked"
@@ -136,3 +139,68 @@ def test_install_aborts_without_the_guard(tmp_path: Path) -> None:
 
     assert "REACHED" not in bad.stdout      # 가드 없으면 중단
     assert "REACHED" in good.stdout          # 가드 있으면 계속
+
+
+# --- archive_dir 옵션 ------------------------------------------------------
+# ~/.claude/skills/ 에서는 SKILL.md 보유가 곧 스킬 인식 조건이다. 스킬 디렉터리를
+# 옆에 `.replaced.*` 로 백업하면 그 사본이 중복 스킬로 로드된다. 그래서 스킬
+# 배포는 백업을 스캔 범위 밖(아카이브)으로 빼야 한다.
+
+def test_archive_dir_moves_backup_outside_dest_parent(tmp_path: Path, src: Path) -> None:
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    dest = skills / "my-skill"
+    dest.mkdir()
+    (dest / "SKILL.md").write_text("---\nname: my-skill\n---\n", encoding="utf-8")
+    archive = tmp_path / "archive" / "20260825-1"
+
+    result = run_link(src, dest, archive)
+
+    assert result.returncode == 0
+    assert dest.is_symlink()
+    # 백업이 skills/ 안에 남지 않았다 — 남으면 중복 스킬로 로드된다
+    assert list(skills.glob("*.replaced.*")) == []
+    assert [p.name for p in skills.iterdir()] == ["my-skill"]
+    assert (archive / "my-skill" / "SKILL.md").is_file()
+
+
+def test_archive_dir_created_lazily(tmp_path: Path, src: Path) -> None:
+    """백업할 게 없으면 아카이브 디렉터리를 만들지 않는다."""
+    dest = tmp_path / "absent"
+    archive = tmp_path / "archive" / "20260825-1"
+
+    result = run_link(src, dest, archive)
+
+    assert result.returncode == 0
+    assert dest.is_symlink()
+    assert not archive.exists()
+
+
+def test_archive_dir_failure_skips_link(tmp_path: Path, src: Path) -> None:
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "keep.txt").write_text("x", encoding="utf-8")
+    # chmod 로 막으면 root 에서 무시돼 환경 의존이 된다. 부모를 일반 파일로 두면
+    # mkdir 이 ENOTDIR 로 실패하므로 uid 와 무관하게 결정적이다.
+    blocked = tmp_path / "blocked"
+    blocked.write_text("나는 디렉터리가 아니다\n", encoding="utf-8")
+
+    result = run_link(src, dest, blocked / "archive")
+
+    assert result.returncode == 1
+    # 공통어 "건너뛴다" 만 보면 mv 실패 경로와 구분되지 않아, 가드를 빼도 통과한다.
+    # 아카이브 생성 실패 경로임을 메시지로 특정한다.
+    assert "백업 디렉터리" in result.stderr
+    assert not dest.is_symlink()
+    assert (dest / "keep.txt").is_file()       # 원본 보존
+
+
+def test_without_archive_dir_backup_stays_beside(tmp_path: Path, src: Path) -> None:
+    """archive_dir 를 안 주면 기존 동작(옆에 .replaced.*)을 유지한다."""
+    dest = tmp_path / "dest.sh"
+    dest.write_text("old\n", encoding="utf-8")
+
+    result = run_link(src, dest)
+
+    assert result.returncode == 0
+    assert len(list(tmp_path.glob("dest.sh.replaced.*"))) == 1
