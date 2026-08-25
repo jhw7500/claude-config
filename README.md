@@ -55,20 +55,61 @@ MCP 서버는 호스트별 상태(설치·키·경로)라 `install.sh` 본체에
 필요한 호스트에서만:
 
 ```bash
-install -m 600 secrets.example.env secrets.local.env  # 키·경로 채우기 (.gitignore로 제외됨)
-bash scripts/setup-mcp.sh                   # 사내 포함 (또는 --no-internal / --dry-run)
+bash scripts/setup-mcp.sh --no-internal     # preview/check (사내 포함은 옵션 생략)
+bash scripts/setup-mcp.sh --no-internal --apply
+# 이전 스크립트가 만든 legacy local 항목까지 user scope로 명시적으로 이동할 때만:
+bash scripts/setup-mcp.sh --no-internal --apply --migrate-local
 ```
 
-두 setup 스크립트는 `secrets.local.env`가 현재 사용자 소유의 regular file, mode `0600`,
-hard-link 1개인지 확인하고 symlink 또는 unsafe metadata이면 실행을 중단합니다.
-파일 내용은 shell로 `source`하지 않고 data-only assignment로 파싱합니다. 빈 줄·주석,
-선택적 `export`, 한 줄당 `KEY=VALUE`, single/double quote, `$VAR`/`${VAR}` 확장만 지원하며
-`secrets.example.env`에 없는 키, 중복 키, 제어문자, 명령 치환·shell 문장은 파일 전체를 적용하기 전에 거부합니다.
-`--dry-run`은 env 값을 가리고 command/args의 변수도 확장하지 않습니다.
+기본 실행과 `--check`는 비파괴 preview이며 `--dry-run`은 호환 별칭입니다. 종료 코드는
+동기화 완료 `0`, missing/drift `2`, 안전하게 진행할 수 없는 상태 또는 운영 오류 `1`,
+잘못된 모드 조합 `64`입니다. 변경은 `--apply`를 명시한 경우에만 수행합니다.
 
-`manifest/mcp.json`의 서버를 `claude mcp add <name> -e KEY=val -- <cmd>` 로 멱등 등록합니다(이미 있으면 skip).
+`manifest/mcp.json`의 서버는 개인 프로젝트 전반에서 쓰는 `user` scope로 관리합니다.
+기존 type/command/args/env를 비교해 `IN_SYNC`, `MISSING`, `DRIFT`만 값 없이 보고합니다.
+현재 작업 프로젝트의 project scope에 같은 이름이 있으면 항상 `SHADOWED`로 차단합니다.
+legacy local 항목도 기본적으로
+차단하며, 검토 후 `--apply --migrate-local`을 명시한 경우에만 모든 local project map에서
+해당 관리 이름을 제거하고 user 항목으로 이동합니다. 관리하지 않는 항목과 다른 설정 키는 보존합니다.
+
+apply는 `claude` 자식 프로세스나 remove/add 명령을 실행하지 않습니다. private regular file인
+사용자 설정을 잠근 뒤 preview 때 읽은 전체 바이트와 다시 비교합니다. 설정 디렉터리도 현재 사용자
+소유의 실제 directory이며 group/world-writable이 아니어야 합니다. preview의 directory inode를
+apply에서 다시 확인하고, lock/read/temp/replace/fsync를 같은 dirfd에 고정합니다. 모든 관리 항목을
+mode `0600` 임시 파일에 만든 후 한 번의 atomic replace로 커밋하며, 비교 중 외부 변경이 감지되면
+아무것도 적용하지 않고 중단합니다. 이 스크립트의 동시 실행은 lock으로 직렬화되지만 lock을 따르지 않는
+외부 설정 변경과 함께 실행해서는 안 됩니다. project `.mcp.json`도 preview에서 전체 바이트를 snapshot하고
+커밋 직전에 다시 비교하므로 동시에 변경되면 적용 없이 중단합니다. replace 후 directory fsync만 실패하면
+이미 적용됐을 수 있으므로 `APPLIED_UNCONFIRMED`를 보고하며, 다른 설정 작업을 멈춘 뒤 `--check`로 실제
+상태를 확인합니다.
+
+placeholder는 Claude Code가 MCP를 시작할 때 확장하므로, 새 Claude 세션을 시작하는 프로세스에
+host-control/credential store가 필요한 변수를 주입해야 합니다. `setup-mcp.sh`는 저장소의
+`secrets.local.env`를 읽거나 export하지 않으며, manifest의 env에는 기본값 없는 `${VAR}`만
+저장합니다. command에는 placeholder를 허용하지 않고, args에는 manifest가 승인한 정확한 경로
+표현 `${FILESYSTEM_MCP_ROOT}`, `${JHW_NOTION_DIST}/index.js`만 허용합니다. credential
+플래그·label, URL userinfo, credential-bearing 연결 URL/URI/DSN, capability URL과 현재
+credential 환경값의 복제를 preflight에서 거부합니다. percent-encode나 JSON string escape로
+감싼 carrier도 정규화해 검사합니다. Oracle의 target 없는 `user/password`는 정확한
+`sqlplus`/`sql`/`sqlcl` 실행 문맥과 `--connect`/`--logon` 값 문맥에서만 차단해 일반
+`owner/repository` 경로와 구분합니다. `curl`, MySQL/MariaDB, Redis, Mongo shell,
+`sshpass`, `sqlcmd`/`osql`/`bcp`, Docker/Podman login의 credential-bearing 단축 옵션도 해당
+명령 문맥에서만 판정하며, `sh` 계열의 `-c`, `env`/`sudo`, `timeout`/`nohup`/`nice`/`stdbuf`가
+감싼 하위 명령까지 같은 검사를 재귀 적용합니다.
+이 검사는 임의의 모든 CLI가 가진 비밀번호 문법을 추측하는 범용 secret detector가 아닙니다.
+일반 구조 carrier, 현재 환경의 credential 값, 위에 열거한 명령 문맥을 보호 범위로 삼습니다.
+manifest에 새 command나 새로운 args 형식을 추가할 때는 literal 차단 사례와 정상 대조군을
+보안 회귀 테스트에 함께 추가해야 합니다. 현재 관리 manifest의 실제 값은 env placeholder로만
+전달되며 설정 payload, argv, 출력에 들어가지 않습니다.
+
+`secrets.local.env`는 아래 Slack 브릿지 전용입니다. Slack setup만 이 파일이 현재 사용자 소유
+regular file, mode `0600`, hard-link 1개인지 검증하고 data-only assignment로 파싱합니다.
+기존 파일에 MCP 항목이 남아 있으면 제거하고 credential store/host-control 환경으로 옮겨야 하며,
+Slack 이외의 변수 이름은 setup 단계에서 거부됩니다.
+
 공개 6개(brave/morph/pdf/sequentialthinking/filesystem/repowire) + 사내 4개(cts-email/cts-ta/jhw-notion/ssh-mcp).
 notion(OAuth)·repowire-channel은 수동 확인이 필요합니다.
+credential 노출 대응은 [MCP credential 운영 절차](docs/security/mcp-credential-incident-response.md)를 따릅니다.
 
 ## 동기화하지 않는 것 (중요)
 
