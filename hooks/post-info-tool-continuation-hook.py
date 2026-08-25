@@ -83,6 +83,8 @@ def main() -> int:
         payload = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return 0
+    if not isinstance(payload, dict):  # 비객체 top-level JSON — 조용히 무시 (훅 규약: 모든 경로 exit 0)
+        return 0
 
     tool_name = payload.get("tool_name", "")
     if not isinstance(tool_name, str) or not tool_name:

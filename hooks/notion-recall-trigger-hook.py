@@ -48,6 +48,8 @@ def main() -> int:
         payload = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return 0
+    if not isinstance(payload, dict):  # 비객체 top-level JSON — 조용히 무시 (훅 규약: 모든 경로 exit 0)
+        return 0
 
     prompt = (
         payload.get("prompt")

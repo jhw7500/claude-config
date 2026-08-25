@@ -569,6 +569,8 @@ def main():
     except json.JSONDecodeError as e:
         print(f"Error: Invalid JSON input: {e}", file=sys.stderr)
         sys.exit(1)
+    if not isinstance(input_data, dict):  # 비객체 top-level JSON — 조용히 무시 (훅 규약: 모든 경로 exit 0)
+        sys.exit(0)
 
     cwd = input_data.get('cwd', str(Path.home()))
     session_id = input_data.get('sessionId', '') or input_data.get('session_id', '')
