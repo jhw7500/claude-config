@@ -858,6 +858,31 @@ def test_preview_blocks_literal_default_in_credential_placeholder(tmp_path):
     assert not call_log.exists()
 
 
+def test_apply_blocks_literal_default_in_concatenated_credential_placeholder(
+    tmp_path,
+):
+    repo, env, config_path, call_log = make_fixture(tmp_path)
+    manifest_path = repo / "manifest" / "mcp.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["probe"]["env"] = {
+        "PGPASSWORD": f"${{PGPASSWORD:-{CANARY}}}",
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    original_config = config_path.read_bytes()
+
+    result = run_setup(repo, env, "--apply")
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert (
+        "[BLOCKED] user/probe: env.PGPASSWORD credential placeholder may not "
+        "have a default"
+    ) in result.stderr
+    assert CANARY not in combined
+    assert config_path.read_bytes() == original_config
+    assert not call_log.exists()
+
+
 def test_check_returns_in_sync_without_cli_calls(tmp_path):
     repo, env, config_path, call_log = make_fixture(tmp_path)
     config = json.loads(config_path.read_text(encoding="utf-8"))
