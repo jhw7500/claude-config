@@ -83,9 +83,22 @@ mode `0600` 임시 파일에 만든 후 한 번의 atomic replace로 커밋하�
 
 placeholder는 Claude Code가 MCP를 시작할 때 확장하므로, 새 Claude 세션을 시작하는 프로세스에
 host-control/credential store가 필요한 변수를 주입해야 합니다. `setup-mcp.sh`는 저장소의
-`secrets.local.env`를 읽거나 export하지 않으며, manifest에는 `${VAR}` placeholder만 저장합니다.
-credential형 env의 literal/default, command/args의 credential 플래그·변수 참조와 현재 credential
-환경값의 복제를 preflight에서 거부하므로 실제 값은 설정 payload, argv, 출력에 들어가지 않습니다.
+`secrets.local.env`를 읽거나 export하지 않으며, manifest의 env에는 기본값 없는 `${VAR}`만
+저장합니다. command에는 placeholder를 허용하지 않고, args에는 manifest가 승인한 정확한 경로
+표현 `${FILESYSTEM_MCP_ROOT}`, `${JHW_NOTION_DIST}/index.js`만 허용합니다. credential
+플래그·label, URL userinfo, credential-bearing 연결 URL/URI/DSN, capability URL과 현재
+credential 환경값의 복제를 preflight에서 거부합니다. percent-encode나 JSON string escape로
+감싼 carrier도 정규화해 검사합니다. Oracle의 target 없는 `user/password`는 정확한
+`sqlplus`/`sql`/`sqlcl` 실행 문맥과 `--connect`/`--logon` 값 문맥에서만 차단해 일반
+`owner/repository` 경로와 구분합니다. `curl`, MySQL/MariaDB, Redis, Mongo shell,
+`sshpass`, `sqlcmd`/`osql`/`bcp`, Docker/Podman login의 credential-bearing 단축 옵션도 해당
+명령 문맥에서만 판정하며, `sh` 계열의 `-c`, `env`/`sudo`, `timeout`/`nohup`/`nice`/`stdbuf`가
+감싼 하위 명령까지 같은 검사를 재귀 적용합니다.
+이 검사는 임의의 모든 CLI가 가진 비밀번호 문법을 추측하는 범용 secret detector가 아닙니다.
+일반 구조 carrier, 현재 환경의 credential 값, 위에 열거한 명령 문맥을 보호 범위로 삼습니다.
+manifest에 새 command나 새로운 args 형식을 추가할 때는 literal 차단 사례와 정상 대조군을
+보안 회귀 테스트에 함께 추가해야 합니다. 현재 관리 manifest의 실제 값은 env placeholder로만
+전달되며 설정 payload, argv, 출력에 들어가지 않습니다.
 
 `secrets.local.env`는 아래 Slack 브릿지 전용입니다. Slack setup만 이 파일이 현재 사용자 소유
 regular file, mode `0600`, hard-link 1개인지 검증하고 data-only assignment로 파싱합니다.

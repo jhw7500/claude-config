@@ -29,8 +29,21 @@ shell history, CI artifact, 디버그 로그, 이슈·PR 댓글을 포함한다.
 
 ## 재발 방지 확인
 
-- `manifest/mcp.json`의 env 값은 `${VAR}` 형식이다. credential이 아닌 설정값만 `${VAR:-default}`를 사용할 수 있다.
-- credential형 값은 command/args에 존재하지 않는다.
+- `manifest/mcp.json`의 env 값은 기본값 없는 `${VAR}` 형식이며 `${VAR:-default}`는 사용하지 않는다.
+- command에는 placeholder를 사용하지 않는다. args에는 승인된 정확한 경로 표현
+  `${FILESYSTEM_MCP_ROOT}`, `${JHW_NOTION_DIST}/index.js`만 사용하고 credential은 env로만 전달한다.
+- credential형 값, URL userinfo, credential query/DSN label, capability URL은 raw,
+  percent-encode, JSON string escape 형태로도 command/args에 존재하지 않는다.
+- Oracle TNS형 `name/value@alias`는 package ref와 모호하므로 argv에서 fail-closed로 차단한다.
+  target 없는 `name/value`는 정확한 `sqlplus`/`sql`/`sqlcl` 실행 문맥과
+  `--connect`/`--logon` 값 문맥에서 차단하고, 그 밖의 일반 `owner/repository` 경로는 허용한다.
+- 명령별 단축 credential 옵션은 해당 실행 파일에서만 차단한다. `sh` 계열의 `-c`, `env`,
+  `sudo`, `timeout`, `nohup`, `nice`, `stdbuf`로 감싼 하위 명령과 JSON command/args 표현에도
+  같은 검사가 적용되는지 확인한다.
+  stdin·prompt·파일 경로로 값을 받는 안전한 형식은 literal argv와 구분한다.
+- preflight는 임의의 모든 외부 CLI 문법을 자동으로 아는 범용 secret detector가 아니다.
+  manifest의 command나 args 형식을 새로 추가·변경할 때는 해당 CLI의 공식 credential 문법을
+  검토하고, literal 차단 사례와 정상 대조군을 같은 변경의 보안 회귀 테스트에 추가한다.
 - `scripts/setup-mcp.sh --check` 출력에는 서버 이름, scope, 변경 필드만 나타난다.
 - project shadow가 있으면 자동 삭제하지 않고 `SHADOWED`를 수동 해소한 뒤 재시도한다.
 - legacy local shadow는 내용을 검토한 뒤에만 `--apply --migrate-local`로 user scope에 이동한다.
