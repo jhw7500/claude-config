@@ -3,6 +3,7 @@
 ln -sfn 은 목적지가 실디렉터리일 때 실패하지 않고 그 안에 링크를 만든다.
 배포는 조용히 실패하고, 훅은 안 도는 것과 정상인 것이 겉으로 같아 오래 숨는다.
 """
+import os
 import subprocess
 from pathlib import Path
 
@@ -77,6 +78,7 @@ def test_existing_symlink_replaced_without_backup(tmp_path: Path, src: Path) -> 
     assert list(tmp_path.glob("dest.sh.replaced.*")) == []
 
 
+@pytest.mark.skipif(os.getuid() == 0, reason="root 는 chmod 권한 차단을 무시한다")
 def test_skips_and_reports_when_backup_impossible(tmp_path: Path, src: Path) -> None:
     """치우지 못하면 조용히 덮지 않고 건너뛴다."""
     parent = tmp_path / "locked"
@@ -178,13 +180,12 @@ def test_archive_dir_failure_skips_link(tmp_path: Path, src: Path) -> None:
     dest = tmp_path / "dest"
     dest.mkdir()
     (dest / "keep.txt").write_text("x", encoding="utf-8")
+    # chmod 로 막으면 root 에서 무시돼 환경 의존이 된다. 부모를 일반 파일로 두면
+    # mkdir 이 ENOTDIR 로 실패하므로 uid 와 무관하게 결정적이다.
     blocked = tmp_path / "blocked"
-    blocked.mkdir()
-    blocked.chmod(0o500)                       # 하위 생성 불가
-    try:
-        result = run_link(src, dest, blocked / "archive")
-    finally:
-        blocked.chmod(0o700)
+    blocked.write_text("나는 디렉터리가 아니다\n", encoding="utf-8")
+
+    result = run_link(src, dest, blocked / "archive")
 
     assert result.returncode == 1
     assert "건너뛴다" in result.stderr
