@@ -27,12 +27,13 @@ PLACEHOLDER = re.compile(
 CREDENTIAL_NAME = re.compile(
     r"(?:^|_)(?:API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|TOKEN|PASSWORD|PASSWD|"
     r"SECRET|CREDENTIAL|AUTH|AUTHORIZATION|BEARER)(?:_|$)|"
-    r"(?:PASSWORD|PASSWD)(?:_|$)",
+    r"(?:PASSWORD|PASSWD|(?:ACCESS|REFRESH)_?TOKEN)(?:_|$)",
     re.IGNORECASE,
 )
 CREDENTIAL_FLAG = re.compile(
     r"^--?(?:[a-z0-9]+[-_])*(?:api[-_]?key|access[-_]?key|"
-    r"private[-_]?key|client[-_]?secret|token|password|passwd|secret|"
+    r"private[-_]?key|client[-_]?secret|(?:access|refresh)[-_]?token|"
+    r"token|password|passwd|secret|"
     r"credential|auth|authorization|bearer|headers?|env|environment|"
     r"env[-_]?(?:var|variable))$",
     re.IGNORECASE,
@@ -42,7 +43,8 @@ CREDENTIAL_ASSIGNMENT = re.compile(
 )
 CREDENTIAL_LABEL = re.compile(
     r"(?:^|[?&=,;{\s])[\"']?(?:x[-_])?(?:api[-_]?key|access[-_]?key|"
-    r"private[-_]?key|client[-_]?secret|token|password|passwd|secret|"
+    r"private[-_]?key|client[-_]?secret|(?:access|refresh)[-_]?token|"
+    r"token|password|passwd|secret|"
     r"credential|auth|authorization|bearer)[\"']?\s*[:=]",
     re.IGNORECASE,
 )

@@ -266,6 +266,8 @@ def test_preview_blocks_credentials_in_command_or_args(
         ["--authorization", CANARY],
         [f"--bearer={CANARY}"],
         [f"--access-key={CANARY}"],
+        [f"--accessToken={CANARY}"],
+        [f"--refreshToken={CANARY}"],
         ["--private-key", CANARY],
         ["--header", f"Bearer {CANARY}"],
         ["-H", f"Authorization: Bearer {CANARY}"],
@@ -278,6 +280,8 @@ def test_preview_blocks_credentials_in_command_or_args(
         ["--wrapper-option", f"PROBE_TOKEN={CANARY}"],
         ["--config", f'{{"token":"{CANARY}"}}'],
         ["--config", f"{{'api_key': '{CANARY}'}}"],
+        ["--config", f'{{"accessToken":"{CANARY}"}}'],
+        ["--config", f'{{"refreshToken":"{CANARY}"}}'],
     ],
 )
 def test_preview_blocks_extended_credential_flags_without_inherited_secret(
@@ -858,14 +862,16 @@ def test_preview_blocks_literal_default_in_credential_placeholder(tmp_path):
     assert not call_log.exists()
 
 
+@pytest.mark.parametrize("variable", ["PGPASSWORD", "accessToken", "refreshToken"])
 def test_apply_blocks_literal_default_in_concatenated_credential_placeholder(
     tmp_path,
+    variable,
 ):
     repo, env, config_path, call_log = make_fixture(tmp_path)
     manifest_path = repo / "manifest" / "mcp.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["probe"]["env"] = {
-        "PGPASSWORD": f"${{PGPASSWORD:-{CANARY}}}",
+        variable: f"${{{variable}:-{CANARY}}}",
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     original_config = config_path.read_bytes()
@@ -875,7 +881,7 @@ def test_apply_blocks_literal_default_in_concatenated_credential_placeholder(
     combined = result.stdout + result.stderr
     assert result.returncode == 1
     assert (
-        "[BLOCKED] user/probe: env.PGPASSWORD credential placeholder may not "
+        f"[BLOCKED] user/probe: env.{variable} credential placeholder may not "
         "have a default"
     ) in result.stderr
     assert CANARY not in combined
