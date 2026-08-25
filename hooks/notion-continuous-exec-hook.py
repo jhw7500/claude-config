@@ -88,6 +88,8 @@ def main() -> int:
         payload = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
         return 0
+    if not isinstance(payload, dict):  # 비객체 top-level JSON — 조용히 무시 (훅 규약: 모든 경로 exit 0)
+        return 0
 
     # 실증: Claude Code는 'prompt' 키 사용. user_prompt/message는 레거시 fallback.
     prompt = (
