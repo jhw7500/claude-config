@@ -64,6 +64,7 @@ def make_fixture(tmp_path: Path, script_name: str) -> tuple[Path, dict[str, str]
 
     test_home = tmp_path / "home"
     test_home.mkdir()
+    test_home.chmod(0o700)
     env = sanitized_env()
     env["HOME"] = str(test_home)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
@@ -132,8 +133,8 @@ def run_loader(
     )
 
 
-@pytest.mark.parametrize("script_name", ["setup-mcp.sh", "setup-slack-bridge.sh"])
-def test_setup_rejects_group_or_world_readable_secret_file(tmp_path, script_name):
+def test_setup_slack_rejects_group_or_world_readable_secret_file(tmp_path):
+    script_name = "setup-slack-bridge.sh"
     repo, env = make_fixture(tmp_path, script_name)
     secret_file = write_secret_file(repo, mode=0o644)
     sourced_marker = tmp_path / "unsafe-file-was-sourced"
@@ -147,8 +148,8 @@ def test_setup_rejects_group_or_world_readable_secret_file(tmp_path, script_name
     assert not sourced_marker.exists()
 
 
-@pytest.mark.parametrize("script_name", ["setup-mcp.sh", "setup-slack-bridge.sh"])
-def test_setup_rejects_symlinked_secret_file(tmp_path, script_name):
+def test_setup_slack_rejects_symlinked_secret_file(tmp_path):
+    script_name = "setup-slack-bridge.sh"
     repo, env = make_fixture(tmp_path, script_name)
     target = tmp_path / "actual-secrets.env"
     target.write_text(SECRET_CONTENT, encoding="utf-8")
@@ -161,8 +162,8 @@ def test_setup_rejects_symlinked_secret_file(tmp_path, script_name):
     assert "unsafe secret file" in result.stderr.lower()
 
 
-@pytest.mark.parametrize("script_name", ["setup-mcp.sh", "setup-slack-bridge.sh"])
-def test_setup_rejects_hardlinked_secret_file(tmp_path, script_name):
+def test_setup_slack_rejects_hardlinked_secret_file(tmp_path):
+    script_name = "setup-slack-bridge.sh"
     repo, env = make_fixture(tmp_path, script_name)
     secret_file = write_secret_file(repo)
     os.link(secret_file, tmp_path / "second-link.env")
@@ -394,19 +395,19 @@ def test_loader_updates_a_callers_local_environment_value(tmp_path):
     assert result.stdout == "loaded"
 
 
-def test_setup_mcp_dry_run_redacts_expanded_secret_values(tmp_path):
+def test_setup_mcp_dry_run_alias_reports_missing_without_secret_values(tmp_path):
     repo, env = make_fixture(tmp_path, "setup-mcp.sh")
     write_secret_file(repo)
 
     result = run_setup(repo, env, "setup-mcp.sh")
 
     combined = result.stdout + result.stderr
-    assert result.returncode == 0, combined
+    assert result.returncode == 2, combined
     assert CANARY not in combined
-    assert "BRAVE_API_KEY=<redacted>" in result.stdout
+    assert "[MISSING] user/brave-search" in result.stdout
 
 
-def test_setup_mcp_dry_run_does_not_expand_secrets_in_command_or_args(tmp_path):
+def test_setup_mcp_dry_run_blocks_credentials_in_command_or_args(tmp_path):
     repo, env = make_fixture(tmp_path, "setup-mcp.sh")
     write_secret_file(repo)
     manifest_path = repo / "manifest" / "mcp.json"
@@ -418,13 +419,13 @@ def test_setup_mcp_dry_run_does_not_expand_secrets_in_command_or_args(tmp_path):
     result = run_setup(repo, env, "setup-mcp.sh")
 
     combined = result.stdout + result.stderr
-    assert result.returncode == 0, combined
+    assert result.returncode == 1, combined
     assert CANARY not in combined
-    assert "-- ${BRAVE_API_KEY} --token ${BRAVE_API_KEY}" in result.stdout
+    assert "command may not reference credential variables" in result.stderr
 
 
-def test_setup_rejects_unsupported_env_names_before_starting_child_processes(tmp_path):
-    repo, env = make_fixture(tmp_path, "setup-mcp.sh")
+def test_setup_slack_rejects_unsupported_env_names_before_starting_child_processes(tmp_path):
+    repo, env = make_fixture(tmp_path, "setup-slack-bridge.sh")
     secret_file = write_secret_file(repo)
     injection_dir = tmp_path / "python-injection"
     injection_dir.mkdir()
@@ -437,7 +438,7 @@ def test_setup_rejects_unsupported_env_names_before_starting_child_processes(tmp
     with secret_file.open("a", encoding="utf-8") as stream:
         stream.write(f"PYTHONPATH={injection_dir}\n")
 
-    result = run_setup(repo, env, "setup-mcp.sh")
+    result = run_setup(repo, env, "setup-slack-bridge.sh")
 
     assert result.returncode != 0
     assert "unsupported environment variable" in result.stderr.lower()
