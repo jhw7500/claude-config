@@ -276,6 +276,8 @@ def test_preview_blocks_credentials_in_command_or_args(
         [f"-ePROBE_TOKEN={CANARY}"],
         [f"--env=PROBE_TOKEN={CANARY}"],
         ["--wrapper-option", f"PROBE_TOKEN={CANARY}"],
+        ["--config", f'{{"token":"{CANARY}"}}'],
+        ["--config", f"{{'api_key': '{CANARY}'}}"],
     ],
 )
 def test_preview_blocks_extended_credential_flags_without_inherited_secret(

@@ -40,9 +40,9 @@ CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?:^|[?&=,;\s])(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?=\s*[:=])"
 )
 CREDENTIAL_LABEL = re.compile(
-    r"(?:^|[?&=,;\s])(?:x[-_])?(?:api[-_]?key|access[-_]?key|"
+    r"(?:^|[?&=,;{\s])[\"']?(?:x[-_])?(?:api[-_]?key|access[-_]?key|"
     r"private[-_]?key|client[-_]?secret|token|password|passwd|secret|"
-    r"credential|auth|authorization|bearer)\s*[:=]",
+    r"credential|auth|authorization|bearer)[\"']?\s*[:=]",
     re.IGNORECASE,
 )
 SHORT_ENV_CARRIER = re.compile(r"^-e(?:$|=|[A-Za-z_][A-Za-z0-9_]*=)")
