@@ -268,9 +268,30 @@ def test_counts_only_supported_hook_payload_fields(env, attachment: dict) -> Non
     """실제 schema별 출력 필드는 놓치지 않고 구조화된 값도 안전하게 읽는다."""
     hook = env.add_hook("demo-hook.py", MARKED)
     settings = env.wire([("Stop", "*", f"python3 {hook}")])
+    if attachment["type"] == "hook_blocking_error":
+        attachment["blockingError"]["command"] = f"python3 {hook}"
     env.transcript([hook_attachment(attachment)])
 
     assert status_of(env.run(settings), "demo-hook.py") == "ok"
+
+
+def test_blocking_error_nested_command_mismatch_is_unknown(env) -> None:
+    """blockingError.command가 다른 script면 marker가 같아도 발화로 귀속하지 않는다."""
+    hook = env.add_hook("demo-hook.py", MARKED)
+    settings = env.wire([("Stop", "*", f"python3 {hook}")])
+    attachment = {
+        "type": "hook_blocking_error",
+        "hookEvent": "Stop",
+        "hookName": "Stop",
+        "toolUseID": "tool-use-id",
+        "blockingError": {
+            "blockingError": "[DEMO-MARKER] blocked",
+            "command": "python3 /old/deleted/demo-hook.py",
+        },
+    }
+    env.transcript([hook_attachment(attachment)])
+
+    assert status_of(env.run(settings), "demo-hook.py") == "UNKNOWN"
 
 
 @pytest.mark.parametrize(

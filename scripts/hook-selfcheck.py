@@ -161,11 +161,16 @@ def hook_evidence(record: dict) -> dict | None:
         schema = attachment.get("type")
         if isinstance(schema, str) and schema in HOOK_ATTACHMENT_FIELDS:
             event = attachment.get("hookEvent")
+            command = attachment.get("command")
+            if schema == "hook_blocking_error":
+                blocking = attachment.get("blockingError")
+                if isinstance(blocking, dict):
+                    command = blocking.get("command")
             return {
                 "trusted": isinstance(event, str) and bool(event),
                 "event": event if isinstance(event, str) and event else None,
                 "text": attachment_payload(schema, attachment),
-                "script": command_script(attachment.get("command")),
+                "script": command_script(command),
                 "attachment": attachment,
             }
         if isinstance(schema, str) and (
