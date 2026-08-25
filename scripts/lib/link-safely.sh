@@ -30,6 +30,20 @@ link_safely() {
     else
       backup="$dest.replaced.$(date +%Y%m%d%H%M%S)"
     fi
+    # 백업 경로가 이미 있으면 덮지 않고 번호를 붙인다. archive_dir 는 basename 만
+    # 쓰므로 같은 디렉터리를 재사용하면 충돌하고, 옆에 두는 경로도 같은 초에 두 번
+    # 호출되면 겹친다. 어느 쪽이든 기존 백업을 잃지 않는다.
+    if [ -e "$backup" ]; then
+      local n=1 max=${LINK_SAFELY_MAX_BACKUPS:-1000}
+      while [ -e "$backup.$n" ]; do
+        n=$((n + 1))
+        if [ "$n" -gt "$max" ]; then
+          echo "[link_safely] 경고: 백업 번호가 $max 를 넘어 링크를 건너뛴다" >&2
+          return 1
+        fi
+      done
+      backup="$backup.$n"
+    fi
     if ! mv "$dest" "$backup" 2>/dev/null; then
       echo "[link_safely] 경고: $dest 를 치우지 못해 링크를 건너뛴다" >&2
       return 1
