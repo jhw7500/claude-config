@@ -55,8 +55,9 @@ literal을 남기지 않는다. `secrets.local.env`는 Slack 브릿지 setup 전
 
 apply는 Claude CLI의 remove/add를 호출하지 않고, 안전한 설정 directory를 dirfd로 고정한 뒤
 private user 설정을 lock·전체 바이트 비교한다. mode `0600` 임시 파일을 같은 dirfd에서 한 번의
-atomic replace로 커밋하며, directory inode나 설정 바이트가 변경되면 적용 없이 중단하므로
-다른 설정 작업이 끝난 뒤 preview부터 재시도한다. lock을 따르지 않는 외부 프로세스는 마지막 비교와
-replace 사이에 경쟁할 수 있으므로 Claude 설정을 동시에 변경하면서 apply하지 않는다. 전원 종료나
-파일 시스템 오류 뒤에는 `--check`로 실제 상태를 확인한 뒤 복구한다. 특히
+atomic replace로 커밋하며, directory inode·user 설정 바이트·project `.mcp.json` snapshot이
+변경되면 적용 없이 중단하므로 다른 설정 작업이 끝난 뒤 preview부터 재시도한다. lock을 따르지 않는
+외부 프로세스는 마지막 비교와 replace 사이에 경쟁할 수 있으므로 user 설정이나 project `.mcp.json`을
+동시에 변경하면서 apply하지 않는다. 전원 종료나 파일 시스템 오류 뒤에는 `--check`로 실제 상태를
+확인한 뒤 복구한다. 특히
 `APPLIED_UNCONFIRMED`는 replace 이후 durability 확인만 실패한 상태이므로 미적용으로 단정하지 않는다.

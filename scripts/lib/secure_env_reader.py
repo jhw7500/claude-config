@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read a repo-local env file through one verified file descriptor."""
+"""Read the repo-local Slack env file through one verified file descriptor."""
 
 from __future__ import annotations
 
@@ -24,21 +24,10 @@ NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 UNQUOTED_CONTROL_CHARACTERS = frozenset(";&|<>()")
 ALLOWED_ENV_NAMES = frozenset(
     {
-        "BRAVE_API_KEY",
-        "EMAIL_PASSWORD",
-        "EMAIL_USER",
-        "FILESYSTEM_MCP_ROOT",
-        "HIWORKS_PASSWORD",
-        "HIWORKS_USER",
-        "JHW_NOTION_DIST",
-        "MORPH_API_KEY",
-        "MORPH_ENABLED_TOOLS",
-        "NOTION_API_KEY",
         "SLACK_ALLOWED_USER_ID",
         "SLACK_APP_TOKEN",
         "SLACK_BOT_TOKEN",
         "SLACK_CHANNEL_ID",
-        "TLS_REJECT_UNAUTHORIZED",
     }
 )
 

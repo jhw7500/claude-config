@@ -2037,6 +2037,8 @@ def test_atomic_apply_aborts_if_config_changes_before_commit(tmp_path, monkeypat
         {"probe": {"type": "stdio", "command": "safe", "args": [], "env": {}}},
         set(),
         expected_directory,
+        tmp_path / ".mcp.json",
+        None,
     )
 
     assert result == "changed"
@@ -2047,6 +2049,82 @@ def test_atomic_apply_aborts_if_config_changes_before_commit(tmp_path, monkeypat
         if path.name != ".claude.json.mcp-sync.lock"
     ]
     assert not leftovers
+
+
+def test_apply_aborts_if_project_shadow_appears_before_commit(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    repo, env, config_path, call_log = make_fixture(tmp_path)
+    helper = load_sync_helper()
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    original_config = config_path.read_bytes()
+    original_create = helper._create_private_temp
+
+    def create_temp_after_project_shadow(directory_fd, basename):
+        descriptor, temporary_name = original_create(directory_fd, basename)
+        (repo / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "probe": {
+                            "type": "stdio",
+                            "command": "shadow-command",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return descriptor, temporary_name
+
+    monkeypatch.setattr(helper, "_create_private_temp", create_temp_after_project_shadow)
+
+    result = helper.check(
+        repo / "manifest" / "mcp.json",
+        with_internal=False,
+        apply=True,
+    )
+    captured = capsys.readouterr()
+
+    assert result == 1
+    assert "[BLOCKED] MCP configuration changed after preview" in captured.err
+    assert "[APPLIED]" not in captured.out
+    assert config_path.read_bytes() == original_config
+    assert not call_log.exists()
+    leftovers = [
+        path
+        for path in config_path.parent.glob(".claude.json.mcp-sync.*")
+        if path.name != ".claude.json.mcp-sync.lock"
+    ]
+    assert not leftovers
+
+
+def test_apply_allows_an_unchanged_unmanaged_project_server(tmp_path):
+    repo, env, config_path, call_log = make_fixture(tmp_path)
+    project_config = {
+        "mcpServers": {
+            "unmanaged": {
+                "type": "stdio",
+                "command": "keep-project-command",
+            }
+        }
+    }
+    project_config_path = repo / ".mcp.json"
+    project_config_path.write_text(json.dumps(project_config), encoding="utf-8")
+    original_project_config = project_config_path.read_bytes()
+
+    result = run_setup(repo, env, "--apply")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[APPLIED] user/probe" in result.stdout
+    assert json.loads(config_path.read_text(encoding="utf-8"))["mcpServers"][
+        "probe"
+    ]["command"] == "new-command"
+    assert project_config_path.read_bytes() == original_project_config
+    assert not call_log.exists()
 
 
 def test_atomic_apply_rejects_config_directory_retarget_after_preview(tmp_path):
@@ -2075,6 +2153,8 @@ def test_atomic_apply_rejects_config_directory_retarget_after_preview(tmp_path):
         {"probe": desired},
         set(),
         expected_directory,
+        tmp_path / ".mcp.json",
+        None,
     )
 
     assert result == "changed"
@@ -2112,6 +2192,8 @@ def test_atomic_apply_reports_durability_uncertain_after_committed_replace(
         {"probe": desired},
         set(),
         expected_directory,
+        tmp_path / ".mcp.json",
+        None,
     )
 
     assert result == "durability-uncertain"

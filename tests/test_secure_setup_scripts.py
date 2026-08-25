@@ -15,8 +15,6 @@ LOADER = SOURCE_ROOT / "scripts" / "lib" / "secure-env-file.sh"
 CANARY = "CANARY_SECRET_MUST_NOT_APPEAR"
 SECRET_CONTENT = "\n".join(
     [
-        f"BRAVE_API_KEY={CANARY}",
-        "MORPH_API_KEY=morph-test-value",
         "SLACK_BOT_TOKEN=xoxb-test-value",
         "SLACK_APP_TOKEN=xapp-test-value",
         f"SLACK_CHANNEL_ID={CANARY}",
@@ -34,6 +32,14 @@ SAFE_TEST_ENV = (
     "TMPDIR",
     "TZ",
     "USER",
+)
+SLACK_ENV_NAMES = frozenset(
+    {
+        "SLACK_ALLOWED_USER_ID",
+        "SLACK_APP_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "SLACK_CHANNEL_ID",
+    }
 )
 
 
@@ -68,14 +74,7 @@ def make_fixture(tmp_path: Path, script_name: str) -> tuple[Path, dict[str, str]
     env = sanitized_env()
     env["HOME"] = str(test_home)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    for key in (
-        "BRAVE_API_KEY",
-        "MORPH_API_KEY",
-        "SLACK_BOT_TOKEN",
-        "SLACK_APP_TOKEN",
-        "SLACK_CHANNEL_ID",
-        "SLACK_ALLOWED_USER_ID",
-    ):
+    for key in SLACK_ENV_NAMES:
         env.pop(key, None)
     return repo, env
 
@@ -94,6 +93,17 @@ def load_reader_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_secure_env_reader_and_example_are_slack_only():
+    reader = load_reader_module()
+    assignments = reader.parse_env_assignments(
+        (SOURCE_ROOT / "secrets.example.env").read_bytes(),
+        environ={"HOME": "/safe/home"},
+    )
+
+    assert reader.ALLOWED_ENV_NAMES == SLACK_ENV_NAMES
+    assert {name for name, _value in assignments} == SLACK_ENV_NAMES
 
 
 def run_setup(
@@ -190,9 +200,9 @@ def test_reader_pins_open_file_when_path_is_replaced(tmp_path, monkeypatch):
     reader = load_reader_module()
     secret_file = tmp_path / "secrets.env"
     replacement = tmp_path / "replacement.env"
-    original = b"BRAVE_API_KEY=original-value\n"
+    original = b"SLACK_BOT_TOKEN=original-value\n"
     secret_file.write_bytes(original)
-    replacement.write_bytes(b"BRAVE_API_KEY=replacement-value\n")
+    replacement.write_bytes(b"SLACK_BOT_TOKEN=replacement-value\n")
     secret_file.chmod(0o600)
     replacement.chmod(0o600)
     real_read = reader.os.read
@@ -212,10 +222,10 @@ def test_reader_pins_open_file_when_path_is_replaced(tmp_path, monkeypatch):
 
 def test_loader_preserves_trailing_backslash_at_eof(tmp_path):
     secret_file = tmp_path / "secrets.env"
-    secret_file.write_bytes(b"MORPH_ENABLED_TOOLS=abc\\")
+    secret_file.write_bytes(b"SLACK_CHANNEL_ID=abc\\")
     secret_file.chmod(0o600)
 
-    result = run_loader(secret_file, "printf '%s' \"$MORPH_ENABLED_TOOLS\"")
+    result = run_loader(secret_file, "printf '%s' \"$SLACK_CHANNEL_ID\"")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == "abc\\"
@@ -224,10 +234,10 @@ def test_loader_preserves_trailing_backslash_at_eof(tmp_path):
 @pytest.mark.parametrize(
     "payload",
     [
-        "BRAVE_API_KEY=$(touch {marker})\n",
-        "BRAVE_API_KEY=`touch {marker}`\n",
-        "BRAVE_API_KEY=value;touch {marker}\n",
-        "BRAVE_API_KEY=value\ntouch {marker}\n",
+        "SLACK_BOT_TOKEN=$(touch {marker})\n",
+        "SLACK_BOT_TOKEN=`touch {marker}`\n",
+        "SLACK_BOT_TOKEN=value;touch {marker}\n",
+        "SLACK_BOT_TOKEN=value\ntouch {marker}\n",
     ],
 )
 def test_loader_rejects_shell_code_without_executing(tmp_path, payload):
@@ -250,10 +260,10 @@ def test_loader_accepts_documented_assignment_syntax(tmp_path):
     secret_file = tmp_path / "secrets.env"
     secret_file.write_bytes(
         b"# data-only dotenv syntax\r\n"
-        b"export BRAVE_API_KEY='literal $HOME # ='\r\n"
-        b'MORPH_API_KEY="double ${HOME}/path with spaces and \\$literal"\r\n'
-        b"MORPH_ENABLED_TOOLS=edit\\ file\r\n"
-        b"TLS_REJECT_UNAUTHORIZED=0 # inline comment"
+        b"export SLACK_BOT_TOKEN='literal $HOME # ='\r\n"
+        b'SLACK_APP_TOKEN="double ${HOME}/path with spaces and \\$literal"\r\n'
+        b"SLACK_CHANNEL_ID=edit\\ file\r\n"
+        b"SLACK_ALLOWED_USER_ID=0 # inline comment"
     )
     secret_file.chmod(0o600)
     env = sanitized_env()
@@ -261,8 +271,8 @@ def test_loader_accepts_documented_assignment_syntax(tmp_path):
 
     result = run_loader(
         secret_file,
-        "printf '%s\n' \"$BRAVE_API_KEY\" \"$MORPH_API_KEY\" "
-        '"$MORPH_ENABLED_TOOLS" "$TLS_REJECT_UNAUTHORIZED"',
+        "printf '%s\n' \"$SLACK_BOT_TOKEN\" \"$SLACK_APP_TOKEN\" "
+        '"$SLACK_CHANNEL_ID" "$SLACK_ALLOWED_USER_ID"',
         env=env,
     )
 
@@ -284,30 +294,28 @@ def test_loader_accepts_the_documented_example_file(tmp_path):
 
     result = run_loader(
         secret_file,
-        "printf '%s|%s' \"$FILESYSTEM_MCP_ROOT\" \"$JHW_NOTION_DIST\"",
+        "printf '%s|%s|%s|%s' \"$SLACK_BOT_TOKEN\" \"$SLACK_APP_TOKEN\" "
+        '"$SLACK_CHANNEL_ID" "$SLACK_ALLOWED_USER_ID"',
         env=env,
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == (
-        "/safe/home/ai/claude|"
-        "/safe/home/ai/opencode/projects/jhw-notion/mcp-server/dist"
-    )
+    assert result.stdout == "|||"
 
 
 def test_loader_does_not_partially_apply_an_invalid_file(tmp_path):
     secret_file = tmp_path / "secrets.env"
     secret_file.write_text(
-        "BRAVE_API_KEY=changed\nPYTHONPATH=/tmp/injection\n",
+        "SLACK_BOT_TOKEN=changed\nPYTHONPATH=/tmp/injection\n",
         encoding="utf-8",
     )
     secret_file.chmod(0o600)
     env = sanitized_env()
-    env["BRAVE_API_KEY"] = "original"
+    env["SLACK_BOT_TOKEN"] = "original"
 
     result = run_loader(
         secret_file,
-        'loader_status=$?\nprintf \'%s|%s\' "$loader_status" "$BRAVE_API_KEY"',
+        'loader_status=$?\nprintf \'%s|%s\' "$loader_status" "$SLACK_BOT_TOKEN"',
         env=env,
         errexit=False,
     )
@@ -320,8 +328,11 @@ def test_loader_does_not_partially_apply_an_invalid_file(tmp_path):
 @pytest.mark.parametrize(
     ("payload", "extra_env"),
     [
-        (b"BRAVE_API_KEY='safe\t--\tbash'\n", {}),
-        (b"BRAVE_API_KEY=$INHERITED_VALUE\n", {"INHERITED_VALUE": "safe\nINJECTED=value"}),
+        (b"SLACK_BOT_TOKEN='safe\t--\tbash'\n", {}),
+        (
+            b"SLACK_BOT_TOKEN=$INHERITED_VALUE\n",
+            {"INHERITED_VALUE": "safe\nINJECTED=value"},
+        ),
     ],
 )
 def test_loader_rejects_control_characters_in_values(tmp_path, payload, extra_env):
@@ -341,8 +352,8 @@ def test_loader_rejects_control_characters_in_values(tmp_path, payload, extra_en
 @pytest.mark.parametrize(
     ("declaration", "original"),
     [
-        ("declare -l BRAVE_API_KEY=ORIGINAL", "original"),
-        ("declare -u BRAVE_API_KEY=original", "ORIGINAL"),
+        ("declare -l SLACK_BOT_TOKEN=ORIGINAL", "original"),
+        ("declare -u SLACK_BOT_TOKEN=original", "ORIGINAL"),
     ],
 )
 def test_loader_rejects_shell_variables_that_transform_values(
@@ -351,12 +362,12 @@ def test_loader_rejects_shell_variables_that_transform_values(
     original,
 ):
     secret_file = tmp_path / "secrets.env"
-    secret_file.write_text("BRAVE_API_KEY=MiXeD\n", encoding="utf-8")
+    secret_file.write_text("SLACK_BOT_TOKEN=MiXeD\n", encoding="utf-8")
     secret_file.chmod(0o600)
 
     result = run_loader(
         secret_file,
-        'loader_status=$?\nprintf \'%s|%s\' "$loader_status" "$BRAVE_API_KEY"',
+        'loader_status=$?\nprintf \'%s|%s\' "$loader_status" "$SLACK_BOT_TOKEN"',
         before_load=declaration,
         env=sanitized_env(),
         errexit=False,
@@ -369,15 +380,15 @@ def test_loader_rejects_shell_variables_that_transform_values(
 
 def test_loader_updates_a_callers_local_environment_value(tmp_path):
     secret_file = tmp_path / "secrets.env"
-    secret_file.write_text("BRAVE_API_KEY=loaded\n", encoding="utf-8")
+    secret_file.write_text("SLACK_BOT_TOKEN=loaded\n", encoding="utf-8")
     secret_file.chmod(0o600)
     command = "\n".join(
         [
             'source "$1"',
             "caller() {",
-            "  local BRAVE_API_KEY=original",
+            "  local SLACK_BOT_TOKEN=original",
             '  load_private_env_file "$1"',
-            '  printf \'%s\' "$BRAVE_API_KEY"',
+            '  printf \'%s\' "$SLACK_BOT_TOKEN"',
             "}",
             'caller "$2"',
         ]
@@ -422,6 +433,20 @@ def test_setup_mcp_dry_run_blocks_credentials_in_command_or_args(tmp_path):
     assert result.returncode == 1, combined
     assert CANARY not in combined
     assert "command may not reference credential variables" in result.stderr
+
+
+def test_setup_slack_rejects_legacy_mcp_env_names_without_value_disclosure(tmp_path):
+    repo, env = make_fixture(tmp_path, "setup-slack-bridge.sh")
+    secret_file = write_secret_file(repo)
+    with secret_file.open("a", encoding="utf-8") as stream:
+        stream.write(f"BRAVE_API_KEY={CANARY}\n")
+
+    result = run_setup(repo, env, "setup-slack-bridge.sh")
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "unsupported environment variable" in result.stderr.lower()
+    assert CANARY not in combined
 
 
 def test_setup_slack_rejects_unsupported_env_names_before_starting_child_processes(tmp_path):

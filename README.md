@@ -78,8 +78,10 @@ apply는 `claude` 자식 프로세스나 remove/add 명령을 실행하지 않�
 apply에서 다시 확인하고, lock/read/temp/replace/fsync를 같은 dirfd에 고정합니다. 모든 관리 항목을
 mode `0600` 임시 파일에 만든 후 한 번의 atomic replace로 커밋하며, 비교 중 외부 변경이 감지되면
 아무것도 적용하지 않고 중단합니다. 이 스크립트의 동시 실행은 lock으로 직렬화되지만 lock을 따르지 않는
-외부 설정 변경과 함께 실행해서는 안 됩니다. replace 후 directory fsync만 실패하면 이미 적용됐을 수
-있으므로 `APPLIED_UNCONFIRMED`를 보고하며, 다른 설정 작업을 멈춘 뒤 `--check`로 실제 상태를 확인합니다.
+외부 설정 변경과 함께 실행해서는 안 됩니다. project `.mcp.json`도 preview에서 전체 바이트를 snapshot하고
+커밋 직전에 다시 비교하므로 동시에 변경되면 적용 없이 중단합니다. replace 후 directory fsync만 실패하면
+이미 적용됐을 수 있으므로 `APPLIED_UNCONFIRMED`를 보고하며, 다른 설정 작업을 멈춘 뒤 `--check`로 실제
+상태를 확인합니다.
 
 placeholder는 Claude Code가 MCP를 시작할 때 확장하므로, 새 Claude 세션을 시작하는 프로세스에
 host-control/credential store가 필요한 변수를 주입해야 합니다. `setup-mcp.sh`는 저장소의
@@ -102,6 +104,8 @@ manifest에 새 command나 새로운 args 형식을 추가할 때는 literal 차
 
 `secrets.local.env`는 아래 Slack 브릿지 전용입니다. Slack setup만 이 파일이 현재 사용자 소유
 regular file, mode `0600`, hard-link 1개인지 검증하고 data-only assignment로 파싱합니다.
+기존 파일에 MCP 항목이 남아 있으면 제거하고 credential store/host-control 환경으로 옮겨야 하며,
+Slack 이외의 변수 이름은 setup 단계에서 거부됩니다.
 
 공개 6개(brave/morph/pdf/sequentialthinking/filesystem/repowire) + 사내 4개(cts-email/cts-ta/jhw-notion/ssh-mcp).
 notion(OAuth)·repowire-channel은 수동 확인이 필요합니다.

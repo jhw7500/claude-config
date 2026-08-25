@@ -2043,13 +2043,32 @@ def _config_directory(config_path: Path) -> Iterator[int]:
         os.close(descriptor)
 
 
-def _read_object(path: Path, *, missing_ok: bool = False) -> dict[str, Any]:
-    if missing_ok and not path.exists():
-        return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
+def _read_optional_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _read_object_snapshot(
+    path: Path,
+    *,
+    missing_ok: bool = False,
+) -> ConfigSnapshot:
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        if missing_ok:
+            return ConfigSnapshot(raw=None, data={})
+        raise
+    data = json.loads(raw.decode("utf-8"))
     if not isinstance(data, dict):
         raise ValueError("top-level JSON value is not an object")
-    return data
+    return ConfigSnapshot(raw=raw, data=data)
+
+
+def _read_object(path: Path, *, missing_ok: bool = False) -> dict[str, Any]:
+    return _read_object_snapshot(path, missing_ok=missing_ok).data
 
 
 def _read_user_config(path: Path, directory_fd: int) -> ConfigSnapshot:
@@ -2122,7 +2141,11 @@ def _servers(container: dict[str, Any]) -> dict[str, Any]:
     return servers
 
 
-def _shadow_scopes(config: dict[str, Any], project_dir: Path, name: str) -> list[str]:
+def _shadow_scopes(
+    config: dict[str, Any],
+    project_config: dict[str, Any],
+    name: str,
+) -> list[str]:
     shadows: list[str] = []
     projects = config.get("projects", {})
     if not isinstance(projects, dict):
@@ -2134,7 +2157,6 @@ def _shadow_scopes(config: dict[str, Any], project_dir: Path, name: str) -> list
             shadows.append("local")
             break
 
-    project_config = _read_object(project_dir / ".mcp.json", missing_ok=True)
     if name in _servers(project_config):
         shadows.append("project")
     return shadows
@@ -2262,6 +2284,8 @@ def _atomic_apply(
     replacements: dict[str, dict[str, Any]],
     local_migrations: set[str],
     expected_directory: tuple[int, int],
+    project_config_path: Path,
+    expected_project_raw: bytes | None,
 ) -> str:
     temporary_name: str | None = None
     committed = False
@@ -2316,6 +2340,12 @@ def _atomic_apply(
                     before_commit = _read_user_config(config_path, directory_fd)
                     if before_commit.raw != expected_raw:
                         return "changed"
+                    try:
+                        current_project_raw = _read_optional_bytes(project_config_path)
+                    except OSError:
+                        return "changed"
+                    if current_project_raw != expected_project_raw:
+                        return "changed"
 
                     os.replace(
                         temporary_name,
@@ -2353,6 +2383,8 @@ def check(
         snapshot = _read_user_config(config_path, directory_fd)
     existing_servers = _servers(snapshot.data)
     project_dir = Path(os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())).resolve()
+    project_config_path = project_dir / ".mcp.json"
+    project_snapshot = _read_object_snapshot(project_config_path, missing_ok=True)
 
     pending = False
     blocked = False
@@ -2368,7 +2400,7 @@ def check(
             raise ValueError("manifest entry does not declare user scope")
         _validate_manifest_entry(name, raw_entry)
 
-        shadows = _shadow_scopes(snapshot.data, project_dir, name)
+        shadows = _shadow_scopes(snapshot.data, project_snapshot.data, name)
         blocking_shadows = [
             scope for scope in shadows if scope != "local" or not migrate_local
         ]
@@ -2414,6 +2446,8 @@ def check(
         replacements,
         local_migrations,
         config_directory,
+        project_config_path,
+        project_snapshot.raw,
     )
     if result == "changed":
         print("[BLOCKED] MCP configuration changed after preview", file=sys.stderr)
