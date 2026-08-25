@@ -6,14 +6,30 @@
 # 디렉터리라 훅이 실행되지 않는다. 훅은 안 도는 것과 정상인 것이 겉으로 같아서
 # 이 실패는 오래 숨는다 — scripts/hook-selfcheck.py 가 필요했던 이유와 같다.
 #
-# link_safely <src> <dest>
-#   목적지가 심링크가 아닌 실체(파일·디렉터리)면 타임스탬프를 붙여 옆으로 치운 뒤
-#   링크한다. 치우지 못하면 링크하지 않고 1을 반환한다 — 조용히 덮지 않는다.
+# link_safely <src> <dest> [archive_dir]
+#   목적지가 심링크가 아닌 실체(파일·디렉터리)면 치운 뒤 링크한다.
+#   치우지 못하면 링크하지 않고 1을 반환한다 — 조용히 덮지 않는다.
+#
+#   archive_dir 를 주면 그 디렉터리 안으로 옮기고, 없으면 목적지 옆에
+#   `.replaced.<타임스탬프>` 로 붙인다.
+#
+#   스킬 배포에는 archive_dir 가 필수다. ~/.claude/skills/ 에서는 SKILL.md 보유가
+#   곧 스킬 인식 조건이라(실측: SKILL.md 를 가진 10개 디렉터리가 로드된 스킬 10개와
+#   정확히 일치, 없는 3개는 미로드), 스킬 디렉터리를 옆에 백업하면 그 사본이
+#   중복 스킬로 로드된다. 백업을 스캔 범위 밖으로 빼야 한다.
 
 link_safely() {
-  local src=$1 dest=$2 backup
+  local src=$1 dest=$2 archive_dir=${3:-} backup
   if [ -e "$dest" ] && [ ! -L "$dest" ]; then
-    backup="$dest.replaced.$(date +%Y%m%d%H%M%S)"
+    if [ -n "$archive_dir" ]; then
+      if ! mkdir -p "$archive_dir" 2>/dev/null; then
+        echo "[link_safely] 경고: 백업 디렉터리 $archive_dir 를 만들지 못해 링크를 건너뛴다" >&2
+        return 1
+      fi
+      backup="$archive_dir/$(basename "$dest")"
+    else
+      backup="$dest.replaced.$(date +%Y%m%d%H%M%S)"
+    fi
     if ! mv "$dest" "$backup" 2>/dev/null; then
       echo "[link_safely] 경고: $dest 를 치우지 못해 링크를 건너뛴다" >&2
       return 1

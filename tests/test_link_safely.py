@@ -12,8 +12,9 @@ import pytest
 LIB = Path(__file__).parents[1] / "scripts" / "lib" / "link-safely.sh"
 
 
-def run_link(src: Path, dest: Path) -> subprocess.CompletedProcess[str]:
-    script = f'. "{LIB}"\nlink_safely "{src}" "{dest}"\n'
+def run_link(src: Path, dest: Path, archive: Path | None = None) -> subprocess.CompletedProcess[str]:
+    args = f'"{src}" "{dest}"' + (f' "{archive}"' if archive else "")
+    script = f'. "{LIB}"\nlink_safely {args}\n'
     return subprocess.run(["bash", "-c", script], text=True, capture_output=True, check=False)
 
 
@@ -136,3 +137,67 @@ def test_install_aborts_without_the_guard(tmp_path: Path) -> None:
 
     assert "REACHED" not in bad.stdout      # 가드 없으면 중단
     assert "REACHED" in good.stdout          # 가드 있으면 계속
+
+
+# --- archive_dir 옵션 ------------------------------------------------------
+# ~/.claude/skills/ 에서는 SKILL.md 보유가 곧 스킬 인식 조건이다. 스킬 디렉터리를
+# 옆에 `.replaced.*` 로 백업하면 그 사본이 중복 스킬로 로드된다. 그래서 스킬
+# 배포는 백업을 스캔 범위 밖(아카이브)으로 빼야 한다.
+
+def test_archive_dir_moves_backup_outside_dest_parent(tmp_path: Path, src: Path) -> None:
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    dest = skills / "my-skill"
+    dest.mkdir()
+    (dest / "SKILL.md").write_text("---\nname: my-skill\n---\n", encoding="utf-8")
+    archive = tmp_path / "archive" / "20260825-1"
+
+    result = run_link(src, dest, archive)
+
+    assert result.returncode == 0
+    assert dest.is_symlink()
+    # 백업이 skills/ 안에 남지 않았다 — 남으면 중복 스킬로 로드된다
+    assert list(skills.glob("*.replaced.*")) == []
+    assert [p.name for p in skills.iterdir()] == ["my-skill"]
+    assert (archive / "my-skill" / "SKILL.md").is_file()
+
+
+def test_archive_dir_created_lazily(tmp_path: Path, src: Path) -> None:
+    """백업할 게 없으면 아카이브 디렉터리를 만들지 않는다."""
+    dest = tmp_path / "absent"
+    archive = tmp_path / "archive" / "20260825-1"
+
+    result = run_link(src, dest, archive)
+
+    assert result.returncode == 0
+    assert dest.is_symlink()
+    assert not archive.exists()
+
+
+def test_archive_dir_failure_skips_link(tmp_path: Path, src: Path) -> None:
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "keep.txt").write_text("x", encoding="utf-8")
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    blocked.chmod(0o500)                       # 하위 생성 불가
+    try:
+        result = run_link(src, dest, blocked / "archive")
+    finally:
+        blocked.chmod(0o700)
+
+    assert result.returncode == 1
+    assert "건너뛴다" in result.stderr
+    assert not dest.is_symlink()
+    assert (dest / "keep.txt").is_file()       # 원본 보존
+
+
+def test_without_archive_dir_backup_stays_beside(tmp_path: Path, src: Path) -> None:
+    """archive_dir 를 안 주면 기존 동작(옆에 .replaced.*)을 유지한다."""
+    dest = tmp_path / "dest.sh"
+    dest.write_text("old\n", encoding="utf-8")
+
+    result = run_link(src, dest)
+
+    assert result.returncode == 0
+    assert len(list(tmp_path.glob("dest.sh.replaced.*"))) == 1
