@@ -12,6 +12,9 @@ Slack 비공개 채널에서 기존 Claude Code 세션을 헤드리스로 이어
 3. `secrets.local.env` 에 `SLACK_BOT_TOKEN/SLACK_APP_TOKEN/SLACK_CHANNEL_ID/SLACK_ALLOWED_USER_ID` 채우기.
 4. `bash scripts/setup-slack-bridge.sh` 실행.
 
+`secrets.local.env`는 mode `0600`의 현재 사용자 소유 파일이어야 하며, 저장소 루트
+README의 data-only assignment 문법과 `secrets.example.env` allowlist를 따릅니다.
+
 ## 채널 명령
 - `sessions` / `list` — 최근 세션 목록(버튼)
 - `select <번호|id>` — 대상 세션 선택

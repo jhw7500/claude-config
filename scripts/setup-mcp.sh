@@ -54,9 +54,9 @@ for name, c in mcp.items():
         value = "<redacted>" if dry_run else os.path.expandvars(v)
         tokens += ["-e", "%s=%s" % (k, value)]
     tokens.append("--")
-    tokens.append(os.path.expandvars(c["command"]))
+    tokens.append(c["command"] if dry_run else os.path.expandvars(c["command"]))
     for a in c.get("args", []):
-        tokens.append(os.path.expandvars(a))
+        tokens.append(a if dry_run else os.path.expandvars(a))
     print(name + "\t" + "\t".join(tokens))
 PY
 )

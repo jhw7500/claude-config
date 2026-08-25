@@ -43,10 +43,10 @@ ENV_FILE="$HOME/.config/claude-slack-bridge.env"
 mkdir -p "$(dirname "$ENV_FILE")"
 ( umask 077
   {
-    echo "SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN"
-    echo "SLACK_APP_TOKEN=$SLACK_APP_TOKEN"
-    echo "SLACK_CHANNEL_ID=$SLACK_CHANNEL_ID"
-    echo "SLACK_ALLOWED_USER_ID=$SLACK_ALLOWED_USER_ID"
+    printf '%s\n' "SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN"
+    printf '%s\n' "SLACK_APP_TOKEN=$SLACK_APP_TOKEN"
+    printf '%s\n' "SLACK_CHANNEL_ID=$SLACK_CHANNEL_ID"
+    printf '%s\n' "SLACK_ALLOWED_USER_ID=$SLACK_ALLOWED_USER_ID"
   } > "$ENV_FILE" )
 chmod 600 "$ENV_FILE"
 echo "[setup] wrote $ENV_FILE (SLACK_* only)"
