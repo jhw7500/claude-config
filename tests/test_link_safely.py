@@ -204,3 +204,20 @@ def test_without_archive_dir_backup_stays_beside(tmp_path: Path, src: Path) -> N
 
     assert result.returncode == 0
     assert len(list(tmp_path.glob("dest.sh.replaced.*"))) == 1
+
+
+def test_archive_dir_reuse_does_not_clobber_existing_backup(tmp_path: Path, src: Path) -> None:
+    """archive_dir 는 basename 만 쓴다 — 재사용 시 기존 백업을 덮으면 안 된다."""
+    archive = tmp_path / "archive"
+    first = tmp_path / "a" / "dup"
+    second = tmp_path / "b" / "dup"
+    for path, body in ((first, "첫 번째\n"), (second, "두 번째\n")):
+        path.parent.mkdir()
+        path.write_text(body, encoding="utf-8")
+
+    assert run_link(src, first, archive).returncode == 0
+    assert run_link(src, second, archive).returncode == 0
+
+    saved = sorted(p.read_text(encoding="utf-8") for p in archive.iterdir())
+    assert saved == ["두 번째\n", "첫 번째\n"]      # 둘 다 살아 있다
+    assert first.is_symlink() and second.is_symlink()
