@@ -1889,6 +1889,56 @@ def test_encoded_or_cross_stream_secret_is_rejected(
 
 
 @pytest.mark.parametrize(
+    "argv",
+    [
+        [
+            "task", "start", "--resolve-from-checkout", "true",
+            "--repo-path", "/fixture/source",
+            "--issue-url", "https://github.com/example/control/issues/28",
+            "--issue-node-id", "I_kwDOControl28",
+            "--issue-revision", "issue-revision-28",
+            "--session", "codex-resolved-formal",
+        ],
+        [
+            "task", "start", "--resolve-from-checkout", "true",
+            "--repo-path", "/fixture/source",
+            "--temp-alias", "control-resolver",
+            "--goal", "resolve checkout coordinates",
+            "--done", "unique Project selected",
+            "--scope", "Task registration",
+            "--session", "codex-resolved-temporary",
+        ],
+    ],
+)
+def test_resolver_start_forwards_complete_registration_argv(
+    launcher: ModuleType,
+    tmp_path: Path,
+    argv: list[str],
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    raw_upstream = runner.control_results[
+        ("task", "start", "--issue", "https://example.test/issues/28")
+    ]
+    runner.control_results[tuple(argv)] = raw_upstream
+
+    result = run_secure(launcher, tmp_path, argv, runner)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "command": "task start",
+        "result": {
+            "branch": TASK_BRANCH,
+            "claim_id": CLAIM_ID,
+            "task_id": TASK_ID,
+            "worktree_ref": WORKTREE_REF,
+        },
+    }
+    assert [call["argv"][2:] for call in runner.calls[2:]] == [
+        ("preflight",), tuple(argv),
+    ]
+
+
+@pytest.mark.parametrize(
     ("argv", "code", "returncode"),
     [
         (["preflight"], "SENSITIVE_OUTPUT_REJECTED", 78),
@@ -1922,6 +1972,8 @@ def test_encoded_or_cross_stream_secret_is_rejected(
         (["task", "start", "--issue", "https://example.test/issues/28"], "AMBIGUOUS_REGISTRY_REMOTE", 78),
         (["task", "start", "--issue", "https://example.test/issues/28"], "REGISTRY_REMOTE_NOT_SSH", 78),
         (["task", "start", "--issue", "https://example.test/issues/28"], "REGISTRY_REMOTE_MISMATCH", 78),
+        (["task", "start", "--resolve-from-checkout", "true"], "PROJECT_REPOSITORY_NOT_FOUND", 1),
+        (["task", "start", "--resolve-from-checkout", "true"], "PROJECT_REPOSITORY_AMBIGUOUS", 1),
     ],
 )
 def test_reachable_command_errors_are_preserved(
