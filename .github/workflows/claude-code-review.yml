@@ -8,11 +8,12 @@ jobs:
   claude-review:
     if: ${{ github.event.pull_request.head.repo.fork == false && github.event.pull_request.head.repo.full_name == github.repository }}
     permissions:
+      actions: read
       contents: read
       id-token: write
       issues: read
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/claude-code-review.yml@06183ff67c6052489ccac3b7cb37fd93aa3f6307
+    uses: jhw7500/automation/.github/workflows/claude-code-review.yml@79e87569272b865642c1d1493740135b567717ac
     with:
       pr_number: ${{ github.event.pull_request.number }}
     secrets:
