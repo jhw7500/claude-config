@@ -3037,8 +3037,17 @@ def test_global_task_guidance_uses_only_installed_host_launcher() -> None:
     task_rule = next(line for line in guidance.splitlines() if line.startswith("9. **Task 등록 권유"))
 
     assert '"$HOME/.local/bin/jhw-control-host" preflight' in task_rule
-    assert '"$HOME/.local/bin/jhw-control-host" portfolio status' in task_rule
     assert '"$HOME/.local/bin/jhw-control-host" task start' in task_rule
+    assert '--resolve-from-checkout true' in task_rule
+    assert '"$HOME/.local/bin/jhw-control-host" task finish' in task_rule
+    assert 'jhw-control-host" portfolio status' not in task_rule
+    assert 'jhw-control task start' not in task_rule
+    assert 'jhw-control task finish' not in task_rule
+    assert 'PROJECT_REPOSITORY_NOT_FOUND' in task_rule
+    assert '정확한 Project Record에 Repository를 등록' in task_rule
+    assert 'PROJECT_REPOSITORY_AMBIGUOUS' in task_rule
+    assert 'Repository 연관을 하나로 축소' in task_rule
+    assert 'Project를 임의 선택하거나 explicit mode로 자동 fallback하지 않는다' in task_rule
     assert "control.env" not in task_rule
     assert "source" not in task_rule
     assert "credential" not in task_rule.lower()
@@ -3061,9 +3070,19 @@ def test_readme_documents_secure_store_only_provision_and_no_migration() -> None
         "현재 UID",
         "0500",
         "--contract",
+        "contract v3",
         "preflight",
         "portfolio status",
         "task start",
+        "task finish",
+        "--resolve-from-checkout true",
+        "hidden preflight",
+        "worktree_removed",
+        "HANDOFF_RETRY_CONFLICT",
+        "--project",
+        "--repo-id",
+        "--task",
+        "producer merge → install.sh 재실행 → clean-shell --contract/preflight",
     ):
         assert required in readme
     assert "자동 migration하지" in readme
