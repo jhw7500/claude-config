@@ -3054,31 +3054,41 @@ def test_global_task_guidance_uses_only_installed_host_launcher() -> None:
 
 
 def _assert_readme_v3_contract_boundaries(readme: str) -> None:
-    command_surface = re.search(
-        r"contract v3의 명령 surface는 정확히 (?P<commands>.*?) 다섯 개입니다\.",
-        readme,
-        flags=re.DOTALL,
-    )
-    assert command_surface is not None
-    assert re.findall(r"`([^`]+)`", command_surface.group("commands")) == [
+    section = readme.split("<!-- jhw-control-host-v3-contract:start -->", 1)[1].split(
+        "<!-- jhw-control-host-v3-contract:end -->", 1,
+    )[0]
+    lines = [line for line in section.splitlines() if line]
+    assert len(lines) == 5
+    assert lines[:2] == [
+        "| Inventory | Exact v3 values |",
+        "| --- | --- |",
+    ]
+    rows = {
+        cells[0]: cells[1]
+        for line in lines[2:]
+        for cells in [[cell.strip() for cell in line.split("|")[1:-1]]]
+        if len(cells) == 2
+    }
+    assert set(rows) == {
+        "launcher command families",
+        "finish required/base fields",
+        "finish conditional fields",
+    }
+    assert re.findall(r"`([^`]+)`", rows["launcher command families"]) == [
         "unlock", "preflight", "portfolio status", "task start", "task finish",
     ]
-
-    finish_section = readme.split("`task finish`의 required/base fields는", 1)[1].split(
-        "반환 오류도", 1,
-    )[0]
-    required_fields = re.search(
-        r"(?P<fields>(?:`[^`]+`, ){4}`[^`]+`)이며",
-        finish_section,
-    )
-    assert required_fields is not None
-    assert re.findall(r"`([^`]+)`", required_fields.group("fields")) == [
+    assert re.findall(r"`([^`]+)`", rows["finish required/base fields"]) == [
         "task_id", "claim_id", "status", "released_at", "worktree_removed",
     ]
-    assert re.findall(
-        r"유일한 조건부 필드는 (?:canonical |정확히 )?`([^`]+)`",
-        finish_section,
-    ) == ["handoff_pointer", "cleanup_error=WORKTREE_CLEANUP_FAILED"]
+    assert re.findall(r"`([^`]+)`", rows["finish conditional fields"]) == [
+        "handoff_pointer", "cleanup_error=WORKTREE_CLEANUP_FAILED",
+    ]
+
+
+def _add_to_v3_contract_section(readme: str, addition: str) -> str:
+    marker = "<!-- jhw-control-host-v3-contract:end -->"
+    assert readme.count(marker) == 1
+    return readme.replace(marker, f"{addition}\n{marker}", 1)
 
 
 def test_readme_documents_secure_store_only_provision_and_no_migration() -> None:
@@ -3144,18 +3154,45 @@ def test_readme_documents_secure_store_only_provision_and_no_migration() -> None
     assert "portfolio status로 좌표를 확인" not in readme
     _assert_readme_v3_contract_boundaries(readme)
 
-    extra_command = readme.replace(
-        "`task finish` 다섯 개입니다.",
-        "`task finish`, `task cancel` 다섯 개입니다.",
-        1,
+    extra_command = _add_to_v3_contract_section(
+        readme,
+        "`jhw-control-host task cancel --task <tsk-id>`",
     )
     with pytest.raises(AssertionError):
         _assert_readme_v3_contract_boundaries(extra_command)
 
-    extra_conditional_field = readme.replace(
-        "`cleanup_error=WORKTREE_CLEANUP_FAILED`다. 따라서",
-        "`cleanup_error=WORKTREE_CLEANUP_FAILED`다. `abandoned`의 유일한 조건부 필드는 `release_note`다. 따라서",
-        1,
+    extra_conditional_field = _add_to_v3_contract_section(
+        readme,
+        "abandoned 결과에는 `release_note`도 반환할 수 있다.",
     )
     with pytest.raises(AssertionError):
         _assert_readme_v3_contract_boundaries(extra_conditional_field)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda readme: _add_to_v3_contract_section(
+            readme,
+            "`jhw-control-host task cancel --task <tsk-id>`",
+        ),
+        lambda readme: _add_to_v3_contract_section(
+            readme,
+            "abandoned 결과에는 `release_note`도 반환할 수 있다.",
+        ),
+        lambda readme: _add_to_v3_contract_section(
+            readme,
+            "운영자 note `operator_note`도 required/base output이다.",
+        ),
+    ],
+    ids=["extra-launcher-command", "extra-conditional-field", "extra-required-base-field"],
+)
+def test_readme_v3_contract_boundaries_rejects_unbounded_documentation(
+    mutate,
+) -> None:
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    mutated = mutate(readme)
+
+    assert mutated != readme
+    with pytest.raises(AssertionError):
+        _assert_readme_v3_contract_boundaries(mutated)
