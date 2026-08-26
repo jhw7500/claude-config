@@ -133,7 +133,80 @@ def test_hook_wiring_stays_idempotent(home: Path) -> None:
 def test_links_are_still_created(home: Path) -> None:
     run_install(home)
     claude = home / ".claude"
+    launcher = home / ".local" / "bin" / "jhw-control-host"
 
     assert (claude / "hooks" / "task-nudge.sh").is_symlink()
     assert (claude / "scripts" / "hook-selfcheck.py").is_symlink()
     assert (claude / "skills" / "task-observer").is_symlink()
+    assert launcher.is_symlink()
+    installed = home / ".local" / "lib" / "jhw-control-host" / "jhw-control-host.py"
+    assert launcher.resolve() == installed.resolve()
+    assert installed.read_bytes() == (REPO / "scripts" / "jhw-control-host.py").read_bytes()
+    assert stat.S_IMODE(installed.stat().st_mode) == 0o500
+    assert stat.S_IMODE(installed.parent.stat().st_mode) == 0o700
+    assert mode_of(home / ".local") == 0o700
+    assert mode_of(home / ".local" / "bin") == 0o700
+    assert mode_of(home / ".local" / "lib") == 0o700
+    assert os.access(launcher, os.X_OK)
+
+
+@pytest.mark.parametrize("unsafe", ["writable-local", "unsafe-symlink-target"])
+def test_launcher_install_rejects_unsafe_path_ancestors(home: Path, unsafe: str) -> None:
+    local = home / ".local"
+    if unsafe == "writable-local":
+        local.mkdir(mode=0o777)
+        local.chmod(0o777)
+    else:
+        target = home.parent / "shared-local"
+        target.mkdir(mode=0o777)
+        target.chmod(0o777)
+        local.symlink_to(target, target_is_directory=True)
+
+    result = run_install(home)
+
+    assert result.returncode != 0
+    assert "launcher 설치 경로가 안전하지 않다" in result.stderr
+    assert not (home / ".local" / "lib" / "jhw-control-host" / "jhw-control-host.py").exists()
+
+
+def test_launcher_install_rejects_symlink_to_directory_target(home: Path) -> None:
+    launcher_dir = home / ".local" / "lib" / "jhw-control-host"
+    launcher_dir.mkdir(parents=True)
+    directory_target = launcher_dir / "unexpected-directory"
+    directory_target.mkdir()
+    launcher = launcher_dir / "jhw-control-host.py"
+    launcher.symlink_to(directory_target, target_is_directory=True)
+
+    result = run_install(home)
+
+    assert result.returncode != 0
+    assert "launcher 설치 대상이 디렉터리다" in result.stderr
+    assert launcher.is_symlink()
+    assert list(directory_target.iterdir()) == []
+
+
+def test_readme_requires_reinstall_to_update_launcher_copy() -> None:
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+
+    assert "launcher 갱신에는 `./install.sh` 재실행" in readme
+
+
+def test_launcher_install_backs_up_existing_file_once_and_is_idempotent(home: Path) -> None:
+    binary_dir = home / ".local" / "bin"
+    binary_dir.mkdir(parents=True)
+    launcher = binary_dir / "jhw-control-host"
+    launcher.write_text("legacy launcher\n", encoding="utf-8")
+
+    first = run_install(home)
+
+    assert first.returncode == 0, first.stderr
+    assert launcher.is_symlink()
+    backups_after_first = sorted(binary_dir.glob("jhw-control-host.replaced.*"))
+    assert len(backups_after_first) == 1
+    assert backups_after_first[0].read_text(encoding="utf-8") == "legacy launcher\n"
+
+    second = run_install(home)
+
+    assert second.returncode == 0, second.stderr
+    assert launcher.is_symlink()
+    assert sorted(binary_dir.glob("jhw-control-host.replaced.*")) == backups_after_first
