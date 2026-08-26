@@ -59,6 +59,16 @@ contract v3의 명령 surface는 정확히 `unlock`, `preflight`, `portfolio sta
 hidden preflight를 강제하며, 설정·저장소가 안전하지 않거나 preflight가 실패하면 Task mutation을
 실행하지 않습니다.
 
+### v3 contract inventory
+
+<!-- jhw-control-host-v3-contract:start -->
+| Inventory | Exact v3 values |
+| --- | --- |
+| launcher command families | `unlock`, `preflight`, `portfolio status`, `task start`, `task finish` |
+| finish required/base fields | `task_id`, `claim_id`, `status`, `released_at`, `worktree_removed` |
+| finish conditional fields | `handoff_pointer`, `cleanup_error=WORKTREE_CLEANUP_FAILED` |
+<!-- jhw-control-host-v3-contract:end -->
+
 지원 범위는 Linux Secret Service(DBus session), `/usr/bin/python3`의 system `keyring`·`SecretStorage`,
 그리고 `auth status --show-token --json hosts`와 secure credential store를 지원하는 GitHub CLI입니다.
 launcher는 현재 UID의 private `/run/user/<uid>`와 실제 D-Bus UNIX socket을 직접 검증·파생하므로
