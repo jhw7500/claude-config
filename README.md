@@ -54,8 +54,9 @@ plug off bkit                            # 플러그인 끄기 → 세션에서 
 
 `jhw-control-host`는 clean shell에서 Project Control 호출에 필요한 non-secret 좌표와 세 credential을
 parent shell에 남기지 않고 child `jhw-control`에만 주입하는 **secure-store-only** launcher입니다.
-허용 명령은 `unlock`, `preflight`, `portfolio status`, `task start`뿐이며 `task start` 직전에는
-preflight를 다시 강제합니다. 설정·저장소가 안전하지 않거나 preflight가 실패하면 Task mutation을
+contract v3의 명령 surface는 정확히 `unlock`, `preflight`, `portfolio status`, `task start`,
+`task finish` 다섯 개입니다. `task start`와 `task finish` 앞에는 사용자 출력에 드러나지 않는
+hidden preflight를 강제하며, 설정·저장소가 안전하지 않거나 preflight가 실패하면 Task mutation을
 실행하지 않습니다.
 
 지원 범위는 Linux Secret Service(DBus session), `/usr/bin/python3`의 system `keyring`·`SecretStorage`,
@@ -106,8 +107,29 @@ credential 조회 전에 같은 기준으로 검사하고, 검색 디렉터리 �
 "$HOME/.local/bin/jhw-control-host" unlock
 "$HOME/.local/bin/jhw-control-host" preflight
 "$HOME/.local/bin/jhw-control-host" portfolio status
-"$HOME/.local/bin/jhw-control-host" task start <기존-jhw-task-인자>
+"$HOME/.local/bin/jhw-control-host" task start --resolve-from-checkout true <신규-Formal/Temporary-인자>
+"$HOME/.local/bin/jhw-control-host" task start --task <tsk-id> <기존-Task-재개-인자>
+"$HOME/.local/bin/jhw-control-host" task finish --task <tsk-id> --claim <clm-id> --status <completed|handoff|abandoned>
 ```
+
+신규 Formal/Temporary Task는 visible absolute launcher preflight 성공 뒤 현재 checkout의 exact root와
+`--resolve-from-checkout true`를 사용한다. Project/Repository ID를 portfolio 좌표에서 조합하거나
+추측하지 않는다. resolver가 `PROJECT_REPOSITORY_NOT_FOUND`를 반환하면 Repository를 정확한 Project
+Record에 등록한 뒤 재시도하고, `PROJECT_REPOSITORY_AMBIGUOUS`면 Repository의 Project 연관을 하나로
+축소한 뒤 재시도한다. 어느 경우에도 Project를 임의 선택하거나 explicit mode로 자동 fallback하지
+않는다. `--project`, `--repo-id`, `--task`는 start projection의 optional caller-coordinate binding이며,
+생략해도 downstream Task/Claim coordinate validation은 약해지지 않는다.
+
+`task finish`는 `task_id`, `claim_id`, `status`, `released_at`, `worktree_removed`만 엄격히 projection한다.
+`handoff`는 canonical `handoff_pointer`만 허용하고 worktree 제거 또는 cleanup error를 허용하지 않는다.
+`completed`와 `abandoned`는 pointer를 허용하지 않으며, worktree가 남으면 정확히
+`WORKTREE_CLEANUP_FAILED` cleanup_error여야 한다. 반환 오류도 allowlist와 reason을 엄격히 검사한다:
+`HANDOFF_RETRY_CONFLICT`의 handoff/git-state metadata reason, `INVALID_WORKTREE_INSPECTION`의
+`duplicate_dirty_files`, `WORKTREE_DIRTY`의 `handoff_copy_not_plain_file`만 reason을 가진다.
+
+producer rollout 순서는 `producer merge → install.sh 재실행 → clean-shell --contract/preflight
+→ jhw-notion resolver/skill merge → approved real Task smoke`다. installer는 producer-first 갱신을
+지원하지만, 설치 중 credential 조회·갱신을 하지 않고 기존 파일 값을 자동 migration하지 않는다.
 
 launcher 자체 오류는 path-free JSON과 안정적인 exit code로 반환합니다. 하위 `jhw-control` 출력은
 12 KiB·단일 JSON·command별 strict schema·stdout/stderr 계약을 검증한 뒤 canonical JSON으로 다시
