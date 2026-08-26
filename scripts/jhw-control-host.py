@@ -55,6 +55,20 @@ COMMON_CONTROL_ERROR_CODES = frozenset(
         "AUTHORITY_MOVED", "AUTHORITY_POLICY_NOT_LEGACY", "TOOL_VERSION_TOO_OLD",
     }
 )
+TASK_FINISH_ERROR_REASONS = {
+    "HANDOFF_RETRY_CONFLICT": frozenset(
+        {
+            "invalid_git_state_line", "duplicate_git_state_key",
+            "unexpected_git_state_key", "missing_git_state_key",
+            "invalid_git_state_count", "missing_git_identity",
+            "invalid_dirty_digest", "legacy_dirty_evidence_ambiguous",
+            "git_identity_changed", "dirty_delta_changed",
+            "handoff_metadata_mismatch", "retry_fields_changed",
+        }
+    ),
+    "INVALID_WORKTREE_INSPECTION": frozenset({"duplicate_dirty_files"}),
+    "WORKTREE_DIRTY": frozenset({"handoff_copy_not_plain_file"}),
+}
 COMMAND_CONTROL_ERROR_CODES = {
     "preflight": COMMON_CONTROL_ERROR_CODES
     | {
@@ -108,6 +122,20 @@ COMMAND_CONTROL_ERROR_CODES = {
         "AMBIGUOUS_REGISTRY_REMOTE", "REGISTRY_REMOTE_NOT_SSH", "REGISTRY_REMOTE_MISMATCH",
         "PROJECT_NOT_PRIVATE",
         "PROJECT_REPOSITORY_NOT_FOUND", "PROJECT_REPOSITORY_AMBIGUOUS",
+    },
+    "task finish": COMMON_CONTROL_ERROR_CODES
+    | {
+        "CLAIM_MISMATCH", "CLAIM_NOT_FOUND", "HOST_MISMATCH", "TASK_COMPLETED",
+        "INVALID_CLOCK", "SOURCE_REVISION_MISMATCH", "INVALID_FINISH_OUTCOME",
+        "HANDOFF_MISSING", "HANDOFF_RETRY_CONFLICT", "INVALID_HANDOFF_EVIDENCE",
+        "UNSAFE_HANDOFF_PATH", "INVALID_WORKTREE_INSPECTION", "WORKTREE_DIRTY",
+        "WORKTREE_NOT_MAPPED", "WORKTREE_REMOVE_PENDING", "WORKTREE_REMOVED",
+        "WORKTREE_PLAN_MISMATCH", "WORKTREE_CLAIM_MISMATCH",
+        "WORKTREE_MAPPING_MISMATCH", "WORKTREE_BRANCH_MISMATCH",
+        "WORKTREE_REPOSITORY_MISMATCH", "WORKTREE_CREATE_PENDING",
+        "INVALID_WORKTREE_STATE", "INVALID_GIT_STATE", "INVALID_REPOSITORY_PATH",
+        "UNSAFE_WORKTREE_PATH", "UNSAFE_WORKTREE_ROOT", "UNSAFE_STATE_PATH",
+        "MUTATION_PATH_MISMATCH",
     },
 }
 CONFLICT_EXIT_CODES = frozenset({"TASK_ALREADY_CLAIMED", "CLAIM_MISMATCH", "CLAIM_NOT_FOUND"})
@@ -298,10 +326,10 @@ def read_control_config(path: str | os.PathLike[str], *, uid: int | None = None)
 
 
 CONTRACT = {
-    "commands": ["unlock", "preflight", "portfolio status", "task start"],
+    "commands": ["unlock", "preflight", "portfolio status", "task start", "task finish"],
     "credential_policy": "secure-store-only",
     "name": "jhw-control-host",
-    "version": 2,
+    "version": 3,
 }
 
 
@@ -1114,6 +1142,7 @@ def _allowed_invocation(argv: Sequence[str]) -> bool:
         or values == ("preflight",)
         or values[:2] == ("portfolio", "status")
         or values[:2] == ("task", "start")
+        or values[:2] == ("task", "finish")
     )
 
 
@@ -1191,6 +1220,16 @@ def _requested_id(
     if len(positions) != 1 or positions[0] + 1 >= len(command):
         raise LauncherError("CONTROL_OUTPUT_INVALID")
     return _canonical_id(command[positions[0] + 1], pattern)
+
+
+def _requested_literal(request: Sequence[str], flag: str, allowed: set[str]) -> str:
+    positions = [index for index, value in enumerate(request) if value == flag]
+    if len(positions) != 1 or positions[0] + 1 >= len(request):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    selected = _bounded_text(request[positions[0] + 1], maximum=32)
+    if selected not in allowed:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    return selected
 
 
 def _timestamp(value: object) -> str:
@@ -1421,6 +1460,50 @@ def _validate_task_start_result(
     return projected
 
 
+def _validate_task_finish_result(value: object, *, request: Sequence[str]) -> dict[str, object]:
+    result = _exact_object(
+        value,
+        {"task_id", "claim_id", "status", "released_at", "worktree_removed"},
+        {"cleanup_error", "handoff_pointer"},
+    )
+    task_id = _canonical_id(result["task_id"], TASK_ID_RE)
+    claim_id = _canonical_id(result["claim_id"], CLAIM_ID_RE)
+    requested_task = _requested_id(request, "--task", TASK_ID_RE)
+    requested_claim = _requested_id(request, "--claim", CLAIM_ID_RE)
+    requested_status = _requested_literal(request, "--status", {"completed", "handoff", "abandoned"})
+    if (task_id, claim_id, result["status"]) != (requested_task, requested_claim, requested_status):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    released_at = _timestamp(result["released_at"])
+    removed = result["worktree_removed"]
+    if not isinstance(removed, bool):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    cleanup = result.get("cleanup_error")
+    pointer = result.get("handoff_pointer")
+    projected: dict[str, object] = {
+        "task_id": task_id,
+        "claim_id": claim_id,
+        "status": requested_status,
+        "released_at": released_at,
+        "worktree_removed": removed,
+    }
+    if requested_status == "handoff":
+        expected_pointer = f"handoffs/{task_id}/{claim_id}.md"
+        if removed or cleanup is not None or pointer != expected_pointer:
+            raise LauncherError("CONTROL_OUTPUT_INVALID")
+        projected["handoff_pointer"] = expected_pointer
+    else:
+        if pointer is not None:
+            raise LauncherError("CONTROL_OUTPUT_INVALID")
+        if cleanup is None:
+            if not removed:
+                raise LauncherError("CONTROL_OUTPUT_INVALID")
+        else:
+            if cleanup != "WORKTREE_CLEANUP_FAILED" or removed:
+                raise LauncherError("CONTROL_OUTPUT_INVALID")
+            projected["cleanup_error"] = cleanup
+    return projected
+
+
 def _validate_error_result(
     value: object,
     *,
@@ -1433,7 +1516,11 @@ def _validate_error_result(
         raise LauncherError("CONTROL_OUTPUT_INVALID")
     projected: dict[str, object] = {"code": code}
     if "reason" in error:
-        raise LauncherError("CONTROL_OUTPUT_INVALID")
+        reason = error["reason"]
+        allowed_reasons = TASK_FINISH_ERROR_REASONS.get(str(code), frozenset())
+        if command != "task finish" or not isinstance(reason, str) or reason not in allowed_reasons:
+            raise LauncherError("CONTROL_OUTPUT_INVALID")
+        projected["reason"] = reason
     if "conflicting_claim" in error:
         if code != "TASK_ALREADY_CLAIMED":
             raise LauncherError("CONTROL_OUTPUT_INVALID")
@@ -1512,6 +1599,8 @@ def _validated_control_result(result: CommandResult, command: Sequence[str], *, 
                 build_host=build_host,
                 request=command,
             )
+        elif expected == "task finish":
+            projected_result = _validate_task_finish_result(payload.get("result"), request=command)
         else:
             raise LauncherError("CONTROL_OUTPUT_INVALID")
         output = {"command": expected, "result": projected_result, **_output_warnings(payload)}
@@ -1699,7 +1788,7 @@ def run_program(
             *(value for index, value in enumerate(argv) if index and argv[index - 1] == "--repo-path"),
             *(value for value in (child_env.get("SSH_AUTH_SOCK"),) if value),
         )
-        if tuple(argv[:2]) == ("task", "start"):
+        if tuple(argv[:2]) in {("task", "start"), ("task", "finish")}:
             preflight = _program_result(
                 _control_call(runner, selected_tools, ("preflight",), child_env),
                 command=("preflight",),
