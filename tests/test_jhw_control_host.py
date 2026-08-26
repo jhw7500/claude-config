@@ -3055,6 +3055,7 @@ def test_global_task_guidance_uses_only_installed_host_launcher() -> None:
 
 def test_readme_documents_secure_store_only_provision_and_no_migration() -> None:
     readme = (REPO / "README.md").read_text(encoding="utf-8")
+    command_block = readme.split('"$HOME/.local/bin/jhw-control-host" --contract', 1)[1].split("```", 1)[0]
 
     for required in (
         "jhw-control-host",
@@ -3087,3 +3088,29 @@ def test_readme_documents_secure_store_only_provision_and_no_migration() -> None
         assert required in readme
     assert "자동 migration하지" in readme
     assert "설치 중 credential" in readme
+    assert (
+        "contract v3의 명령 surface는 정확히 `unlock`, `preflight`, `portfolio status`, `task start`,\n"
+        "`task finish` 다섯 개입니다."
+    ) in readme
+    assert (
+        "`task start`와 `task finish` 앞에는 사용자 출력에 드러나지 않는\n"
+        "hidden preflight를 강제"
+    ) in readme
+    assert '"$HOME/.local/bin/jhw-control-host" task start --resolve-from-checkout true' in command_block
+    assert '"$HOME/.local/bin/jhw-control-host" task start --task <tsk-id>' in command_block
+    assert '"$HOME/.local/bin/jhw-control-host" task finish --task <tsk-id> --claim <clm-id>' in command_block
+    assert "`task finish`의 required/base fields는 `task_id`, `claim_id`, `status`, `released_at`, `worktree_removed`" in readme
+    assert "`handoff`의 유일한 조건부 필드는 canonical `handoff_pointer`" in readme
+    assert "non-handoff cleanup failure의 유일한 조건부 필드는 정확히 `cleanup_error=WORKTREE_CLEANUP_FAILED`" in readme
+    assert "`HANDOFF_RETRY_CONFLICT`의 handoff/git-state metadata reason" in readme
+    assert "`INVALID_WORKTREE_INSPECTION`의\n`duplicate_dirty_files`, `WORKTREE_DIRTY`의 `handoff_copy_not_plain_file`만 reason" in readme
+    assert "start projection의 optional caller-coordinate binding" in readme
+    assert "생략해도 downstream Task/Claim coordinate validation은 약해지지 않는다" in readme
+    rollout = (
+        "producer merge → install.sh 재실행 → clean-shell --contract/preflight\n"
+        "→ jhw-notion resolver/skill merge → approved real Task smoke"
+    )
+    assert rollout in readme
+    assert "jhw-control task start" not in readme
+    assert "jhw-control task finish" not in readme
+    assert "portfolio status로 좌표를 확인" not in readme

@@ -120,10 +120,10 @@ Record에 등록한 뒤 재시도하고, `PROJECT_REPOSITORY_AMBIGUOUS`면 Repos
 않는다. `--project`, `--repo-id`, `--task`는 start projection의 optional caller-coordinate binding이며,
 생략해도 downstream Task/Claim coordinate validation은 약해지지 않는다.
 
-`task finish`는 `task_id`, `claim_id`, `status`, `released_at`, `worktree_removed`만 엄격히 projection한다.
-`handoff`는 canonical `handoff_pointer`만 허용하고 worktree 제거 또는 cleanup error를 허용하지 않는다.
-`completed`와 `abandoned`는 pointer를 허용하지 않으며, worktree가 남으면 정확히
-`WORKTREE_CLEANUP_FAILED` cleanup_error여야 한다. 반환 오류도 allowlist와 reason을 엄격히 검사한다:
+`task finish`의 required/base fields는 `task_id`, `claim_id`, `status`, `released_at`, `worktree_removed`이며
+엄격히 projection한다. `handoff`의 유일한 조건부 필드는 canonical `handoff_pointer`이고, worktree 제거 또는
+cleanup error를 허용하지 않는다. non-handoff cleanup failure의 유일한 조건부 필드는 정확히 `cleanup_error=WORKTREE_CLEANUP_FAILED`다. 따라서 `completed`와 `abandoned`는 pointer를 허용하지 않으며,
+cleanup error가 없으면 worktree_removed가 true여야 한다. 반환 오류도 allowlist와 reason을 엄격히 검사한다:
 `HANDOFF_RETRY_CONFLICT`의 handoff/git-state metadata reason, `INVALID_WORKTREE_INSPECTION`의
 `duplicate_dirty_files`, `WORKTREE_DIRTY`의 `handoff_copy_not_plain_file`만 reason을 가진다.
 
