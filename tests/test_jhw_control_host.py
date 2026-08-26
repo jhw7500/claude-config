@@ -172,8 +172,8 @@ def test_executable_startup_ignores_path_and_python_poison(tmp_path: Path) -> No
 
     assert path_result.returncode == 0, path_result.stderr
     assert module_result.returncode == 0, module_result.stderr
-    assert json.loads(path_result.stdout)["version"] == 2
-    assert json.loads(module_result.stdout)["version"] == 2
+    assert json.loads(path_result.stdout)["version"] == 3
+    assert json.loads(module_result.stdout)["version"] == 3
     assert not path_marker.exists()
     assert not module_marker.exists()
 
@@ -197,10 +197,10 @@ def test_contract_needs_no_config_or_provider_and_is_path_free(
     assert result.stderr == b""
     payload = json.loads(result.stdout)
     assert payload == {
-        "commands": ["unlock", "preflight", "portfolio status", "task start"],
+        "commands": ["unlock", "preflight", "portfolio status", "task start", "task finish"],
         "credential_policy": "secure-store-only",
         "name": "jhw-control-host",
-        "version": 2,
+        "version": 3,
     }
     assert str(tmp_path).encode() not in result.stdout
     assert b"ambient-must-not-appear" not in result.stdout
@@ -310,8 +310,53 @@ CLAIM_ID = "clm-0198aabb-ccdd-7eef-8abc-0123456789ab"
 WORKTREE_REF = "wt-0123456789ab-issue-28"
 TASK_BRANCH = "task/0123456789ab-issue-28"
 OTHER_TASK_ID = "tsk-0198aabb-ccdd-7eef-8abc-fedcba987654"
+OTHER_CLAIM_ID = "clm-0198aabb-ccdd-7eef-8abc-fedcba987654"
 OTHER_WORKTREE_REF = "wt-fedcba987654-issue-29"
 OTHER_TASK_BRANCH = "task/fedcba987654-issue-29"
+FINISH_REQUEST = (
+    "task", "finish", "--task", TASK_ID, "--claim", CLAIM_ID,
+    "--status", "handoff", "--validation", "pytest: pass",
+)
+FINISH_RESULT = {
+    "task_id": TASK_ID,
+    "claim_id": CLAIM_ID,
+    "status": "handoff",
+    "released_at": "2026-08-26T00:00:00Z",
+    "worktree_removed": False,
+    "handoff_pointer": f"handoffs/{TASK_ID}/{CLAIM_ID}.md",
+}
+TASK_FINISH_ERROR_REASONS = {
+    "HANDOFF_RETRY_CONFLICT": frozenset({
+        "invalid_git_state_line", "duplicate_git_state_key",
+        "unexpected_git_state_key", "missing_git_state_key",
+        "invalid_git_state_count", "missing_git_identity",
+        "invalid_dirty_digest", "legacy_dirty_evidence_ambiguous",
+        "git_identity_changed", "dirty_delta_changed",
+        "handoff_metadata_mismatch", "retry_fields_changed",
+    }),
+    "INVALID_WORKTREE_INSPECTION": frozenset({"duplicate_dirty_files"}),
+    "WORKTREE_DIRTY": frozenset({"handoff_copy_not_plain_file"}),
+}
+TASK_FINISH_CODES_BY_CALL_SITE = {
+    "finish_preconditions": frozenset({
+        "CLAIM_MISMATCH", "CLAIM_NOT_FOUND", "HOST_MISMATCH", "TASK_COMPLETED",
+        "INVALID_CLOCK", "SOURCE_REVISION_MISMATCH", "INVALID_FINISH_OUTCOME",
+    }),
+    "handoff_validation": frozenset({
+        "HANDOFF_MISSING", "HANDOFF_RETRY_CONFLICT", "INVALID_HANDOFF_EVIDENCE",
+        "UNSAFE_HANDOFF_PATH",
+    }),
+    "worktree_inspection_and_release": frozenset({
+        "INVALID_WORKTREE_INSPECTION", "WORKTREE_DIRTY", "WORKTREE_NOT_MAPPED",
+        "WORKTREE_REMOVE_PENDING", "WORKTREE_REMOVED", "WORKTREE_PLAN_MISMATCH",
+        "WORKTREE_CLAIM_MISMATCH", "WORKTREE_MAPPING_MISMATCH",
+        "WORKTREE_BRANCH_MISMATCH", "WORKTREE_REPOSITORY_MISMATCH",
+        "WORKTREE_CREATE_PENDING", "INVALID_WORKTREE_STATE", "INVALID_GIT_STATE",
+        "INVALID_REPOSITORY_PATH", "UNSAFE_WORKTREE_PATH", "UNSAFE_WORKTREE_ROOT",
+        "UNSAFE_STATE_PATH", "MUTATION_PATH_MISMATCH",
+    }),
+}
+EXPECTED_TASK_FINISH_SPECIFIC_CODES = frozenset().union(*TASK_FINISH_CODES_BY_CALL_SITE.values())
 UNLOCK_PRIVATE_XML = """\
 <node>
   <interface name="org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface">
@@ -1704,9 +1749,220 @@ def test_control_output_requires_json_stream_contract(
     assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
 
 
+def test_task_finish_runs_hidden_preflight_then_forwards_safe_result(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
+        0,
+        json.dumps({"command": "task finish", "result": FINISH_RESULT}, separators=(",", ":")).encode() + b"\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {"command": "task finish", "result": FINISH_RESULT}
+    assert [call["argv"][2:] for call in runner.calls[2:]] == [("preflight",), FINISH_REQUEST]
+
+
+def test_task_finish_hidden_preflight_failure_skips_lifecycle_mutation(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    failure = launcher.CommandResult(78, b"", b'{"error":{"code":"PREFLIGHT_UNAVAILABLE"}}\n')
+    runner.control_results[("preflight",)] = failure
+
+    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
+
+    assert result == launcher.ProgramResult(failure.returncode, failure.stdout, failure.stderr)
+    assert [call["argv"][2:] for call in runner.calls[2:]] == [("preflight",)]
+
+
+@pytest.mark.parametrize(
+    "status_result",
+    [
+        {**FINISH_RESULT, "status": "completed", "worktree_removed": True, "handoff_pointer": None},
+        {**FINISH_RESULT, "status": "abandoned", "worktree_removed": False, "handoff_pointer": None, "cleanup_error": "WORKTREE_CLEANUP_FAILED"},
+    ],
+)
+def test_task_finish_projects_completed_and_abandoned_results(
+    launcher: ModuleType,
+    tmp_path: Path,
+    status_result: dict[str, object],
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    request = (*FINISH_REQUEST[:6], "--status", str(status_result["status"]), "--validation", "pytest: pass")
+    result_payload = {key: value for key, value in status_result.items() if value is not None}
+    runner.control_results[request] = launcher.CommandResult(
+        0,
+        json.dumps({"command": "task finish", "result": result_payload}, separators=(",", ":")).encode() + b"\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(request), runner)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {"command": "task finish", "result": result_payload}
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda result: result.update({"task_id": OTHER_TASK_ID}),
+        lambda result: result.update({"claim_id": OTHER_CLAIM_ID}),
+        lambda result: result.update({"status": "completed"}),
+        lambda result: result.update({"released_at": "2026-02-30T00:00:00Z"}),
+        lambda result: result.update({"worktree_removed": "false"}),
+        lambda result: result.update({"handoff_pointer": f"/handoffs/{TASK_ID}/{CLAIM_ID}.md"}),
+        lambda result: result.update({"handoff_pointer": f"handoffs/{OTHER_TASK_ID}/{CLAIM_ID}.md"}),
+        lambda result: result.update({"cleanup_error": "anything"}),
+        lambda result: result.pop("released_at"),
+        lambda result: result.update({"extra": True}),
+    ],
+)
+def test_task_finish_rejects_malformed_success_without_payload(
+    launcher: ModuleType,
+    tmp_path: Path,
+    mutate,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    malformed = dict(FINISH_RESULT)
+    mutate(malformed)
+    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
+        0,
+        json.dumps({"command": "task finish", "result": malformed}, separators=(",", ":")).encode() + b"\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+    assert not result.stdout
+
+
+def test_task_finish_success_preserves_outer_warnings(launcher: ModuleType, tmp_path: Path) -> None:
+    runner = FakeCommandRunner(launcher)
+    payload = {
+        "command": "task finish",
+        "result": FINISH_RESULT,
+        "journal_warning": {"code": "JOURNAL_WRITE_FAILED"},
+        "registration_record_warning": {"code": "REGISTRATION_RECORD_UNWRITABLE"},
+    }
+    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
+        0, json.dumps(payload, separators=(",", ":")).encode() + b"\n", b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
+
+    assert json.loads(result.stdout) == {
+        "command": "task finish",
+        "journal_warning": {"code": "JOURNAL_WRITE_FAILED"},
+        "registration_record_warning": {"code": "REGISTRATION_RECORD_UNWRITABLE"},
+        "result": FINISH_RESULT,
+    }
+
+
+def test_task_finish_error_allowlist_is_exact(launcher: ModuleType) -> None:
+    assert launcher.COMMAND_CONTROL_ERROR_CODES["task finish"] == (
+        launcher.COMMON_CONTROL_ERROR_CODES | EXPECTED_TASK_FINISH_SPECIFIC_CODES
+    )
+
+
+@pytest.mark.parametrize("code", sorted(EXPECTED_TASK_FINISH_SPECIFIC_CODES))
+def test_every_task_finish_specific_error_projects(
+    launcher: ModuleType,
+    tmp_path: Path,
+    code: str,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
+        4 if code in {"CLAIM_MISMATCH", "CLAIM_NOT_FOUND"} else 1,
+        b"",
+        json.dumps({"error": {"code": code}}, separators=(",", ":")).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
+
+    assert result.returncode == (4 if code in {"CLAIM_MISMATCH", "CLAIM_NOT_FOUND"} else 1)
+    assert json.loads(result.stderr) == {"error": {"code": code}}
+
+
+@pytest.mark.parametrize("code,reason", [
+    (code, reason)
+    for code, reasons in TASK_FINISH_ERROR_REASONS.items()
+    for reason in sorted(reasons)
+])
+def test_task_finish_error_reasons_are_code_bound(
+    launcher: ModuleType,
+    tmp_path: Path,
+    code: str,
+    reason: str,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
+        1, b"", json.dumps({"error": {"code": code, "reason": reason}}, separators=(",", ":")).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
+
+    assert result.returncode == 1
+    assert json.loads(result.stderr) == {"error": {"code": code, "reason": reason}}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"code": "HANDOFF_RETRY_CONFLICT", "reason": "unknown"},
+        {"code": "WORKTREE_DIRTY", "reason": "git_identity_changed"},
+        {"code": "TASK_COMPLETED", "reason": "handoff_copy_not_plain_file"},
+        {"code": "MADE_UP_ERROR"},
+        {"code": "WORKTREE_DIRTY", "conflicting_claim": {}},
+        {"code": "WORKTREE_DIRTY", "retained_claim": {}},
+    ],
+)
+def test_task_finish_rejects_invalid_error_shapes(
+    launcher: ModuleType,
+    tmp_path: Path,
+    error: dict[str, object],
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
+        1, b"", json.dumps({"error": error}, separators=(",", ":")).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+
+
+def test_task_finish_error_preserves_outer_warnings(launcher: ModuleType, tmp_path: Path) -> None:
+    runner = FakeCommandRunner(launcher)
+    payload = {
+        "error": {"code": "WORKTREE_DIRTY", "reason": "handoff_copy_not_plain_file"},
+        "journal_warning": {"code": "JOURNAL_WRITE_FAILED"},
+        "registration_record_warning": {"code": "REGISTRATION_RECORD_UNREADABLE"},
+    }
+    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
+        1, b"", json.dumps(payload, separators=(",", ":")).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
+
+    assert result.returncode == 1
+    assert json.loads(result.stderr) == payload
+
+
 @pytest.mark.parametrize(
     "argv",
-    [[], ["--help"], ["task"], ["task", "finish"], ["board", "status"], ["project", "register"]],
+    [
+        [], ["--help"], ["task"], ["task", "status"], ["task", "recover"],
+        ["task", "handoff"], ["board", "status"], ["project", "register"],
+    ],
 )
 def test_non_allowlisted_command_stops_before_config_or_provider(
     launcher: ModuleType,
