@@ -3053,6 +3053,34 @@ def test_global_task_guidance_uses_only_installed_host_launcher() -> None:
     assert "credential" not in task_rule.lower()
 
 
+def _assert_readme_v3_contract_boundaries(readme: str) -> None:
+    command_surface = re.search(
+        r"contract v3의 명령 surface는 정확히 (?P<commands>.*?) 다섯 개입니다\.",
+        readme,
+        flags=re.DOTALL,
+    )
+    assert command_surface is not None
+    assert re.findall(r"`([^`]+)`", command_surface.group("commands")) == [
+        "unlock", "preflight", "portfolio status", "task start", "task finish",
+    ]
+
+    finish_section = readme.split("`task finish`의 required/base fields는", 1)[1].split(
+        "반환 오류도", 1,
+    )[0]
+    required_fields = re.search(
+        r"(?P<fields>(?:`[^`]+`, ){4}`[^`]+`)이며",
+        finish_section,
+    )
+    assert required_fields is not None
+    assert re.findall(r"`([^`]+)`", required_fields.group("fields")) == [
+        "task_id", "claim_id", "status", "released_at", "worktree_removed",
+    ]
+    assert re.findall(
+        r"유일한 조건부 필드는 (?:canonical |정확히 )?`([^`]+)`",
+        finish_section,
+    ) == ["handoff_pointer", "cleanup_error=WORKTREE_CLEANUP_FAILED"]
+
+
 def test_readme_documents_secure_store_only_provision_and_no_migration() -> None:
     readme = (REPO / "README.md").read_text(encoding="utf-8")
     command_block = readme.split('"$HOME/.local/bin/jhw-control-host" --contract', 1)[1].split("```", 1)[0]
@@ -3114,3 +3142,20 @@ def test_readme_documents_secure_store_only_provision_and_no_migration() -> None
     assert "jhw-control task start" not in readme
     assert "jhw-control task finish" not in readme
     assert "portfolio status로 좌표를 확인" not in readme
+    _assert_readme_v3_contract_boundaries(readme)
+
+    extra_command = readme.replace(
+        "`task finish` 다섯 개입니다.",
+        "`task finish`, `task cancel` 다섯 개입니다.",
+        1,
+    )
+    with pytest.raises(AssertionError):
+        _assert_readme_v3_contract_boundaries(extra_command)
+
+    extra_conditional_field = readme.replace(
+        "`cleanup_error=WORKTREE_CLEANUP_FAILED`다. 따라서",
+        "`cleanup_error=WORKTREE_CLEANUP_FAILED`다. `abandoned`의 유일한 조건부 필드는 `release_note`다. 따라서",
+        1,
+    )
+    with pytest.raises(AssertionError):
+        _assert_readme_v3_contract_boundaries(extra_conditional_field)
