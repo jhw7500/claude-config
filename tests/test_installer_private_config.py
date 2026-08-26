@@ -10,13 +10,24 @@ import pytest
 
 REPO = Path(__file__).parents[1]
 INSTALL = REPO / "install.sh"
+PRIVATE_FILE = REPO / "scripts" / "lib" / "private-file.sh"
 
 
-def run_install(home: Path, umask: str = "022") -> subprocess.CompletedProcess[str]:
+def run_install(
+    home: Path,
+    umask: str = "022",
+    *,
+    path: str | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ, HOME=str(home))
+    if path is not None:
+        env["PATH"] = path
+    if extra_env is not None:
+        env.update(extra_env)
     # permissive umask 에서도 결과 mode 가 결정적이어야 한다
     return subprocess.run(
-        ["bash", "-c", f'umask {umask}; exec bash "{INSTALL}"'],
+        ["/bin/bash", "-c", f'umask {umask}; exec /bin/bash "{INSTALL}"'],
         env=env, text=True, capture_output=True, check=False,
     )
 
@@ -148,6 +159,80 @@ def test_links_are_still_created(home: Path) -> None:
     assert mode_of(home / ".local" / "bin") == 0o700
     assert mode_of(home / ".local" / "lib") == 0o700
     assert os.access(launcher, os.X_OK)
+
+
+def test_launcher_install_never_executes_leading_path_canaries(home: Path, tmp_path: Path) -> None:
+    """Restoring ambient command lookup would execute one of these fakes."""
+    poison = tmp_path / "poison-bin"
+    poison.mkdir()
+    canary_log = tmp_path / "path-canary.log"
+    real_tools = {
+        "basename": "/usr/bin/basename",
+        "chmod": "/usr/bin/chmod",
+        "cp": "/usr/bin/cp",
+        "date": "/usr/bin/date",
+        "dirname": "/usr/bin/dirname",
+        "grep": "/usr/bin/grep",
+        "install": "/usr/bin/install",
+        "ln": "/usr/bin/ln",
+        "mkdir": "/usr/bin/mkdir",
+        "mktemp": "/usr/bin/mktemp",
+        "mv": "/usr/bin/mv",
+        "python3": "/usr/bin/python3",
+        "rm": "/usr/bin/rm",
+    }
+    for name, real_tool in real_tools.items():
+        fake = poison / name
+        fake.write_text(
+            "#!/bin/sh\n"
+            'printf "%s\\n" "${0##*/}" >> "$PATH_CANARY_LOG"\n'
+            f'exec "{real_tool}" "$@"\n',
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+
+    result = run_install(
+        home,
+        path=f"{poison}{os.pathsep}{os.environ['PATH']}",
+        extra_env={"PATH_CANARY_LOG": str(canary_log)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not canary_log.exists(), canary_log.read_text(encoding="utf-8")
+    installed = home / ".local" / "lib" / "jhw-control-host" / "jhw-control-host.py"
+    assert installed.read_bytes() == (REPO / "scripts" / "jhw-control-host.py").read_bytes()
+
+
+def test_trusted_command_path_rejects_another_principals_writable_directory(tmp_path: Path) -> None:
+    """Removing command-PATH validation would permit an attacker-owned tool."""
+    safe = tmp_path / "safe-bin"
+    safe.mkdir(mode=0o700)
+    safe.chmod(0o700)
+    unsafe = tmp_path / "unsafe-bin"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+
+    def check(path: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                '. "$1"\nassert_trusted_command_path "$2"',
+                "command-path-test",
+                str(PRIVATE_FILE),
+                str(path),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    assert check(safe).returncode == 0
+    assert check(unsafe).returncode != 0
+    sticky = Path("/tmp")
+    sticky_mode = sticky.stat().st_mode
+    if sticky.stat().st_uid == 0 and sticky_mode & stat.S_IWOTH and sticky_mode & stat.S_ISVTX:
+        assert check(sticky).returncode != 0
 
 
 @pytest.mark.parametrize("unsafe", ["writable-local", "unsafe-symlink-target"])
