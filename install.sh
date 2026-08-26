@@ -1,11 +1,25 @@
 #!/bin/bash
 # 다른 호스트에서 실행: 개인 Claude Code 자산 설치 (스킬 + 셸 함수 + 스크립트 + 지침)
+# Installer-owned command lookup: never inherit the caller's PATH while
+# selecting tools that install the credential-bearing launcher.
+PATH=/usr/bin:/bin
+export PATH
 set -e
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE=${BASH_SOURCE[0]}
+case "$SCRIPT_SOURCE" in
+  */*) SCRIPT_DIR=${SCRIPT_SOURCE%/*} ;;
+  *) SCRIPT_DIR=. ;;
+esac
+REPO_DIR="$(cd -- "$SCRIPT_DIR" && pwd -P)"
 # shellcheck source=scripts/lib/link-safely.sh
 . "$REPO_DIR/scripts/lib/link-safely.sh"
 # shellcheck source=scripts/lib/private-file.sh
 . "$REPO_DIR/scripts/lib/private-file.sh"
+
+if ! assert_trusted_command_path "$PATH"; then
+  echo "[install] 오류: installer command path가 안전하지 않다" >&2
+  exit 1
+fi
 
 # launcher가 credential을 읽기 전 다른 local principal이 entrypoint/target을
 # 치환할 수 없도록, 설치 작업에 앞서 기존 전체 경로 체인을 fail-closed 검사한다.
@@ -65,6 +79,11 @@ if ! assert_private_path_chain \
   echo "[install] 오류: launcher 설치 경로가 안전하지 않다" >&2
   exit 1
 fi
+# Preserve the existing optional user-local tool discovery only after its
+# directory chain is verified; this is constructed here, never restored from
+# the caller's ambient PATH.
+PATH="$HOME/.local/bin:$PATH"
+export PATH
 if [ -d "$HOST_LAUNCHER" ]; then
   echo "[install] 오류: launcher 설치 대상이 디렉터리다" >&2
   exit 1
