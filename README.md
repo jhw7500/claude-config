@@ -10,7 +10,7 @@
 | `skills/gstack-toggle/` | gstack 사용자 스킬(~47개) on/off 토글(디렉토리 이동 방식). 미설치 호스트선 no-op이라 안전 |
 | `slack-bridge/` | Slack 비공개 채널 ↔ Claude Code 세션 헤드리스 브릿지. `setup-slack-bridge.sh`로 systemd `--user` 서비스 설치. 상세는 `slack-bridge/README.md` |
 | `shell/plug.sh` | `plug on\|off <key>` 셸 함수 (bkit/docs/pw/pyright/compound) |
-| `scripts/` | 개인 hook/toggle: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, **apex-toggle.sh**, **setup-mcp.sh** |
+| `scripts/` | 개인 hook/toggle과 **jhw-control-host.py** secure launcher: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, apex-toggle.sh, setup-mcp.sh |
 | `hooks/` | 커스텀 훅 6개: carl·notion-continuous·general-continuation·post-info·post-action·bg-task. install.sh가 env-aware **자동 배선** |
 | `manifest/` | `mcp.json` — MCP 서버 정의(공개 6 + 사내 4). `setup-mcp.sh`가 사용 |
 | `claude-md/` | 글로벌 지침: **global-guidance.md**(공통·항상) + CLAUDE-notion.md(notion 환경) + RTK.md(rtk 환경) |
@@ -23,7 +23,8 @@ cd claude-config && ./install.sh
 source ~/.bashrc
 ```
 
-- `skills/`·`scripts/`는 **심볼릭 링크** → `git pull`만 하면 자동 갱신
+- `skills/`·`hooks/`·일반 `scripts/`는 **심볼릭 링크**라 `git pull`로 갱신됩니다. host-control
+  launcher는 mode `0500` 보안 사본이므로 launcher 갱신에는 `./install.sh` 재실행이 필요합니다.
 - **CLAUDE.md 전역지침 (env-aware)**: `~/.claude/CLAUDE.md`의 `claude-config:START/END` 블록만 관리 — 항상 `@global-guidance.md`, **notion MCP 있으면** `@CLAUDE-notion.md`, **`rtk` 있으면** `@RTK.md`를 자동 추가. **OMC 블록은 미변경**(inline/file-split 무관), 실행 전 `.bak` 백업
 - **훅 자동 배선**: `settings.json`에 멱등 추가 — `.bak` 백업, `statusLine`·기존 훅 보존
   - **항상**: `timestamp`(프롬프트/완료) · `stop-text-required`(조기종료 방지) · `general-continuation` · `bg-task-progress`(Pre/Post/SubagentStop, `Agent|Bash`) · `post-info-tool-continuation`
@@ -48,6 +49,77 @@ plug off bkit                            # 플러그인 끄기 → 세션에서 
 # gstack 스킬셋은 Claude 세션에서 "gstack 켜줘/꺼줘" (gstack-toggle 스킬)
 ~/.claude/scripts/apex-toggle.sh off     # APEX 커맨드 비활성화 → 새 세션
 ```
+
+## Project Control Task launcher
+
+`jhw-control-host`는 clean shell에서 Project Control 호출에 필요한 non-secret 좌표와 세 credential을
+parent shell에 남기지 않고 child `jhw-control`에만 주입하는 **secure-store-only** launcher입니다.
+허용 명령은 `unlock`, `preflight`, `portfolio status`, `task start`뿐이며 `task start` 직전에는
+preflight를 다시 강제합니다. 설정·저장소가 안전하지 않거나 preflight가 실패하면 Task mutation을
+실행하지 않습니다.
+
+지원 범위는 Linux Secret Service(DBus session), `/usr/bin/python3`의 system `keyring`·`SecretStorage`,
+그리고 `auth status --show-token --json hosts`와 secure credential store를 지원하는 GitHub CLI입니다.
+launcher는 현재 UID의 private `/run/user/<uid>`와 실제 D-Bus UNIX socket을 직접 검증·파생하므로
+Codex/Claude parent shell에 `XDG_RUNTIME_DIR`나 `DBUS_SESSION_BUS_ADDRESS`를 주입하지 않습니다.
+store가 잠겨 있으면 사용자 터미널에서 다음 한 명령으로 먼저 풉니다.
+
+```bash
+jhw-control-host unlock
+```
+
+이 명령은 기존 `org.freedesktop.secrets` owner를 고정하고 GNOME keyring 40의 exact private
+`UnlockWithMasterPassword` 계약을 feature-detect한 뒤 canonical login collection만 해제합니다.
+daemon을 생성·교체하거나 collection을 생성하지 않으며, 암호는 echo 없이 읽어 child 메모리와 로컬
+D-Bus에만 전달하고 argv·환경·파일·출력에는 넣지 않습니다. 모든 종료 경로에서 terminal 상태를
+복구하고 읽지 않은 입력도 폐기합니다. 비지원 Secret Service나 계약 변경은
+fail-closed합니다. 이미 풀렸으면 암호를 묻지 않습니다. 잠금 해제 후 backend를 고정해 다음 값을
+명시적으로 provision합니다.
+
+```bash
+/usr/bin/python3 -I -m keyring --keyring-backend keyring.backends.SecretService.Keyring set jhw-control GH_PROJECT_TOKEN
+/usr/bin/python3 -I -m keyring --keyring-backend keyring.backends.SecretService.Keyring set jhw-control NOTION_API_KEY
+gh auth login --hostname github.com --git-protocol ssh --web
+```
+
+Project token과 Repo token은 달라야 합니다. GitHub CLI 저장 상태는 `gh auth status --hostname github.com
+--active --json hosts`의 단일 active entry가 `tokenSource=keyring`이어야 하며, 평문 `hosts.yml` token은
+거부됩니다. 계정이 없거나 평문 저장 상태이면 위 `gh auth login`을 다시 수행하고 launcher로
+`tokenSource=keyring`을 재검증합니다(credential store가 없어서 `gh`가 평문 fallback하면 계속 거부).
+`install.sh`는 launcher를 전용 `0700` 디렉터리의 mode `0500` 사본으로 atomic 설치하고
+`~/.local/bin`에는 그 사본의 링크만 배치합니다. **설치 중 credential 조회·갱신을 하지 않고** 기존
+파일 값을 자동 migration하지 않습니다. 잠김 시 조치는 `jhw-control-host unlock` 하나이며,
+runtime 누락·credential 누락 시에도 launcher가 출력하는 path-free 단일 조치만 수행합니다.
+
+보안 경계에서 현재 UID는 OS credential store에 접근할 수 있는 신뢰 주체입니다. launcher는 그 밖의
+로컬 principal이 바꿀 수 있는 executable 및 ancestor를 거부합니다. group-write는 해당 group의
+primary/supplementary member가 현재 UID 하나뿐임을 계정 DB에서 확인할 때만 허용하고, POSIX
+access/default ACL과 world-write는 거부하며, ambient
+`PATH`·Python/Node preload·credential 환경은 상속하지 않습니다. 고정 PATH의 모든 검색 디렉터리도
+credential 조회 전에 같은 기준으로 검사하고, 검색 디렉터리 자체에는 sticky world-write도 허용하지
+않습니다. installer 역시 `$HOME`부터 launcher entrypoint/target까지 기존 원본·해결 경로 체인을 먼저
+검사합니다. 따라서 downstream `jhw-control` 설치물과 그 상위 디렉터리도 다른 principal의 write
+권한이 없어야 합니다.
+
+```bash
+"$HOME/.local/bin/jhw-control-host" --contract
+"$HOME/.local/bin/jhw-control-host" unlock
+"$HOME/.local/bin/jhw-control-host" preflight
+"$HOME/.local/bin/jhw-control-host" portfolio status
+"$HOME/.local/bin/jhw-control-host" task start <기존-jhw-task-인자>
+```
+
+launcher 자체 오류는 path-free JSON과 안정적인 exit code로 반환합니다. 하위 `jhw-control` 출력은
+12 KiB·단일 JSON·command별 strict schema·stdout/stderr 계약을 검증한 뒤 canonical JSON으로 다시
+직렬화합니다. `task start` 성공은 `task_id`, `claim_id`, `branch`, `worktree_ref`와 검증된 optional
+`latest_handoff`만 남기며, 명시한 `--task`/`--project`/`--repo-id`와 응답 좌표도 대조합니다. 다른
+호스트가 먼저 선점한 정상 충돌의 host 값은 bounded 검증·민감정보 검사만 하고 반환하지 않습니다.
+오류 code와 exit code 조합도 command별 계약과 다르면 폐기합니다. token 또는 보호된
+config/credential-store/입력 checkout 경로가 raw·stream 결합·JSON decode·base64·대소문자가 섞인
+hex/percent escape·표준 URL quote 형태로 출력에 섞이면 전체 출력을 폐기하고
+`SENSITIVE_OUTPUT_REJECTED`로 실패합니다. Portfolio의 Unicode 텍스트 길이, GitHub ID byte 상한,
+repository slug도 downstream schema와 같은 경계로 검증합니다. Claude와 Codex의
+`$jhw-task` 정본 연동은 연결된 jhw-notion #74 Formal Task에서 같은 delivery sequence로 배포합니다.
 
 ## MCP 등록 (opt-in)
 
