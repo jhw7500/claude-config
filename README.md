@@ -52,6 +52,7 @@ plug off bkit                            # 플러그인 끄기 → 세션에서 
 
 ## Project Control Task launcher
 
+<!-- jhw-control-host-v3-operator-contract:start -->
 `jhw-control-host`는 clean shell에서 Project Control 호출에 필요한 non-secret 좌표와 세 credential을
 parent shell에 남기지 않고 child `jhw-control`에만 주입하는 **secure-store-only** launcher입니다.
 contract v3의 명령 surface는 정확히 `unlock`, `preflight`, `portfolio status`, `task start`,
@@ -152,6 +153,7 @@ hex/percent escape·표준 URL quote 형태로 출력에 섞이면 전체 출력
 `SENSITIVE_OUTPUT_REJECTED`로 실패합니다. Portfolio의 Unicode 텍스트 길이, GitHub ID byte 상한,
 repository slug도 downstream schema와 같은 경계로 검증합니다. Claude와 Codex의
 `$jhw-task` 정본 연동은 연결된 jhw-notion #74 Formal Task에서 같은 delivery sequence로 배포합니다.
+<!-- jhw-control-host-v3-operator-contract:end -->
 
 ## MCP 등록 (opt-in)
 
