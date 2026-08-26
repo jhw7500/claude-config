@@ -79,11 +79,6 @@ if ! assert_private_path_chain \
   echo "[install] 오류: launcher 설치 경로가 안전하지 않다" >&2
   exit 1
 fi
-# Preserve the existing optional user-local tool discovery only after its
-# directory chain is verified; this is constructed here, never restored from
-# the caller's ambient PATH.
-PATH="$HOME/.local/bin:$PATH"
-export PATH
 if [ -d "$HOST_LAUNCHER" ]; then
   echo "[install] 오류: launcher 설치 대상이 디렉터리다" >&2
   exit 1
@@ -130,7 +125,14 @@ if grep -qi "notion" "$HOME/.claude.json" 2>/dev/null; then
 else
   rm -f ~/.claude/CLAUDE-notion.md 2>/dev/null; NOTION="없음(skip)"
 fi
-if command -v rtk >/dev/null 2>&1; then
+RTK_AVAILABLE=0
+for RTK_CANDIDATE in "$HOME/.local/bin/rtk" /usr/local/bin/rtk /usr/bin/rtk; do
+  if [ -x "$RTK_CANDIDATE" ] && [ ! -d "$RTK_CANDIDATE" ]; then
+    RTK_AVAILABLE=1
+    break
+  fi
+done
+if [ "$RTK_AVAILABLE" -eq 1 ]; then
   install_doc "$REPO_DIR/claude-md/RTK.md" ~/.claude/RTK.md
   IMPORTS="$IMPORTS
 @RTK.md"; RTK="있음"

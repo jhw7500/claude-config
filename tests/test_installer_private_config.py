@@ -203,6 +203,52 @@ def test_launcher_install_never_executes_leading_path_canaries(home: Path, tmp_p
     assert installed.read_bytes() == (REPO / "scripts" / "jhw-control-host.py").read_bytes()
 
 
+@pytest.mark.parametrize("entry_kind", ["executable", "symlink"])
+def test_launcher_install_never_executes_user_local_path_canaries(
+    home: Path, tmp_path: Path, entry_kind: str,
+) -> None:
+    """The user-local tool directory must remain data, not installer PATH."""
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True, mode=0o700)
+    local_bin.chmod(0o700)
+    canary_log = tmp_path / "path-canary.log"
+    names = ("rtk", "install", "mv", "ln", "python3", "basename")
+
+    if entry_kind == "executable":
+        delegator_dir = local_bin
+    else:
+        delegator_dir = tmp_path / "delegators"
+        delegator_dir.mkdir()
+
+    for name in names:
+        delegator = delegator_dir / name
+        real_tool = Path("/usr/bin") / name
+        body = (
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "${{0##*/}}" >> "$PATH_CANARY_LOG"\n'
+        )
+        if name == "rtk":
+            body += "exit 97\n"
+        else:
+            body += f'exec "{real_tool}" "$@"\n'
+        delegator.write_text(body, encoding="utf-8")
+        delegator.chmod(0o755)
+        if entry_kind == "symlink":
+            (local_bin / name).symlink_to(delegator)
+
+    result = run_install(
+        home,
+        path="/usr/bin:/bin",
+        extra_env={"PATH_CANARY_LOG": str(canary_log)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "@RTK.md" in (home / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+    assert not canary_log.exists()
+    installed = home / ".local" / "lib" / "jhw-control-host" / "jhw-control-host.py"
+    assert installed.read_bytes() == (REPO / "scripts" / "jhw-control-host.py").read_bytes()
+
+
 def test_trusted_command_path_rejects_another_principals_writable_directory(tmp_path: Path) -> None:
     """Removing command-PATH validation would permit an attacker-owned tool."""
     safe = tmp_path / "safe-bin"
