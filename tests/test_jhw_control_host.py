@@ -3053,11 +3053,41 @@ def test_global_task_guidance_uses_only_installed_host_launcher() -> None:
     assert "credential" not in task_rule.lower()
 
 
+def _readme_inline_code_spans(markdown: str) -> list[str]:
+    spans = []
+    index = 0
+    in_fence = False
+    while index < len(markdown):
+        if markdown.startswith("```", index):
+            in_fence = not in_fence
+            index += 3
+        elif markdown[index] == "`" and not in_fence:
+            end = markdown.find("`", index + 1)
+            assert end != -1
+            spans.append(markdown[index + 1:end])
+            index = end + 1
+        else:
+            index += 1
+    assert not in_fence
+    return spans
+
+
 def _assert_readme_v3_contract_boundaries(readme: str) -> None:
-    section = readme.split("<!-- jhw-control-host-v3-contract:start -->", 1)[1].split(
-        "<!-- jhw-control-host-v3-contract:end -->", 1,
-    )[0]
-    lines = [line for line in section.splitlines() if line]
+    outer_start = "<!-- jhw-control-host-v3-operator-contract:start -->"
+    outer_end = "<!-- jhw-control-host-v3-operator-contract:end -->"
+    inventory_start = "<!-- jhw-control-host-v3-contract:start -->"
+    inventory_end = "<!-- jhw-control-host-v3-contract:end -->"
+
+    assert readme.count(outer_start) == 1
+    assert readme.count(outer_end) == 1
+    assert f"## Project Control Task launcher\n\n{outer_start}" in readme
+    assert f"{outer_end}\n\n## MCP 등록 (opt-in)" in readme
+    operator_contract = readme.split(outer_start, 1)[1].split(outer_end, 1)[0]
+
+    assert operator_contract.count(inventory_start) == 1
+    assert operator_contract.count(inventory_end) == 1
+    inventory = operator_contract.split(inventory_start, 1)[1].split(inventory_end, 1)[0]
+    lines = [line for line in inventory.splitlines() if line]
     assert len(lines) == 5
     assert lines[:2] == [
         "| Inventory | Exact v3 values |",
@@ -3074,21 +3104,83 @@ def _assert_readme_v3_contract_boundaries(readme: str) -> None:
         "finish required/base fields",
         "finish conditional fields",
     }
-    assert re.findall(r"`([^`]+)`", rows["launcher command families"]) == [
+    command_families = re.findall(r"`([^`]+)`", rows["launcher command families"])
+    assert command_families == [
         "unlock", "preflight", "portfolio status", "task start", "task finish",
     ]
-    assert re.findall(r"`([^`]+)`", rows["finish required/base fields"]) == [
+    required_fields = re.findall(r"`([^`]+)`", rows["finish required/base fields"])
+    assert required_fields == [
         "task_id", "claim_id", "status", "released_at", "worktree_removed",
     ]
-    assert re.findall(r"`([^`]+)`", rows["finish conditional fields"]) == [
+    conditional_fields = re.findall(r"`([^`]+)`", rows["finish conditional fields"])
+    assert conditional_fields == [
         "handoff_pointer", "cleanup_error=WORKTREE_CLEANUP_FAILED",
     ]
+
+    inventory_block = operator_contract.split(inventory_start, 1)[1].split(
+        inventory_end, 1,
+    )[0]
+    operator_prose = operator_contract.replace(
+        f"{inventory_start}{inventory_block}{inventory_end}",
+        "",
+        1,
+    )
+    documented_command_families = set(re.findall(
+        r"(?<![A-Za-z0-9_-])(?:jhw-control-host[\"`]?\s+)?"
+        r"(unlock|preflight|portfolio\s+[a-z][a-z-]*|task\s+[a-z][a-z-]*)"
+        r"(?![A-Za-z0-9_-])",
+        operator_prose,
+    ))
+    assert documented_command_families == set(command_families)
+
+    other_identifier_tokens = {
+        "abandoned",
+        "branch",
+        "completed",
+        "duplicate_dirty_files",
+        "gh",
+        "handoff",
+        "handoff_copy_not_plain_file",
+        "keyring",
+        "latest_handoff",
+        "preflight",
+        "unlock",
+        "worktree_ref",
+    }
+    expected_identifier_tokens = (
+        set(required_fields) | set(conditional_fields) | other_identifier_tokens
+    )
+    documented_identifier_tokens = {
+        span
+        for span in _readme_inline_code_spans(operator_prose)
+        if re.fullmatch(
+            r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*(?:=[A-Z][A-Z0-9_]*)?",
+            span,
+        )
+    }
+    assert documented_identifier_tokens == expected_identifier_tokens
+
+    documented_snake_case_tokens = set(re.findall(
+        r"(?<![A-Za-z0-9])"
+        r"([a-z][a-z0-9]*(?:_[a-z0-9]+)+(?:=[A-Z][A-Z0-9_]*)?)"
+        r"(?![A-Za-z0-9])",
+        operator_prose,
+    ))
+    assert documented_snake_case_tokens == {
+        token for token in expected_identifier_tokens if "_" in token
+    }
 
 
 def _add_to_v3_contract_section(readme: str, addition: str) -> str:
     marker = "<!-- jhw-control-host-v3-contract:end -->"
     assert readme.count(marker) == 1
     return readme.replace(marker, f"{addition}\n{marker}", 1)
+
+
+def _add_after_v3_contract_inventory(readme: str, addition: str) -> str:
+    marker = "<!-- jhw-control-host-v3-contract:end -->"
+    assert readme.count(marker) == 1
+    return readme.replace(marker, f"{marker}\n{addition}", 1)
 
 
 def test_readme_documents_secure_store_only_provision_and_no_migration() -> None:
@@ -3172,22 +3264,22 @@ def test_readme_documents_secure_store_only_provision_and_no_migration() -> None
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda readme: _add_to_v3_contract_section(
+        lambda readme: _add_after_v3_contract_inventory(
             readme,
             "`jhw-control-host task cancel --task <tsk-id>`",
         ),
-        lambda readme: _add_to_v3_contract_section(
+        lambda readme: _add_after_v3_contract_inventory(
             readme,
             "abandoned 결과에는 `release_note`도 반환할 수 있다.",
         ),
-        lambda readme: _add_to_v3_contract_section(
+        lambda readme: _add_after_v3_contract_inventory(
             readme,
             "운영자 note `operator_note`도 required/base output이다.",
         ),
     ],
     ids=["extra-launcher-command", "extra-conditional-field", "extra-required-base-field"],
 )
-def test_readme_v3_contract_boundaries_rejects_unbounded_documentation(
+def test_readme_documents_v3_contract_boundaries_rejects_outside_inventory_bypasses(
     mutate,
 ) -> None:
     readme = (REPO / "README.md").read_text(encoding="utf-8")
