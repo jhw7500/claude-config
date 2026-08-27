@@ -339,6 +339,9 @@ TASK_SUBCOMMANDS = (
     "assert-owner",
 )
 TASK_SUBCOMMAND_SET = frozenset(TASK_SUBCOMMANDS)
+MUTATING_TASK_SUBCOMMANDS = frozenset({
+    "start", "child-start", "contract", "completion-ready", "promote", "finish",
+})
 
 CONTRACT = {
     "commands": [
@@ -1169,6 +1172,25 @@ def _allowed_invocation(argv: Sequence[str]) -> bool:
     )
 
 
+def _task_requires_preflight(argv: Sequence[str]) -> bool:
+    values = tuple(argv)
+    if len(values) < 2 or values[0] != "task":
+        return False
+    if values[1] in MUTATING_TASK_SUBCOMMANDS:
+        return True
+    if values[1] != "recover":
+        return False
+    action_positions = [
+        index for index, value in enumerate(values)
+        if value == "--action"
+    ]
+    return not (
+        len(action_positions) == 1
+        and action_positions[0] + 1 < len(values)
+        and values[action_positions[0] + 1] == "status"
+    )
+
+
 def _control_call(
     runner: Callable[..., CommandResult],
     tools: HostTools,
@@ -1823,7 +1845,7 @@ def run_program(
             *(value for index, value in enumerate(argv) if index and argv[index - 1] == "--repo-path"),
             *(value for value in (child_env.get("SSH_AUTH_SOCK"),) if value),
         )
-        if tuple(argv[:2]) in {("task", "start"), ("task", "finish")}:
+        if _task_requires_preflight(argv):
             preflight = _program_result(
                 _control_call(runner, selected_tools, ("preflight",), child_env),
                 command=("preflight",),
