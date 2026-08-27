@@ -39,6 +39,25 @@ CONFIG_VALUES = {
     "JHW_PREFLIGHT_PROJECT_ITEM_ID": "PVTI_fixture",
     "JHW_PREFLIGHT_REGISTRY_ISSUE_NUMBER": "1",
 }
+V4_COMMANDS = [
+    "unlock",
+    "preflight",
+    "portfolio status",
+    "task start",
+    "task child-start",
+    "task contract",
+    "task completion-ready",
+    "task promote",
+    "task status",
+    "task handoff",
+    "task finish",
+    "task recover",
+    "task assert-owner",
+]
+V4_TASK_SUBCOMMANDS = [
+    "start", "child-start", "contract", "completion-ready", "promote",
+    "status", "handoff", "finish", "recover", "assert-owner",
+]
 
 
 def load_launcher() -> ModuleType:
@@ -172,8 +191,10 @@ def test_executable_startup_ignores_path_and_python_poison(tmp_path: Path) -> No
 
     assert path_result.returncode == 0, path_result.stderr
     assert module_result.returncode == 0, module_result.stderr
-    assert json.loads(path_result.stdout)["version"] == 3
-    assert json.loads(module_result.stdout)["version"] == 3
+    assert json.loads(path_result.stdout)["version"] == 4
+    assert json.loads(module_result.stdout)["version"] == 4
+    assert json.loads(path_result.stdout)["commands"] == V4_COMMANDS
+    assert json.loads(module_result.stdout)["commands"] == V4_COMMANDS
     assert not path_marker.exists()
     assert not module_marker.exists()
 
@@ -197,13 +218,48 @@ def test_contract_needs_no_config_or_provider_and_is_path_free(
     assert result.stderr == b""
     payload = json.loads(result.stdout)
     assert payload == {
-        "commands": ["unlock", "preflight", "portfolio status", "task start", "task finish"],
+        "commands": V4_COMMANDS,
         "credential_policy": "secure-store-only",
         "name": "jhw-control-host",
-        "version": 3,
+        "version": 4,
     }
     assert str(tmp_path).encode() not in result.stdout
     assert b"ambient-must-not-appear" not in result.stdout
+
+
+@pytest.mark.parametrize("subcommand", V4_TASK_SUBCOMMANDS)
+def test_v4_task_inventory_is_allowlisted(subcommand: str, launcher: ModuleType) -> None:
+    assert launcher._allowed_invocation(["task", subcommand]) is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["task"],
+        ["task", "cancel"],
+        ["task", "switch"],
+        ["task", "start-extra"],
+        ["portfolio", "export"],
+    ],
+)
+def test_outside_v4_inventory_is_rejected_before_config_or_provider(
+    launcher: ModuleType,
+    tmp_path: Path,
+    argv: list[str],
+) -> None:
+    def unexpected_runner(*_args, **_kwargs):
+        raise AssertionError("rejected command must not read a provider or run a child")
+
+    result = launcher.run_program(
+        argv,
+        home=tmp_path / "missing-home",
+        environment={"GH_TOKEN": "ambient-must-not-appear"},
+        uid=os.getuid(),
+        command_runner=unexpected_runner,
+    )
+
+    assert result.returncode == 2
+    assert json.loads(result.stderr) == {"error": {"code": "INVALID_ARGUMENT"}}
 
 
 def test_reads_exact_literal_control_config(launcher: ModuleType, tmp_path: Path) -> None:
@@ -2030,8 +2086,8 @@ def test_task_finish_error_preserves_outer_warnings(launcher: ModuleType, tmp_pa
 @pytest.mark.parametrize(
     "argv",
     [
-        [], ["--help"], ["task"], ["task", "status"], ["task", "recover"],
-        ["task", "handoff"], ["board", "status"], ["project", "register"],
+        [], ["--help"], ["task"], ["task", "cancel"], ["task", "switch"],
+        ["board", "status"], ["project", "register"],
     ],
 )
 def test_non_allowlisted_command_stops_before_config_or_provider(

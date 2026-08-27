@@ -326,11 +326,30 @@ def read_control_config(path: str | os.PathLike[str], *, uid: int | None = None)
         os.close(descriptor)
 
 
+TASK_SUBCOMMANDS = (
+    "start",
+    "child-start",
+    "contract",
+    "completion-ready",
+    "promote",
+    "status",
+    "handoff",
+    "finish",
+    "recover",
+    "assert-owner",
+)
+TASK_SUBCOMMAND_SET = frozenset(TASK_SUBCOMMANDS)
+
 CONTRACT = {
-    "commands": ["unlock", "preflight", "portfolio status", "task start", "task finish"],
+    "commands": [
+        "unlock",
+        "preflight",
+        "portfolio status",
+        *(f"task {subcommand}" for subcommand in TASK_SUBCOMMANDS),
+    ],
     "credential_policy": "secure-store-only",
     "name": "jhw-control-host",
-    "version": 3,
+    "version": 4,
 }
 
 
@@ -1142,8 +1161,11 @@ def _allowed_invocation(argv: Sequence[str]) -> bool:
         values == ("unlock",)
         or values == ("preflight",)
         or values[:2] == ("portfolio", "status")
-        or values[:2] == ("task", "start")
-        or values[:2] == ("task", "finish")
+        or (
+            len(values) >= 2
+            and values[0] == "task"
+            and values[1] in TASK_SUBCOMMAND_SET
+        )
     )
 
 
