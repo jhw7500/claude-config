@@ -1416,7 +1416,11 @@ def _validate_task_start_result(
     request: Sequence[str],
 ) -> dict[str, object]:
     result = _exact_object(value, {"task", "claim", "branch", "worktree_ref", "reused"}, {"latest_handoff"})
-    task = _exact_object(result.get("task"), {"task_id", "kind", "project_id", "repo_id"})
+    task = _exact_object(
+        result.get("task"),
+        {"task_id", "kind", "project_id", "repo_id"},
+        {"task_role"},
+    )
     claim = _exact_object(
         result.get("claim"),
         {"task_id", "claim_id", "project_id", "repo_id", "host", "branch", "worktree_ref", "started_at"},
@@ -1428,7 +1432,15 @@ def _validate_task_start_result(
     requested_task_id = _requested_id(request, "--task", TASK_ID_RE)
     requested_project_id = _requested_id(request, "--project", PROJECT_ID_RE)
     requested_repo_id = _requested_id(request, "--repo-id", REPO_ID_RE)
-    if task.get("kind") not in {"formal", "temporary"}:
+    task_kind = task.get("kind")
+    task_role = task.get("task_role")
+    if task_kind not in {"formal", "temporary"}:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    if "task_role" in task and (
+        not isinstance(task_role, str)
+        or task_role not in {"standalone", "parent"}
+        or (task_kind == "temporary" and task_role != "standalone")
+    ):
         raise LauncherError("CONTROL_OUTPUT_INVALID")
     worktree_ref, branch = _worktree_coordinates(
         task_id,
