@@ -42,120 +42,8 @@ REPO_ID_RE = re.compile(r"^repo-[a-z0-9][a-z0-9-]{1,62}$")
 WORKTREE_REF_RE = re.compile(r"^wt-[a-z0-9][a-z0-9-]{1,120}$")
 GITHUB_SLUG_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
 OFFSET_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$")
-COMMON_CONTROL_ERROR_CODES = frozenset(
-    {
-        "UNEXPECTED", "INVALID_CLI_ARGUMENT", "COMMAND_TIMEOUT", "COMMAND_FAILED",
-        "COMMAND_ABORTED", "COMMAND_OUTPUT_TOO_LARGE", "CLI_OUTPUT_TOO_LARGE",
-        "RAW_OUTPUT_TOO_LARGE", "LOCK_ACQUIRE_FAILED", "LOCK_ACQUIRE_TIMEOUT",
-        "LOCK_SPAWN_FAILED", "LOCK_SETUP_FAILED", "LOCK_BUSY", "LOCK_CONTENDED",
-        "REGISTRY_MOVED_DURING_READ", "REGISTRY_CORRUPT", "REGISTRY_DIRTY",
-        "REGISTRY_INDEX_UNSAFE", "REMOTE_DIVERGED", "REMOTE_VERIFY_FAILED",
-        "INVALID_CONFIG", "MISSING_CREDENTIAL", "SENSITIVE_DATA_REJECTED",
-        "SENSITIVE_OUTPUT_REJECTED", "SENSITIVE_SCAN_TOO_LARGE",
-        "AUTHORITY_UNAVAILABLE", "AUTHORITY_EPOCH_ROLLBACK",
-        "AUTHORITY_MOVED", "AUTHORITY_POLICY_NOT_LEGACY", "TOOL_VERSION_TOO_OLD",
-    }
-)
-TASK_FINISH_ERROR_REASONS = {
-    "HANDOFF_RETRY_CONFLICT": frozenset(
-        {
-            "invalid_git_state_line", "duplicate_git_state_key",
-            "unexpected_git_state_key", "missing_git_state_key",
-            "invalid_git_state_count", "missing_git_identity",
-            "invalid_dirty_digest", "legacy_dirty_evidence_ambiguous",
-            "git_identity_changed", "dirty_delta_changed",
-            "handoff_metadata_mismatch", "retry_fields_changed",
-        }
-    ),
-    "INVALID_WORKTREE_INSPECTION": frozenset({"duplicate_dirty_files"}),
-    "WORKTREE_DIRTY": frozenset({"handoff_copy_not_plain_file"}),
-}
-COMMAND_CONTROL_ERROR_CODES = {
-    "preflight": COMMON_CONTROL_ERROR_CODES
-    | {
-        "PREFLIGHT_UNAVAILABLE", "INVALID_PREFLIGHT_RESULT", "PREFLIGHT_RESTORE_FAILED",
-        "PREFLIGHT_PROJECT_INTEGRITY", "INVALID_PREFLIGHT_ISSUE", "INVALID_PREFLIGHT_ITEM",
-        "NOTION_GUARD_INDETERMINATE", "NOTION_WRITES_DISABLED", "PORTFOLIO_UNAVAILABLE",
-        "CREDENTIALS_NOT_SEPARATE", "PROJECT_SCOPE_UNVERIFIABLE",
-        "PROJECT_TOKEN_HAS_REPO_SCOPE", "PROJECT_SCOPE_MISSING", "PROJECT_SCOPE_NOT_EXACT",
-        "UNSUPPORTED_REGISTRY_OWNER", "REGISTRY_ROOT_MISMATCH", "AMBIGUOUS_REGISTRY_REMOTE",
-        "REGISTRY_REMOTE_NOT_SSH", "REGISTRY_REMOTE_MISMATCH", "PROJECT_NOT_PRIVATE",
-        "REPOSITORY_NOT_PRIVATE", "INVALID_PROJECT_FIELDS", "INVALID_PROJECT_RESPONSE",
-        "INVALID_REPOSITORY_RESPONSE", "DUPLICATE_PROJECT_ITEM", "DUPLICATE_PROJECT_RECORD",
-        "REPOSITORY_IDENTITY_MISMATCH", "PROJECT_NOT_FOUND", "PROJECT_CHANGED_DURING_READ",
-        "INCOMPLETE_PROJECT_FIELD_READ", "INVALID_PROJECT_MUTATION", "UNSAFE_STATE_PATH",
-    },
-    "portfolio status": COMMON_CONTROL_ERROR_CODES
-    | {
-        "PORTFOLIO_UNAVAILABLE", "INVALID_PORTFOLIO_RESULT", "PORTFOLIO_PAYLOAD_TOO_LARGE",
-        "PORTFOLIO_ITEM_TOO_LARGE", "PORTFOLIO_REPOSITORY_SECTION_TOO_LARGE",
-        "INVALID_PAGE_ID", "PROJECT_NOT_FOUND", "INVALID_PREFLIGHT_ITEM",
-        "INVALID_PROJECT_RECORD", "REPOSITORY_NOT_FOUND",
-        "PROJECT_NOT_PRIVATE", "INVALID_PROJECT_SOURCE", "PROJECT_CHANGED_DURING_READ",
-        "INCOMPLETE_PROJECT_FIELD_READ", "INCOMPLETE_PROJECT_READ", "INVALID_PROJECT_FIELDS",
-        "INVALID_PROJECT_ITEM", "INVALID_PROJECT_RESPONSE",
-        "DUPLICATE_PROJECT_ITEM", "DUPLICATE_PROJECT_RECORD",
-    },
-    "task start": COMMON_CONTROL_ERROR_CODES
-    | {
-        "TASK_ALREADY_CLAIMED", "CLAIM_MISMATCH", "CLAIM_NOT_FOUND",
-        "CLAIM_HISTORY_NOT_FOUND", "HOST_MISMATCH", "TASK_COMPLETED", "TASK_START_FAILED",
-        "TASK_CONTRACT_REQUIRED", "TASK_CONTRACT_MISMATCH", "TASK_CONTRACT_ACTIVE",
-        "TASK_SCOPE_MISMATCH", "TASK_ALIAS_MISMATCH", "TASK_ALIAS_CONFLICT",
-        "ISSUE_IDENTITY_MISMATCH", "ISSUE_REVISION_MISMATCH", "ISSUE_REPOSITORY_MISMATCH",
-        "INVALID_ISSUE_URL", "INVALID_ISSUE_RESPONSE", "INVALID_REPOSITORY_ID",
-        "INVALID_REPOSITORY_RESPONSE", "REPOSITORY_IDENTITY_MISMATCH", "REPOSITORY_NOT_FOUND",
-        "REPOSITORY_NOT_PRIVATE", "INVALID_CHECKOUT_PATH", "CHECKOUT_ROOT_MISMATCH",
-        "INVALID_CHECKOUT_ORIGIN", "AMBIGUOUS_CHECKOUT_ORIGIN", "CHECKOUT_REMOTE_MISMATCH",
-        "INVALID_TASK_ID", "INVALID_CLAIM_ID", "INVALID_CLAIM", "INVALID_CLOCK",
-        "INVALID_FORMAL_TASK", "INVALID_TEMPORARY_TASK", "FORMAL_TASK_SOURCE_MISMATCH",
-        "STALE_SOURCE_REVISION", "TEMPORARY_ALIAS_CONFLICT", "PROJECT_RECORD_NOT_FOUND",
-        "PROJECT_REPOSITORY_MISMATCH", "WORKTREE_CLEANUP_REQUIRED", "WORKTREE_PLAN_MISMATCH",
-        "WORKTREE_MAPPING_MISMATCH", "WORKTREE_LIFECYCLE_MISMATCH", "WORKTREE_CREATE_PENDING",
-        "WORKTREE_MAPPING_AMBIGUOUS", "WORKTREE_BRANCH_MISMATCH", "WORKTREE_REPOSITORY_MISMATCH",
-        "INVALID_WORKTREE_STATE", "INVALID_GIT_STATE", "INVALID_REPOSITORY_PATH",
-        "UNSAFE_WORKTREE_PATH", "UNSAFE_WORKTREE_ROOT", "INVALID_WORKTREE_REF",
-        "UNSAFE_STATE_PATH", "WORKTREE_STATE_WRITE_FAILED", "HANDOFF_MISSING",
-        "INVALID_HANDOFF_PATH", "INVALID_HANDOFF_EVIDENCE",
-        "INVALID_MUTATION_PATH", "MUTATION_PATH_MISMATCH",
-        "INVALID_PROJECT_RESPONSE", "PROJECT_NOT_FOUND", "PROJECT_CHANGED_DURING_READ",
-        "INCOMPLETE_PROJECT_READ", "INVALID_PREFLIGHT_ITEM", "INVALID_PROJECT_RECORD",
-        "DUPLICATE_PROJECT_ITEM", "DUPLICATE_PROJECT_RECORD", "REGISTRY_ROOT_MISMATCH",
-        "AMBIGUOUS_REGISTRY_REMOTE", "REGISTRY_REMOTE_NOT_SSH", "REGISTRY_REMOTE_MISMATCH",
-        "PROJECT_NOT_PRIVATE",
-        "PROJECT_REPOSITORY_NOT_FOUND", "PROJECT_REPOSITORY_AMBIGUOUS",
-    },
-    "task finish": COMMON_CONTROL_ERROR_CODES
-    | {
-        "CLAIM_MISMATCH", "CLAIM_NOT_FOUND", "HOST_MISMATCH", "TASK_COMPLETED",
-        "INVALID_CLOCK", "SOURCE_REVISION_MISMATCH", "INVALID_FINISH_OUTCOME",
-        "HANDOFF_MISSING", "HANDOFF_RETRY_CONFLICT", "INVALID_HANDOFF_EVIDENCE",
-        "UNSAFE_HANDOFF_PATH", "INVALID_WORKTREE_INSPECTION", "WORKTREE_DIRTY",
-        "WORKTREE_NOT_MAPPED", "WORKTREE_REMOVE_PENDING", "WORKTREE_REMOVED",
-        "WORKTREE_PLAN_MISMATCH", "WORKTREE_CLAIM_MISMATCH",
-        "WORKTREE_MAPPING_MISMATCH", "WORKTREE_BRANCH_MISMATCH",
-        "WORKTREE_REPOSITORY_MISMATCH", "WORKTREE_CREATE_PENDING",
-        "INVALID_WORKTREE_STATE", "INVALID_GIT_STATE", "INVALID_REPOSITORY_PATH",
-        "UNSAFE_WORKTREE_PATH", "UNSAFE_WORKTREE_ROOT", "UNSAFE_STATE_PATH",
-        "MUTATION_PATH_MISMATCH",
-    },
-}
-CONFLICT_EXIT_CODES = frozenset({"TASK_ALREADY_CLAIMED", "CLAIM_MISMATCH", "CLAIM_NOT_FOUND"})
-RETRY_EXIT_CODES = frozenset(
-    {"REMOTE_DIVERGED", "REMOTE_VERIFY_FAILED", "REGISTRY_DIRTY", "LOCK_BUSY", "LOCK_CONTENDED", "LOCK_ACQUIRE_TIMEOUT"}
-)
-POLICY_EXIT_CODES = frozenset(
-    {
-        "AUTHORITY_UNAVAILABLE", "AUTHORITY_EPOCH_ROLLBACK", "AUTHORITY_POLICY_NOT_LEGACY",
-        "TOOL_VERSION_TOO_OLD", "NOTION_GUARD_INDETERMINATE", "MISSING_CREDENTIAL",
-        "PORTFOLIO_UNAVAILABLE", "PREFLIGHT_UNAVAILABLE", "INVALID_CONFIG",
-        "CREDENTIALS_NOT_SEPARATE", "PROJECT_SCOPE_UNVERIFIABLE",
-        "PROJECT_TOKEN_HAS_REPO_SCOPE", "PROJECT_SCOPE_MISSING", "PROJECT_SCOPE_NOT_EXACT",
-        "UNSUPPORTED_REGISTRY_OWNER", "REGISTRY_REMOTE_NOT_SSH", "REGISTRY_REMOTE_MISMATCH",
-        "AMBIGUOUS_REGISTRY_REMOTE", "PROJECT_NOT_PRIVATE", "REPOSITORY_NOT_PRIVATE",
-        "COMMAND_TIMEOUT",
-    }
-)
+ERROR_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
+ERROR_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 HANDOFF_SECTION_NAMES = frozenset(
     {
         "Progress Since Last Checkpoint",
@@ -1589,75 +1477,86 @@ def _validate_generic_task_result(value: object) -> dict[str, object]:
     return dict(_required_object(value, set()))
 
 
+def _validate_retained_claim(value: object, *, request: Sequence[str]) -> dict[str, object]:
+    retained = _required_object(value, {"task_id", "claim_id", "state"})
+    task_id = _canonical_id(retained["task_id"], TASK_ID_RE)
+    requested_task = _requested_id(request, "--task", TASK_ID_RE)
+    state = retained["state"]
+    if (
+        requested_task is not None and task_id != requested_task
+    ) or not isinstance(state, str) or state not in {"active", "released"}:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    return {
+        "task_id": task_id,
+        "claim_id": _canonical_id(retained["claim_id"], CLAIM_ID_RE),
+        "state": state,
+    }
+
+
+def _validate_retained_task(value: object, *, request: Sequence[str]) -> dict[str, object]:
+    retained = _required_object(value, {"task_id"})
+    task_id = _canonical_id(retained["task_id"], TASK_ID_RE)
+    requested_task = _requested_id(request, "--task", TASK_ID_RE)
+    if requested_task is not None and task_id != requested_task:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    return {"task_id": task_id}
+
+
+def _validate_conflicting_claim(
+    value: object,
+    *,
+    request: Sequence[str],
+) -> dict[str, object]:
+    conflict = _required_object(
+        value,
+        {"task_id", "claim_id", "branch", "worktree_ref", "started_at"},
+    )
+    task_id = _canonical_id(conflict["task_id"], TASK_ID_RE)
+    requested_task = _requested_id(request, "--task", TASK_ID_RE)
+    if requested_task is not None and task_id != requested_task:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    worktree_ref, branch = _worktree_coordinates(
+        task_id,
+        conflict["worktree_ref"],
+        conflict["branch"],
+    )
+    return {
+        "task_id": task_id,
+        "claim_id": _canonical_id(conflict["claim_id"], CLAIM_ID_RE),
+        "branch": branch,
+        "worktree_ref": worktree_ref,
+        "started_at": _timestamp(conflict["started_at"]),
+    }
+
+
 def _validate_error_result(
     value: object,
     *,
-    command: str,
     request: Sequence[str],
 ) -> dict[str, object]:
-    error = _exact_object(value, {"code"}, {"reason", "conflicting_claim", "retained_claim"})
-    code = error.get("code")
-    if not isinstance(code, str) or code not in COMMAND_CONTROL_ERROR_CODES.get(command, frozenset()):
+    error = _required_object(value, {"code"})
+    code = error["code"]
+    if not isinstance(code, str) or ERROR_CODE_RE.fullmatch(code) is None:
         raise LauncherError("CONTROL_OUTPUT_INVALID")
     projected: dict[str, object] = {"code": code}
     if "reason" in error:
         reason = error["reason"]
-        allowed_reasons = TASK_FINISH_ERROR_REASONS.get(str(code), frozenset())
-        if command != "task finish" or not isinstance(reason, str) or reason not in allowed_reasons:
+        if not isinstance(reason, str) or ERROR_REASON_RE.fullmatch(reason) is None:
             raise LauncherError("CONTROL_OUTPUT_INVALID")
         projected["reason"] = reason
     if "conflicting_claim" in error:
-        if code != "TASK_ALREADY_CLAIMED":
-            raise LauncherError("CONTROL_OUTPUT_INVALID")
-        conflict = _exact_object(
-            error["conflicting_claim"],
-            {"task_id", "claim_id", "host", "branch", "worktree_ref", "started_at"},
+        projected["conflicting_claim"] = _validate_conflicting_claim(
+            error["conflicting_claim"], request=request,
         )
-        task_id = _canonical_id(conflict.get("task_id"), TASK_ID_RE)
-        requested_task_id = _requested_id(request, "--task", TASK_ID_RE)
-        worktree_ref, branch = _worktree_coordinates(
-            task_id,
-            conflict.get("worktree_ref"),
-            conflict.get("branch"),
-        )
-        _bounded_text(conflict.get("host"), maximum=255)
-        if requested_task_id is not None and task_id != requested_task_id:
-            raise LauncherError("CONTROL_OUTPUT_INVALID")
-        projected["conflicting_claim"] = {
-            "task_id": task_id,
-            "claim_id": _canonical_id(conflict.get("claim_id"), CLAIM_ID_RE),
-            "branch": branch,
-            "worktree_ref": worktree_ref,
-            "started_at": _timestamp(conflict.get("started_at")),
-        }
     if "retained_claim" in error:
-        if command != "task start" or code == "TASK_ALREADY_CLAIMED":
-            raise LauncherError("CONTROL_OUTPUT_INVALID")
-        retained = _exact_object(error["retained_claim"], {"task_id", "claim_id", "state"})
-        if retained.get("state") not in {"active", "released"}:
-            raise LauncherError("CONTROL_OUTPUT_INVALID")
-        retained_task_id = _canonical_id(retained.get("task_id"), TASK_ID_RE)
-        requested_task_id = _requested_id(request, "--task", TASK_ID_RE)
-        if requested_task_id is not None and retained_task_id != requested_task_id:
-            raise LauncherError("CONTROL_OUTPUT_INVALID")
-        projected["retained_claim"] = {
-            "task_id": retained_task_id,
-            "claim_id": _canonical_id(retained.get("claim_id"), CLAIM_ID_RE),
-            "state": retained["state"],
-        }
+        projected["retained_claim"] = _validate_retained_claim(
+            error["retained_claim"], request=request,
+        )
+    if "retained_task" in error:
+        projected["retained_task"] = _validate_retained_task(
+            error["retained_task"], request=request,
+        )
     return projected
-
-
-def _expected_error_returncode(code: str, *, command: str) -> int:
-    if code in CONFLICT_EXIT_CODES:
-        return 4
-    if code in RETRY_EXIT_CODES:
-        return 75
-    if code == "INVALID_CLI_ARGUMENT":
-        return 2
-    if command == "preflight" or code in POLICY_EXIT_CODES:
-        return 78
-    return 1
 
 
 def _validated_control_result(result: CommandResult, command: Sequence[str], *, build_host: str) -> ProgramResult:
@@ -1702,9 +1601,7 @@ def _validated_control_result(result: CommandResult, command: Sequence[str], *, 
         {"journal_warning", "registration_record_warning"},
     )
     expected = " ".join(command[:2]) if command and command[0] in {"portfolio", "task"} else " ".join(command)
-    validated_error = _validate_error_result(payload.get("error"), command=expected, request=command)
-    if result.returncode != _expected_error_returncode(str(validated_error["code"]), command=expected):
-        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    validated_error = _validate_error_result(payload.get("error"), request=command)
     output = {
         "error": validated_error,
         **_output_warnings(payload),

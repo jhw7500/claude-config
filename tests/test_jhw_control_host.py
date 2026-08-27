@@ -390,38 +390,6 @@ GENERIC_TASK_SUCCESSES = [
     (("task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "status"), {"kind": "status", "task_id": TASK_ID, "claim_id": CLAIM_ID}),
     (("task", "assert-owner", "--task", TASK_ID, "--claim", CLAIM_ID), {"owned": True, "claim": {"task_id": TASK_ID, "claim_id": CLAIM_ID}}),
 ]
-TASK_FINISH_ERROR_REASONS = {
-    "HANDOFF_RETRY_CONFLICT": frozenset({
-        "invalid_git_state_line", "duplicate_git_state_key",
-        "unexpected_git_state_key", "missing_git_state_key",
-        "invalid_git_state_count", "missing_git_identity",
-        "invalid_dirty_digest", "legacy_dirty_evidence_ambiguous",
-        "git_identity_changed", "dirty_delta_changed",
-        "handoff_metadata_mismatch", "retry_fields_changed",
-    }),
-    "INVALID_WORKTREE_INSPECTION": frozenset({"duplicate_dirty_files"}),
-    "WORKTREE_DIRTY": frozenset({"handoff_copy_not_plain_file"}),
-}
-TASK_FINISH_CODES_BY_CALL_SITE = {
-    "finish_preconditions": frozenset({
-        "CLAIM_MISMATCH", "CLAIM_NOT_FOUND", "HOST_MISMATCH", "TASK_COMPLETED",
-        "INVALID_CLOCK", "SOURCE_REVISION_MISMATCH", "INVALID_FINISH_OUTCOME",
-    }),
-    "handoff_validation": frozenset({
-        "HANDOFF_MISSING", "HANDOFF_RETRY_CONFLICT", "INVALID_HANDOFF_EVIDENCE",
-        "UNSAFE_HANDOFF_PATH",
-    }),
-    "worktree_inspection_and_release": frozenset({
-        "INVALID_WORKTREE_INSPECTION", "WORKTREE_DIRTY", "WORKTREE_NOT_MAPPED",
-        "WORKTREE_REMOVE_PENDING", "WORKTREE_REMOVED", "WORKTREE_PLAN_MISMATCH",
-        "WORKTREE_CLAIM_MISMATCH", "WORKTREE_MAPPING_MISMATCH",
-        "WORKTREE_BRANCH_MISMATCH", "WORKTREE_REPOSITORY_MISMATCH",
-        "WORKTREE_CREATE_PENDING", "INVALID_WORKTREE_STATE", "INVALID_GIT_STATE",
-        "INVALID_REPOSITORY_PATH", "UNSAFE_WORKTREE_PATH", "UNSAFE_WORKTREE_ROOT",
-        "UNSAFE_STATE_PATH", "MUTATION_PATH_MISMATCH",
-    }),
-}
-EXPECTED_TASK_FINISH_SPECIFIC_CODES = frozenset().union(*TASK_FINISH_CODES_BY_CALL_SITE.values())
 UNLOCK_PRIVATE_XML = """\
 <node>
   <interface name="org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface">
@@ -2182,78 +2150,82 @@ def test_task_finish_success_preserves_outer_warnings(launcher: ModuleType, tmp_
     }
 
 
-def test_task_finish_error_allowlist_is_exact(launcher: ModuleType) -> None:
-    assert launcher.COMMAND_CONTROL_ERROR_CODES["task finish"] == (
-        launcher.COMMON_CONTROL_ERROR_CODES | EXPECTED_TASK_FINISH_SPECIFIC_CODES
-    )
-
-
-@pytest.mark.parametrize("code", sorted(EXPECTED_TASK_FINISH_SPECIFIC_CODES))
-def test_every_task_finish_specific_error_projects(
-    launcher: ModuleType,
-    tmp_path: Path,
-    code: str,
-) -> None:
-    runner = FakeCommandRunner(launcher)
-    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
-        4 if code in {"CLAIM_MISMATCH", "CLAIM_NOT_FOUND"} else 1,
-        b"",
-        json.dumps({"error": {"code": code}}, separators=(",", ":")).encode() + b"\n",
-    )
-
-    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
-
-    assert result.returncode == (4 if code in {"CLAIM_MISMATCH", "CLAIM_NOT_FOUND"} else 1)
-    assert json.loads(result.stderr) == {"error": {"code": code}}
-
-
-@pytest.mark.parametrize("code,reason", [
-    (code, reason)
-    for code, reasons in TASK_FINISH_ERROR_REASONS.items()
-    for reason in sorted(reasons)
-])
-def test_task_finish_error_reasons_are_code_bound(
-    launcher: ModuleType,
-    tmp_path: Path,
-    code: str,
-    reason: str,
-) -> None:
-    runner = FakeCommandRunner(launcher)
-    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
-        1, b"", json.dumps({"error": {"code": code, "reason": reason}}, separators=(",", ":")).encode() + b"\n",
-    )
-
-    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
-
-    assert result.returncode == 1
-    assert json.loads(result.stderr) == {"error": {"code": code, "reason": reason}}
-
-
 @pytest.mark.parametrize(
     "error",
     [
-        {"code": "HANDOFF_RETRY_CONFLICT", "reason": "unknown"},
-        {"code": "WORKTREE_DIRTY", "reason": "git_identity_changed"},
-        {"code": "TASK_COMPLETED", "reason": "handoff_copy_not_plain_file"},
-        {"code": "MADE_UP_ERROR"},
-        {"code": "WORKTREE_DIRTY", "conflicting_claim": {}},
-        {"code": "WORKTREE_DIRTY", "retained_claim": {}},
+        {"code": "lowercase"},
+        {"code": "A"},
+        {"code": "_LEADING"},
+        {"code": "A" * 65},
+        {"code": 7},
+        {"code": "SAFE_CODE", "reason": "Uppercase"},
+        {"code": "SAFE_CODE", "reason": "has-hyphen"},
+        {"code": "SAFE_CODE", "reason": "a" * 65},
     ],
 )
-def test_task_finish_rejects_invalid_error_shapes(
+def test_error_code_and_reason_formats_are_bounded(
     launcher: ModuleType,
     tmp_path: Path,
     error: dict[str, object],
 ) -> None:
     runner = FakeCommandRunner(launcher)
-    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
-        1, b"", json.dumps({"error": error}, separators=(",", ":")).encode() + b"\n",
+    command = ("task", "status", "--task", TASK_ID)
+    runner.control_results[command] = launcher.CommandResult(
+        1, b"", json.dumps({"error": error}).encode() + b"\n",
     )
 
-    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
+    result = run_secure(launcher, tmp_path, list(command), runner)
 
     assert result.returncode == 78
     assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+
+
+def test_safe_reason_survives_and_unrecognized_details_are_dropped(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "status", "--task", TASK_ID)
+    runner.control_results[command] = launcher.CommandResult(
+        1,
+        b"",
+        b'{"error":{"code":"FUTURE_STABLE_ERROR","reason":"new_safe_reason","diagnostic":"drop-me","nested":{"drop":true}}}\n',
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert json.loads(result.stderr) == {
+        "error": {"code": "FUTURE_STABLE_ERROR", "reason": "new_safe_reason"},
+    }
+
+
+@pytest.mark.parametrize("returncode", [1, 2, 4, 75, 78])
+@pytest.mark.parametrize("argv", [
+    ["preflight"],
+    ["portfolio", "status"],
+    ["task", "start"],
+    ["task", "status", "--task", TASK_ID],
+    ["task", "finish", "--task", TASK_ID, "--claim", CLAIM_ID, "--status", "handoff"],
+])
+def test_stable_downstream_error_code_preserves_any_allowed_exit(
+    launcher: ModuleType,
+    tmp_path: Path,
+    argv: list[str],
+    returncode: int,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[tuple(argv)] = launcher.CommandResult(
+        returncode,
+        b"",
+        b'{"error":{"code":"FUTURE_STABLE_ERROR"}}\n',
+    )
+    if argv[:2] in [["task", "start"], ["task", "finish"]]:
+        runner.control_results[("preflight",)] = launcher.CommandResult(0, PREFLIGHT_OUTPUT, b"")
+
+    result = run_secure(launcher, tmp_path, argv, runner)
+
+    assert result.returncode == returncode
+    assert json.loads(result.stderr) == {"error": {"code": "FUTURE_STABLE_ERROR"}}
 
 
 def test_task_finish_error_preserves_outer_warnings(launcher: ModuleType, tmp_path: Path) -> None:
@@ -2571,65 +2543,42 @@ def test_reachable_command_errors_are_preserved(
     assert json.loads(result.stderr) == {"error": {"code": code}}
 
 
-@pytest.mark.parametrize(
-    ("argv", "error", "returncode"),
-    [
-        (["preflight"], {"code": "BOARD_BUSY", "reason": "exclusive_holder"}, 4),
-        (["preflight"], {"code": "MADE_UP_ERROR"}, 4),
-        (["preflight"], {"code": "MISSING_CREDENTIAL"}, 4),
-        (["portfolio", "status"], {"code": "TASK_ALREADY_CLAIMED"}, 4),
-        (["portfolio", "status"], {"code": "INVALID_CLOCK"}, 1),
-        (
-            ["task", "start", "--issue", "https://example.test/issues/28"],
-            {"code": "HANDOFF_RETRY_CONFLICT", "reason": "git_identity_changed"},
-            1,
-        ),
-        *[
-            (
-                ["task", "start", "--issue", "https://example.test/issues/28"],
-                {"code": code},
-                1,
-            )
-            for code in (
-                "CLAIM_ALREADY_ACTIVE",
-                "SOURCE_REVISION_MISMATCH",
-                "WORKTREE_NOT_MAPPED",
-                "WORKTREE_CLAIM_MISMATCH",
-                "WORKTREE_REMOVE_PENDING",
-                "WORKTREE_REMOVED",
-                "WORKTREE_UNPUSHED",
-                "WORKTREE_CLEANUP_FAILED",
-                "INVALID_WORKTREE_INSPECTION",
-                "STATE_PERSIST_FAILED",
-                "UNSAFE_HANDOFF_PATH",
-                "HANDOFF_NOT_FOUND",
-                "INVALID_REPOSITORY",
-                "REPOSITORY_ID_COLLISION",
-                "SOURCE_ALREADY_MAPPED",
-            )
-        ],
-        (["portfolio", "status"], {"code": "PROJECT_RECORD_NOT_FOUND"}, 1),
-        (["portfolio", "status"], {"code": "INVALID_REPOSITORY_RESPONSE"}, 1),
-    ],
-)
-def test_error_output_uses_a_closed_command_specific_schema(
+def test_error_preserves_only_canonical_workflow_coordinates(
     launcher: ModuleType,
     tmp_path: Path,
-    argv: list[str],
-    error: dict[str, object],
-    returncode: int,
 ) -> None:
     runner = FakeCommandRunner(launcher)
-    runner.control_results[tuple(argv)] = launcher.CommandResult(
-        returncode,
-        b"",
-        json.dumps({"error": error}, separators=(",", ":")).encode() + b"\n",
+    command = ("task", "child-start", "--parent", OTHER_TASK_ID)
+    upstream_error = {
+        "code": "TASK_SESSION_BUSY",
+        "reason": "session_busy",
+        "retained_claim": {
+            "task_id": TASK_ID,
+            "claim_id": CLAIM_ID,
+            "state": "released",
+            "host": "drop-me",
+        },
+        "retained_task": {"task_id": TASK_ID, "alias": "drop-me"},
+        "diagnostic": "drop-me",
+    }
+    runner.control_results[command] = launcher.CommandResult(
+        4, b"", json.dumps({"error": upstream_error}).encode() + b"\n",
     )
 
-    result = run_secure(launcher, tmp_path, argv, runner)
+    result = run_secure(launcher, tmp_path, list(command), runner)
 
-    assert result.returncode == 78
-    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+    assert json.loads(result.stderr) == {
+        "error": {
+            "code": "TASK_SESSION_BUSY",
+            "reason": "session_busy",
+            "retained_claim": {
+                "task_id": TASK_ID,
+                "claim_id": CLAIM_ID,
+                "state": "released",
+            },
+            "retained_task": {"task_id": TASK_ID},
+        },
+    }
 
 
 @pytest.mark.parametrize(
@@ -2638,8 +2587,6 @@ def test_error_output_uses_a_closed_command_specific_schema(
         {"branch": "task/different"},
         {"worktree_ref": "/tmp/not-a-coordinate"},
         {"branch": "task/ffffffffffff-other", "worktree_ref": "wt-ffffffffffff-other"},
-        {"host": "other\nbuild-host"},
-        {"host": "x" * 256},
         {"started_at": "2026-02-30T00:00:00Z"},
     ],
 )
@@ -2714,6 +2661,52 @@ def test_task_conflict_accepts_another_host_but_does_not_disclose_it(
         }
     }
     assert b"other-build-host" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"retained_claim": {"task_id": "not-a-task", "claim_id": CLAIM_ID, "state": "active"}},
+        {"retained_claim": {"task_id": TASK_ID, "claim_id": "not-a-claim", "state": "active"}},
+        {"retained_claim": {"task_id": TASK_ID, "claim_id": CLAIM_ID, "state": "unknown"}},
+        {"retained_task": {"task_id": "not-a-task"}},
+        {
+            "conflicting_claim": {
+                "task_id": "not-a-task",
+                "claim_id": CLAIM_ID,
+                "branch": TASK_BRANCH,
+                "worktree_ref": WORKTREE_REF,
+                "started_at": "2026-08-26T00:00:00Z",
+            },
+        },
+        {
+            "conflicting_claim": {
+                "task_id": TASK_ID,
+                "claim_id": "not-a-claim",
+                "branch": TASK_BRANCH,
+                "worktree_ref": WORKTREE_REF,
+                "started_at": "2026-08-26T00:00:00Z",
+            },
+        },
+    ],
+)
+def test_error_rejects_invalid_retained_or_conflict_coordinates(
+    launcher: ModuleType,
+    tmp_path: Path,
+    details: dict[str, object],
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "status", "--task", TASK_ID)
+    runner.control_results[command] = launcher.CommandResult(
+        1,
+        b"",
+        json.dumps({"error": {"code": "FUTURE_STABLE_ERROR", **details}}).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
 
 
 @pytest.mark.parametrize(
