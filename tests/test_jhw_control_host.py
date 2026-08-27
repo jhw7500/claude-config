@@ -58,6 +58,26 @@ V4_TASK_SUBCOMMANDS = [
     "start", "child-start", "contract", "completion-ready", "promote",
     "status", "handoff", "finish", "recover", "assert-owner",
 ]
+V4_TASK_COMMAND_LINES = [
+    '"$HOME/.local/bin/jhw-control-host" task start --resolve-from-checkout true <registration-args>',
+    '"$HOME/.local/bin/jhw-control-host" task child-start <child-args>',
+    '"$HOME/.local/bin/jhw-control-host" task contract <contract-args>',
+    '"$HOME/.local/bin/jhw-control-host" task completion-ready <evidence-args>',
+    '"$HOME/.local/bin/jhw-control-host" task promote <promotion-args>',
+    '"$HOME/.local/bin/jhw-control-host" task status --task <tsk-id>',
+    '"$HOME/.local/bin/jhw-control-host" task handoff --task <tsk-id>',
+    '"$HOME/.local/bin/jhw-control-host" task finish --task <tsk-id> --claim <clm-id> --status <completed|handoff|abandoned>',
+    '"$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <clm-id> --action <status|force-end|takeover|cleanup>',
+    '"$HOME/.local/bin/jhw-control-host" task assert-owner --task <tsk-id> --claim <clm-id>',
+]
+V4_PRODUCER_ROLLOUT = (
+    "`producer merge → install.sh 재실행 → clean-shell --contract/preflight\n"
+    "→ jhw-notion Task skill host-only 전환 → approved real Task migration`"
+)
+V4_COORDINATE_POLICY = (
+    "workflow 분기에 필요한 `conflicting_claim`,\n"
+    "`retained_claim`, `retained_task`는 canonical coordinate만 남기고 그 밖의 detail은 폐기합니다."
+)
 
 
 def load_launcher() -> ModuleType:
@@ -3396,6 +3416,12 @@ def _assert_readme_v4_contract_boundaries(readme: str) -> None:
     assert f"{outer_end}\n\n## MCP 등록 (opt-in)" in readme
     operator_contract = readme.split(outer_start, 1)[1].split(outer_end, 1)[0]
 
+    command_block = operator_contract.split(
+        '"$HOME/.local/bin/jhw-control-host" --contract', 1,
+    )[1].split("```", 1)[0]
+    task_commands = [line.strip() for line in command_block.splitlines() if " task " in line]
+    assert task_commands == V4_TASK_COMMAND_LINES
+
     assert operator_contract.count(inventory_start) == 1
     assert operator_contract.count(inventory_end) == 1
     inventory = operator_contract.split(inventory_start, 1)[1].split(inventory_end, 1)[0]
@@ -3481,7 +3507,8 @@ def _assert_readme_v4_contract_boundaries(readme: str) -> None:
         "conflicting_claim",
         "retained_claim",
         "retained_task",
-        "producer merge → install.sh 재실행 → clean-shell --contract/preflight",
+        V4_PRODUCER_ROLLOUT,
+        V4_COORDINATE_POLICY,
     ):
         assert required in operator_contract
 
@@ -3531,15 +3558,16 @@ def test_readme_documents_secure_store_only_provision_and_no_migration() -> None
     assert "설치 중 credential" in readme
     for task_subcommand in V4_TASK_SUBCOMMANDS:
         assert f'"$HOME/.local/bin/jhw-control-host" task {task_subcommand}' in command_block
-    assert "jhw-control task start" not in command_block
-    assert "jhw-control task finish" not in command_block
+    task_commands = [line.strip() for line in command_block.splitlines() if " task " in line]
+    assert task_commands == V4_TASK_COMMAND_LINES
     assert "jhw-control task" in readme
     assert "canonical JSON object pass-through after common security validation" in readme
     assert "code `[A-Z][A-Z0-9_]{1,63}`, optional reason `[a-z][a-z0-9_]{0,63}`, exit `1|2|4|75|78`" in readme
     assert "`task start`와 `task finish`는 v3 public projection과 caller-coordinate binding을 유지" in readme
     assert "`task child-start`는 `task_id`, `claim_id`, `branch`,\n`worktree_ref` 네 좌표만 반환" in readme
     assert "host는 command별\ncode allowlist나 code-to-exit 표를 복제하지 않습니다" in readme
-    assert "jhw-notion Task skill host-only 전환" in readme
+    assert V4_PRODUCER_ROLLOUT in readme
+    assert V4_COORDINATE_POLICY in readme
     _assert_readme_v4_contract_boundaries(readme)
 
     extra_command = _add_to_v4_contract_section(
