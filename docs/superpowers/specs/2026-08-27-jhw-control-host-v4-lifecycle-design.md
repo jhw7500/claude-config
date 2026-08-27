@@ -1,7 +1,7 @@
 # jhw-control-host v4 Task lifecycle 설계
 
 - 날짜: 2026-08-27
-- 상태: 대화 설계 승인, 문서 검토 대기
+- 상태: 사용자 승인
 - 대상: `jhw7500/claude-config#28`, `jhw7500/jhw-notion#74`
 
 ## 배경
