@@ -3384,11 +3384,11 @@ def _readme_inline_code_spans(markdown: str) -> list[str]:
     return spans
 
 
-def _assert_readme_v3_contract_boundaries(readme: str) -> None:
-    outer_start = "<!-- jhw-control-host-v3-operator-contract:start -->"
-    outer_end = "<!-- jhw-control-host-v3-operator-contract:end -->"
-    inventory_start = "<!-- jhw-control-host-v3-contract:start -->"
-    inventory_end = "<!-- jhw-control-host-v3-contract:end -->"
+def _assert_readme_v4_contract_boundaries(readme: str) -> None:
+    outer_start = "<!-- jhw-control-host-v4-operator-contract:start -->"
+    outer_end = "<!-- jhw-control-host-v4-operator-contract:end -->"
+    inventory_start = "<!-- jhw-control-host-v4-contract:start -->"
+    inventory_end = "<!-- jhw-control-host-v4-contract:end -->"
 
     assert readme.count(outer_start) == 1
     assert readme.count(outer_end) == 1
@@ -3400,34 +3400,41 @@ def _assert_readme_v3_contract_boundaries(readme: str) -> None:
     assert operator_contract.count(inventory_end) == 1
     inventory = operator_contract.split(inventory_start, 1)[1].split(inventory_end, 1)[0]
     lines = [line for line in inventory.splitlines() if line]
-    assert len(lines) == 5
+    assert len(lines) == 8
     assert lines[:2] == [
-        "| Inventory | Exact v3 values |",
+        "| Inventory | Exact v4 values |",
         "| --- | --- |",
     ]
-    rows = {
-        cells[0]: cells[1]
-        for line in lines[2:]
-        for cells in [[cell.strip() for cell in line.split("|")[1:-1]]]
-        if len(cells) == 2
-    }
+    rows = {}
+    for line in lines[2:]:
+        match = re.fullmatch(r"\|\s*([^|]+?)\s*\|\s*(.*?)\s*\|", line)
+        assert match is not None
+        rows[match.group(1)] = match.group(2)
     assert set(rows) == {
         "launcher command families",
-        "finish required/base fields",
-        "finish conditional fields",
+        "hidden preflight mutations",
+        "read-only without hidden preflight",
+        "compatibility projections",
+        "generic Task results",
+        "downstream errors",
     }
     command_families = re.findall(r"`([^`]+)`", rows["launcher command families"])
-    assert command_families == [
-        "unlock", "preflight", "portfolio status", "task start", "task finish",
+    assert command_families == V4_COMMANDS
+    assert re.findall(r"`([^`]+)`", rows["hidden preflight mutations"]) == [
+        "task start", "task child-start", "task contract", "task completion-ready",
+        "task promote", "task finish", "task recover --action force-end|takeover|cleanup",
     ]
-    required_fields = re.findall(r"`([^`]+)`", rows["finish required/base fields"])
-    assert required_fields == [
-        "task_id", "claim_id", "status", "released_at", "worktree_removed",
+    assert re.findall(r"`([^`]+)`", rows["read-only without hidden preflight"]) == [
+        "task status", "task handoff", "task assert-owner", "task recover --action status",
     ]
-    conditional_fields = re.findall(r"`([^`]+)`", rows["finish conditional fields"])
-    assert conditional_fields == [
-        "handoff_pointer", "cleanup_error=WORKTREE_CLEANUP_FAILED",
-    ]
+    assert rows["compatibility projections"] == "`task start`, `task finish`, `task child-start`"
+    assert rows["generic Task results"] == (
+        "canonical JSON object pass-through after common security validation"
+    )
+    assert rows["downstream errors"] == (
+        "code `[A-Z][A-Z0-9_]{1,63}`, optional reason `[a-z][a-z0-9_]{0,63}`, "
+        "exit `1|2|4|75|78`"
+    )
 
     inventory_block = operator_contract.split(inventory_start, 1)[1].split(
         inventory_end, 1,
@@ -3443,25 +3450,19 @@ def _assert_readme_v3_contract_boundaries(readme: str) -> None:
         r"(?![A-Za-z0-9_-])",
         operator_prose,
     ))
-    assert documented_command_families == set(command_families)
+    assert documented_command_families == set(V4_COMMANDS)
 
-    other_identifier_tokens = {
-        "abandoned",
+    expected_identifier_tokens = {
         "branch",
-        "completed",
-        "duplicate_dirty_files",
+        "claim_id",
+        "conflicting_claim",
         "gh",
-        "handoff",
-        "handoff_copy_not_plain_file",
         "keyring",
-        "latest_handoff",
-        "preflight",
-        "unlock",
+        "retained_claim",
+        "retained_task",
+        "task_id",
         "worktree_ref",
     }
-    expected_identifier_tokens = (
-        set(required_fields) | set(conditional_fields) | other_identifier_tokens
-    )
     documented_identifier_tokens = {
         span
         for span in _readme_inline_code_spans(operator_prose)
@@ -3472,25 +3473,27 @@ def _assert_readme_v3_contract_boundaries(readme: str) -> None:
     }
     assert documented_identifier_tokens == expected_identifier_tokens
 
-    documented_snake_case_tokens = set(re.findall(
-        r"(?<![A-Za-z0-9])"
-        r"([a-z][a-z0-9]*(?:_[a-z0-9]+)+(?:=[A-Z][A-Z0-9_]*)?)"
-        r"(?![A-Za-z0-9])",
-        operator_prose,
-    ))
-    assert documented_snake_case_tokens == {
-        token for token in expected_identifier_tokens if "_" in token
-    }
+    for required in (
+        "compatibility projections",
+        "generic Task results",
+        "downstream errors",
+        "SENSITIVE_OUTPUT_REJECTED",
+        "conflicting_claim",
+        "retained_claim",
+        "retained_task",
+        "producer merge → install.sh 재실행 → clean-shell --contract/preflight",
+    ):
+        assert required in operator_contract
 
 
-def _add_to_v3_contract_section(readme: str, addition: str) -> str:
-    marker = "<!-- jhw-control-host-v3-contract:end -->"
+def _add_to_v4_contract_section(readme: str, addition: str) -> str:
+    marker = "<!-- jhw-control-host-v4-contract:end -->"
     assert readme.count(marker) == 1
     return readme.replace(marker, f"{addition}\n{marker}", 1)
 
 
-def _add_after_v3_contract_inventory(readme: str, addition: str) -> str:
-    marker = "<!-- jhw-control-host-v3-contract:end -->"
+def _add_after_v4_contract_inventory(readme: str, addition: str) -> str:
+    marker = "<!-- jhw-control-host-v4-contract:end -->"
     assert readme.count(marker) == 1
     return readme.replace(marker, f"{marker}\n{addition}", 1)
 
@@ -3513,85 +3516,66 @@ def test_readme_documents_secure_store_only_provision_and_no_migration() -> None
         "현재 UID",
         "0500",
         "--contract",
-        "contract v3",
+        "contract v4",
         "preflight",
         "portfolio status",
         "task start",
         "task finish",
         "--resolve-from-checkout true",
         "hidden preflight",
-        "worktree_removed",
-        "HANDOFF_RETRY_CONFLICT",
-        "--project",
-        "--repo-id",
-        "--task",
+        "generic Task results",
         "producer merge → install.sh 재실행 → clean-shell --contract/preflight",
     ):
         assert required in readme
     assert "자동 migration하지" in readme
     assert "설치 중 credential" in readme
-    assert (
-        "contract v3의 명령 surface는 정확히 `unlock`, `preflight`, `portfolio status`, `task start`,\n"
-        "`task finish` 다섯 개입니다."
-    ) in readme
-    assert (
-        "`task start`와 `task finish` 앞에는 사용자 출력에 드러나지 않는\n"
-        "hidden preflight를 강제"
-    ) in readme
-    assert '"$HOME/.local/bin/jhw-control-host" task start --resolve-from-checkout true' in command_block
-    assert '"$HOME/.local/bin/jhw-control-host" task start --task <tsk-id>' in command_block
-    assert '"$HOME/.local/bin/jhw-control-host" task finish --task <tsk-id> --claim <clm-id>' in command_block
-    assert "`task finish`의 required/base fields는 `task_id`, `claim_id`, `status`, `released_at`, `worktree_removed`" in readme
-    assert "`handoff`의 유일한 조건부 필드는 canonical `handoff_pointer`" in readme
-    assert "non-handoff cleanup failure의 유일한 조건부 필드는 정확히 `cleanup_error=WORKTREE_CLEANUP_FAILED`" in readme
-    assert "`HANDOFF_RETRY_CONFLICT`의 handoff/git-state metadata reason" in readme
-    assert "`INVALID_WORKTREE_INSPECTION`의\n`duplicate_dirty_files`, `WORKTREE_DIRTY`의 `handoff_copy_not_plain_file`만 reason" in readme
-    assert "start projection의 optional caller-coordinate binding" in readme
-    assert "생략해도 downstream Task/Claim coordinate validation은 약해지지 않는다" in readme
-    rollout = (
-        "producer merge → install.sh 재실행 → clean-shell --contract/preflight\n"
-        "→ jhw-notion resolver/skill merge → approved real Task smoke"
-    )
-    assert rollout in readme
-    assert "jhw-control task start" not in readme
-    assert "jhw-control task finish" not in readme
-    assert "portfolio status로 좌표를 확인" not in readme
-    _assert_readme_v3_contract_boundaries(readme)
+    for task_subcommand in V4_TASK_SUBCOMMANDS:
+        assert f'"$HOME/.local/bin/jhw-control-host" task {task_subcommand}' in command_block
+    assert "jhw-control task start" not in command_block
+    assert "jhw-control task finish" not in command_block
+    assert "jhw-control task" in readme
+    assert "canonical JSON object pass-through after common security validation" in readme
+    assert "code `[A-Z][A-Z0-9_]{1,63}`, optional reason `[a-z][a-z0-9_]{0,63}`, exit `1|2|4|75|78`" in readme
+    assert "`task start`와 `task finish`는 v3 public projection과 caller-coordinate binding을 유지" in readme
+    assert "`task child-start`는 `task_id`, `claim_id`, `branch`,\n`worktree_ref` 네 좌표만 반환" in readme
+    assert "host는 command별\ncode allowlist나 code-to-exit 표를 복제하지 않습니다" in readme
+    assert "jhw-notion Task skill host-only 전환" in readme
+    _assert_readme_v4_contract_boundaries(readme)
 
-    extra_command = _add_to_v3_contract_section(
+    extra_command = _add_to_v4_contract_section(
         readme,
         "`jhw-control-host task cancel --task <tsk-id>`",
     )
     with pytest.raises(AssertionError):
-        _assert_readme_v3_contract_boundaries(extra_command)
+        _assert_readme_v4_contract_boundaries(extra_command)
 
-    extra_conditional_field = _add_to_v3_contract_section(
+    extra_conditional_field = _add_to_v4_contract_section(
         readme,
         "abandoned 결과에는 `release_note`도 반환할 수 있다.",
     )
     with pytest.raises(AssertionError):
-        _assert_readme_v3_contract_boundaries(extra_conditional_field)
+        _assert_readme_v4_contract_boundaries(extra_conditional_field)
 
 
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda readme: _add_after_v3_contract_inventory(
+        lambda readme: _add_after_v4_contract_inventory(
             readme,
             "`jhw-control-host task cancel --task <tsk-id>`",
         ),
-        lambda readme: _add_after_v3_contract_inventory(
+        lambda readme: _add_after_v4_contract_inventory(
             readme,
             "abandoned 결과에는 `release_note`도 반환할 수 있다.",
         ),
-        lambda readme: _add_after_v3_contract_inventory(
+        lambda readme: _add_after_v4_contract_inventory(
             readme,
             "운영자 note `operator_note`도 required/base output이다.",
         ),
     ],
     ids=["extra-launcher-command", "extra-conditional-field", "extra-required-base-field"],
 )
-def test_readme_documents_v3_contract_boundaries_rejects_outside_inventory_bypasses(
+def test_readme_documents_v4_contract_boundaries_rejects_outside_inventory_bypasses(
     mutate,
 ) -> None:
     readme = (REPO / "README.md").read_text(encoding="utf-8")
@@ -3599,4 +3583,4 @@ def test_readme_documents_v3_contract_boundaries_rejects_outside_inventory_bypas
 
     assert mutated != readme
     with pytest.raises(AssertionError):
-        _assert_readme_v3_contract_boundaries(mutated)
+        _assert_readme_v4_contract_boundaries(mutated)

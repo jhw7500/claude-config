@@ -52,23 +52,24 @@ plug off bkit                            # 플러그인 끄기 → 세션에서 
 
 ## Project Control Task launcher
 
-<!-- jhw-control-host-v3-operator-contract:start -->
+<!-- jhw-control-host-v4-operator-contract:start -->
 `jhw-control-host`는 clean shell에서 Project Control 호출에 필요한 non-secret 좌표와 세 credential을
 parent shell에 남기지 않고 child `jhw-control`에만 주입하는 **secure-store-only** launcher입니다.
-contract v3의 명령 surface는 정확히 `unlock`, `preflight`, `portfolio status`, `task start`,
-`task finish` 다섯 개입니다. `task start`와 `task finish` 앞에는 사용자 출력에 드러나지 않는
-hidden preflight를 강제하며, 설정·저장소가 안전하지 않거나 preflight가 실패하면 Task mutation을
-실행하지 않습니다.
+contract v4는 아래 13개 command family만 공개합니다. lifecycle mutation은 hidden preflight 뒤에만
+실행하고, 읽기 전용 진단은 preflight 장애 중에도 secure launcher 경계 안에서 실행합니다.
 
-### v3 contract inventory
+### v4 contract inventory
 
-<!-- jhw-control-host-v3-contract:start -->
-| Inventory | Exact v3 values |
+<!-- jhw-control-host-v4-contract:start -->
+| Inventory | Exact v4 values |
 | --- | --- |
-| launcher command families | `unlock`, `preflight`, `portfolio status`, `task start`, `task finish` |
-| finish required/base fields | `task_id`, `claim_id`, `status`, `released_at`, `worktree_removed` |
-| finish conditional fields | `handoff_pointer`, `cleanup_error=WORKTREE_CLEANUP_FAILED` |
-<!-- jhw-control-host-v3-contract:end -->
+| launcher command families | `unlock`, `preflight`, `portfolio status`, `task start`, `task child-start`, `task contract`, `task completion-ready`, `task promote`, `task status`, `task handoff`, `task finish`, `task recover`, `task assert-owner` |
+| hidden preflight mutations | `task start`, `task child-start`, `task contract`, `task completion-ready`, `task promote`, `task finish`, `task recover --action force-end|takeover|cleanup` |
+| read-only without hidden preflight | `task status`, `task handoff`, `task assert-owner`, `task recover --action status` |
+| compatibility projections | `task start`, `task finish`, `task child-start` |
+| generic Task results | canonical JSON object pass-through after common security validation |
+| downstream errors | code `[A-Z][A-Z0-9_]{1,63}`, optional reason `[a-z][a-z0-9_]{0,63}`, exit `1|2|4|75|78` |
+<!-- jhw-control-host-v4-contract:end -->
 
 지원 범위는 Linux Secret Service(DBus session), `/usr/bin/python3`의 system `keyring`·`SecretStorage`,
 그리고 `auth status --show-token --json hosts`와 secure credential store를 지원하는 GitHub CLI입니다.
@@ -118,42 +119,36 @@ credential 조회 전에 같은 기준으로 검사하고, 검색 디렉터리 �
 "$HOME/.local/bin/jhw-control-host" unlock
 "$HOME/.local/bin/jhw-control-host" preflight
 "$HOME/.local/bin/jhw-control-host" portfolio status
-"$HOME/.local/bin/jhw-control-host" task start --resolve-from-checkout true <신규-Formal/Temporary-인자>
-"$HOME/.local/bin/jhw-control-host" task start --task <tsk-id> <기존-Task-재개-인자>
+"$HOME/.local/bin/jhw-control-host" task start --resolve-from-checkout true <registration-args>
+"$HOME/.local/bin/jhw-control-host" task child-start <child-args>
+"$HOME/.local/bin/jhw-control-host" task contract <contract-args>
+"$HOME/.local/bin/jhw-control-host" task completion-ready <evidence-args>
+"$HOME/.local/bin/jhw-control-host" task promote <promotion-args>
+"$HOME/.local/bin/jhw-control-host" task status --task <tsk-id>
+"$HOME/.local/bin/jhw-control-host" task handoff --task <tsk-id>
 "$HOME/.local/bin/jhw-control-host" task finish --task <tsk-id> --claim <clm-id> --status <completed|handoff|abandoned>
+"$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <clm-id> --action <status|force-end|takeover|cleanup>
+"$HOME/.local/bin/jhw-control-host" task assert-owner --task <tsk-id> --claim <clm-id>
 ```
 
-신규 Formal/Temporary Task는 visible absolute launcher preflight 성공 뒤 현재 checkout의 exact root와
-`--resolve-from-checkout true`를 사용한다. Project/Repository ID를 portfolio 좌표에서 조합하거나
-추측하지 않는다. resolver가 `PROJECT_REPOSITORY_NOT_FOUND`를 반환하면 Repository를 정확한 Project
-Record에 등록한 뒤 재시도하고, `PROJECT_REPOSITORY_AMBIGUOUS`면 Repository의 Project 연관을 하나로
-축소한 뒤 재시도한다. 어느 경우에도 Project를 임의 선택하거나 explicit mode로 자동 fallback하지
-않는다. `--project`, `--repo-id`, `--task`는 start projection의 optional caller-coordinate binding이며,
-생략해도 downstream Task/Claim coordinate validation은 약해지지 않는다.
+`task start`와 `task finish`는 v3 public projection과 caller-coordinate binding을 유지하고 안전한
+additive downstream field는 무시합니다. `task child-start`는 `task_id`, `claim_id`, `branch`,
+`worktree_ref` 네 좌표만 반환합니다. 나머지 Task command의 result object는 common envelope와
+sensitive scan을 통과한 뒤 canonical JSON으로 다시 직렬화합니다. command별 상세 result schema는
+`jhw-control` 한 곳에서 관리합니다.
 
-`task finish`의 required/base fields는 `task_id`, `claim_id`, `status`, `released_at`, `worktree_removed`이며
-엄격히 projection한다. `handoff`의 유일한 조건부 필드는 canonical `handoff_pointer`이고, worktree 제거 또는
-cleanup error를 허용하지 않는다. non-handoff cleanup failure의 유일한 조건부 필드는 정확히 `cleanup_error=WORKTREE_CLEANUP_FAILED`다. 따라서 `completed`와 `abandoned`는 pointer를 허용하지 않으며,
-cleanup error가 없으면 worktree_removed가 true여야 한다. 반환 오류도 allowlist와 reason을 엄격히 검사한다:
-`HANDOFF_RETRY_CONFLICT`의 handoff/git-state metadata reason, `INVALID_WORKTREE_INSPECTION`의
-`duplicate_dirty_files`, `WORKTREE_DIRTY`의 `handoff_copy_not_plain_file`만 reason을 가진다.
+downstream error는 stable code, optional bounded reason, 원래 exit를 보존합니다. host는 command별
+code allowlist나 code-to-exit 표를 복제하지 않습니다. workflow 분기에 필요한 `conflicting_claim`,
+`retained_claim`, `retained_task`는 canonical coordinate만 남기고 그 밖의 detail은 폐기합니다.
+
+모든 child output은 최대 12 KiB, duplicate-free 단일 JSON, success stdout/error stderr, success command
+binding을 만족해야 합니다. credential과 protected config/store/state/checkout path가 raw 또는 encoded
+형태로 섞이면 `SENSITIVE_OUTPUT_REJECTED`로 전체 출력을 폐기합니다. raw `jhw-control task`, ambient
+credential, 파일 credential fallback은 제공하지 않습니다.
 
 producer rollout 순서는 `producer merge → install.sh 재실행 → clean-shell --contract/preflight
-→ jhw-notion resolver/skill merge → approved real Task smoke`다. installer는 producer-first 갱신을
-지원하지만, 설치 중 credential 조회·갱신을 하지 않고 기존 파일 값을 자동 migration하지 않는다.
-
-launcher 자체 오류는 path-free JSON과 안정적인 exit code로 반환합니다. 하위 `jhw-control` 출력은
-12 KiB·단일 JSON·command별 strict schema·stdout/stderr 계약을 검증한 뒤 canonical JSON으로 다시
-직렬화합니다. `task start` 성공은 `task_id`, `claim_id`, `branch`, `worktree_ref`와 검증된 optional
-`latest_handoff`만 남기며, 명시한 `--task`/`--project`/`--repo-id`와 응답 좌표도 대조합니다. 다른
-호스트가 먼저 선점한 정상 충돌의 host 값은 bounded 검증·민감정보 검사만 하고 반환하지 않습니다.
-오류 code와 exit code 조합도 command별 계약과 다르면 폐기합니다. token 또는 보호된
-config/credential-store/입력 checkout 경로가 raw·stream 결합·JSON decode·base64·대소문자가 섞인
-hex/percent escape·표준 URL quote 형태로 출력에 섞이면 전체 출력을 폐기하고
-`SENSITIVE_OUTPUT_REJECTED`로 실패합니다. Portfolio의 Unicode 텍스트 길이, GitHub ID byte 상한,
-repository slug도 downstream schema와 같은 경계로 검증합니다. Claude와 Codex의
-`$jhw-task` 정본 연동은 연결된 jhw-notion #74 Formal Task에서 같은 delivery sequence로 배포합니다.
-<!-- jhw-control-host-v3-operator-contract:end -->
+→ jhw-notion Task skill host-only 전환 → approved real Task migration`입니다.
+<!-- jhw-control-host-v4-operator-contract:end -->
 
 ## MCP 등록 (opt-in)
 
