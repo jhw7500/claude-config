@@ -1576,6 +1576,76 @@ def test_task_start_output_requires_exact_consistent_source_shape(
     assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
 
 
+@pytest.mark.parametrize(
+    ("kind", "task_role"),
+    [
+        ("formal", "standalone"),
+        ("formal", "parent"),
+        ("temporary", "standalone"),
+    ],
+)
+def test_task_start_accepts_supported_task_role_without_exposing_it(
+    launcher: ModuleType,
+    tmp_path: Path,
+    kind: str,
+    task_role: str,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "start", "--issue", "https://example.test/issues/28")
+    payload = json.loads(runner.control_results[command].stdout)
+    payload["result"]["task"].update({"kind": kind, "task_role": task_role})
+    runner.control_results[command] = launcher.CommandResult(
+        0,
+        json.dumps(payload, separators=(",", ":")).encode() + b"\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "command": "task start",
+        "result": {
+            "branch": TASK_BRANCH,
+            "claim_id": CLAIM_ID,
+            "task_id": TASK_ID,
+            "worktree_ref": WORKTREE_REF,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "task_role"),
+    [
+        ("formal", "unsupported"),
+        ("temporary", "parent"),
+        ("formal", None),
+        ("formal", []),
+        ("formal", {}),
+    ],
+)
+def test_task_start_rejects_invalid_task_role_semantics(
+    launcher: ModuleType,
+    tmp_path: Path,
+    kind: str,
+    task_role: object,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "start", "--issue", "https://example.test/issues/28")
+    payload = json.loads(runner.control_results[command].stdout)
+    payload["result"]["task"].update({"kind": kind, "task_role": task_role})
+    runner.control_results[command] = launcher.CommandResult(
+        0,
+        json.dumps(payload, separators=(",", ":")).encode() + b"\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+
+
 def test_task_start_output_projects_only_approved_fields(
     launcher: ModuleType,
     tmp_path: Path,
