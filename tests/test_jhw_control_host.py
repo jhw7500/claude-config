@@ -1255,6 +1255,35 @@ def test_validated_session_bus_rejects_unsafe_endpoints(
     assert caught.value.code == "OS_CREDENTIAL_STORE_UNAVAILABLE"
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["task", "start"], True),
+        (["task", "child-start"], True),
+        (["task", "contract"], True),
+        (["task", "completion-ready"], True),
+        (["task", "promote"], True),
+        (["task", "finish"], True),
+        (["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "force-end"], True),
+        (["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "takeover"], True),
+        (["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "cleanup"], True),
+        (["task", "status", "--task", TASK_ID], False),
+        (["task", "handoff", "--task", TASK_ID], False),
+        (["task", "assert-owner", "--task", TASK_ID, "--claim", CLAIM_ID], False),
+        (["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "status"], False),
+        (["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID], True),
+        (["task", "recover", "--action", "status", "--action", "status"], True),
+        (["task", "recover", "--action", "unknown"], True),
+    ],
+)
+def test_task_hidden_preflight_classification(
+    launcher: ModuleType,
+    argv: list[str],
+    expected: bool,
+) -> None:
+    assert launcher._task_requires_preflight(argv) is expected
+
+
 def test_interactive_runner_restores_terminal_state_after_timeout(
     launcher: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
@@ -1410,6 +1439,54 @@ def test_allowed_commands_use_stores_and_forward_safe_result_exactly(
         assert "NODE_OPTIONS" not in env
         assert "PYTHONPATH" not in env
         assert "LD_PRELOAD" not in env
+
+
+@pytest.mark.parametrize("argv", [
+    ["task", "start"],
+    ["task", "child-start"],
+    ["task", "contract"],
+    ["task", "completion-ready"],
+    ["task", "promote"],
+    ["task", "finish"],
+    ["task", "recover", "--action", "cleanup"],
+])
+def test_v4_mutations_stop_after_failed_hidden_preflight(
+    launcher: ModuleType,
+    tmp_path: Path,
+    argv: list[str],
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    failure = launcher.CommandResult(
+        78, b"", b'{"error":{"code":"PREFLIGHT_UNAVAILABLE"}}\n',
+    )
+    runner.control_results[("preflight",)] = failure
+
+    result = run_secure(launcher, tmp_path, argv, runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "PREFLIGHT_UNAVAILABLE"}}
+    assert [call["argv"][2:] for call in runner.calls[2:]] == [("preflight",)]
+
+
+@pytest.mark.parametrize("argv", [
+    ["task", "status", "--task", TASK_ID],
+    ["task", "handoff", "--task", TASK_ID],
+    ["task", "assert-owner", "--task", TASK_ID, "--claim", CLAIM_ID],
+    ["task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "status"],
+])
+def test_v4_read_only_commands_skip_hidden_preflight(
+    launcher: ModuleType,
+    tmp_path: Path,
+    argv: list[str],
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[tuple(argv)] = launcher.CommandResult(
+        1, b"", b'{"error":{"code":"SAFE_READ_FAILURE"}}\n',
+    )
+
+    run_secure(launcher, tmp_path, argv, runner)
+
+    assert [call["argv"][2:] for call in runner.calls[2:]] == [tuple(argv)]
 
 
 @pytest.mark.parametrize("title", ["한" * 100, "😀" * 128])
