@@ -381,6 +381,15 @@ FINISH_RESULT = {
     "worktree_removed": False,
     "handoff_pointer": f"handoffs/{TASK_ID}/{CLAIM_ID}.md",
 }
+GENERIC_TASK_SUCCESSES = [
+    (("task", "contract", "--task", TASK_ID), {"task": {"task_id": TASK_ID}, "future_safe": True}),
+    (("task", "completion-ready", "--task", TASK_ID, "--claim", CLAIM_ID), {"task_id": TASK_ID, "claim_id": CLAIM_ID, "recorded_at": "2026-08-27T00:00:00Z"}),
+    (("task", "promote", "--task", TASK_ID), {"task": {"task_id": TASK_ID, "kind": "formal"}}),
+    (("task", "status", "--task", TASK_ID), {"task": {"task_id": TASK_ID}, "claim": None}),
+    (("task", "handoff", "--task", TASK_ID), {"handoff_pointer": f"handoffs/{TASK_ID}/{CLAIM_ID}.md", "truncated": False}),
+    (("task", "recover", "--task", TASK_ID, "--expect", CLAIM_ID, "--action", "status"), {"kind": "status", "task_id": TASK_ID, "claim_id": CLAIM_ID}),
+    (("task", "assert-owner", "--task", TASK_ID, "--claim", CLAIM_ID), {"owned": True, "claim": {"task_id": TASK_ID, "claim_id": CLAIM_ID}}),
+]
 TASK_FINISH_ERROR_REASONS = {
     "HANDOFF_RETRY_CONFLICT": frozenset({
         "invalid_git_state_line", "duplicate_git_state_key",
@@ -609,6 +618,21 @@ class FakeCommandRunner:
         if isinstance(result, BaseException):
             raise result
         return result
+
+
+def task_success(
+    launcher: ModuleType,
+    command: tuple[str, ...],
+    result: dict[str, object],
+):
+    return launcher.CommandResult(
+        0,
+        json.dumps(
+            {"command": " ".join(command[:2]), "result": result},
+            separators=(",", ":"),
+        ).encode() + b"\n",
+        b"",
+    )
 
 
 def run_secure(
@@ -1685,7 +1709,6 @@ def test_keyring_backend_selection_ignores_ambient_configuration(
                 {"branch": "task/ffffffffffff-other", "worktree_ref": "wt-ffffffffffff-other"}
             ),
         ),
-        lambda payload: payload["result"].update({"unexpected": "field"}),
     ],
 )
 def test_task_start_output_requires_exact_consistent_source_shape(
@@ -1710,23 +1733,23 @@ def test_task_start_output_requires_exact_consistent_source_shape(
 
 
 @pytest.mark.parametrize(
-    ("kind", "task_role"),
+    "downstream_only",
     [
-        ("formal", "standalone"),
-        ("formal", "parent"),
-        ("temporary", "standalone"),
+        {"kind": "future-kind", "task_role": "future-role"},
+        {"kind": None, "task_role": {"future": True}},
+        {"future_task_field": ["safe", "json"]},
     ],
 )
-def test_task_start_accepts_supported_task_role_without_exposing_it(
+def test_task_start_ignores_downstream_only_task_fields(
     launcher: ModuleType,
     tmp_path: Path,
-    kind: str,
-    task_role: str,
+    downstream_only: dict[str, object],
 ) -> None:
     runner = FakeCommandRunner(launcher)
     command = ("task", "start", "--issue", "https://example.test/issues/28")
     payload = json.loads(runner.control_results[command].stdout)
-    payload["result"]["task"].update({"kind": kind, "task_role": task_role})
+    payload["result"]["task"].update(downstream_only)
+    payload["result"]["reused"] = {"future": "shape"}
     runner.control_results[command] = launcher.CommandResult(
         0,
         json.dumps(payload, separators=(",", ":")).encode() + b"\n",
@@ -1736,47 +1759,9 @@ def test_task_start_accepts_supported_task_role_without_exposing_it(
     result = run_secure(launcher, tmp_path, list(command), runner)
 
     assert result.returncode == 0
-    assert json.loads(result.stdout) == {
-        "command": "task start",
-        "result": {
-            "branch": TASK_BRANCH,
-            "claim_id": CLAIM_ID,
-            "task_id": TASK_ID,
-            "worktree_ref": WORKTREE_REF,
-        },
+    assert set(json.loads(result.stdout)["result"]) == {
+        "task_id", "claim_id", "branch", "worktree_ref",
     }
-
-
-@pytest.mark.parametrize(
-    ("kind", "task_role"),
-    [
-        ("formal", "unsupported"),
-        ("temporary", "parent"),
-        ("formal", None),
-        ("formal", []),
-        ("formal", {}),
-    ],
-)
-def test_task_start_rejects_invalid_task_role_semantics(
-    launcher: ModuleType,
-    tmp_path: Path,
-    kind: str,
-    task_role: object,
-) -> None:
-    runner = FakeCommandRunner(launcher)
-    command = ("task", "start", "--issue", "https://example.test/issues/28")
-    payload = json.loads(runner.control_results[command].stdout)
-    payload["result"]["task"].update({"kind": kind, "task_role": task_role})
-    runner.control_results[command] = launcher.CommandResult(
-        0,
-        json.dumps(payload, separators=(",", ":")).encode() + b"\n",
-        b"",
-    )
-
-    result = run_secure(launcher, tmp_path, list(command), runner)
-
-    assert result.returncode == 78
-    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
 
 
 def test_task_start_output_projects_only_approved_fields(
@@ -1787,6 +1772,9 @@ def test_task_start_output_projects_only_approved_fields(
     command = ("task", "start", "--issue", "https://example.test/issues/28")
     payload = json.loads(runner.control_results[command].stdout)
     payload["journal_warning"] = {"code": "JOURNAL_WRITE_FAILED"}
+    payload["result"]["future_safe"] = {"ignored": True}
+    payload["result"]["task"]["future_safe"] = {"ignored": True}
+    payload["result"]["claim"]["future_safe"] = {"ignored": True}
     runner.control_results[command] = launcher.CommandResult(
         0,
         json.dumps(payload, separators=(",", ":")).encode() + b"\n",
@@ -1952,6 +1940,93 @@ def test_control_output_requires_json_stream_contract(
     assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
 
 
+@pytest.mark.parametrize(("command", "upstream_result"), GENERIC_TASK_SUCCESSES)
+def test_v4_generic_task_results_are_canonicalized_without_schema_duplication(
+    launcher: ModuleType,
+    tmp_path: Path,
+    command: tuple[str, ...],
+    upstream_result: dict[str, object],
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[command] = task_success(launcher, command, upstream_result)
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "command": " ".join(command[:2]),
+        "result": upstream_result,
+    }
+
+
+def test_task_child_start_projects_only_four_coordinates(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    command = ("task", "child-start", "--parent", OTHER_TASK_ID)
+    runner = FakeCommandRunner(launcher)
+    raw_start = json.loads(
+        runner.control_results[("task", "start", "--issue", "https://example.test/issues/28")].stdout
+    )
+    raw_start["command"] = "task child-start"
+    raw_start["result"]["future_safe"] = {"ignored": True}
+    runner.control_results[command] = launcher.CommandResult(
+        0, json.dumps(raw_start, separators=(",", ":")).encode() + b"\n", b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert json.loads(result.stdout) == {
+        "command": "task child-start",
+        "result": {
+            "task_id": TASK_ID,
+            "claim_id": CLAIM_ID,
+            "branch": TASK_BRANCH,
+            "worktree_ref": WORKTREE_REF,
+        },
+    }
+
+
+@pytest.mark.parametrize("upstream_result", [None, [], "text", 1, True])
+def test_v4_generic_task_success_requires_a_result_object(
+    launcher: ModuleType,
+    tmp_path: Path,
+    upstream_result: object,
+) -> None:
+    command = ("task", "status", "--task", TASK_ID)
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[command] = launcher.CommandResult(
+        0,
+        json.dumps({"command": "task status", "result": upstream_result}).encode() + b"\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+
+
+@pytest.mark.parametrize("constant", [b"NaN", b"Infinity", b"-Infinity"])
+def test_v4_generic_task_result_rejects_non_json_numeric_constants(
+    launcher: ModuleType,
+    tmp_path: Path,
+    constant: bytes,
+) -> None:
+    command = ("task", "status", "--task", TASK_ID)
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[command] = launcher.CommandResult(
+        0,
+        b'{"command":"task status","result":{"value":' + constant + b"}}\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+
+
 def test_task_finish_runs_hidden_preflight_then_forwards_safe_result(
     launcher: ModuleType,
     tmp_path: Path,
@@ -2011,6 +2086,24 @@ def test_task_finish_projects_completed_and_abandoned_results(
     assert json.loads(result.stdout) == {"command": "task finish", "result": result_payload}
 
 
+def test_task_finish_projects_only_approved_fields(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    result_payload = {**FINISH_RESULT, "future_safe": {"ignored": True}}
+    runner.control_results[FINISH_REQUEST] = launcher.CommandResult(
+        0,
+        json.dumps({"command": "task finish", "result": result_payload}, separators=(",", ":")).encode() + b"\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {"command": "task finish", "result": FINISH_RESULT}
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -2023,7 +2116,6 @@ def test_task_finish_projects_completed_and_abandoned_results(
         lambda result: result.update({"handoff_pointer": f"handoffs/{OTHER_TASK_ID}/{CLAIM_ID}.md"}),
         lambda result: result.update({"cleanup_error": "anything"}),
         lambda result: result.pop("released_at"),
-        lambda result: result.update({"extra": True}),
     ],
 )
 def test_task_finish_rejects_malformed_success_without_payload(

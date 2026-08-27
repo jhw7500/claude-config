@@ -238,7 +238,14 @@ class Credentials:
 
 
 def _json_bytes(value: object) -> bytes:
-    return (json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n").encode()
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )
+    return (encoded + "\n").encode()
 
 
 def _error_result(error: LauncherError) -> ProgramResult:
@@ -953,10 +960,18 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("non-standard JSON numeric constant")
+
+
 def _parse_json(payload: bytes) -> object:
     try:
-        return json.loads(payload.decode("utf-8"), object_pairs_hook=_unique_json_object)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        return json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise LauncherError("CREDENTIAL_PROVIDER_INVALID") from None
 
 
@@ -1221,6 +1236,16 @@ def _exact_object(value: object, required: set[str], optional: set[str] | None =
     return value
 
 
+def _required_object(value: object, required: set[str]) -> dict[str, object]:
+    if (
+        not isinstance(value, dict)
+        or not all(isinstance(key, str) for key in value)
+        or not required.issubset(value)
+    ):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    return value
+
+
 def _bounded_text(value: object, *, maximum: int = 4096) -> str:
     if not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum:
         raise LauncherError("CONTROL_OUTPUT_INVALID")
@@ -1460,13 +1485,15 @@ def _validate_task_start_result(
     build_host: str,
     request: Sequence[str],
 ) -> dict[str, object]:
-    result = _exact_object(value, {"task", "claim", "branch", "worktree_ref", "reused"}, {"latest_handoff"})
-    task = _exact_object(
-        result.get("task"),
-        {"task_id", "kind", "project_id", "repo_id"},
-        {"task_role"},
+    result = _required_object(
+        value,
+        {"task", "claim", "branch", "worktree_ref"},
     )
-    claim = _exact_object(
+    task = _required_object(
+        result.get("task"),
+        {"task_id", "project_id", "repo_id"},
+    )
+    claim = _required_object(
         result.get("claim"),
         {"task_id", "claim_id", "project_id", "repo_id", "host", "branch", "worktree_ref", "started_at"},
     )
@@ -1477,16 +1504,6 @@ def _validate_task_start_result(
     requested_task_id = _requested_id(request, "--task", TASK_ID_RE)
     requested_project_id = _requested_id(request, "--project", PROJECT_ID_RE)
     requested_repo_id = _requested_id(request, "--repo-id", REPO_ID_RE)
-    task_kind = task.get("kind")
-    task_role = task.get("task_role")
-    if task_kind not in {"formal", "temporary"}:
-        raise LauncherError("CONTROL_OUTPUT_INVALID")
-    if "task_role" in task and (
-        not isinstance(task_role, str)
-        or task_role not in {"standalone", "parent"}
-        or (task_kind == "temporary" and task_role != "standalone")
-    ):
-        raise LauncherError("CONTROL_OUTPUT_INVALID")
     worktree_ref, branch = _worktree_coordinates(
         task_id,
         result.get("worktree_ref"),
@@ -1499,7 +1516,6 @@ def _validate_task_start_result(
         or claim.get("branch") != branch
         or claim.get("worktree_ref") != worktree_ref
         or claim.get("host") != build_host
-        or not isinstance(result.get("reused"), bool)
         or (requested_task_id is not None and task_id != requested_task_id)
         or (requested_project_id is not None and project_id != requested_project_id)
         or (requested_repo_id is not None and repo_id != requested_repo_id)
@@ -1518,10 +1534,9 @@ def _validate_task_start_result(
 
 
 def _validate_task_finish_result(value: object, *, request: Sequence[str]) -> dict[str, object]:
-    result = _exact_object(
+    result = _required_object(
         value,
         {"task_id", "claim_id", "status", "released_at", "worktree_removed"},
-        {"cleanup_error", "handoff_pointer"},
     )
     task_id = _canonical_id(result["task_id"], TASK_ID_RE)
     claim_id = _canonical_id(result["claim_id"], CLAIM_ID_RE)
@@ -1559,6 +1574,10 @@ def _validate_task_finish_result(value: object, *, request: Sequence[str]) -> di
                 raise LauncherError("CONTROL_OUTPUT_INVALID")
             projected["cleanup_error"] = cleanup
     return projected
+
+
+def _validate_generic_task_result(value: object) -> dict[str, object]:
+    return dict(_required_object(value, set()))
 
 
 def _validate_error_result(
@@ -1650,14 +1669,18 @@ def _validated_control_result(result: CommandResult, command: Sequence[str], *, 
             projected_result = _validate_preflight_result(payload.get("result"))
         elif expected == "portfolio status":
             projected_result = _validate_portfolio_result(payload.get("result"))
-        elif expected == "task start":
+        elif expected in {"task start", "task child-start"}:
             projected_result = _validate_task_start_result(
                 payload.get("result"),
                 build_host=build_host,
                 request=command,
             )
+            if expected == "task child-start":
+                projected_result.pop("latest_handoff", None)
         elif expected == "task finish":
             projected_result = _validate_task_finish_result(payload.get("result"), request=command)
+        elif expected.startswith("task ") and expected.split(" ", 1)[1] in TASK_SUBCOMMAND_SET:
+            projected_result = _validate_generic_task_result(payload.get("result"))
         else:
             raise LauncherError("CONTROL_OUTPUT_INVALID")
         output = {"command": expected, "result": projected_result, **_output_warnings(payload)}
