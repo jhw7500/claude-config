@@ -2027,6 +2027,27 @@ def test_v4_generic_task_result_rejects_non_json_numeric_constants(
     assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
 
 
+@pytest.mark.parametrize("value", [b"1e10000", b"-1e10000"])
+def test_v4_generic_task_result_rejects_non_finite_exponent_overflow(
+    launcher: ModuleType,
+    tmp_path: Path,
+    value: bytes,
+) -> None:
+    command = ("task", "status", "--task", TASK_ID)
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[command] = launcher.CommandResult(
+        0,
+        b'{"command":"task status","result":{"value":' + value + b"}}\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 78
+    assert not result.stdout
+    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+
+
 def test_task_finish_runs_hidden_preflight_then_forwards_safe_result(
     launcher: ModuleType,
     tmp_path: Path,

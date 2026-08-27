@@ -6,8 +6,9 @@ from __future__ import annotations
 import base64
 import errno
 import grp
-import json
 import hmac
+import json
+import math
 import os
 import pwd
 import re
@@ -964,12 +965,20 @@ def _reject_json_constant(_value: str) -> None:
     raise ValueError("non-standard JSON numeric constant")
 
 
+def _finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON float")
+    return parsed
+
+
 def _parse_json(payload: bytes) -> object:
     try:
         return json.loads(
             payload.decode("utf-8"),
             object_pairs_hook=_unique_json_object,
             parse_constant=_reject_json_constant,
+            parse_float=_finite_json_float,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise LauncherError("CREDENTIAL_PROVIDER_INVALID") from None
