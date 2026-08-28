@@ -3,18 +3,34 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number
+        type: number
+        required: true
+      force_review:
+        description: Perform one authorized same-HEAD review
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   claude-review:
-    if: ${{ github.event.pull_request.head.repo.fork == false && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: >-
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.fork == false &&
+      github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && inputs.force_review)
     permissions:
       actions: read
       contents: read
       id-token: write
       issues: read
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/claude-code-review.yml@b79d282d25c04bcdb63c26e47773d3c86fdf60a3
+    uses: jhw7500/automation/.github/workflows/claude-code-review.yml@a394b653db79d153d56eb8eb7d7620595cc12ef7
     with:
-      pr_number: ${{ github.event.pull_request.number }}
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
