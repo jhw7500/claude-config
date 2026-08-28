@@ -793,6 +793,128 @@ def test_session_bus_environment_validates_and_derives_canonical_coordinates(
     assert validations == [(expected_runtime, expected_uid)]
 
 
+def test_credential_store_probe_reports_owner_and_lock_state_without_prompt(
+    unlock_helper_namespace: dict[str, object],
+) -> None:
+    namespace = unlock_helper_namespace
+    inspect = namespace.get("inspect_credential_store")
+    assert callable(inspect)
+    GLib = namespace["GLib"]
+
+    class Connection:
+        def __init__(self) -> None:
+            self.methods: list[str] = []
+
+        def call_sync(
+            self,
+            _destination,
+            _path,
+            _interface,
+            method,
+            _parameters,
+            _reply_type,
+            flags,
+            _timeout,
+            _cancellable,
+        ):
+            self.methods.append(method)
+            assert flags == namespace["NO_AUTO_START"]
+            return {
+                "GetNameOwner": GLib.Variant("(s)", (":1.44",)),
+                "Introspect": GLib.Variant("(s)", (UNLOCK_PRIVATE_XML,)),
+                "ReadAlias": GLib.Variant(
+                    "(o)",
+                    ("/org/freedesktop/secrets/collection/login",),
+                ),
+                "Get": GLib.Variant("(v)", (GLib.Variant("b", False),)),
+            }[method]
+
+    connection = Connection()
+
+    assert inspect(connection) == (":1.44", "unlocked")
+    assert connection.methods == ["GetNameOwner", "Introspect", "ReadAlias", "Get"]
+
+
+def test_credential_store_probe_main_emits_only_state_and_closes_connection(
+    unlock_helper_namespace: dict[str, object],
+) -> None:
+    namespace = unlock_helper_namespace
+    GLib = namespace["GLib"]
+
+    class Connection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def call_sync(
+            self,
+            _destination,
+            _path,
+            _interface,
+            method,
+            _parameters,
+            _reply_type,
+            _flags,
+            _timeout,
+            _cancellable,
+        ):
+            return {
+                "GetNameOwner": GLib.Variant("(s)", (":1.44",)),
+                "Introspect": GLib.Variant("(s)", (UNLOCK_PRIVATE_XML,)),
+                "ReadAlias": GLib.Variant(
+                    "(o)",
+                    ("/org/freedesktop/secrets/collection/login",),
+                ),
+                "Get": GLib.Variant("(v)", (GLib.Variant("b", False),)),
+            }[method]
+
+        def close_sync(self, _cancellable) -> None:
+            self.closed = True
+
+    connection = Connection()
+    output = io.StringIO()
+
+    returncode = namespace["main"](
+        connection_factory=lambda: connection,
+        password_reader=lambda: pytest.fail("probe must not read a password"),
+        output=output,
+        mode="probe",
+    )
+
+    assert returncode == 0
+    assert output.getvalue() == '{"owner":":1.44","status":"unlocked"}\n'
+    assert connection.closed is True
+
+
+def test_credential_store_probe_maps_missing_owner_without_output(
+    unlock_helper_namespace: dict[str, object],
+) -> None:
+    namespace = unlock_helper_namespace
+
+    class MissingOwnerConnection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def call_sync(self, *_args, **_kwargs):
+            raise RuntimeError("no owner")
+
+        def close_sync(self, _cancellable) -> None:
+            self.closed = True
+
+    connection = MissingOwnerConnection()
+    output = io.StringIO()
+
+    returncode = namespace["main"](
+        connection_factory=lambda: connection,
+        password_reader=lambda: pytest.fail("missing owner must not read a password"),
+        output=output,
+        mode="probe",
+    )
+
+    assert returncode == 22
+    assert output.getvalue() == ""
+    assert connection.closed is True
+
+
 def test_unlock_helper_skips_password_when_login_collection_is_already_unlocked(
     launcher: ModuleType,
     unlock_helper_namespace: dict[str, object],

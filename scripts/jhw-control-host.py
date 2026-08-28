@@ -280,6 +280,7 @@ sys.stdout.write(json.dumps({"backend": "keyring.backends.SecretService.Keyring"
 
 
 UNLOCK_HELPER = """\
+import json
 import os
 import sys
 import termios
@@ -408,7 +409,7 @@ def read_password(fd=0):
             pass
 
 
-def unlock_credential_store(connection, password_reader):
+def inspect_credential_store(connection):
     owner = call(
         connection,
         "org.freedesktop.DBus",
@@ -418,6 +419,8 @@ def unlock_credential_store(connection, password_reader):
         GLib.Variant("(s)", (SERVICE_NAME,)),
         "(s)",
     ).unpack()[0]
+    if not isinstance(owner, str) or not owner.startswith(":"):
+        raise UnlockFailure(22)
     validate_private_contract(connection, owner)
     collection = call(
         connection,
@@ -430,7 +433,14 @@ def unlock_credential_store(connection, password_reader):
     ).unpack()[0]
     if collection != LOGIN_COLLECTION:
         raise UnlockFailure(22)
-    if not collection_locked(connection, owner, collection):
+    state = "locked" if collection_locked(connection, owner, collection) else "unlocked"
+    return owner, state
+
+
+def unlock_credential_store(connection, password_reader):
+    owner, state = inspect_credential_store(connection)
+    collection = LOGIN_COLLECTION
+    if state == "unlocked":
         return "already-unlocked"
     password = password_reader()
     if not isinstance(password, bytearray) or not (1 <= len(password) <= 1024):
@@ -488,30 +498,44 @@ def open_connection():
     )
 
 
-def main(connection_factory=None, password_reader=None, output=None):
+def main(connection_factory=None, password_reader=None, output=None, mode="unlock"):
+    selected_mode = mode
+    if selected_mode not in {"probe", "unlock"}:
+        return 26
     selected_factory = open_connection if connection_factory is None else connection_factory
     selected_reader = read_password if password_reader is None else password_reader
     selected_output = sys.stdout if output is None else output
     connection = None
     try:
         connection = selected_factory()
-        status = unlock_credential_store(connection, selected_reader)
+        if selected_mode == "probe":
+            owner, status = inspect_credential_store(connection)
+        else:
+            status = unlock_credential_store(connection, selected_reader)
     except UnlockFailure as error:
         return error.returncode
     except (KeyboardInterrupt, EOFError):
         return 25
     except BaseException:
-        return 26
+        return 22 if selected_mode == "probe" else 26
     finally:
         if connection is not None:
             try:
                 connection.close_sync(None)
             except BaseException:
                 pass
-    if status == "already-unlocked":
-        selected_output.write('{"status":"already-unlocked"}\\n')
-    elif status == "unlocked":
-        selected_output.write('{"status":"unlocked"}\\n')
+    if selected_mode == "probe" and status in {"locked", "unlocked"}:
+        selected_output.write(
+            json.dumps(
+                {"owner": owner, "status": status},
+                separators=(",", ":"),
+            )
+            + "\\n"
+        )
+    elif selected_mode == "unlock" and status in {"already-unlocked", "unlocked"}:
+        selected_output.write(
+            json.dumps({"status": status}, separators=(",", ":")) + "\\n"
+        )
     else:
         return 26
     selected_output.flush()
@@ -519,7 +543,11 @@ def main(connection_factory=None, password_reader=None, output=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if sys.argv[1:] == []:
+        raise SystemExit(main(mode="unlock"))
+    if sys.argv[1:] == ["probe"]:
+        raise SystemExit(main(mode="probe"))
+    raise SystemExit(26)
 """
 
 
