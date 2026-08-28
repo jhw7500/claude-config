@@ -35,6 +35,7 @@ UNLOCK_TIMEOUT_SECONDS = 120.0
 CONTROL_TIMEOUT_SECONDS = 600.0
 TRUSTED_PATH = "/usr/local/bin:/usr/bin:/bin"
 SAFE_KEYRING_BACKEND = "keyring.backends.SecretService.Keyring"
+DBUS_UNIQUE_NAME_RE = re.compile(r"^:[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$")
 TASK_ID_RE = re.compile(r"^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 CLAIM_ID_RE = re.compile(r"^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 PROJECT_ID_RE = re.compile(r"^prj-[a-z0-9][a-z0-9-]{1,62}$")
@@ -280,6 +281,7 @@ sys.stdout.write(json.dumps({"backend": "keyring.backends.SecretService.Keyring"
 
 
 UNLOCK_HELPER = """\
+import json
 import os
 import sys
 import termios
@@ -408,7 +410,7 @@ def read_password(fd=0):
             pass
 
 
-def unlock_credential_store(connection, password_reader):
+def inspect_credential_store(connection):
     owner = call(
         connection,
         "org.freedesktop.DBus",
@@ -418,6 +420,8 @@ def unlock_credential_store(connection, password_reader):
         GLib.Variant("(s)", (SERVICE_NAME,)),
         "(s)",
     ).unpack()[0]
+    if not isinstance(owner, str) or not owner.startswith(":"):
+        raise UnlockFailure(22)
     validate_private_contract(connection, owner)
     collection = call(
         connection,
@@ -430,7 +434,14 @@ def unlock_credential_store(connection, password_reader):
     ).unpack()[0]
     if collection != LOGIN_COLLECTION:
         raise UnlockFailure(22)
-    if not collection_locked(connection, owner, collection):
+    state = "locked" if collection_locked(connection, owner, collection) else "unlocked"
+    return owner, state
+
+
+def unlock_credential_store(connection, password_reader):
+    owner, state = inspect_credential_store(connection)
+    collection = LOGIN_COLLECTION
+    if state == "unlocked":
         return "already-unlocked"
     password = password_reader()
     if not isinstance(password, bytearray) or not (1 <= len(password) <= 1024):
@@ -488,30 +499,44 @@ def open_connection():
     )
 
 
-def main(connection_factory=None, password_reader=None, output=None):
+def main(connection_factory=None, password_reader=None, output=None, mode="unlock"):
+    selected_mode = mode
+    if selected_mode not in {"probe", "unlock"}:
+        return 26
     selected_factory = open_connection if connection_factory is None else connection_factory
     selected_reader = read_password if password_reader is None else password_reader
     selected_output = sys.stdout if output is None else output
     connection = None
     try:
         connection = selected_factory()
-        status = unlock_credential_store(connection, selected_reader)
+        if selected_mode == "probe":
+            owner, status = inspect_credential_store(connection)
+        else:
+            status = unlock_credential_store(connection, selected_reader)
     except UnlockFailure as error:
         return error.returncode
     except (KeyboardInterrupt, EOFError):
         return 25
     except BaseException:
-        return 26
+        return 22 if selected_mode == "probe" else 26
     finally:
         if connection is not None:
             try:
                 connection.close_sync(None)
             except BaseException:
                 pass
-    if status == "already-unlocked":
-        selected_output.write('{"status":"already-unlocked"}\\n')
-    elif status == "unlocked":
-        selected_output.write('{"status":"unlocked"}\\n')
+    if selected_mode == "probe" and status in {"locked", "unlocked"}:
+        selected_output.write(
+            json.dumps(
+                {"owner": owner, "status": status},
+                separators=(",", ":"),
+            )
+            + "\\n"
+        )
+    elif selected_mode == "unlock" and status in {"already-unlocked", "unlocked"}:
+        selected_output.write(
+            json.dumps({"status": status}, separators=(",", ":")) + "\\n"
+        )
     else:
         return 26
     selected_output.flush()
@@ -519,7 +544,11 @@ def main(connection_factory=None, password_reader=None, output=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if sys.argv[1:] == []:
+        raise SystemExit(main(mode="unlock"))
+    if sys.argv[1:] == ["probe"]:
+        raise SystemExit(main(mode="probe"))
+    raise SystemExit(26)
 """
 
 
@@ -930,6 +959,55 @@ def _unlock_credential_store(
         0,
         stdout=_json_bytes({"command": "unlock", "result": {"status": payload["status"]}}),
     )
+
+
+def _probe_credential_store(
+    runner: Callable[..., CommandResult],
+    python: str,
+    env: Mapping[str, str],
+) -> str:
+    unavailable = LauncherError("OS_CREDENTIAL_STORE_UNAVAILABLE")
+    try:
+        result = runner(
+            (python, "-I", "-c", UNLOCK_HELPER, "probe"),
+            env=env,
+            timeout_seconds=PROVIDER_TIMEOUT_SECONDS,
+            max_output_bytes=1024,
+            tty_input=False,
+        )
+    except KeyboardInterrupt:
+        raise
+    except (CommandTimeout, CommandOutputTooLarge, CommandStartFailed, OSError, ValueError):
+        raise unavailable from None
+    if result.returncode != 0:
+        if result.returncode == 20:
+            raise LauncherError(
+                "KEYRING_RUNTIME_UNAVAILABLE",
+                action="install keyring and SecretStorage for /usr/bin/python3",
+            )
+        if result.returncode == 23:
+            raise LauncherError("OS_CREDENTIAL_STORE_UNLOCK_UNSUPPORTED")
+        raise unavailable
+    if result.stderr:
+        raise unavailable
+    try:
+        payload = _parse_json(result.stdout)
+    except LauncherError:
+        raise unavailable from None
+    if not isinstance(payload, dict) or set(payload) != {"owner", "status"}:
+        raise unavailable
+    owner = payload.get("owner")
+    status = payload.get("status")
+    if not isinstance(owner, str) or DBUS_UNIQUE_NAME_RE.fullmatch(owner) is None:
+        raise unavailable
+    if status == "locked":
+        raise LauncherError(
+            "OS_CREDENTIAL_STORE_LOCKED",
+            action="jhw-control-host unlock",
+        )
+    if status != "unlocked":
+        raise unavailable
+    return owner
 
 
 def _secret(value: object, code: str) -> str:
@@ -1748,6 +1826,11 @@ def run_program(
         selected_tools = resolve_host_tools(selected_home, uid=selected_uid) if tools is None else tools
         provider_env = _provider_environment(selected_home, source_environment, uid=selected_uid)
         keyring_env = _keyring_environment(selected_home, source_environment, uid=selected_uid)
+        initial_owner = _probe_credential_store(
+            runner,
+            selected_tools.python,
+            provider_env,
+        )
         project, notion = _load_keyring_credentials(runner, selected_tools, keyring_env)
         repository = _load_repository_credential(
             runner,
@@ -1755,6 +1838,19 @@ def run_program(
             provider_env,
             owner=config["JHW_GITHUB_OWNER"],
         )
+        final_owner = _probe_credential_store(
+            runner,
+            selected_tools.python,
+            provider_env,
+        )
+        if initial_owner != final_owner:
+            raise LauncherError(
+                "OS_CREDENTIAL_STORE_CHANGED",
+                action=(
+                    "restore one user Secret Service session and rerun "
+                    "jhw-control-host preflight"
+                ),
+            )
         if hmac.compare_digest(project, repository):
             raise LauncherError("CREDENTIALS_NOT_SEPARATE")
         credentials = Credentials(project=project, repository=repository, notion=notion)
