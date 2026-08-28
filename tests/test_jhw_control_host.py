@@ -75,8 +75,9 @@ V4_PRODUCER_ROLLOUT = (
     "→ jhw-notion Task skill host-only 전환 → approved real Task migration`"
 )
 V4_COORDINATE_POLICY = (
-    "workflow 분기에 필요한 `conflicting_claim`,\n"
-    "`retained_claim`, `retained_task`는 canonical coordinate만 남기고 그 밖의 detail은 폐기합니다."
+    "workflow 분기에 필요한 `conflicting_claim`은\n"
+    "`task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 coordinate만 남깁니다.\n"
+    "`retained_claim`, `retained_task`도 각 canonical coordinate만 남기고 그 밖의 detail은 폐기합니다."
 )
 
 
@@ -2676,7 +2677,7 @@ def test_task_conflict_error_requires_canonical_consistent_coordinates(
     assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
 
 
-def test_task_conflict_accepts_another_host_but_does_not_disclose_it(
+def test_task_conflict_preserves_the_canonical_host_coordinate(
     launcher: ModuleType,
     tmp_path: Path,
 ) -> None:
@@ -2686,6 +2687,7 @@ def test_task_conflict_accepts_another_host_but_does_not_disclose_it(
         "task_id": TASK_ID,
         "claim_id": CLAIM_ID,
         "host": "other-build-host",
+        "session_id": "drop-internal-session",
         "branch": TASK_BRANCH,
         "worktree_ref": WORKTREE_REF,
         "started_at": "2026-08-26T00:00:00Z",
@@ -2709,13 +2711,13 @@ def test_task_conflict_accepts_another_host_but_does_not_disclose_it(
             "conflicting_claim": {
                 "task_id": TASK_ID,
                 "claim_id": CLAIM_ID,
+                "host": "other-build-host",
                 "branch": TASK_BRANCH,
                 "worktree_ref": WORKTREE_REF,
                 "started_at": "2026-08-26T00:00:00Z",
             },
         }
     }
-    assert b"other-build-host" not in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -3518,10 +3520,12 @@ def _assert_readme_v4_contract_boundaries(readme: str) -> None:
         "claim_id",
         "conflicting_claim",
         "gh",
+        "host",
         "keyring",
         "retained_claim",
         "retained_task",
         "task_id",
+        "started_at",
         "worktree_ref",
     }
     documented_identifier_tokens = {

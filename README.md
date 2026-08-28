@@ -138,8 +138,9 @@ sensitive scan을 통과한 뒤 canonical JSON으로 다시 직렬화합니다. 
 `jhw-control` 한 곳에서 관리합니다.
 
 downstream error는 stable code, optional bounded reason, 원래 exit를 보존합니다. host는 command별
-code allowlist나 code-to-exit 표를 복제하지 않습니다. workflow 분기에 필요한 `conflicting_claim`,
-`retained_claim`, `retained_task`는 canonical coordinate만 남기고 그 밖의 detail은 폐기합니다.
+code allowlist나 code-to-exit 표를 복제하지 않습니다. workflow 분기에 필요한 `conflicting_claim`은
+`task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 coordinate만 남깁니다.
+`retained_claim`, `retained_task`도 각 canonical coordinate만 남기고 그 밖의 detail은 폐기합니다.
 
 모든 child output은 최대 12 KiB, duplicate-free 단일 JSON, success stdout/error stderr, success command
 binding을 만족해야 합니다. credential과 protected config/store/state/checkout path가 raw 또는 encoded

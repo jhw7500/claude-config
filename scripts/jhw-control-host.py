@@ -1509,7 +1509,7 @@ def _validate_conflicting_claim(
 ) -> dict[str, object]:
     conflict = _required_object(
         value,
-        {"task_id", "claim_id", "branch", "worktree_ref", "started_at"},
+        {"task_id", "claim_id", "host", "branch", "worktree_ref", "started_at"},
     )
     task_id = _canonical_id(conflict["task_id"], TASK_ID_RE)
     requested_task = _requested_id(request, "--task", TASK_ID_RE)
@@ -1523,6 +1523,7 @@ def _validate_conflicting_claim(
     return {
         "task_id": task_id,
         "claim_id": _canonical_id(conflict["claim_id"], CLAIM_ID_RE),
+        "host": _bounded_text(conflict["host"], maximum=255),
         "branch": branch,
         "worktree_ref": worktree_ref,
         "started_at": _timestamp(conflict["started_at"]),
