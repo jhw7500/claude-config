@@ -758,7 +758,7 @@ def test_unlock_is_early_isolated_and_auto_discovers_the_user_bus(
     assert not (tmp_path / "missing-home" / ".config").exists()
 
 
-def test_clean_preflight_auto_discovers_the_same_user_bus_for_both_providers(
+def test_clean_preflight_ignores_alternate_tmux_bus_for_all_providers(
     launcher: ModuleType,
     tmp_path: Path,
 ) -> None:
@@ -768,14 +768,18 @@ def test_clean_preflight_auto_discovers_the_same_user_bus_for_both_providers(
     result = launcher.run_program(
         ["preflight"],
         home=tmp_path,
-        environment={"LANG": "C.UTF-8"},
+        environment={
+            "LANG": "C.UTF-8",
+            "XDG_RUNTIME_DIR": "/tmp/tmux-runtime",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/tmux-runtime/bus",
+        },
         uid=os.getuid(),
         command_runner=runner,
         tools=runner.tools,
     )
 
     assert result.returncode == 0
-    for call in runner.calls[:2]:
+    for call in runner.calls[:4]:
         assert call["env"]["XDG_RUNTIME_DIR"] == f"/run/user/{os.getuid()}"
         assert call["env"]["DBUS_SESSION_BUS_ADDRESS"] == (
             f"unix:path=/run/user/{os.getuid()}/bus"
@@ -1608,6 +1612,67 @@ def test_validated_session_bus_rejects_unsafe_endpoints(
     finally:
         if server is not None:
             server.close()
+
+    assert caught.value.code == "OS_CREDENTIAL_STORE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("wrong_owner_target", ["runtime", "bus"])
+def test_validated_session_bus_rejects_wrong_endpoint_owner(
+    launcher: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrong_owner_target: str,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    bus = runtime / "bus"
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(bus))
+    target = runtime if wrong_owner_target == "runtime" else bus
+    real_lstat = Path.lstat
+
+    def lstat_with_wrong_owner(path: Path):
+        metadata = real_lstat(path)
+        if path != target:
+            return metadata
+        fields = list(metadata)
+        fields[4] = os.getuid() + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_wrong_owner)
+    try:
+        with pytest.raises(launcher.LauncherError) as caught:
+            launcher._validated_session_bus(runtime, uid=os.getuid())
+    finally:
+        server.close()
+
+    assert caught.value.code == "OS_CREDENTIAL_STORE_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("acl_target", ["runtime", "bus"])
+def test_validated_session_bus_rejects_extended_endpoint_acl(
+    launcher: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    acl_target: str,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    bus = runtime / "bus"
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(bus))
+    target = runtime if acl_target == "runtime" else bus
+
+    def has_target_acl(path: Path, *, directory: bool) -> bool:
+        assert directory is (path == runtime)
+        return path == target
+
+    monkeypatch.setattr(launcher, "_has_extended_posix_acl", has_target_acl)
+    try:
+        with pytest.raises(launcher.LauncherError) as caught:
+            launcher._validated_session_bus(runtime, uid=os.getuid())
+    finally:
+        server.close()
 
     assert caught.value.code == "OS_CREDENTIAL_STORE_UNAVAILABLE"
 
