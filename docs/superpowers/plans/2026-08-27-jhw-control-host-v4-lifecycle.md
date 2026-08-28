@@ -768,7 +768,7 @@ def test_error_preserves_only_canonical_workflow_coordinates(
     }
 ```
 
-Parameterize invalid IDs, invalid retained state, mismatched explicit `--task`, inconsistent conflict branch/worktree, and invalid timestamp; each must collapse to `CONTROL_OUTPUT_INVALID` without leaking the bad metadata. Remove the two `host` mutations from `test_task_conflict_error_requires_canonical_consistent_coordinates`: host is ignored downstream detail, so the existing `test_task_conflict_accepts_another_host_but_does_not_disclose_it` remains the positive regression proving it is not exposed.
+Parameterize invalid IDs, invalid retained state, mismatched explicit `--task`, inconsistent conflict branch/worktree, invalid timestamp, and invalid `host`; each must collapse to `CONTROL_OUTPUT_INVALID` without leaking the bad metadata. The final contract decision makes `host` a required bounded public coordinate, so the positive regression must preserve it while continuing to discard `session_id` and every other downstream detail.
 
 - [ ] **Step 4: Run the new error tests to verify RED**
 
@@ -816,7 +816,7 @@ def _validate_retained_task(value: object, *, request: Sequence[str]) -> dict[st
     return {"task_id": task_id}
 ```
 
-Move conflict coordinate validation into this helper. `host` is downstream-only and is ignored if present; the public workflow coordinates remain required and internally consistent:
+Move conflict coordinate validation into this helper. The final contract decision includes `host` in the public workflow coordinates; all six coordinates are required, bounded, and internally consistent:
 
 ```python
 def _validate_conflicting_claim(
@@ -826,7 +826,7 @@ def _validate_conflicting_claim(
 ) -> dict[str, object]:
     conflict = _required_object(
         value,
-        {"task_id", "claim_id", "branch", "worktree_ref", "started_at"},
+        {"task_id", "claim_id", "host", "branch", "worktree_ref", "started_at"},
     )
     task_id = _canonical_id(conflict["task_id"], TASK_ID_RE)
     requested_task = _requested_id(request, "--task", TASK_ID_RE)
@@ -840,6 +840,7 @@ def _validate_conflicting_claim(
     return {
         "task_id": task_id,
         "claim_id": _canonical_id(conflict["claim_id"], CLAIM_ID_RE),
+        "host": _bounded_text(conflict["host"], maximum=255),
         "branch": branch,
         "worktree_ref": worktree_ref,
         "started_at": _timestamp(conflict["started_at"]),
