@@ -95,6 +95,25 @@ def launcher() -> ModuleType:
     return load_launcher()
 
 
+@pytest.fixture(autouse=True)
+def isolate_launcher_session_bus_from_host(
+    launcher: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def deterministic_session_bus(*, uid: int) -> dict[str, str]:
+        runtime = f"/run/user/{uid}"
+        return {
+            "XDG_RUNTIME_DIR": runtime,
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus",
+        }
+
+    monkeypatch.setattr(
+        launcher,
+        "_session_bus_environment",
+        deterministic_session_bus,
+    )
+
+
 @pytest.fixture
 def unlock_helper_namespace(
     launcher: ModuleType,
@@ -728,6 +747,22 @@ def test_clean_preflight_auto_discovers_the_same_user_bus_for_both_providers(
         assert call["env"]["DBUS_SESSION_BUS_ADDRESS"] == (
             f"unix:path=/run/user/{os.getuid()}/bus"
         )
+
+
+def test_fake_runner_preflight_does_not_require_a_host_session_bus(
+    launcher: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_host_session_bus(*_args, **_kwargs):
+        raise AssertionError("fake-runner tests must not inspect the host session bus")
+
+    monkeypatch.setattr(launcher, "_validated_session_bus", reject_host_session_bus)
+    runner = FakeCommandRunner(launcher)
+
+    result = run_secure(launcher, tmp_path, ["preflight"], runner)
+
+    assert result.returncode == 0
 
 
 def test_unlock_helper_skips_password_when_login_collection_is_already_unlocked(
