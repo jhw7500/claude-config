@@ -10,7 +10,7 @@
 | `skills/gstack-toggle/` | gstack 사용자 스킬(~47개) on/off 토글(디렉토리 이동 방식). 미설치 호스트선 no-op이라 안전 |
 | `slack-bridge/` | Slack 비공개 채널 ↔ Claude Code 세션 헤드리스 브릿지. `setup-slack-bridge.sh`로 systemd `--user` 서비스 설치. 상세는 `slack-bridge/README.md` |
 | `shell/plug.sh` | `plug on\|off <key>` 셸 함수 (bkit/docs/pw/pyright/compound) |
-| `scripts/` | 개인 hook/toggle: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, **apex-toggle.sh**, **setup-mcp.sh** |
+| `scripts/` | 개인 hook/toggle과 **jhw-control-host.py** secure launcher: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, apex-toggle.sh, setup-mcp.sh |
 | `hooks/` | 커스텀 훅 6개: carl·notion-continuous·general-continuation·post-info·post-action·bg-task. install.sh가 env-aware **자동 배선** |
 | `manifest/` | `mcp.json` — MCP 서버 정의(공개 6 + 사내 4). `setup-mcp.sh`가 사용 |
 | `claude-md/` | 글로벌 지침: **global-guidance.md**(공통·항상) + CLAUDE-notion.md(notion 환경) + RTK.md(rtk 환경) |
@@ -23,7 +23,8 @@ cd claude-config && ./install.sh
 source ~/.bashrc
 ```
 
-- `skills/`·`scripts/`는 **심볼릭 링크** → `git pull`만 하면 자동 갱신
+- `skills/`·`hooks/`·일반 `scripts/`는 **심볼릭 링크**라 `git pull`로 갱신됩니다. host-control
+  launcher는 mode `0500` 보안 사본이므로 launcher 갱신에는 `./install.sh` 재실행이 필요합니다.
 - **CLAUDE.md 전역지침 (env-aware)**: `~/.claude/CLAUDE.md`의 `claude-config:START/END` 블록만 관리 — 항상 `@global-guidance.md`, **notion MCP 있으면** `@CLAUDE-notion.md`, **`rtk` 있으면** `@RTK.md`를 자동 추가. **OMC 블록은 미변경**(inline/file-split 무관), 실행 전 `.bak` 백업
 - **훅 자동 배선**: `settings.json`에 멱등 추가 — `.bak` 백업, `statusLine`·기존 훅 보존
   - **항상**: `timestamp`(프롬프트/완료) · `stop-text-required`(조기종료 방지) · `general-continuation` · `bg-task-progress`(Pre/Post/SubagentStop, `Agent|Bash`) · `post-info-tool-continuation`
@@ -48,6 +49,107 @@ plug off bkit                            # 플러그인 끄기 → 세션에서 
 # gstack 스킬셋은 Claude 세션에서 "gstack 켜줘/꺼줘" (gstack-toggle 스킬)
 ~/.claude/scripts/apex-toggle.sh off     # APEX 커맨드 비활성화 → 새 세션
 ```
+
+## Project Control Task launcher
+
+<!-- jhw-control-host-v4-operator-contract:start -->
+`jhw-control-host`는 clean shell에서 Project Control 호출에 필요한 non-secret 좌표와 세 credential을
+parent shell에 남기지 않고 child `jhw-control`에만 주입하는 **secure-store-only** launcher입니다.
+contract v4는 아래 13개 command family만 공개합니다. lifecycle mutation은 hidden preflight 뒤에만
+실행하고, 읽기 전용 진단은 preflight 장애 중에도 secure launcher 경계 안에서 실행합니다.
+
+### v4 contract inventory
+
+<!-- jhw-control-host-v4-contract:start -->
+| Inventory | Exact v4 values |
+| --- | --- |
+| launcher command families | `unlock`, `preflight`, `portfolio status`, `task start`, `task child-start`, `task contract`, `task completion-ready`, `task promote`, `task status`, `task handoff`, `task finish`, `task recover`, `task assert-owner` |
+| hidden preflight mutations | `task start`, `task child-start`, `task contract`, `task completion-ready`, `task promote`, `task finish`, `task recover --action force-end|takeover|cleanup` |
+| read-only without hidden preflight | `task status`, `task handoff`, `task assert-owner`, `task recover --action status` |
+| compatibility projections | `task start`, `task finish`, `task child-start` |
+| generic Task results | canonical JSON object pass-through after common security validation |
+| downstream errors | code `[A-Z][A-Z0-9_]{1,63}`, optional reason `[a-z][a-z0-9_]{0,63}`, exit `1|2|4|75|78` |
+<!-- jhw-control-host-v4-contract:end -->
+
+지원 범위는 Linux Secret Service(DBus session), `/usr/bin/python3`의 system `keyring`·`SecretStorage`,
+그리고 `auth status --show-token --json hosts`와 secure credential store를 지원하는 GitHub CLI입니다.
+launcher는 현재 UID의 private `/run/user/<uid>`와 실제 D-Bus UNIX socket을 직접 검증·파생하므로
+Codex/Claude parent shell에 `XDG_RUNTIME_DIR`나 `DBUS_SESSION_BUS_ADDRESS`를 주입하지 않습니다.
+store가 잠겨 있으면 사용자 터미널에서 다음 한 명령으로 먼저 풉니다.
+
+```bash
+jhw-control-host unlock
+```
+
+이 명령은 기존 `org.freedesktop.secrets` owner를 고정하고 GNOME keyring 40의 exact private
+`UnlockWithMasterPassword` 계약을 feature-detect한 뒤 canonical login collection만 해제합니다.
+daemon을 생성·교체하거나 collection을 생성하지 않으며, 암호는 echo 없이 읽어 child 메모리와 로컬
+D-Bus에만 전달하고 argv·환경·파일·출력에는 넣지 않습니다. 모든 종료 경로에서 terminal 상태를
+복구하고 읽지 않은 입력도 폐기합니다. 비지원 Secret Service나 계약 변경은
+fail-closed합니다. 이미 풀렸으면 암호를 묻지 않습니다. 잠금 해제 후 backend를 고정해 다음 값을
+명시적으로 provision합니다.
+
+```bash
+/usr/bin/python3 -I -m keyring --keyring-backend keyring.backends.SecretService.Keyring set jhw-control GH_PROJECT_TOKEN
+/usr/bin/python3 -I -m keyring --keyring-backend keyring.backends.SecretService.Keyring set jhw-control NOTION_API_KEY
+gh auth login --hostname github.com --git-protocol ssh --web
+```
+
+Project token과 Repo token은 달라야 합니다. GitHub CLI 저장 상태는 `gh auth status --hostname github.com
+--active --json hosts`의 단일 active entry가 `tokenSource=keyring`이어야 하며, 평문 `hosts.yml` token은
+거부됩니다. 계정이 없거나 평문 저장 상태이면 위 `gh auth login`을 다시 수행하고 launcher로
+`tokenSource=keyring`을 재검증합니다(credential store가 없어서 `gh`가 평문 fallback하면 계속 거부).
+`install.sh`는 launcher를 전용 `0700` 디렉터리의 mode `0500` 사본으로 atomic 설치하고
+`~/.local/bin`에는 그 사본의 링크만 배치합니다. **설치 중 credential 조회·갱신을 하지 않고** 기존
+파일 값을 자동 migration하지 않습니다. 잠김 시 조치는 `jhw-control-host unlock` 하나이며,
+runtime 누락·credential 누락 시에도 launcher가 출력하는 path-free 단일 조치만 수행합니다.
+
+보안 경계에서 현재 UID는 OS credential store에 접근할 수 있는 신뢰 주체입니다. launcher는 그 밖의
+로컬 principal이 바꿀 수 있는 executable 및 ancestor를 거부합니다. group-write는 해당 group의
+primary/supplementary member가 현재 UID 하나뿐임을 계정 DB에서 확인할 때만 허용하고, POSIX
+access/default ACL과 world-write는 거부하며, ambient
+`PATH`·Python/Node preload·credential 환경은 상속하지 않습니다. 고정 PATH의 모든 검색 디렉터리도
+credential 조회 전에 같은 기준으로 검사하고, 검색 디렉터리 자체에는 sticky world-write도 허용하지
+않습니다. installer 역시 `$HOME`부터 launcher entrypoint/target까지 기존 원본·해결 경로 체인을 먼저
+검사합니다. 따라서 downstream `jhw-control` 설치물과 그 상위 디렉터리도 다른 principal의 write
+권한이 없어야 합니다.
+
+```bash
+"$HOME/.local/bin/jhw-control-host" --contract
+"$HOME/.local/bin/jhw-control-host" unlock
+"$HOME/.local/bin/jhw-control-host" preflight
+"$HOME/.local/bin/jhw-control-host" portfolio status
+"$HOME/.local/bin/jhw-control-host" task start --resolve-from-checkout true <registration-args>
+"$HOME/.local/bin/jhw-control-host" task child-start <child-args>
+"$HOME/.local/bin/jhw-control-host" task contract <contract-args>
+"$HOME/.local/bin/jhw-control-host" task completion-ready <evidence-args>
+"$HOME/.local/bin/jhw-control-host" task promote <promotion-args>
+"$HOME/.local/bin/jhw-control-host" task status --task <tsk-id>
+"$HOME/.local/bin/jhw-control-host" task handoff --task <tsk-id>
+"$HOME/.local/bin/jhw-control-host" task finish --task <tsk-id> --claim <clm-id> --status <completed|handoff|abandoned>
+"$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <clm-id> --action <status|force-end|takeover|cleanup>
+"$HOME/.local/bin/jhw-control-host" task assert-owner --task <tsk-id> --claim <clm-id>
+```
+
+`task start`와 `task finish`는 v3 public projection과 caller-coordinate binding을 유지하고 안전한
+additive downstream field는 무시합니다. `task child-start`는 `task_id`, `claim_id`, `branch`,
+`worktree_ref` 네 좌표만 반환합니다. 나머지 Task command의 result object는 common envelope와
+sensitive scan을 통과한 뒤 canonical JSON으로 다시 직렬화합니다. command별 상세 result schema는
+`jhw-control` 한 곳에서 관리합니다.
+
+downstream error는 stable code, optional bounded reason, 원래 exit를 보존합니다. host는 command별
+code allowlist나 code-to-exit 표를 복제하지 않습니다. workflow 분기에 필요한 `conflicting_claim`은
+`task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 coordinate만 남깁니다.
+`retained_claim`, `retained_task`도 각 canonical coordinate만 남기고 그 밖의 detail은 폐기합니다.
+
+모든 child output은 최대 12 KiB, duplicate-free 단일 JSON, success stdout/error stderr, success command
+binding을 만족해야 합니다. credential과 protected config/store/state/checkout path가 raw 또는 encoded
+형태로 섞이면 `SENSITIVE_OUTPUT_REJECTED`로 전체 출력을 폐기합니다. raw `jhw-control task`, ambient
+credential, 파일 credential fallback은 제공하지 않습니다.
+
+producer rollout 순서는 `producer merge → install.sh 재실행 → clean-shell --contract/preflight
+→ jhw-notion Task skill host-only 전환 → approved real Task migration`입니다.
+<!-- jhw-control-host-v4-operator-contract:end -->
 
 ## MCP 등록 (opt-in)
 
