@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import importlib.util
 import base64
 import io
@@ -100,7 +101,9 @@ def launcher() -> ModuleType:
 def isolate_launcher_session_bus_from_host(
     launcher: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+) -> Callable[..., dict[str, str]]:
+    production_session_bus_environment = launcher._session_bus_environment
+
     def deterministic_session_bus(*, uid: int) -> dict[str, str]:
         runtime = f"/run/user/{uid}"
         return {
@@ -113,6 +116,7 @@ def isolate_launcher_session_bus_from_host(
         "_session_bus_environment",
         deterministic_session_bus,
     )
+    return production_session_bus_environment
 
 
 @pytest.fixture
@@ -764,6 +768,29 @@ def test_fake_runner_preflight_does_not_require_a_host_session_bus(
     result = run_secure(launcher, tmp_path, ["preflight"], runner)
 
     assert result.returncode == 0
+
+
+def test_session_bus_environment_validates_and_derives_canonical_coordinates(
+    launcher: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    isolate_launcher_session_bus_from_host: Callable[..., dict[str, str]],
+) -> None:
+    expected_uid = 1234
+    expected_runtime = Path("/run/user/1234")
+    expected_bus = expected_runtime / "bus"
+    validations: list[tuple[Path, int]] = []
+
+    def validated_session_bus(runtime: Path, *, uid: int) -> Path:
+        validations.append((runtime, uid))
+        return expected_bus
+
+    monkeypatch.setattr(launcher, "_validated_session_bus", validated_session_bus)
+
+    assert isolate_launcher_session_bus_from_host(uid=expected_uid) == {
+        "XDG_RUNTIME_DIR": "/run/user/1234",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1234/bus",
+    }
+    assert validations == [(expected_runtime, expected_uid)]
 
 
 def test_unlock_helper_skips_password_when_login_collection_is_already_unlocked(
@@ -2623,6 +2650,7 @@ def test_error_preserves_only_canonical_workflow_coordinates(
 
     result = run_secure(launcher, tmp_path, list(command), runner)
 
+    assert result.returncode == 4
     assert json.loads(result.stderr) == {
         "error": {
             "code": "TASK_SESSION_BUSY",
@@ -2644,12 +2672,16 @@ def test_error_preserves_only_canonical_workflow_coordinates(
         {"worktree_ref": "/tmp/not-a-coordinate"},
         {"branch": "task/ffffffffffff-other", "worktree_ref": "wt-ffffffffffff-other"},
         {"started_at": "2026-02-30T00:00:00Z"},
+        {"host": 1},
+        {"host": ""},
+        {"host": "build\nhost"},
+        {"host": "é" * 128},
     ],
 )
 def test_task_conflict_error_requires_canonical_consistent_coordinates(
     launcher: ModuleType,
     tmp_path: Path,
-    change: dict[str, str],
+    change: dict[str, object],
 ) -> None:
     runner = FakeCommandRunner(launcher)
     command = ("task", "start", "--issue", "https://example.test/issues/28")
@@ -2731,6 +2763,7 @@ def test_task_conflict_preserves_the_canonical_host_coordinate(
             "conflicting_claim": {
                 "task_id": "not-a-task",
                 "claim_id": CLAIM_ID,
+                "host": "build-1",
                 "branch": TASK_BRANCH,
                 "worktree_ref": WORKTREE_REF,
                 "started_at": "2026-08-26T00:00:00Z",
@@ -2740,6 +2773,16 @@ def test_task_conflict_preserves_the_canonical_host_coordinate(
             "conflicting_claim": {
                 "task_id": TASK_ID,
                 "claim_id": "not-a-claim",
+                "host": "build-1",
+                "branch": TASK_BRANCH,
+                "worktree_ref": WORKTREE_REF,
+                "started_at": "2026-08-26T00:00:00Z",
+            },
+        },
+        {
+            "conflicting_claim": {
+                "task_id": TASK_ID,
+                "claim_id": CLAIM_ID,
                 "branch": TASK_BRANCH,
                 "worktree_ref": WORKTREE_REF,
                 "started_at": "2026-08-26T00:00:00Z",
@@ -3309,6 +3352,19 @@ spec = importlib.util.spec_from_file_location("isolated_jhw_control_host", scrip
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
+
+def reject_host_session_bus(*_args, **_kwargs):
+    raise AssertionError("isolated fake-runner harness must not inspect the host session bus")
+
+def deterministic_session_bus(*, uid):
+    runtime = f"/run/user/{{uid}}"
+    return {{
+        "XDG_RUNTIME_DIR": runtime,
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={{runtime}}/bus",
+    }}
+
+module._validated_session_bus = reject_host_session_bus
+module._session_bus_environment = deterministic_session_bus
 tools = module.HostTools("/trusted/python3", "/trusted/gh", "/trusted/node", "/trusted/control")
 calls = []
 
