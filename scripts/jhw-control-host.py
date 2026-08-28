@@ -35,6 +35,7 @@ UNLOCK_TIMEOUT_SECONDS = 120.0
 CONTROL_TIMEOUT_SECONDS = 600.0
 TRUSTED_PATH = "/usr/local/bin:/usr/bin:/bin"
 SAFE_KEYRING_BACKEND = "keyring.backends.SecretService.Keyring"
+DBUS_UNIQUE_NAME_RE = re.compile(r"^:[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$")
 TASK_ID_RE = re.compile(r"^tsk-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 CLAIM_ID_RE = re.compile(r"^clm-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 PROJECT_ID_RE = re.compile(r"^prj-[a-z0-9][a-z0-9-]{1,62}$")
@@ -960,6 +961,55 @@ def _unlock_credential_store(
     )
 
 
+def _probe_credential_store(
+    runner: Callable[..., CommandResult],
+    python: str,
+    env: Mapping[str, str],
+) -> str:
+    unavailable = LauncherError("OS_CREDENTIAL_STORE_UNAVAILABLE")
+    try:
+        result = runner(
+            (python, "-I", "-c", UNLOCK_HELPER, "probe"),
+            env=env,
+            timeout_seconds=PROVIDER_TIMEOUT_SECONDS,
+            max_output_bytes=1024,
+            tty_input=False,
+        )
+    except KeyboardInterrupt:
+        raise
+    except (CommandTimeout, CommandOutputTooLarge, CommandStartFailed, OSError, ValueError):
+        raise unavailable from None
+    if result.returncode != 0:
+        if result.returncode == 20:
+            raise LauncherError(
+                "KEYRING_RUNTIME_UNAVAILABLE",
+                action="install keyring and SecretStorage for /usr/bin/python3",
+            )
+        if result.returncode == 23:
+            raise LauncherError("OS_CREDENTIAL_STORE_UNLOCK_UNSUPPORTED")
+        raise unavailable
+    if result.stderr:
+        raise unavailable
+    try:
+        payload = _parse_json(result.stdout)
+    except LauncherError:
+        raise unavailable from None
+    if not isinstance(payload, dict) or set(payload) != {"owner", "status"}:
+        raise unavailable
+    owner = payload.get("owner")
+    status = payload.get("status")
+    if not isinstance(owner, str) or DBUS_UNIQUE_NAME_RE.fullmatch(owner) is None:
+        raise unavailable
+    if status == "locked":
+        raise LauncherError(
+            "OS_CREDENTIAL_STORE_LOCKED",
+            action="jhw-control-host unlock",
+        )
+    if status != "unlocked":
+        raise unavailable
+    return owner
+
+
 def _secret(value: object, code: str) -> str:
     if not isinstance(value, str):
         raise LauncherError(code)
@@ -1776,6 +1826,11 @@ def run_program(
         selected_tools = resolve_host_tools(selected_home, uid=selected_uid) if tools is None else tools
         provider_env = _provider_environment(selected_home, source_environment, uid=selected_uid)
         keyring_env = _keyring_environment(selected_home, source_environment, uid=selected_uid)
+        initial_owner = _probe_credential_store(
+            runner,
+            selected_tools.python,
+            provider_env,
+        )
         project, notion = _load_keyring_credentials(runner, selected_tools, keyring_env)
         repository = _load_repository_credential(
             runner,
@@ -1783,6 +1838,19 @@ def run_program(
             provider_env,
             owner=config["JHW_GITHUB_OWNER"],
         )
+        final_owner = _probe_credential_store(
+            runner,
+            selected_tools.python,
+            provider_env,
+        )
+        if initial_owner != final_owner:
+            raise LauncherError(
+                "OS_CREDENTIAL_STORE_CHANGED",
+                action=(
+                    "restore one user Secret Service session and rerun "
+                    "jhw-control-host preflight"
+                ),
+            )
         if hmac.compare_digest(project, repository):
             raise LauncherError("CREDENTIALS_NOT_SEPARATE")
         credentials = Credentials(project=project, repository=repository, notion=notion)

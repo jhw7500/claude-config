@@ -512,6 +512,19 @@ class FakeCommandRunner:
         self.launcher = launcher
         self.tools = fake_tools(launcher)
         self.calls: list[dict[str, object]] = []
+        self.probe_results: list[object] = [
+            launcher.CommandResult(
+                0,
+                b'{"owner":":1.44","status":"unlocked"}\n',
+                b"",
+            ),
+            launcher.CommandResult(
+                0,
+                b'{"owner":":1.44","status":"unlocked"}\n',
+                b"",
+            ),
+        ]
+        self.probe_index = 0
         self.keyring_result = launcher.CommandResult(
             0,
             json.dumps(
@@ -619,7 +632,22 @@ class FakeCommandRunner:
             and command[3] == getattr(self.launcher, "UNLOCK_HELPER", None)
         ):
             result = self.unlock_result
-        elif command[0] == self.tools.python:
+        elif command == (
+            self.tools.python,
+            "-I",
+            "-c",
+            getattr(self.launcher, "UNLOCK_HELPER", None),
+            "probe",
+        ):
+            index = min(self.probe_index, len(self.probe_results) - 1)
+            result = self.probe_results[index]
+            self.probe_index += 1
+        elif command == (
+            self.tools.python,
+            "-I",
+            "-c",
+            getattr(self.launcher, "KEYRING_HELPER", None),
+        ):
             result = self.keyring_result
         elif command[0] == self.tools.gh:
             result = self.gh_result
@@ -1398,6 +1426,138 @@ def test_unlock_replaces_malformed_success_with_one_fixed_error(
     }
 
 
+def test_credential_store_probe_locked_stops_before_providers(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.probe_results[0] = launcher.CommandResult(
+        0,
+        b'{"owner":":1.44","status":"locked"}\n',
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, ["preflight"], runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {
+        "error": {
+            "action": "jhw-control-host unlock",
+            "code": "OS_CREDENTIAL_STORE_LOCKED",
+        }
+    }
+    assert len(runner.calls) == 1
+    assert runner.calls[0]["argv"] == (
+        runner.tools.python,
+        "-I",
+        "-c",
+        launcher.UNLOCK_HELPER,
+        "probe",
+    )
+    assert runner.calls[0]["tty_input"] is False
+
+
+def test_secret_service_owner_change_discards_credentials_before_control(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.probe_results[1] = launcher.CommandResult(
+        0,
+        b'{"owner":":1.99","status":"unlocked"}\n',
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, ["preflight"], runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {
+        "error": {
+            "action": (
+                "restore one user Secret Service session and rerun "
+                "jhw-control-host preflight"
+            ),
+            "code": "OS_CREDENTIAL_STORE_CHANGED",
+        }
+    }
+    assert not any(
+        call["argv"][:2] == (runner.tools.node, runner.tools.control)
+        for call in runner.calls
+    )
+    assert PROJECT_TOKEN.encode() not in result.stdout + result.stderr
+    assert REPOSITORY_TOKEN.encode() not in result.stdout + result.stderr
+    assert NOTION_TOKEN.encode() not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr"),
+    [
+        (b'{"owner":":1.44","owner":":1.45","status":"unlocked"}', b""),
+        (b'{"owner":":1.44","status":"unlocked","extra":true}', b""),
+        (b'{"owner":"org.freedesktop.secrets","status":"unlocked"}', b""),
+        (b'{"owner":":1.44","status":"unknown"}', b""),
+        (
+            b'{"owner":":1.44","status":"unlocked"}',
+            b"probe-private-diagnostic",
+        ),
+    ],
+)
+def test_credential_store_probe_output_failures_are_suppressed(
+    launcher: ModuleType,
+    tmp_path: Path,
+    stdout: bytes,
+    stderr: bytes,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.probe_results[0] = launcher.CommandResult(0, stdout, stderr)
+
+    result = run_secure(launcher, tmp_path, ["preflight"], runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {
+        "error": {"code": "OS_CREDENTIAL_STORE_UNAVAILABLE"}
+    }
+    assert b"probe-private-diagnostic" not in result.stdout + result.stderr
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("helper_returncode", "expected_error"),
+    [
+        (
+            20,
+            {
+                "action": "install keyring and SecretStorage for /usr/bin/python3",
+                "code": "KEYRING_RUNTIME_UNAVAILABLE",
+            },
+        ),
+        (22, {"code": "OS_CREDENTIAL_STORE_UNAVAILABLE"}),
+        (23, {"code": "OS_CREDENTIAL_STORE_UNLOCK_UNSUPPORTED"}),
+        (26, {"code": "OS_CREDENTIAL_STORE_UNAVAILABLE"}),
+    ],
+)
+def test_credential_store_probe_maps_helper_failures_without_output(
+    launcher: ModuleType,
+    tmp_path: Path,
+    helper_returncode: int,
+    expected_error: dict[str, str],
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.probe_results[0] = launcher.CommandResult(
+        helper_returncode,
+        b"probe-output-canary",
+        b"probe-error-canary",
+    )
+
+    result = run_secure(launcher, tmp_path, ["preflight"], runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": expected_error}
+    assert b"probe-output-canary" not in result.stdout + result.stderr
+    assert b"probe-error-canary" not in result.stdout + result.stderr
+    assert len(runner.calls) == 1
+
+
 def test_validated_session_bus_accepts_only_a_private_uid_owned_unix_socket(
     launcher: ModuleType,
     tmp_path: Path,
@@ -1586,8 +1746,21 @@ def test_allowed_commands_use_stores_and_forward_safe_result_exactly(
     assert result.returncode == 0
     assert result.stderr == b""
     assert json.loads(result.stdout) == json.loads(expected_stdout)
-    assert runner.calls[0]["argv"][:3] == (runner.tools.python, "-I", "-c")
+    probe_argv = (
+        runner.tools.python,
+        "-I",
+        "-c",
+        launcher.UNLOCK_HELPER,
+        "probe",
+    )
+    assert runner.calls[0]["argv"] == probe_argv
     assert runner.calls[1]["argv"] == (
+        runner.tools.python,
+        "-I",
+        "-c",
+        launcher.KEYRING_HELPER,
+    )
+    assert runner.calls[2]["argv"] == (
         runner.tools.gh,
         "auth",
         "status",
@@ -1598,14 +1771,15 @@ def test_allowed_commands_use_stores_and_forward_safe_result_exactly(
         "--json",
         "hosts",
     )
-    assert [call["argv"][2:] for call in runner.calls[2:]] == expected_control
+    assert runner.calls[3]["argv"] == probe_argv
+    assert [call["argv"][2:] for call in runner.calls[4:]] == expected_control
 
-    provider_envs = [call["env"] for call in runner.calls[:2]]
+    provider_envs = [call["env"] for call in runner.calls[:4]]
     for index, env in enumerate(provider_envs):
         assert env["HOME"] == str(tmp_path)
         assert env["PATH"] == launcher.TRUSTED_PATH
         assert env["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path=/run/user/{os.getuid()}/bus"
-        if index == 0:
+        if index == 1:
             assert env["PYTHON_KEYRING_BACKEND"] == launcher.SAFE_KEYRING_BACKEND
         else:
             assert "PYTHON_KEYRING_BACKEND" not in env
@@ -1626,7 +1800,7 @@ def test_allowed_commands_use_stores_and_forward_safe_result_exactly(
         ):
             assert name not in env
 
-    for call in runner.calls[2:]:
+    for call in runner.calls[4:]:
         env = call["env"]
         assert env["GH_PROJECT_TOKEN"] == PROJECT_TOKEN
         assert env["GH_REPO_TOKEN"] == REPOSITORY_TOKEN
@@ -1662,7 +1836,7 @@ def test_v4_mutations_stop_after_failed_hidden_preflight(
 
     assert result.returncode == 78
     assert json.loads(result.stderr) == {"error": {"code": "PREFLIGHT_UNAVAILABLE"}}
-    assert [call["argv"][2:] for call in runner.calls[2:]] == [("preflight",)]
+    assert [call["argv"][2:] for call in runner.calls[4:]] == [("preflight",)]
 
 
 @pytest.mark.parametrize("argv", [
@@ -1683,7 +1857,7 @@ def test_v4_read_only_commands_skip_hidden_preflight(
 
     run_secure(launcher, tmp_path, argv, runner)
 
-    assert [call["argv"][2:] for call in runner.calls[2:]] == [tuple(argv)]
+    assert [call["argv"][2:] for call in runner.calls[4:]] == [tuple(argv)]
 
 
 @pytest.mark.parametrize("title", ["한" * 100, "😀" * 128])
@@ -2236,7 +2410,7 @@ def test_task_finish_runs_hidden_preflight_then_forwards_safe_result(
 
     assert result.returncode == 0
     assert json.loads(result.stdout) == {"command": "task finish", "result": FINISH_RESULT}
-    assert [call["argv"][2:] for call in runner.calls[2:]] == [("preflight",), FINISH_REQUEST]
+    assert [call["argv"][2:] for call in runner.calls[4:]] == [("preflight",), FINISH_REQUEST]
 
 
 def test_task_finish_hidden_preflight_failure_skips_lifecycle_mutation(
@@ -2250,7 +2424,7 @@ def test_task_finish_hidden_preflight_failure_skips_lifecycle_mutation(
     result = run_secure(launcher, tmp_path, list(FINISH_REQUEST), runner)
 
     assert result == launcher.ProgramResult(failure.returncode, failure.stdout, failure.stderr)
-    assert [call["argv"][2:] for call in runner.calls[2:]] == [("preflight",)]
+    assert [call["argv"][2:] for call in runner.calls[4:]] == [("preflight",)]
 
 
 @pytest.mark.parametrize(
@@ -2498,7 +2672,7 @@ def test_hidden_preflight_failure_preserves_safe_result_and_skips_task(
     )
 
     assert result == launcher.ProgramResult(failure.returncode, failure.stdout, failure.stderr)
-    assert [call["argv"][2:] for call in runner.calls[2:]] == [("preflight",)]
+    assert [call["argv"][2:] for call in runner.calls[4:]] == [("preflight",)]
 
 
 def test_child_stderr_and_exit_are_preserved(launcher: ModuleType, tmp_path: Path) -> None:
@@ -2682,7 +2856,7 @@ def test_resolver_start_forwards_complete_registration_argv(
             "worktree_ref": WORKTREE_REF,
         },
     }
-    assert [call["argv"][2:] for call in runner.calls[2:]] == [
+    assert [call["argv"][2:] for call in runner.calls[4:]] == [
         ("preflight",), tuple(argv),
     ]
 
@@ -3036,7 +3210,7 @@ def test_identical_project_and_repository_tokens_stop_before_child(
 
     assert result.returncode == 78
     assert json.loads(result.stderr) == {"error": {"code": "CREDENTIALS_NOT_SEPARATE"}}
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 4
     assert PROJECT_TOKEN.encode() not in result.stdout + result.stderr
 
 
@@ -3074,7 +3248,7 @@ def test_keyring_provenance_or_missing_secret_fails_closed(
             "/usr/bin/python3 -I -m keyring --keyring-backend "
             "keyring.backends.SecretService.Keyring set jhw-control NOTION_API_KEY"
         )
-    assert len(runner.calls) == 1
+    assert len(runner.calls) == 2
     assert PROJECT_TOKEN.encode() not in result.stdout + result.stderr
     assert NOTION_TOKEN.encode() not in result.stdout + result.stderr
 
@@ -3107,7 +3281,7 @@ def test_github_credential_requires_single_exact_keyring_entry(
         "REPOSITORY_CREDENTIAL_NOT_SECURE",
         "REPOSITORY_CREDENTIAL_UNAVAILABLE",
     }
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 3
     assert REPOSITORY_TOKEN.encode() not in result.stdout + result.stderr
 
 
@@ -3490,9 +3664,15 @@ module._session_bus_environment = deterministic_session_bus
 tools = module.HostTools("/trusted/python3", "/trusted/gh", "/trusted/node", "/trusted/control")
 calls = []
 
-def runner(argv, *, env, timeout_seconds, max_output_bytes):
+def runner(argv, *, env, timeout_seconds, max_output_bytes, tty_input=False):
     command = tuple(argv)
-    if command[0] == tools.python:
+    if command == (tools.python, "-I", "-c", module.UNLOCK_HELPER, "probe"):
+        result = module.CommandResult(
+            0,
+            b'{{"owner":":1.44","status":"unlocked"}}\\n',
+            b"",
+        )
+    elif command == (tools.python, "-I", "-c", module.KEYRING_HELPER):
         result = module.CommandResult(0, json.dumps({{
             "backend": "keyring.backends.SecretService.Keyring",
             "project": "project-" + "p" * 24,
