@@ -89,6 +89,12 @@ D-Bus에만 전달하고 argv·환경·파일·출력에는 넣지 않습니다.
 fail-closed합니다. 이미 풀렸으면 암호를 묻지 않습니다. 잠금 해제 후 backend를 고정해 다음 값을
 명시적으로 provision합니다.
 
+unlock 이외의 모든 command는 credential provider 실행 전후에 `NO_AUTO_START` probe를 수행합니다.
+두 probe는 canonical user bus의 single Secret Service owner, GNOME private interface, login collection의
+unlocked 상태를 credential 없이 확인합니다. provider 구간에서 owner가 교체되면
+`OS_CREDENTIAL_STORE_CHANGED`로 실패하고 downstream control child를 실행하지 않습니다. process 수는
+authority가 아니며 launcher는 daemon을 start/restart/kill하지 않습니다.
+
 ```bash
 /usr/bin/python3 -I -m keyring --keyring-backend keyring.backends.SecretService.Keyring set jhw-control GH_PROJECT_TOKEN
 /usr/bin/python3 -I -m keyring --keyring-backend keyring.backends.SecretService.Keyring set jhw-control NOTION_API_KEY
@@ -131,6 +137,22 @@ credential 조회 전에 같은 기준으로 검사하고, 검색 디렉터리 �
 "$HOME/.local/bin/jhw-control-host" task assert-owner --task <tsk-id> --claim <clm-id>
 ```
 
+재부팅 뒤에는 canonical owner가 준비된 후 interactive terminal에서 unlock을 한 번 허용합니다. 이어서
+ambient D-Bus 좌표가 없는 clean environment에서 contract와 preflight를 검증합니다.
+
+```bash
+env -i HOME="$HOME" LANG=C.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin \
+  "$HOME/.local/bin/jhw-control-host" --contract
+env -i HOME="$HOME" LANG=C.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin \
+  "$HOME/.local/bin/jhw-control-host" preflight
+```
+
+새 tmux session에서도 같은 clean preflight가 성공해야 하며 pane이 상속한 `XDG_RUNTIME_DIR` 또는
+`DBUS_SESSION_BUS_ADDRESS`에 의존하면 안 됩니다. 실패 시 per-pane `dbus-run-session`, 추가 daemon,
+plaintext 또는 encrypted-file backend로 fallback하지 않습니다. systemd user session과 canonical owner를
+복구하고 unlock과 두 preflight를 반복합니다. 상세 절차와 오류별 복구·migration·rollback 경계는
+[Secret Service 운영 절차](docs/security/jhw-control-host-secret-service-operations.md)를 따릅니다.
+
 `task start`와 `task finish`는 v3 public projection과 caller-coordinate binding을 유지하고 안전한
 additive downstream field는 무시합니다. `task child-start`는 `task_id`, `claim_id`, `branch`,
 `worktree_ref` 네 좌표만 반환합니다. 나머지 Task command의 result object는 common envelope와
@@ -149,6 +171,9 @@ credential, 파일 credential fallback은 제공하지 않습니다.
 
 producer rollout 순서는 `producer merge → install.sh 재실행 → clean-shell --contract/preflight
 → jhw-notion Task skill host-only 전환 → approved real Task migration`입니다.
+#68 stability gate는 `canonical owner 확인 → 필요 시 1회 interactive unlock → clean contract/preflight
+→ tmux clean preflight → consumer 전환` 순서로 위 rollout 사이에 적용합니다. credential migration은
+없으며 rollback도 이전 검증 launcher의 atomic 재설치와 같은 unlock/preflight 검증만 수행합니다.
 <!-- jhw-control-host-v4-operator-contract:end -->
 
 ## MCP 등록 (opt-in)
