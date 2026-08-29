@@ -3,8 +3,11 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import socket
+import threading
 
 import pytest
 
@@ -22,6 +25,45 @@ def test_read_only_store_does_not_create_root(tmp_path):
     store = state.StateStore(root, read_only=True)
     assert store.load_sessions() == ()
     assert not root.exists()
+
+
+def test_relative_root_is_anchored_before_process_chdir(tmp_path, monkeypatch):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    make_private_directory(first)
+    make_private_directory(second)
+    monkeypatch.chdir(first)
+    store = state.StateStore(Path("state"))
+    monkeypatch.chdir(second)
+    store.save_session(sample_lease())
+    assert (first / "state" / "sessions").is_dir()
+    assert not (second / "state").exists()
+
+
+def test_intermediate_symlink_is_rejected_before_root_creation(tmp_path):
+    real_parent = tmp_path / "real"
+    make_private_directory(real_parent)
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(state.UnsafeStatePath):
+        state.StateStore(linked_parent / "state").save_session(sample_lease())
+    assert not (real_parent / "state").exists()
+
+
+def test_mutation_uses_pinned_root_after_path_is_rebound(tmp_path):
+    root = tmp_path / "state"
+    displaced = tmp_path / "displaced"
+    store = state.StateStore(root)
+    first = sample_lease()
+    second = sample_lease("session:second")
+    store.save_session(first)
+    with store.locked():
+        root.rename(displaced)
+        make_private_directory(root)
+        store.save_session(second)
+    displaced_store = state.StateStore(displaced, read_only=True)
+    assert displaced_store.load_sessions() == (first, second)
+    assert state.StateStore(root, read_only=True).load_sessions() == ()
 
 
 def test_session_filename_is_hash_not_untrusted_id(tmp_path):
@@ -224,6 +266,35 @@ def test_atomic_json_write_failure_removes_private_temporary_file(tmp_path, monk
     assert list((store.root / "sessions").iterdir()) == []
 
 
+def test_atomic_json_temp_collision_preserves_existing_sentinel(tmp_path, monkeypatch):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    sentinel = store.root / "sessions" / ".tmp-collision"
+    write_private_file(sentinel, b"sentinel")
+    monkeypatch.setattr(state.secrets, "token_hex", lambda size: "collision")
+    with pytest.raises(FileExistsError):
+        store.save_session(sample_lease("session:second"))
+    assert sentinel.read_bytes() == b"sentinel"
+
+
+def test_atomic_json_cleanup_preserves_temp_after_inode_gains_second_link(tmp_path, monkeypatch):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    temporary = store.root / "sessions" / ".tmp-owned"
+    second_link = store.root / "sessions" / ".tmp-second-link"
+    monkeypatch.setattr(state.secrets, "token_hex", lambda size: "owned")
+
+    def link_then_fail(fd, data):
+        os.link(temporary, second_link)
+        raise OSError("injected write failure")
+
+    monkeypatch.setattr(state, "_write_all", link_then_fail)
+    with pytest.raises(OSError, match="injected write failure"):
+        store.save_session(sample_lease("session:second"))
+    assert temporary.exists()
+    assert second_link.exists()
+
+
 def test_lock_contention_times_out_without_replacing_lock_inode(tmp_path):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
@@ -264,6 +335,166 @@ def test_lock_path_replacement_during_acquisition_is_rejected(tmp_path, monkeypa
             pass
 
 
+def test_shared_store_serializes_different_threads(tmp_path):
+    store = state.StateStore(tmp_path / "state", lock_timeout=1.0)
+    owner_entered = threading.Event()
+    release_owner = threading.Event()
+    contender_started = threading.Event()
+    contender_done = threading.Event()
+    errors: list[BaseException] = []
+
+    def owner():
+        try:
+            with store.locked():
+                owner_entered.set()
+                release_owner.wait(1.0)
+        except BaseException as error:
+            errors.append(error)
+
+    def contender():
+        try:
+            contender_started.set()
+            store.save_session(sample_lease())
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            contender_done.set()
+
+    owner_thread = threading.Thread(target=owner)
+    contender_thread = threading.Thread(target=contender)
+    owner_thread.start()
+    assert owner_entered.wait(1.0)
+    contender_thread.start()
+    assert contender_started.wait(1.0)
+    assert not contender_done.wait(0.05)
+    release_owner.set()
+    owner_thread.join(1.0)
+    contender_thread.join(1.0)
+    assert contender_done.is_set()
+    assert errors == []
+    assert store.load_sessions() == (sample_lease(),)
+
+
+def test_unlock_error_does_not_leave_stale_cross_thread_ownership(tmp_path, monkeypatch):
+    store = state.StateStore(tmp_path / "state", lock_timeout=0.25)
+    original_flock = state.fcntl.flock
+    fail_unlock = True
+
+    def injected_flock(fd, operation):
+        nonlocal fail_unlock
+        result = original_flock(fd, operation)
+        if operation == fcntl.LOCK_UN and fail_unlock:
+            fail_unlock = False
+            raise OSError("injected unlock error")
+        return result
+
+    monkeypatch.setattr(state.fcntl, "flock", injected_flock)
+    with pytest.raises(OSError, match="injected unlock error"):
+        with store.locked():
+            pass
+
+    errors: list[BaseException] = []
+
+    def retry():
+        try:
+            store.save_session(sample_lease())
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=retry)
+    worker.start()
+    worker.join(1.0)
+    assert not worker.is_alive()
+    assert errors == []
+
+
+@pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf, -0.01])
+def test_lock_timeout_must_be_finite_and_nonnegative(tmp_path, timeout):
+    with pytest.raises(ValueError):
+        state.StateStore(tmp_path / "state", lock_timeout=timeout)
+
+
+def test_lock_timeout_is_converted_exactly_once(tmp_path):
+    class Timeout:
+        def __init__(self):
+            self.calls = 0
+
+        def __float__(self):
+            self.calls += 1
+            return 0.25
+
+    timeout = Timeout()
+    store = state.StateStore(tmp_path / "state", lock_timeout=timeout)
+    assert store.lock_timeout == 0.25
+    assert timeout.calls == 1
+
+
+def _assert_fifo_call_finishes_without_peer(call, fifo: Path) -> None:
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def invoke():
+        try:
+            call()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    prompt = finished.wait(0.1)
+    writer_fd = None
+    if not prompt:
+        writer_fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        worker.join(1.0)
+    finally:
+        if writer_fd is not None:
+            os.close(writer_fd)
+    assert prompt
+    assert len(errors) == 1
+    assert isinstance(errors[0], state.UnsafeStatePath)
+
+
+def test_fifo_record_is_rejected_without_blocking(tmp_path):
+    root = tmp_path / "state"
+    processes = root / "processes"
+    make_private_directory(processes)
+    fifo = processes / "unsafe.json"
+    os.mkfifo(fifo, mode=0o600)
+    _assert_fifo_call_finishes_without_peer(
+        state.StateStore(root, read_only=True).load_processes,
+        fifo,
+    )
+
+
+def test_unix_socket_record_is_rejected_as_unsafe_path(tmp_path):
+    root = tmp_path / "state"
+    processes = root / "processes"
+    make_private_directory(processes)
+    socket_path = processes / "unsafe.json"
+    server = socket.socket(socket.AF_UNIX)
+    try:
+        server.bind(str(socket_path))
+        socket_path.chmod(0o600)
+        with pytest.raises(state.UnsafeStatePath):
+            state.StateStore(root, read_only=True).load_processes()
+    finally:
+        server.close()
+
+
+def test_fifo_event_log_is_rejected_without_blocking(tmp_path):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    fifo = store.root / "events.jsonl"
+    os.mkfifo(fifo, mode=0o600)
+    _assert_fifo_call_finishes_without_peer(
+        lambda: store.append_event({"schema_version": 1, "event": "scan"}),
+        fifo,
+    )
+
+
 def test_event_rotation_is_bounded_private_and_preserves_newest_event(tmp_path):
     store = state.StateStore(tmp_path / "state")
     for index in range(80):
@@ -294,6 +525,19 @@ def test_read_only_audit_does_not_rotate_or_age_prune_event_files(tmp_path):
     assert not old_backup.exists()
 
 
+def test_mutation_removes_all_noncanonical_numeric_event_backups(tmp_path):
+    store = state.StateStore(tmp_path / "state")
+    store.append_event({"schema_version": 1, "event": "scan"})
+    aliases = ["events.jsonl.0", "events.jsonl.00", "events.jsonl.01", "events.jsonl.4"]
+    for name in aliases:
+        write_private_file(store.root / name, b"alias\n")
+    store.append_event({"schema_version": 1, "event": "scan-again"})
+    assert all(not (store.root / name).exists() for name in aliases)
+    assert {path.name for path in store.root.glob("events.jsonl.*")} <= set(
+        state.EVENT_LOG_BACKUP_FILENAMES
+    )
+
+
 def test_mutation_prunes_completed_transactions_but_preserves_installed_reference(tmp_path):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
@@ -305,8 +549,72 @@ def test_mutation_prunes_completed_transactions_but_preserves_installed_referenc
         make_private_directory(transaction)
         os.utime(transaction, (index, index))
     write_private_file(
-        store.root / "install-state.json",
-        json.dumps({"transaction_id": "txn-1"}).encode() + b"\n",
+        store.root / state.INSTALL_STATE_FILENAME,
+        json.dumps({state.INSTALL_STATE_TRANSACTION_FIELD: "txn-1"}).encode() + b"\n",
     )
     store.append_event({"schema_version": 1, "event": "mutate"})
     assert {path.name for path in transactions.iterdir()} == {"txn-1", "txn-3", "txn-4"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"transaction_id": 1},
+        {"transaction_id": ""},
+        {"transaction_id": "txn-1", "extra": True},
+    ],
+)
+def test_malformed_canonical_install_state_fails_before_transaction_pruning(tmp_path, payload):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    transactions = store.root / "transactions"
+    make_private_directory(transactions)
+    for index in range(4):
+        transaction = transactions / f"txn-{index}"
+        make_private_directory(transaction)
+        os.utime(transaction, (index + 1, index + 1))
+    write_private_file(
+        store.root / state.INSTALL_STATE_FILENAME,
+        json.dumps(payload).encode() + b"\n",
+    )
+    with pytest.raises(state.StateCorruption):
+        store.append_event({"schema_version": 1, "event": "mutate"})
+    assert {path.name for path in transactions.iterdir()} == {
+        "txn-0",
+        "txn-1",
+        "txn-2",
+        "txn-3",
+    }
+
+
+@pytest.mark.parametrize("legacy_name", ["install_state.json", "install.json"])
+def test_competing_install_state_alias_fails_before_transaction_pruning(tmp_path, legacy_name):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    transactions = store.root / "transactions"
+    make_private_directory(transactions)
+    for index in range(4):
+        transaction = transactions / f"txn-{index}"
+        make_private_directory(transaction)
+        os.utime(transaction, (index + 1, index + 1))
+    canonical = {state.INSTALL_STATE_TRANSACTION_FIELD: "txn-0"}
+    write_private_file(
+        store.root / state.INSTALL_STATE_FILENAME,
+        json.dumps(canonical).encode() + b"\n",
+    )
+    conflicting = {state.INSTALL_STATE_TRANSACTION_FIELD: "txn-1"}
+    write_private_file(store.root / legacy_name, json.dumps(conflicting).encode() + b"\n")
+    with pytest.raises(state.StateCorruption):
+        store.append_event({"schema_version": 1, "event": "mutate"})
+    assert len(list(transactions.iterdir())) == 4
+
+
+@pytest.mark.parametrize("legacy_name", ["install_state.json", "install.json"])
+def test_legacy_install_state_without_canonical_authority_is_corruption(tmp_path, legacy_name):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    payload = {state.INSTALL_STATE_TRANSACTION_FIELD: "txn-0"}
+    write_private_file(store.root / legacy_name, json.dumps(payload).encode() + b"\n")
+    with pytest.raises(state.StateCorruption):
+        store.append_event({"schema_version": 1, "event": "mutate"})

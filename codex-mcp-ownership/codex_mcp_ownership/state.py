@@ -5,10 +5,12 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import secrets
 import stat
+import threading
 import time
 from typing import Callable, Iterator, TypeVar
 
@@ -20,6 +22,14 @@ EVENT_LOG_MAX_BYTES = 1_048_576
 EVENT_LOG_BACKUPS = 3
 EVENT_LOG_RETENTION_SECONDS = 2_592_000
 TRANSACTION_RETENTION = 3
+EVENT_LOG_BACKUP_FILENAMES = tuple(
+    f"events.jsonl.{number}" for number in range(1, EVENT_LOG_BACKUPS + 1)
+)
+
+INSTALL_STATE_FILENAME = "install-state.json"
+INSTALL_STATE_TRANSACTION_FIELD = "transaction_id"
+INSTALL_STATE_FIELDS = frozenset({INSTALL_STATE_TRANSACTION_FIELD})
+INSTALL_STATE_LEGACY_FILENAMES = ("install_state.json", "install.json")
 
 EVENT_FIELDS = {
     "schema_version",
@@ -131,62 +141,126 @@ def _write_all(fd: int, data: bytes) -> None:
 
 class StateStore:
     def __init__(self, root: Path, read_only: bool = False, lock_timeout: float = 2.0) -> None:
-        if lock_timeout < 0:
+        converted_timeout = float(lock_timeout)
+        if not math.isfinite(converted_timeout) or converted_timeout < 0:
             raise ValueError("lock_timeout must be non-negative")
-        self.root = Path(root)
+        self.root = Path(os.path.abspath(os.fspath(root)))
         self.read_only = read_only
-        self.lock_timeout = float(lock_timeout)
+        self.lock_timeout = converted_timeout
+        self._lock_condition = threading.Condition()
+        self._lock_owner: int | None = None
         self._lock_fd: int | None = None
+        self._pinned_root_fd: int | None = None
         self._lock_depth = 0
 
     def _require_mutable(self) -> None:
         if self.read_only:
             raise ReadOnlyStateError("read-only state store cannot mutate")
 
+    def _owns_lock(self) -> bool:
+        with self._lock_condition:
+            return (
+                self._lock_owner == threading.get_ident()
+                and self._lock_depth > 0
+                and self._pinned_root_fd is not None
+            )
+
     def _root_exists(self) -> bool:
         try:
-            os.lstat(self.root)
+            fd = self._open_root()
         except FileNotFoundError:
             return False
+        os.close(fd)
         return True
 
-    def _ensure_root(self) -> None:
-        self._require_mutable()
-        try:
-            os.mkdir(self.root, _DIRECTORY_MODE)
-        except FileExistsError:
-            pass
-        else:
-            os.chmod(self.root, _DIRECTORY_MODE, follow_symlinks=False)
-        self._open_root(close=True)
-
-    def _open_root(self, *, close: bool = False) -> int:
+    def _walk_root(self, *, create: bool) -> int:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
+        parts = self.root.parts
+        if not self.root.is_absolute() or not parts:
+            raise UnsafeStatePath("state root must be an absolute lexical path")
         try:
-            fd = os.open(self.root, flags)
-        except (OSError, ValueError) as error:
-            raise UnsafeStatePath(f"cannot safely open state root: {self.root}") from error
+            current_fd = os.open(parts[0], flags)
+        except OSError as error:
+            raise UnsafeStatePath("cannot open filesystem root") from error
+        walked = Path(parts[0])
+        transferred = False
         try:
-            _validate_directory(os.fstat(fd), self.root)
-        except Exception:
-            os.close(fd)
-            raise
-        if close:
-            os.close(fd)
-            return -1
-        return fd
+            for index, component in enumerate(parts[1:], start=1):
+                final = index == len(parts) - 1
+                walked /= component
+                try:
+                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    if not final or not create:
+                        raise
+                    try:
+                        os.mkdir(component, _DIRECTORY_MODE, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                    else:
+                        os.chmod(
+                            component,
+                            _DIRECTORY_MODE,
+                            dir_fd=current_fd,
+                            follow_symlinks=False,
+                        )
+                        os.fsync(current_fd)
+                    try:
+                        next_fd = os.open(component, flags, dir_fd=current_fd)
+                    except OSError as error:
+                        raise UnsafeStatePath(
+                            f"cannot safely open state path component: {walked}"
+                        ) from error
+                except OSError as error:
+                    raise UnsafeStatePath(
+                        f"cannot safely open state path component: {walked}"
+                    ) from error
+                os.close(current_fd)
+                current_fd = next_fd
+            _validate_directory(os.fstat(current_fd), self.root)
+            transferred = True
+            return current_fd
+        finally:
+            if not transferred:
+                os.close(current_fd)
 
-    def _open_private_file(self, directory_fd: int, name: str, path: Path) -> int:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    def _open_root(self, *, create: bool = False) -> int:
+        owner = threading.get_ident()
+        with self._lock_condition:
+            if self._lock_owner == owner and self._pinned_root_fd is not None:
+                fd = os.dup(self._pinned_root_fd)
+                _validate_directory(os.fstat(fd), self.root)
+                return fd
+        return self._walk_root(create=create)
+
+    def _open_private_file(
+        self,
+        directory_fd: int,
+        name: str,
+        path: Path,
+        access_flags: int = os.O_RDONLY,
+    ) -> int:
+        try:
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            raise UnsafeStatePath(f"cannot safely inspect state file: {path}") from error
+        _validate_file(before, path)
+        flags = access_flags | os.O_NONBLOCK
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(name, flags, dir_fd=directory_fd)
-        except OSError as error:
-            if error.errno in (errno.ELOOP, errno.ENOTDIR):
-                raise UnsafeStatePath(f"cannot safely open state file: {path}") from error
+        except FileNotFoundError:
             raise
+        except OSError as error:
+            raise UnsafeStatePath(f"cannot safely open state file: {path}") from error
         try:
-            _validate_file(os.fstat(fd), path)
+            after = os.fstat(fd)
+            _validate_file(after, path)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise UnsafeStatePath(f"state file changed during open: {path}")
         except Exception:
             os.close(fd)
             raise
@@ -201,7 +275,7 @@ class StateStore:
         except FileNotFoundError:
             if not create:
                 return None
-            if self._lock_depth == 0:
+            if not self._owns_lock():
                 raise RuntimeError("private directory creation requires the state lock")
             try:
                 os.mkdir(name, _DIRECTORY_MODE, dir_fd=root_fd)
@@ -235,10 +309,12 @@ class StateStore:
                 dir_fd=root_fd,
             )
         except FileExistsError:
-            try:
-                fd = os.open("state.lock", common, dir_fd=root_fd)
-            except OSError as error:
-                raise UnsafeStatePath("cannot safely open state.lock") from error
+            fd = self._open_private_file(
+                root_fd,
+                "state.lock",
+                self.root / "state.lock",
+                os.O_RDWR,
+            )
         else:
             os.fchmod(fd, _FILE_MODE)
             os.fsync(fd)
@@ -250,14 +326,10 @@ class StateStore:
             raise
         return fd
 
-    def _validate_lock_binding(self, lock_fd: int) -> None:
+    def _validate_lock_binding(self, lock_fd: int, root_fd: int) -> None:
         opened = os.fstat(lock_fd)
         _validate_file(opened, self.root / "state.lock")
-        root_fd = self._open_root()
-        try:
-            named_fd = self._open_private_file(root_fd, "state.lock", self.root / "state.lock")
-        finally:
-            os.close(root_fd)
+        named_fd = self._open_private_file(root_fd, "state.lock", self.root / "state.lock")
         try:
             named = os.fstat(named_fd)
         finally:
@@ -268,44 +340,83 @@ class StateStore:
     @contextmanager
     def locked(self) -> Iterator[StateStore]:
         self._require_mutable()
-        if self._lock_depth:
-            self._lock_depth += 1
+        owner = threading.get_ident()
+        deadline = time.monotonic() + self.lock_timeout
+        nested = False
+        with self._lock_condition:
+            if self._lock_owner == owner:
+                if self._pinned_root_fd is None or self._lock_depth < 1:
+                    raise RuntimeError("invalid reentrant state-lock ownership")
+                self._lock_depth += 1
+                nested = True
+            else:
+                while self._lock_owner is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise StateLockTimeout("timed out waiting for state-lock owner")
+                    self._lock_condition.wait(remaining)
+                self._lock_owner = owner
+                self._lock_depth = 1
+        if nested:
             try:
                 yield self
             finally:
-                self._lock_depth -= 1
+                with self._lock_condition:
+                    if self._lock_owner != owner or self._lock_depth <= 1:
+                        raise RuntimeError("invalid nested state-lock release")
+                    self._lock_depth -= 1
             return
-        self._ensure_root()
-        root_fd = self._open_root()
+        root_fd: int | None = None
+        lock_fd: int | None = None
+        flocked = False
         try:
+            root_fd = self._open_root(create=True)
             lock_fd = self._create_lock_file(root_fd)
-        finally:
-            os.close(root_fd)
-        deadline = time.monotonic() + self.lock_timeout
-        try:
             while True:
                 try:
                     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    self._validate_lock_binding(lock_fd)
+                    flocked = True
+                    self._validate_lock_binding(lock_fd, root_fd)
                     break
                 except BlockingIOError as error:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise StateLockTimeout("timed out acquiring state.lock") from error
                     time.sleep(min(0.01, remaining))
-            self._lock_fd = lock_fd
-            self._lock_depth = 1
+            with self._lock_condition:
+                if self._lock_owner != owner or self._lock_depth != 1:
+                    raise RuntimeError("state-lock ownership changed during acquisition")
+                self._lock_fd = lock_fd
+                self._pinned_root_fd = root_fd
             try:
                 yield self
             finally:
-                self._lock_depth = 0
-                self._lock_fd = None
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                with self._lock_condition:
+                    if self._lock_owner != owner or self._lock_depth != 1:
+                        raise RuntimeError("outer state lock exited with nested ownership")
         finally:
-            os.close(lock_fd)
+            try:
+                if flocked and lock_fd is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                try:
+                    if lock_fd is not None:
+                        os.close(lock_fd)
+                finally:
+                    try:
+                        if root_fd is not None:
+                            os.close(root_fd)
+                    finally:
+                        with self._lock_condition:
+                            if self._lock_owner == owner:
+                                self._lock_depth = 0
+                                self._lock_fd = None
+                                self._pinned_root_fd = None
+                                self._lock_owner = None
+                                self._lock_condition.notify_all()
 
     def _atomic_json(self, directory_fd: int, directory: Path, name: str, value: object) -> None:
-        if self._lock_depth == 0:
+        if not self._owns_lock():
             raise RuntimeError("atomic state writes require the state lock")
         data = _canonical_json(value)
         target = directory / name
@@ -323,8 +434,10 @@ class StateStore:
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0)
         )
+        created: os.stat_result | None = None
         try:
             fd = os.open(temporary, flags, _FILE_MODE, dir_fd=directory_fd)
+            created = os.fstat(fd)
             try:
                 os.fchmod(fd, _FILE_MODE)
                 _write_all(fd, data)
@@ -339,10 +452,20 @@ class StateStore:
             )
             os.fsync(directory_fd)
         except Exception:
-            try:
-                os.unlink(temporary, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
+            if created is not None:
+                try:
+                    current = os.stat(temporary, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    current = None
+                if current is not None and (current.st_dev, current.st_ino) == (
+                    created.st_dev,
+                    created.st_ino,
+                ) and (
+                    stat.S_ISREG(current.st_mode)
+                    and current.st_uid == os.getuid()
+                    and current.st_nlink == 1
+                ):
+                    os.unlink(temporary, dir_fd=directory_fd)
             raise
 
     def _maintenance_locked(self) -> None:
@@ -494,7 +617,7 @@ class StateStore:
         name: str,
         raw: bytes,
     ) -> Path:
-        if self._lock_depth == 0:
+        if not self._owns_lock():
             raise RuntimeError("quarantine requires the state lock")
         digest = hashlib.sha256(raw).hexdigest()
         quarantine_fd = self._open_directory(root_fd, "corrupt", create=True)
@@ -557,12 +680,13 @@ class StateStore:
                 os.close(current_fd)
         if size and size + len(record) > EVENT_LOG_MAX_BYTES:
             self._rotate_events_locked(root_fd)
-        flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            fd = os.open(name, flags, dir_fd=root_fd)
+            fd = self._open_private_file(root_fd, name, path, os.O_WRONLY | os.O_APPEND)
         except FileNotFoundError:
-            fd = os.open(name, flags | os.O_CREAT | os.O_EXCL, _FILE_MODE, dir_fd=root_fd)
+            flags = os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK
+            flags |= os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(name, flags, _FILE_MODE, dir_fd=root_fd)
             os.fchmod(fd, _FILE_MODE)
         try:
             _validate_file(os.fstat(fd), path)
@@ -602,6 +726,7 @@ class StateStore:
         root_fd = self._open_root()
         cutoff = time.time() - EVENT_LOG_RETENTION_SECONDS
         try:
+            candidates: list[tuple[str, os.stat_result]] = []
             for name in os.listdir(root_fd):
                 if not name.startswith("events.jsonl."):
                     continue
@@ -613,46 +738,61 @@ class StateStore:
                     value = os.fstat(fd)
                 finally:
                     os.close(fd)
-                if value.st_mtime < cutoff or int(suffix) > EVENT_LOG_BACKUPS:
+                candidates.append((name, value))
+            canonical = set(EVENT_LOG_BACKUP_FILENAMES)
+            changed = False
+            for name, value in candidates:
+                if name not in canonical or value.st_mtime < cutoff:
                     os.unlink(name, dir_fd=root_fd)
-                    os.fsync(root_fd)
+                    changed = True
+            if changed:
+                os.fsync(root_fd)
         finally:
             os.close(root_fd)
 
     def _install_transaction_reference(self, root_fd: int) -> str | None:
-        for name in ("install-state.json", "install_state.json", "install.json"):
+        def read_private(name: str) -> tuple[bytes, str] | None:
             try:
                 fd = self._open_private_file(root_fd, name, self.root / name)
             except FileNotFoundError:
-                continue
+                return None
             try:
                 raw = _read_all(fd)
             finally:
                 os.close(fd)
-            digest = hashlib.sha256(raw).hexdigest()
-            try:
-                value = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise StateCorruption(self.root / name, digest) from None
-            if not isinstance(value, dict):
-                raise StateCorruption(self.root / name, digest)
-            for field in ("transaction_id", "current_transaction", "active_transaction"):
-                reference = value.get(field)
-                if isinstance(reference, str):
-                    return reference
+            return raw, hashlib.sha256(raw).hexdigest()
+
+        for alias in INSTALL_STATE_LEGACY_FILENAMES:
+            legacy = read_private(alias)
+            if legacy is not None:
+                _, digest = legacy
+                raise StateCorruption(self.root / alias, digest)
+
+        canonical = read_private(INSTALL_STATE_FILENAME)
+        if canonical is None:
             return None
-        return None
+        raw, digest = canonical
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise StateCorruption(self.root / INSTALL_STATE_FILENAME, digest) from None
+        if not isinstance(value, dict) or set(value) != INSTALL_STATE_FIELDS:
+            raise StateCorruption(self.root / INSTALL_STATE_FILENAME, digest)
+        reference = value[INSTALL_STATE_TRANSACTION_FIELD]
+        if not isinstance(reference, str) or not reference:
+            raise StateCorruption(self.root / INSTALL_STATE_FILENAME, digest)
+        return reference
 
     def _prune_transactions_locked(self) -> None:
         if not self._root_exists():
             return
         root_fd = self._open_root()
         try:
+            reference = self._install_transaction_reference(root_fd)
             transactions_fd = self._open_directory(root_fd, "transactions", create=False)
             if transactions_fd is None:
                 return
             try:
-                reference = self._install_transaction_reference(root_fd)
                 candidates: list[tuple[int, str]] = []
                 for name in os.listdir(transactions_fd):
                     value = os.stat(name, dir_fd=transactions_fd, follow_symlinks=False)
