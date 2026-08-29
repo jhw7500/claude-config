@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from codex_mcp_ownership import procfs
+from codex_mcp_ownership import model, procfs
 
 
 class FakeClock:
@@ -19,6 +19,68 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self._boot += seconds
+
+
+def sample_identity() -> model.ProcessIdentity:
+    return model.ProcessIdentity(
+        boot_id="test-boot-id",
+        pid=321,
+        ppid=1,
+        pgid=321,
+        start_ticks=424242,
+        exe_dev=8,
+        exe_ino=12345,
+        exe_name="node",
+    )
+
+
+def sample_lease(session_id: str = "session:test_1") -> model.SessionLease:
+    identity = sample_identity()
+    observed = model.ObservedTime("2026-08-29T00:00:00+00:00", identity.boot_id, 12.5)
+    return model.SessionLease(
+        1,
+        session_id,
+        "/workspace",
+        "SessionStart",
+        (identity.stable_key(),),
+        "active",
+        observed,
+    )
+
+
+def sample_process() -> model.ManagedProcess:
+    identity = sample_identity()
+    observed = model.ObservedTime("2026-08-29T00:00:00+00:00", identity.boot_id, 12.5)
+    return model.ManagedProcess(
+        1,
+        identity.stable_key(),
+        "user",
+        "example",
+        "/workspace",
+        identity,
+        None,
+        (identity,),
+        identity.pgid,
+        frozenset({identity.stable_key()}),
+        observed,
+        owner_session_id="session:test_1",
+    )
+
+
+def make_private_directory(path: Path) -> None:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+
+
+def write_private_file(path: Path, content: bytes) -> None:
+    path.write_bytes(content)
+    path.chmod(0o600)
 
 
 def write_proc_entry(

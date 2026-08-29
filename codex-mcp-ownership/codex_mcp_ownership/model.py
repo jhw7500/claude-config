@@ -4,7 +4,18 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import re
 from typing import Literal
+
+
+_SESSION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", re.ASCII)
+
+
+def validate_session_id(value: object) -> str:
+    session_id = _string(value, "session_id")
+    if _SESSION_ID.fullmatch(session_id) is None:
+        raise ValueError("invalid session_id")
+    return session_id
 
 
 def _require_exact_keys(data: object, keys: set[str]) -> dict[str, object]:
@@ -189,7 +200,7 @@ class SessionLease:
             raise ValueError("ended must be a record or null")
         return cls(
             schema_version=schema_version,
-            session_id=_string(parsed["session_id"], "session_id"),
+            session_id=validate_session_id(parsed["session_id"]),
             cwd=_string(parsed["cwd"], "cwd"),
             source=_string(parsed["source"], "source"),
             host_keys=_strings(parsed["host_keys"], "host_keys"),
@@ -289,7 +300,7 @@ class ManagedProcess:
         owner_session_id = parsed["owner_session_id"]
         shared_owner = parsed["shared_owner"]
         if owner_session_id is not None:
-            owner_session_id = _string(owner_session_id, "owner_session_id")
+            owner_session_id = validate_session_id(owner_session_id)
         if shared_owner is not None:
             shared_owner = _string(shared_owner, "shared_owner")
         first_owner_gone_boot = parsed["first_owner_gone_boot"]
