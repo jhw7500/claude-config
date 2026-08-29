@@ -14,6 +14,7 @@ def test_parse_stat_uses_last_closing_parenthesis():
         "0 0 0 0 20 0 1 0 424242 0 0"
     )
     parsed = procfs.parse_stat(raw)
+    assert parsed.pid == 321
     assert parsed.ppid == 77
     assert parsed.pgid == 88
     assert parsed.start_ticks == 424242
@@ -22,6 +23,13 @@ def test_parse_stat_uses_last_closing_parenthesis():
 def test_parse_stat_rejects_malformed_data():
     with pytest.raises(procfs.ProcfsFormatError):
         procfs.parse_stat("321 (node) S not-a-pid")
+
+
+@pytest.mark.parametrize("leading_pid", ("not-a-pid", "+321"))
+def test_parse_stat_rejects_invalid_leading_pid(leading_pid):
+    raw = f"{leading_pid} (node) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 42 0 0"
+    with pytest.raises(procfs.ProcfsFormatError):
+        procfs.parse_stat(raw)
 
 
 def test_identity_changes_when_pid_is_reused(fake_proc):
@@ -42,6 +50,14 @@ def test_rss_rejects_reused_identity(fake_proc):
 
 def test_identity_returns_none_for_missing_process(fake_proc):
     assert fake_proc.identity(999) is None
+
+
+def test_identity_rejects_stat_with_a_different_leading_pid(fake_proc):
+    (fake_proc.root / "321" / "stat").write_text(
+        "999 (node) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 424242 0 0\n",
+        encoding="utf-8",
+    )
+    assert fake_proc.identity(321) is None
 
 
 def test_identity_rejects_start_ticks_changed_during_read(fake_proc, monkeypatch):
@@ -178,3 +194,70 @@ def test_session_and_managed_process_round_trip_with_schema_v1(fake_proc):
     assert model.ManagedProcess.from_dict(managed.to_dict()) == managed
     with pytest.raises(ValueError):
         model.SessionLease.from_dict({**lease.to_dict(), "schema_version": 2})
+
+
+def test_open_pidfd_returns_revalidated_descriptor(fake_proc, monkeypatch):
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    identity = tree.identity(321)
+    assert identity is not None
+    calls = []
+
+    def pidfd_open(pid, flags):
+        calls.append((pid, flags))
+        return 91
+
+    monkeypatch.setattr(procfs.os, "pidfd_open", pidfd_open)
+    assert tree.open_pidfd(identity) == 91
+    assert calls == [(321, 0)]
+
+
+def test_open_pidfd_closes_on_post_open_identity_mismatch(fake_proc, monkeypatch):
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    identity = tree.identity(321)
+    assert identity is not None
+    observations = iter((identity, None))
+    closed = []
+    monkeypatch.setattr(tree, "identity", lambda pid: next(observations))
+    monkeypatch.setattr(procfs.os, "pidfd_open", lambda pid, flags: 91)
+    monkeypatch.setattr(procfs.os, "close", closed.append)
+
+    with pytest.raises(ProcessLookupError) as error:
+        tree.open_pidfd(identity)
+
+    assert error.value.errno == procfs.errno.ESRCH
+    assert closed == [91]
+
+
+def test_open_pidfd_reports_enosys_when_unavailable(fake_proc, monkeypatch):
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    identity = tree.identity(321)
+    assert identity is not None
+    monkeypatch.delattr(procfs.os, "pidfd_open", raising=False)
+
+    with pytest.raises(OSError) as error:
+        tree.open_pidfd(identity)
+
+    assert error.value.errno == procfs.errno.ENOSYS
+
+
+def test_open_pidfd_closes_once_when_post_open_parse_fails(fake_proc, monkeypatch):
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    identity = tree.identity(321)
+    assert identity is not None
+    observations = iter((identity, procfs.ProcfsFormatError("bad stat")))
+    closed = []
+
+    def read_identity(pid):
+        result = next(observations)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(tree, "identity", read_identity)
+    monkeypatch.setattr(procfs.os, "pidfd_open", lambda pid, flags: 91)
+    monkeypatch.setattr(procfs.os, "close", closed.append)
+
+    with pytest.raises(procfs.ProcfsFormatError):
+        tree.open_pidfd(identity)
+
+    assert closed == [91]

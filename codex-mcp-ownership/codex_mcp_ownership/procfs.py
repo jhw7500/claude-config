@@ -15,6 +15,7 @@ class ProcfsFormatError(ValueError):
 
 @dataclass(frozen=True)
 class ProcStat:
+    pid: int
     ppid: int
     pgid: int
     start_ticks: int
@@ -29,7 +30,14 @@ def parse_stat(raw: str) -> ProcStat:
     if len(fields) < 20:
         raise ProcfsFormatError("incomplete proc stat")
     try:
+        pid_text = raw[:left].strip()
+        if not pid_text.isascii() or not pid_text.isdecimal():
+            raise ValueError("invalid pid")
+        pid = int(pid_text)
+        if pid < 1:
+            raise ValueError("invalid pid")
         return ProcStat(
+            pid=pid,
             ppid=int(fields[1]),
             pgid=int(fields[2]),
             start_ticks=int(fields[19]),
@@ -76,7 +84,7 @@ class LinuxProcfs:
             return None
         except OSError:
             return None
-        if before != after:
+        if before != after or before.pid != pid or after.pid != pid:
             return None
         return ProcessIdentity(
             boot_id=boot_id,
@@ -146,7 +154,10 @@ class LinuxProcfs:
         if pidfd_open is None:
             raise OSError(errno.ENOSYS, "pidfd_open is unavailable")
         descriptor = pidfd_open(identity.pid, 0)
-        if self.identity(identity.pid) != identity:
-            os.close(descriptor)
+        try:
+            if self.identity(identity.pid) == identity:
+                return descriptor
             raise ProcessLookupError(errno.ESRCH, "process identity changed while opening pidfd")
-        return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
