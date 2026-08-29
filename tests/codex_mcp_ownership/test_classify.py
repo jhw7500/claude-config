@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -166,16 +167,19 @@ class ClassificationScenario:
         self.now_boot = 300.0
 
     def classify(self, owner_state: str, host_live: bool, elapsed: float):
+        first_gone = None if elapsed == 0.0 else self.now_boot - elapsed
         lease = replace(
             self.matching_lease,
             state=owner_state,
             ended=(
                 None
                 if owner_state == "active"
-                else replace(self.matching_lease.observed, boottime=self.now_boot)
+                else replace(
+                    self.matching_lease.observed,
+                    boottime=(self.now_boot if first_gone is None else first_gone),
+                )
             ),
         )
-        first_gone = None if elapsed == 0.0 else self.now_boot - elapsed
         managed = replace(
             self.process,
             first_owner_gone_boot=(None if owner_state == "active" else first_gone),
@@ -223,6 +227,38 @@ def test_live_identity_with_disappeared_active_host_starts_owner_grace(scenario)
     assert result.grace_deadline_boot == 420.0
 
 
+def test_active_persisted_owner_with_competing_active_match_is_unknown(scenario):
+    competitor = replace(scenario.matching_lease, session_id="thr_competitor")
+    result = classify.classify_process(
+        scenario.process,
+        (scenario.matching_lease, competitor),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+    assert result.state == "unknown"
+    assert result.reason_codes == ("ambiguous_active_owner",)
+    assert result.eligible_term is False
+
+
+def test_ended_owner_with_competing_active_match_is_unknown(scenario):
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=replace(scenario.matching_lease.observed, boottime=150.0),
+    )
+    competitor = replace(scenario.matching_lease, session_id="thr_competitor")
+    managed = replace(scenario.process, first_owner_gone_boot=150.0)
+    result = classify.classify_process(
+        managed,
+        (ended, competitor),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+    assert result.state == "unknown"
+    assert result.reason_codes == ("competing_active_owner",)
+    assert result.eligible_term is False
+
+
 def test_explicit_shared_process_is_never_term_eligible(scenario):
     shared = replace(scenario.process, shared_owner="user:shared-example")
     result = classify.classify_process(
@@ -264,6 +300,98 @@ def test_reused_pid_is_unknown_and_not_live(scenario):
     assert result.eligible_term is False
 
 
+@pytest.mark.parametrize("unreadable", ["boot", "stat", "exe"])
+def test_concrete_unreadable_managed_identity_is_unknown(
+    scenario,
+    monkeypatch,
+    unreadable,
+):
+    original_read = scenario.procfs._read_text
+    original_readlink = procfs.os.readlink
+
+    def read_text(path):
+        if unreadable == "boot" and path == scenario.fake_proc.boot_id_path:
+            raise PermissionError("unreadable boot id")
+        if (
+            unreadable == "stat"
+            and path == scenario.fake_proc.root / "321" / "stat"
+        ):
+            raise PermissionError("unreadable stat")
+        return original_read(path)
+
+    def readlink(path):
+        if unreadable == "exe" and path == scenario.fake_proc.root / "321" / "exe":
+            raise PermissionError("unreadable exe")
+        return original_readlink(path)
+
+    monkeypatch.setattr(scenario.procfs, "_read_text", read_text)
+    monkeypatch.setattr(procfs.os, "readlink", readlink)
+    result = classify.classify_process(
+        scenario.process,
+        (scenario.matching_lease,),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+    assert result.state == "unknown"
+    assert result.reason_codes == ("process_identity_unavailable",)
+    assert result.eligible_term is False
+
+
+def test_unreadable_owner_identity_does_not_become_owner_host_gone(
+    scenario,
+    monkeypatch,
+):
+    original_read = scenario.procfs._read_text
+    host_stat = scenario.fake_proc.root / str(scenario.host_identity.pid) / "stat"
+
+    def read_text(path):
+        if path == host_stat:
+            raise PermissionError("unreadable owner stat")
+        return original_read(path)
+
+    managed = replace(scenario.process, first_owner_gone_boot=105.0)
+    monkeypatch.setattr(scenario.procfs, "_read_text", read_text)
+    result = classify.classify_process(
+        managed,
+        (scenario.matching_lease,),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+    assert result.state == "unknown"
+    assert result.reason_codes == ("owner_identity_unavailable",)
+    assert result.eligible_term is False
+
+
+def test_unrelated_live_process_host_key_does_not_mask_owner_loss(scenario):
+    write_proc_entry(
+        scenario.fake_proc.root,
+        101,
+        "101 (other) S 1 101 101 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1010 0 0\n",
+        scenario.fake_proc.exe,
+    )
+    unrelated = scenario.procfs.identity(101)
+    assert unrelated is not None
+    managed = replace(
+        scenario.process,
+        host_keys=scenario.process.host_keys | {unrelated.stable_key()},
+    )
+    host_path = scenario.fake_proc.root / str(scenario.host_identity.pid)
+    for child in host_path.iterdir():
+        child.unlink()
+    host_path.rmdir()
+
+    result = classify.classify_process(
+        managed,
+        (scenario.matching_lease,),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+
+    assert result.state == "exiting"
+    assert result.reason_codes == ("owner_host_gone", "owner_grace_active")
+    assert result.eligible_term is False
+
+
 def test_owner_boot_mismatch_is_unknown(scenario):
     mismatched = replace(
         scenario.matching_lease,
@@ -281,7 +409,12 @@ def test_owner_boot_mismatch_is_unknown(scenario):
 
 @pytest.mark.parametrize(
     ("now_boot", "grace_seconds"),
-    [(float("nan"), 120.0), (300.0, float("inf")), (300.0, -1.0)],
+    [
+        (float("nan"), 120.0),
+        (-0.001, 120.0),
+        (300.0, float("inf")),
+        (300.0, -1.0),
+    ],
 )
 def test_invalid_classification_time_is_unknown(
     scenario,
@@ -298,6 +431,150 @@ def test_invalid_classification_time_is_unknown(
     assert result.state == "unknown"
     assert result.reason_codes == ("invalid_classification_time",)
     assert result.eligible_term is False
+
+
+def test_finite_grace_overflow_is_unknown_without_owner_loss_proposal(scenario):
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=replace(scenario.matching_lease.observed, boottime=105.0),
+    )
+    result = classify.classify_process(
+        scenario.process,
+        (ended,),
+        scenario.procfs,
+        sys.float_info.max,
+        sys.float_info.max,
+    )
+    assert result.state == "unknown"
+    assert result.reason_codes == ("invalid_classification_time",)
+    assert result.process == scenario.process
+    assert result.eligible_term is False
+
+
+@pytest.mark.parametrize(
+    ("spawned_boot", "observed_boot"),
+    [(-0.001, 105.0), (100.0, -0.001), (301.0, 105.0), (100.0, 301.0)],
+)
+def test_invalid_spawn_or_owner_observation_time_is_unknown(
+    scenario,
+    spawned_boot,
+    observed_boot,
+):
+    managed = replace(
+        scenario.process,
+        spawned=replace(scenario.process.spawned, boottime=spawned_boot),
+    )
+    owner = replace(
+        scenario.matching_lease,
+        observed=replace(scenario.matching_lease.observed, boottime=observed_boot),
+    )
+    result = classify.classify_process(
+        managed,
+        (owner,),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+    assert result.state == "unknown"
+    assert result.reason_codes == ("invalid_lifecycle_time",)
+    assert result.eligible_term is False
+
+
+@pytest.mark.parametrize("ended_boot", [None, 104.999, 300.001])
+def test_invalid_session_end_time_is_unknown(scenario, ended_boot):
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=(
+            None
+            if ended_boot is None
+            else replace(scenario.matching_lease.observed, boottime=ended_boot)
+        ),
+    )
+    result = classify.classify_process(
+        scenario.process,
+        (ended,),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+    assert result.state == "unknown"
+    assert result.reason_codes == ("invalid_lifecycle_time",)
+    assert result.process == scenario.process
+    assert result.eligible_term is False
+
+
+@pytest.mark.parametrize("first_gone", [-0.001, 99.999, 104.999, 300.001])
+def test_impossible_owner_loss_time_is_unknown_without_proposal(scenario, first_gone):
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=replace(scenario.matching_lease.observed, boottime=105.0),
+    )
+    managed = replace(scenario.process, first_owner_gone_boot=first_gone)
+    result = classify.classify_process(
+        managed,
+        (ended,),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+    assert result.state == "unknown"
+    assert result.reason_codes == ("invalid_lifecycle_time",)
+    assert result.process == managed
+    assert result.eligible_term is False
+
+
+@pytest.mark.parametrize(
+    ("first_gone", "term_sent"),
+    [
+        (None, 250.0),
+        (150.0, -0.001),
+        (150.0, 149.999),
+        (150.0, 269.999),
+        (150.0, 300.001),
+    ],
+)
+def test_impossible_term_time_is_unknown(scenario, first_gone, term_sent):
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=replace(scenario.matching_lease.observed, boottime=105.0),
+    )
+    managed = replace(
+        scenario.process,
+        first_owner_gone_boot=first_gone,
+        term_sent_boot=term_sent,
+    )
+    result = classify.classify_process(
+        managed,
+        (ended,),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+    assert result.state == "unknown"
+    assert result.reason_codes == ("invalid_lifecycle_time",)
+    assert result.process == managed
+    assert result.eligible_term is False
+
+
+def test_term_at_orphan_deadline_is_valid(scenario):
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=replace(scenario.matching_lease.observed, boottime=105.0),
+    )
+    managed = replace(
+        scenario.process,
+        first_owner_gone_boot=150.0,
+        term_sent_boot=270.0,
+    )
+    result = classify.classify_process(
+        managed,
+        (ended,),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+    assert result.state == "stubborn"
+    assert result.reason_codes[-1] == "term_survivor"
 
 
 def test_process_with_no_remaining_identity_is_gone(scenario):
@@ -323,11 +600,11 @@ def test_term_survivor_threshold_is_inclusive(scenario, term_elapsed, expected):
     ended = replace(
         scenario.matching_lease,
         state="ended",
-        ended=replace(scenario.matching_lease.observed, boottime=100.0),
+        ended=replace(scenario.matching_lease.observed, boottime=105.0),
     )
     managed = replace(
         scenario.process,
-        first_owner_gone_boot=100.0,
+        first_owner_gone_boot=105.0,
         term_sent_boot=scenario.now_boot - term_elapsed,
     )
     result = classify.classify_process(
@@ -480,6 +757,84 @@ def test_audit_excludes_identity_that_changes_during_rss_revalidation(
 
     assert snapshot.process_count == 0
     assert snapshot.rss_kib == 0
+
+
+def test_audit_rss_error_excludes_identity_and_revokes_eligibility(
+    tmp_path,
+    scenario,
+):
+    root = tmp_path / "state"
+    store = state.StateStore(root)
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=replace(scenario.matching_lease.observed, boottime=105.0),
+    )
+    managed = replace(scenario.process, first_owner_gone_boot=105.0)
+    store.save_session(ended)
+    store.save_process(managed)
+
+    class RaisingRss:
+        proc_root = scenario.procfs.proc_root
+
+        def _boot_id(self):
+            return scenario.procfs._boot_id()
+
+        def observe_identity(self, pid):
+            return scenario.procfs.observe_identity(pid)
+
+        def identity(self, pid):
+            return scenario.procfs.identity(pid)
+
+        def rss_kib(self, identity):
+            raise OSError("unreadable status")
+
+    snapshot = classify.build_audit(
+        store,
+        RaisingRss(),
+        FakeClock(boot=scenario.now_boot),
+    )
+
+    assert snapshot.process_count == 0
+    assert snapshot.rss_kib == 0
+    assert snapshot.classifications[0].state == "unknown"
+    assert snapshot.classifications[0].reason_codes[-1] == "audit_identity_unavailable"
+    assert snapshot.classifications[0].eligible_term is False
+
+
+def test_audit_malformed_stat_between_scans_is_fail_closed(
+    tmp_path,
+    scenario,
+    monkeypatch,
+):
+    root = tmp_path / "state"
+    store = state.StateStore(root)
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=replace(scenario.matching_lease.observed, boottime=105.0),
+    )
+    managed = replace(scenario.process, first_owner_gone_boot=105.0)
+    store.save_session(ended)
+    store.save_process(managed)
+    original_rss = scenario.procfs.rss_kib
+    stat_path = scenario.fake_proc.root / str(managed.wrapper.pid) / "stat"
+
+    def malformed_during_rss(identity):
+        stat_path.write_text("321 (node) malformed\n", encoding="utf-8")
+        return original_rss(identity)
+
+    monkeypatch.setattr(scenario.procfs, "rss_kib", malformed_during_rss)
+    snapshot = classify.build_audit(
+        store,
+        scenario.procfs,
+        FakeClock(boot=scenario.now_boot),
+    )
+
+    assert snapshot.process_count == 0
+    assert snapshot.rss_kib == 0
+    assert snapshot.classifications[0].state == "unknown"
+    assert snapshot.classifications[0].eligible_term is False
 
 
 def test_audit_classification_order_is_stable_by_process_identity(tmp_path, scenario):

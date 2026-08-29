@@ -5,6 +5,7 @@ import errno
 import os
 from pathlib import Path
 import re
+from typing import Literal
 
 from .model import ProcessIdentity
 
@@ -19,6 +20,12 @@ class ProcStat:
     ppid: int
     pgid: int
     start_ticks: int
+
+
+@dataclass(frozen=True)
+class IdentityObservation:
+    kind: Literal["live", "missing", "unavailable"]
+    identity: ProcessIdentity | None
 
 
 def parse_stat(raw: str) -> ProcStat:
@@ -95,6 +102,49 @@ class LinuxProcfs:
             exe_dev=exe_stat.st_dev,
             exe_ino=exe_stat.st_ino,
             exe_name=Path(exe_target).name,
+        )
+
+    def observe_identity(self, pid: int) -> IdentityObservation:
+        if type(pid) is not int or pid < 1:
+            return IdentityObservation("unavailable", None)
+        base = self.proc_root / str(pid)
+        try:
+            boot_id = self._read_text(self.boot_id_path).strip()
+        except OSError:
+            return IdentityObservation("unavailable", None)
+        if not boot_id:
+            return IdentityObservation("unavailable", None)
+        try:
+            before = parse_stat(self._read_text(base / "stat"))
+        except (FileNotFoundError, ProcessLookupError):
+            return IdentityObservation("missing", None)
+        except (OSError, ProcfsFormatError):
+            return IdentityObservation("unavailable", None)
+        try:
+            exe_stat = (base / "exe").stat()
+            exe_target = os.readlink(base / "exe")
+        except (OSError, ProcfsFormatError):
+            return IdentityObservation("unavailable", None)
+        try:
+            after = parse_stat(self._read_text(base / "stat"))
+        except (FileNotFoundError, ProcessLookupError):
+            return IdentityObservation("missing", None)
+        except (OSError, ProcfsFormatError):
+            return IdentityObservation("unavailable", None)
+        if before != after or before.pid != pid or after.pid != pid:
+            return IdentityObservation("unavailable", None)
+        return IdentityObservation(
+            "live",
+            ProcessIdentity(
+                boot_id=boot_id,
+                pid=pid,
+                ppid=before.ppid,
+                pgid=before.pgid,
+                start_ticks=before.start_ticks,
+                exe_dev=exe_stat.st_dev,
+                exe_ino=exe_stat.st_ino,
+                exe_name=Path(exe_target).name,
+            ),
         )
 
     def ancestor_chain(self, pid: int) -> tuple[ProcessIdentity, ...]:

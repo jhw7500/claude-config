@@ -15,7 +15,7 @@ from .model import (
     ProcessIdentity,
     SessionLease,
 )
-from .procfs import LinuxProcfs
+from .procfs import IdentityObservation, LinuxProcfs
 from .state import StateCorruption, StateStore
 
 
@@ -33,22 +33,31 @@ _STATE_ORDER = (
 )
 
 
-def _lease_matches(process: ManagedProcess, lease: SessionLease) -> bool:
-    same_host = bool(process.host_keys & frozenset(lease.host_keys))
+def _owner_host_keys(
+    process: ManagedProcess,
+    lease: SessionLease,
+) -> frozenset[str]:
+    return process.host_keys & frozenset(lease.host_keys)
+
+
+def _lease_has_owner_evidence(process: ManagedProcess, lease: SessionLease) -> bool:
+    same_host = bool(_owner_host_keys(process, lease))
     same_cwd = os.path.realpath(process.cwd) == os.path.realpath(lease.cwd)
     within_window = (
         abs(process.spawned.boottime - lease.observed.boottime)
         <= ASSOCIATION_WINDOW_SECONDS
     )
-    return same_host and same_cwd and within_window and lease.state == "active"
+    return same_host and same_cwd and within_window
 
 
-def _lease_has_owner_evidence(process: ManagedProcess, lease: SessionLease) -> bool:
-    return (
-        bool(process.host_keys & frozenset(lease.host_keys))
-        and os.path.realpath(process.cwd) == os.path.realpath(lease.cwd)
-        and abs(process.spawned.boottime - lease.observed.boottime)
-        <= ASSOCIATION_WINDOW_SECONDS
+def _active_owner_candidates(
+    process: ManagedProcess,
+    leases: tuple[SessionLease, ...],
+) -> tuple[SessionLease, ...]:
+    return tuple(
+        lease
+        for lease in leases
+        if lease.state == "active" and _lease_has_owner_evidence(process, lease)
     )
 
 
@@ -65,7 +74,7 @@ def associate_owner(
             shared_owner=process.shared_owner,
             reason_codes=("explicit_shared_owner",),
         )
-    matches = tuple(lease for lease in leases if _lease_matches(process, lease))
+    matches = _active_owner_candidates(process, leases)
     if len(matches) == 1:
         return Association(
             kind="session",
@@ -101,37 +110,62 @@ def _observe_process(
 ) -> tuple[tuple[ProcessIdentity, ...], str | None]:
     live: list[ProcessIdentity] = []
     for expected in _recorded_identities(process):
-        try:
-            current = procfs.identity(expected.pid)
-        except (OSError, ValueError):
+        observation = _observe_identity(procfs, expected.pid)
+        if observation.kind == "unavailable":
             return (), "process_identity_unavailable"
-        if current is None:
+        if observation.kind == "missing":
             continue
-        if current != expected:
+        if observation.identity != expected:
             return (), "process_identity_mismatch"
         live.append(expected)
     return tuple(live), None
 
 
-def _live_host_keys(procfs: LinuxProcfs) -> frozenset[str] | None:
+def _observe_identity(procfs: LinuxProcfs, pid: int) -> IdentityObservation:
+    observer = getattr(procfs, "observe_identity", None)
+    if callable(observer):
+        try:
+            observation = observer(pid)
+        except (OSError, ValueError):
+            return IdentityObservation("unavailable", None)
+        if isinstance(observation, IdentityObservation):
+            return observation
+        return IdentityObservation("unavailable", None)
+    try:
+        identity = procfs.identity(pid)
+    except (OSError, ValueError):
+        return IdentityObservation("unavailable", None)
+    if identity is None:
+        return IdentityObservation("unavailable", None)
+    return IdentityObservation("live", identity)
+
+
+def _host_identity_state(
+    procfs: LinuxProcfs,
+    owner_host_keys: frozenset[str],
+) -> str:
     proc_root = getattr(procfs, "proc_root", None)
     if not isinstance(proc_root, Path):
-        return None
+        return "unavailable"
     try:
         pids = sorted(
             int(entry.name) for entry in proc_root.iterdir() if entry.name.isdecimal()
         )
     except OSError:
-        return None
-    keys: set[str] = set()
+        return "unavailable"
+    unavailable = False
     for pid in pids:
-        try:
-            identity = procfs.identity(pid)
-        except (OSError, ValueError):
-            return None
-        if identity is not None:
-            keys.add(identity.stable_key())
-    return frozenset(keys)
+        observation = _observe_identity(procfs, pid)
+        if observation.kind == "unavailable":
+            unavailable = True
+            continue
+        if (
+            observation.kind == "live"
+            and observation.identity is not None
+            and observation.identity.stable_key() in owner_host_keys
+        ):
+            return "live"
+    return "unavailable" if unavailable else "missing"
 
 
 def _classification(
@@ -152,6 +186,17 @@ def _classification(
     )
 
 
+def _valid_boot_time(value: object, now_boot: float | None = None) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    converted = float(value)
+    return (
+        math.isfinite(converted)
+        and converted >= 0
+        and (now_boot is None or converted <= now_boot)
+    )
+
+
 def classify_process(
     process: ManagedProcess,
     leases: tuple[SessionLease, ...],
@@ -160,14 +205,22 @@ def classify_process(
     grace_seconds: float = OWNER_GRACE_SECONDS,
 ) -> Classification:
     if (
-        not math.isfinite(now_boot)
+        not _valid_boot_time(now_boot)
         or not math.isfinite(grace_seconds)
         or grace_seconds < 0
+        or not math.isfinite(now_boot + grace_seconds)
     ):
         return _classification(
             process,
             "unknown",
             ("invalid_classification_time",),
+            (),
+        )
+    if not _valid_boot_time(process.spawned.boottime, now_boot):
+        return _classification(
+            process,
+            "unknown",
+            ("invalid_lifecycle_time",),
             (),
         )
     live_identities, identity_error = _observe_process(process, procfs)
@@ -215,6 +268,34 @@ def classify_process(
             ("owner_boot_mismatch",),
             live_identities,
         )
+    if not _valid_boot_time(owner.observed.boottime, now_boot):
+        return _classification(
+            process,
+            "unknown",
+            ("invalid_lifecycle_time",),
+            live_identities,
+        )
+    owner_time_floor = max(process.spawned.boottime, owner.observed.boottime)
+    if owner.state == "ended":
+        if (
+            owner.ended is None
+            or not _valid_boot_time(owner.ended.boottime, now_boot)
+            or owner.ended.boottime < owner.observed.boottime
+        ):
+            return _classification(
+                process,
+                "unknown",
+                ("invalid_lifecycle_time",),
+                live_identities,
+            )
+        owner_time_floor = max(owner_time_floor, owner.ended.boottime)
+    elif owner.ended is not None:
+        return _classification(
+            process,
+            "unknown",
+            ("invalid_lifecycle_time",),
+            live_identities,
+        )
     if not _lease_has_owner_evidence(process, owner):
         return _classification(
             process,
@@ -223,19 +304,78 @@ def classify_process(
             live_identities,
         )
 
+    first_gone = process.first_owner_gone_boot
+    term_sent = process.term_sent_boot
+    if first_gone is not None and (
+        not _valid_boot_time(first_gone, now_boot) or first_gone < owner_time_floor
+    ):
+        return _classification(
+            process,
+            "unknown",
+            ("invalid_lifecycle_time",),
+            live_identities,
+        )
+    grace_deadline: float | None = None
+    if first_gone is not None:
+        grace_deadline = first_gone + grace_seconds
+        if not math.isfinite(grace_deadline):
+            return _classification(
+                process,
+                "unknown",
+                ("invalid_lifecycle_time",),
+                live_identities,
+            )
+    if term_sent is not None and (
+        first_gone is None
+        or not _valid_boot_time(term_sent, now_boot)
+        or grace_deadline is None
+        or term_sent < grace_deadline
+    ):
+        return _classification(
+            process,
+            "unknown",
+            ("invalid_lifecycle_time",),
+            live_identities,
+        )
+    active_candidates = _active_owner_candidates(process, leases)
+    if owner.state == "active" and (
+        len(active_candidates) != 1
+        or active_candidates[0].session_id != owner.session_id
+    ):
+        return _classification(
+            process,
+            "unknown",
+            ("ambiguous_active_owner",),
+            live_identities,
+        )
+    if owner.state == "ended" and active_candidates:
+        return _classification(
+            process,
+            "unknown",
+            ("competing_active_owner",),
+            live_identities,
+        )
+
     owner_loss_reason: str | None = None
     if owner.state == "ended":
         owner_loss_reason = "owner_session_ended"
     else:
-        host_keys = _live_host_keys(procfs)
-        if host_keys is None:
+        host_state = _host_identity_state(procfs, _owner_host_keys(process, owner))
+        if host_state == "unavailable":
             return _classification(
                 process,
                 "unknown",
                 ("owner_identity_unavailable",),
                 live_identities,
             )
-        if process.host_keys & host_keys:
+        if host_state == "live":
+            if first_gone is not None or term_sent is not None:
+                return _classification(
+                    process,
+                    "unknown",
+                    ("invalid_lifecycle_time",),
+                    live_identities,
+                )
             return _classification(
                 process,
                 "active",
@@ -244,28 +384,20 @@ def classify_process(
             )
         owner_loss_reason = "owner_host_gone"
 
-    first_gone = process.first_owner_gone_boot
     if first_gone is None:
         first_gone = now_boot
         process = replace(process, first_owner_gone_boot=first_gone)
-    if first_gone > now_boot:
-        return _classification(
-            process,
-            "unknown",
-            ("owner_loss_time_in_future",),
-            live_identities,
-        )
-    grace_deadline = first_gone + grace_seconds
-    if process.term_sent_boot is not None:
-        if process.term_sent_boot > now_boot:
+        grace_deadline = first_gone + grace_seconds
+        if not math.isfinite(grace_deadline):
             return _classification(
                 process,
                 "unknown",
-                ("term_time_in_future",),
+                ("invalid_lifecycle_time",),
                 live_identities,
-                grace_deadline,
             )
-        if now_boot - process.term_sent_boot >= _TERM_SURVIVOR_SECONDS:
+    assert grace_deadline is not None
+    if term_sent is not None:
+        if now_boot - term_sent >= _TERM_SURVIVOR_SECONDS:
             return _classification(
                 process,
                 "stubborn",
@@ -327,6 +459,26 @@ def _audit_boot_id(
     return ""
 
 
+def _audit_rss_observation(
+    procfs: LinuxProcfs,
+    identity: ProcessIdentity,
+) -> tuple[bool, int]:
+    try:
+        rss_kib = procfs.rss_kib(identity)
+        observation = _observe_identity(procfs, identity.pid)
+    except (OSError, ValueError):
+        return False, 0
+    if (
+        isinstance(rss_kib, bool)
+        or not isinstance(rss_kib, int)
+        or rss_kib < 0
+        or observation.kind != "live"
+        or observation.identity != identity
+    ):
+        return False, 0
+    return True, rss_kib
+
+
 def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSnapshot:
     audit_store = StateStore(
         store.root,
@@ -348,7 +500,7 @@ def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSn
         corrupt_count += 1
 
     now_boot = clock.boottime()
-    classifications = tuple(
+    initial_classifications = tuple(
         sorted(
             (
                 _unknown_after_corruption(
@@ -363,27 +515,44 @@ def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSn
             key=lambda item: item.process.wrapper.stable_key(),
         )
     )
+    observations: dict[str, tuple[bool, int]] = {}
+    unique_live: dict[str, ProcessIdentity] = {}
+    rss_kib = 0
+    classifications_list: list[Classification] = []
+    for item in initial_classifications:
+        verified: list[ProcessIdentity] = []
+        unavailable = False
+        for identity in item.live_identities:
+            key = identity.stable_key()
+            observation = observations.get(key)
+            if observation is None:
+                observation = _audit_rss_observation(procfs, identity)
+                observations[key] = observation
+            exact, rss = observation
+            if not exact:
+                unavailable = True
+                continue
+            verified.append(identity)
+            if key not in unique_live:
+                unique_live[key] = identity
+                rss_kib += rss
+        if unavailable:
+            reason_codes = item.reason_codes
+            if "audit_identity_unavailable" not in reason_codes:
+                reason_codes += ("audit_identity_unavailable",)
+            item = replace(
+                item,
+                state="unknown",
+                reason_codes=reason_codes,
+                live_identities=tuple(verified),
+                eligible_term=False,
+            )
+        classifications_list.append(item)
+    classifications = tuple(classifications_list)
+
     counts = {state: 0 for state in _STATE_ORDER}
     for item in classifications:
         counts[item.state] += 1
-
-    unique_live: dict[str, ProcessIdentity] = {}
-    rss_kib = 0
-    for item in classifications:
-        for identity in item.live_identities:
-            key = identity.stable_key()
-            if key in unique_live:
-                continue
-            rss = procfs.rss_kib(identity)
-            try:
-                still_live = procfs.identity(identity.pid) == identity
-            except (OSError, ValueError):
-                still_live = False
-            if not still_live:
-                continue
-            unique_live[key] = identity
-            if rss is not None:
-                rss_kib += rss
 
     managed = sum(
         any(identity.stable_key() in unique_live for identity in item.live_identities)

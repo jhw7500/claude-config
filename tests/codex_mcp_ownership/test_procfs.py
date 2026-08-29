@@ -52,6 +52,66 @@ def test_identity_returns_none_for_missing_process(fake_proc):
     assert fake_proc.identity(999) is None
 
 
+def test_observe_identity_distinguishes_live_and_confirmed_missing(fake_proc):
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    live = tree.observe_identity(321)
+    missing = tree.observe_identity(999)
+    assert live.kind == "live"
+    assert live.identity == tree.identity(321)
+    assert missing.kind == "missing"
+    assert missing.identity is None
+
+
+@pytest.mark.parametrize("unreadable", ["boot", "stat", "exe"])
+def test_observe_identity_reports_concrete_procfs_unreadability_as_unavailable(
+    fake_proc,
+    monkeypatch,
+    unreadable,
+):
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    original_read = tree._read_text
+    original_readlink = procfs.os.readlink
+
+    def read_text(path):
+        if unreadable == "boot" and path == fake_proc.boot_id_path:
+            raise PermissionError("unreadable boot id")
+        if unreadable == "stat" and path == fake_proc.root / "321" / "stat":
+            raise PermissionError("unreadable stat")
+        return original_read(path)
+
+    def readlink(path):
+        if unreadable == "exe" and path == fake_proc.root / "321" / "exe":
+            raise PermissionError("unreadable exe")
+        return original_readlink(path)
+
+    monkeypatch.setattr(tree, "_read_text", read_text)
+    monkeypatch.setattr(procfs.os, "readlink", readlink)
+    observation = tree.observe_identity(321)
+    assert observation.kind == "unavailable"
+    assert observation.identity is None
+
+
+def test_observe_identity_reports_indeterminate_stat_race_as_unavailable(
+    fake_proc,
+    monkeypatch,
+):
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    original_read = tree._read_text
+    stat_reads = 0
+
+    def read_text(path):
+        nonlocal stat_reads
+        text = original_read(path)
+        if path == fake_proc.root / "321" / "stat":
+            stat_reads += 1
+            if stat_reads == 1:
+                fake_proc.write_start_ticks(321, 999999)
+        return text
+
+    monkeypatch.setattr(tree, "_read_text", read_text)
+    assert tree.observe_identity(321).kind == "unavailable"
+
+
 def test_identity_rejects_stat_with_a_different_leading_pid(fake_proc):
     (fake_proc.root / "321" / "stat").write_text(
         "999 (node) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 424242 0 0\n",
