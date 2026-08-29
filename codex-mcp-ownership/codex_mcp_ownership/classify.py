@@ -280,7 +280,7 @@ def classify_process(
         if (
             owner.ended is None
             or not _valid_boot_time(owner.ended.boottime, now_boot)
-            or owner.ended.boottime < owner.observed.boottime
+            or owner.ended.boottime < owner_time_floor
         ):
             return _classification(
                 process,
@@ -500,26 +500,29 @@ def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSn
         corrupt_count += 1
 
     now_boot = clock.boottime()
-    initial_classifications = tuple(
+    initial_entries = tuple(
         sorted(
             (
-                _unknown_after_corruption(
+                (
                     process,
-                    procfs,
-                    "corrupt_session_state",
+                    _unknown_after_corruption(
+                        process,
+                        procfs,
+                        "corrupt_session_state",
+                    )
+                    if sessions_corrupt
+                    else classify_process(process, leases, procfs, now_boot),
                 )
-                if sessions_corrupt
-                else classify_process(process, leases, procfs, now_boot)
                 for process in processes
             ),
-            key=lambda item: item.process.wrapper.stable_key(),
+            key=lambda entry: entry[0].wrapper.stable_key(),
         )
     )
     observations: dict[str, tuple[bool, int]] = {}
     unique_live: dict[str, ProcessIdentity] = {}
     rss_kib = 0
     classifications_list: list[Classification] = []
-    for item in initial_classifications:
+    for stored_process, item in initial_entries:
         verified: list[ProcessIdentity] = []
         unavailable = False
         for identity in item.live_identities:
@@ -542,6 +545,7 @@ def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSn
                 reason_codes += ("audit_identity_unavailable",)
             item = replace(
                 item,
+                process=stored_process,
                 state="unknown",
                 reason_codes=reason_codes,
                 live_identities=tuple(verified),

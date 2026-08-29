@@ -503,6 +503,41 @@ def test_invalid_session_end_time_is_unknown(scenario, ended_boot):
     assert result.eligible_term is False
 
 
+@pytest.mark.parametrize(
+    ("first_gone", "now_boot"),
+    [(None, 130.0), (130.0, 250.0)],
+    ids=("first-observation", "past-grace"),
+)
+def test_session_end_before_process_spawn_is_unknown_without_proposal(
+    scenario,
+    first_gone,
+    now_boot,
+):
+    managed = replace(
+        scenario.process,
+        spawned=replace(scenario.process.spawned, boottime=120.0),
+        first_owner_gone_boot=first_gone,
+    )
+    owner = replace(
+        scenario.matching_lease,
+        state="ended",
+        observed=replace(scenario.matching_lease.observed, boottime=100.0),
+        ended=replace(scenario.matching_lease.observed, boottime=110.0),
+    )
+
+    result = classify.classify_process(
+        managed,
+        (owner,),
+        scenario.procfs,
+        now_boot,
+    )
+
+    assert result.state == "unknown"
+    assert result.reason_codes == ("invalid_lifecycle_time",)
+    assert result.process == managed
+    assert result.eligible_term is False
+
+
 @pytest.mark.parametrize("first_gone", [-0.001, 99.999, 104.999, 300.001])
 def test_impossible_owner_loss_time_is_unknown_without_proposal(scenario, first_gone):
     ended = replace(
@@ -800,6 +835,63 @@ def test_audit_rss_error_excludes_identity_and_revokes_eligibility(
     assert snapshot.classifications[0].state == "unknown"
     assert snapshot.classifications[0].reason_codes[-1] == "audit_identity_unavailable"
     assert snapshot.classifications[0].eligible_term is False
+
+
+def test_audit_invalidation_restores_stored_process_and_recomputes_counts(
+    tmp_path,
+    scenario,
+):
+    root = tmp_path / "state"
+    store = state.StateStore(root)
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=replace(scenario.matching_lease.observed, boottime=105.0),
+    )
+    stored = scenario.process
+    assert stored.first_owner_gone_boot is None
+    store.save_session(ended)
+    store.save_process(stored)
+
+    class RaisingRss:
+        proc_root = scenario.procfs.proc_root
+
+        def _boot_id(self):
+            return scenario.procfs._boot_id()
+
+        def observe_identity(self, pid):
+            return scenario.procfs.observe_identity(pid)
+
+        def rss_kib(self, identity):
+            raise OSError("unreadable status")
+
+    snapshot = classify.build_audit(
+        store,
+        RaisingRss(),
+        FakeClock(boot=scenario.now_boot),
+    )
+
+    assert len(snapshot.classifications) == 1
+    result = snapshot.classifications[0]
+    assert result.process == stored
+    assert result.state == "unknown"
+    assert result.eligible_term is False
+    assert snapshot.state_counts == (
+        ("active", 0),
+        ("shared", 0),
+        ("exiting", 0),
+        ("orphan", 0),
+        ("unknown", 1),
+        ("stubborn", 0),
+        ("gone", 0),
+    )
+    assert snapshot.process_count == 0
+    assert snapshot.rss_kib == 0
+    assert snapshot.ownership_coverage == (
+        ("managed", 0),
+        ("owned_or_shared", 0),
+        ("unknown", 0),
+    )
 
 
 def test_audit_malformed_stat_between_scans_is_fail_closed(
