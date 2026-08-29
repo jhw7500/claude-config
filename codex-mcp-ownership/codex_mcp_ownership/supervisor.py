@@ -108,26 +108,33 @@ class _SignalMaskState:
             self.restore_failed = True
             raise
 
-    def restore_original(self) -> bool:
+    def restore_original(self) -> tuple[bool, BaseException | None]:
         try:
             current = signal.pthread_sigmask(signal.SIG_BLOCK, ())
         except BaseException:
             current = None
         if current is not None and frozenset(current) == self.original_mask:
             self.restore_failed = False
-            return True
+            return True, None
         for _attempt in range(2):
             try:
                 signal.pthread_sigmask(signal.SIG_SETMASK, self.original_mask)
                 current = signal.pthread_sigmask(signal.SIG_BLOCK, ())
-            except BaseException:
+            except BaseException as error:
                 self.restore_failed = True
+                try:
+                    current = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+                except BaseException:
+                    continue
+                if frozenset(current) == self.original_mask:
+                    self.restore_failed = False
+                    return True, error
                 continue
             if frozenset(current) == self.original_mask:
                 self.restore_failed = False
-                return True
+                return True, None
             self.restore_failed = True
-        return False
+        return False, None
 
 
 @dataclass
@@ -143,6 +150,7 @@ class _OwnedGroupLifecycle:
     child: subprocess.Popen[bytes]
     procfs: LinuxProcfs
     pgid: int
+    leader_exit_observed: bool = False
     leader_reaped: bool = False
     group_access_closed: bool = False
     group_term_sent: bool = False
@@ -150,6 +158,7 @@ class _OwnedGroupLifecycle:
     identities: dict[str, ProcessIdentity] = field(default_factory=dict)
     pidfds: dict[str, int] = field(default_factory=dict)
     owned_pidfds: set[int] = field(default_factory=set)
+    pidfd_close_unverifiable: bool = False
     exact_term_sent: set[str] = field(default_factory=set)
     mask_state: _SignalMaskState = field(default_factory=_SignalMaskState.capture)
 
@@ -207,11 +216,46 @@ class _OwnedGroupLifecycle:
                     return
         except BaseException:
             pass
+        self._close_pidfd_once(pidfd)
+
+    def _close_pidfd_once(self, pidfd: int) -> None:
+        self.owned_pidfds.discard(pidfd)
         try:
             os.close(pidfd)
-        except OSError:
+        except OSError as error:
+            if error.errno != errno.EBADF:
+                self.pidfd_close_unverifiable = True
             return
-        self.owned_pidfds.discard(pidfd)
+        except BaseException:
+            self.pidfd_close_unverifiable = True
+
+    def _open_unreaped_leader_pidfd(self) -> None:
+        if not self.leader_exit_observed or self.leader_reaped:
+            return
+        leader = next(
+            (
+                identity
+                for identity in self.identities.values()
+                if identity.pid == self.child.pid
+            ),
+            None,
+        )
+        if leader is None:
+            return
+        key = leader.stable_key()
+        if key in self.pidfds:
+            return
+        opener = getattr(os, "pidfd_open", None)
+        if not callable(opener):
+            return
+        try:
+            pidfd = opener(self.child.pid, 0)
+        except BaseException:
+            return
+        self.owned_pidfds.add(pidfd)
+        published = self.pidfds.setdefault(key, pidfd)
+        if published != pidfd:
+            self._close_pidfd_once(pidfd)
 
     def capture_exact(self, identities: tuple[ProcessIdentity, ...]) -> None:
         for identity in identities:
@@ -249,6 +293,24 @@ class _OwnedGroupLifecycle:
             }
         )
         self.capture_exact(tuple(captured.values()))
+
+    def capture_final_group(self) -> bool:
+        try:
+            observation = self.procfs.observe_group_members(self.pgid)
+        except BaseException:
+            return False
+        self.capture_exact(observation.members)
+        if observation.kind != "complete":
+            return False
+        self._open_unreaped_leader_pidfd()
+        for identity in tuple(self.identities.values()):
+            key = identity.stable_key()
+            if key in self.pidfds:
+                continue
+            self._open_pidfd(identity)
+            if key not in self.pidfds and self._observation(identity) != "gone":
+                return False
+        return True
 
     def _send_exact(
         self,
@@ -338,8 +400,9 @@ class _OwnedGroupLifecycle:
         while True:
             previous_mask = self.mask_state.block_forwarded()
             try:
-                if self._exit_observed():
-                    self.capture_group()
+                if not self.leader_exit_observed:
+                    self.leader_exit_observed = self._exit_observed()
+                if self.leader_exit_observed and self.capture_final_group():
                     self.group_access_closed = True
                     result = self.child.wait()
                     self.leader_reaped = True
@@ -422,56 +485,19 @@ class _OwnedGroupLifecycle:
         )
 
     def close(self) -> bool:
-        had_failure = False
+        had_failure = self.pidfd_close_unverifiable
         opened = tuple(self.owned_pidfds)
+        self.owned_pidfds.clear()
+        self.pidfds.clear()
         for pidfd in reversed(opened):
             try:
                 os.close(pidfd)
             except OSError as error:
-                if error.errno == errno.EBADF:
-                    self.owned_pidfds.discard(pidfd)
-                else:
+                if error.errno != errno.EBADF:
                     had_failure = True
             except BaseException:
                 had_failure = True
-        remaining: set[int] = set()
-        for pidfd in opened:
-            try:
-                os.fstat(pidfd)
-            except OSError as error:
-                if error.errno == errno.EBADF:
-                    self.owned_pidfds.discard(pidfd)
-                else:
-                    had_failure = True
-                    remaining.add(pidfd)
-            except BaseException:
-                had_failure = True
-                remaining.add(pidfd)
-            else:
-                remaining.add(pidfd)
-        for pidfd in tuple(remaining):
-            try:
-                os.close(pidfd)
-            except BaseException:
-                had_failure = True
-        still_open: set[int] = set()
-        for pidfd in remaining:
-            try:
-                os.fstat(pidfd)
-            except OSError as error:
-                if error.errno == errno.EBADF:
-                    self.owned_pidfds.discard(pidfd)
-                else:
-                    had_failure = True
-                    still_open.add(pidfd)
-            except BaseException:
-                had_failure = True
-                still_open.add(pidfd)
-            else:
-                still_open.add(pidfd)
-        if not still_open:
-            self.pidfds.clear()
-        return not had_failure and not still_open
+        return not had_failure
 
 
 def _validated_request(request: SupervisorRequest) -> SupervisorRequest:
@@ -1015,6 +1041,7 @@ def run_supervisor(
     result = _FATAL_EXIT
     fatal_reason: str | None = None
     process_exit_required = False
+    pending_handler_outcome: BaseException | None = None
     try:
         try:
             child = subprocess.Popen(
@@ -1149,7 +1176,8 @@ def run_supervisor(
         if lifecycle is not None:
             if not lifecycle.close():
                 fd_finalization_failed = True
-        if not mask_state.restore_original():
+        mask_restored, pending_handler_outcome = mask_state.restore_original()
+        if not mask_restored:
             mask_finalization_failed = True
         finalization_reason: str | None = None
         if handler_finalization_failed:
@@ -1168,4 +1196,8 @@ def run_supervisor(
         _fatal(safe_server, fatal_reason)
     if process_exit_required:
         raise SupervisorProcessExitRequired from None
+    if pending_handler_outcome is not None:
+        if isinstance(pending_handler_outcome, KeyboardInterrupt):
+            raise SystemExit(128 + signal.SIGINT) from None
+        raise pending_handler_outcome from None
     return result

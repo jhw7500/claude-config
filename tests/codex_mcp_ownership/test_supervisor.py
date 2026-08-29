@@ -121,6 +121,27 @@ elif fault == "fd":
 
     supervisor.os.pidfd_open = track_pidfd
     supervisor.os.close = interrupt_one_close
+elif fault == "pending_sigint":
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+    original_lifecycle_close = supervisor._OwnedGroupLifecycle.close
+    queued = False
+
+    def raise_from_original_handler(_signum, _frame):
+        record("original-handler-SIGINT")
+        raise KeyboardInterrupt("pending-sigint-secret")
+
+    def close_then_queue_sigint(self):
+        global queued
+        result = original_lifecycle_close(self)
+        record("owned-fds-closed")
+        if not queued:
+            queued = True
+            os.kill(os.getpid(), signal.SIGINT)
+            record("pending-SIGINT-queued")
+        return result
+
+    signal.signal(signal.SIGINT, raise_from_original_handler)
+    supervisor._OwnedGroupLifecycle.close = close_then_queue_sigint
 else:
     raise AssertionError("unknown fault")
 
@@ -139,15 +160,15 @@ request = supervisor.SupervisorRequest(
     args=("-c", child_code, "finalization-argv-secret"),
     cwd=cwd,
 )
-raise SystemExit(
-    supervisor.run_supervisor(
-        request,
-        StateStore(state_root),
-        LinuxProcfs(),
-        SystemClock(),
-        sleeper=lambda _delay: None,
-    )
+result = supervisor.run_supervisor(
+    request,
+    StateStore(state_root),
+    LinuxProcfs(),
+    SystemClock(),
+    sleeper=lambda _delay: None,
 )
+record(f"returned-{result}")
+raise SystemExit(result)
 """
 
 
@@ -1501,6 +1522,11 @@ def test_interrupted_pidfd_close_attempts_every_fd_then_exits_stably(
     closed = {
         line.removeprefix("closed-") for line in trace if line.startswith("closed-")
     }
+    attempted = [
+        line.removeprefix("close-attempt-")
+        for line in trace
+        if line.startswith("close-attempt-")
+    ]
 
     assert completed.returncode == 70
     assert completed.stdout == b""
@@ -1509,7 +1535,27 @@ def test_interrupted_pidfd_close_attempts_every_fd_then_exits_stably(
     )
     assert b"Traceback" not in completed.stderr
     assert opened
-    assert opened == closed
+    assert opened == set(attempted)
+    assert all(attempted.count(fd) == 1 for fd in opened)
+    assert len(closed) == len(opened) - 1
+
+
+def test_pending_sigint_original_handler_exits_130_after_owned_cleanup(
+    tmp_path: Path,
+) -> None:
+    completed, trace = _run_finalization_fault(tmp_path, "pending_sigint")
+
+    assert completed.returncode == 130
+    assert completed.stdout == b""
+    assert completed.stderr == b""
+    assert trace == (
+        "owned-fds-closed",
+        "pending-SIGINT-queued",
+        "original-handler-SIGINT",
+    )
+    assert not any(line.startswith("returned-") for line in trace)
+    assert b"Traceback" not in completed.stderr
+    assert b"secret" not in completed.stderr
 
 
 def test_child_identity_failure_reaps_spawned_child_and_restores_handlers(
@@ -1963,10 +2009,149 @@ def test_nonreaping_exit_check_and_final_capture_share_one_signal_mask(
     monkeypatch.setattr(
         lifecycle, "_exit_observed", lambda: order.append("check") or True
     )
-    monkeypatch.setattr(lifecycle, "capture_group", lambda: order.append("capture"))
+    monkeypatch.setattr(
+        lifecycle,
+        "capture_final_group",
+        lambda: order.append("capture") or True,
+    )
 
     assert lifecycle._wait_once(0.05) == 0
     assert order == ["block", "check", "capture", "reap", "restore"]
+
+
+def test_partial_final_capture_restores_mask_and_retries_before_owned_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+
+    class Child:
+        pid = 12345
+        returncode = None
+        args = ("fixture",)
+
+        def wait(self):
+            order.append("reap")
+            self.returncode = 0
+            return 0
+
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        Child(),  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        Child.pid,
+    )
+    captures = iter((False, True))
+
+    def fake_mask(how, _mask):
+        if how == signal.SIG_BLOCK:
+            order.append("block")
+        elif how == signal.SIG_SETMASK:
+            order.append("restore")
+        return frozenset()
+
+    def capture_final_group() -> bool:
+        complete = next(captures)
+        order.append("capture-complete" if complete else "capture-partial")
+        return complete
+
+    monkeypatch.setattr(supervisor.signal, "pthread_sigmask", fake_mask)
+    monkeypatch.setattr(
+        lifecycle, "_exit_observed", lambda: order.append("check") or True
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "capture_final_group",
+        capture_final_group,
+        raising=False,
+    )
+    monkeypatch.setattr(supervisor.time, "sleep", lambda _delay: None)
+
+    assert lifecycle._wait_once(0.05) == 0
+    assert order == [
+        "block",
+        "check",
+        "capture-partial",
+        "restore",
+        "block",
+        "capture-complete",
+        "reap",
+        "restore",
+    ]
+
+
+def test_complete_final_capture_waits_for_previously_discovered_live_pidfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = procfs.LinuxProcfs().identity(os.getpid())
+    assert identity is not None
+
+    class Child:
+        pid = 12345
+        returncode = None
+
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        Child(),  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        Child.pid,
+    )
+    lifecycle.identities[identity.stable_key()] = identity
+    open_attempts = 0
+
+    def observe_group(_pgid: int):
+        return procfs.GroupMembersObservation("complete", (), ())
+
+    def open_pidfd(_pid: int, _flags: int) -> int:
+        nonlocal open_attempts
+        open_attempts += 1
+        if open_attempts == 1:
+            raise PermissionError("transient pidfd failure")
+        return 101
+
+    monkeypatch.setattr(lifecycle.procfs, "observe_group_members", observe_group)
+    monkeypatch.setattr(lifecycle, "_observation", lambda _identity: "exact")
+    monkeypatch.setattr(supervisor.os, "pidfd_open", open_pidfd)
+    monkeypatch.setattr(supervisor.os, "close", lambda _fd: None)
+
+    assert not lifecycle.capture_final_group()
+    assert lifecycle.capture_final_group()
+    assert lifecycle.pidfds == {identity.stable_key(): 101}
+    assert lifecycle.close()
+
+
+def test_complete_final_capture_anchors_unreaped_zombie_leader_by_pidfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = procfs.LinuxProcfs().identity(os.getpid())
+    assert identity is not None
+
+    class Child:
+        pid = identity.pid
+        returncode = None
+
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        Child(),  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        Child.pid,
+    )
+    lifecycle.identities[identity.stable_key()] = identity
+    lifecycle.leader_exit_observed = True
+    opened: list[tuple[int, int]] = []
+
+    def observe_group(_pgid: int):
+        return procfs.GroupMembersObservation("complete", (), ())
+
+    def open_pidfd(pid: int, flags: int) -> int:
+        opened.append((pid, flags))
+        return 101
+
+    monkeypatch.setattr(lifecycle.procfs, "observe_group_members", observe_group)
+    monkeypatch.setattr(lifecycle, "_observation", lambda _identity: "unavailable")
+    monkeypatch.setattr(supervisor.os, "pidfd_open", open_pidfd)
+    monkeypatch.setattr(supervisor.os, "close", lambda _fd: None)
+
+    assert lifecycle.capture_final_group()
+    assert opened == [(identity.pid, 0)]
+    assert lifecycle.pidfds == {identity.stable_key(): 101}
+    assert lifecycle.close()
 
 
 def test_nonreaping_wait_retries_interrupted_waitid_before_owned_reap(
@@ -2049,7 +2234,106 @@ def test_reentrant_pidfd_publication_closes_duplicate_and_published_fd(
     assert sorted(closed_fds) == opened_fds
 
 
-def test_interrupted_fd_verification_retries_close_instead_of_assuming_ebadf(
+def test_duplicate_pidfd_loser_close_failure_is_sticky_and_never_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = procfs.LinuxProcfs().identity(os.getpid())
+    assert identity is not None
+
+    class Child:
+        pid = 12345
+        returncode = None
+
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        Child(),  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        Child.pid,
+    )
+    opened = iter((101, 102))
+    close_attempts: list[int] = []
+    reentered = False
+    observations = 0
+
+    def open_pidfd(_pid: int, _flags: int) -> int:
+        return next(opened)
+
+    def observe(_identity: model.ProcessIdentity) -> str:
+        nonlocal observations, reentered
+        observations += 1
+        if observations == 2 and not reentered:
+            reentered = True
+            lifecycle._open_pidfd(identity)
+        return "exact"
+
+    def close_fd(fd: int) -> None:
+        close_attempts.append(fd)
+        if fd == 101:
+            raise OSError(5, "ambiguous duplicate close")
+
+    monkeypatch.setattr(supervisor.os, "pidfd_open", open_pidfd)
+    monkeypatch.setattr(supervisor.os, "close", close_fd)
+    monkeypatch.setattr(lifecycle, "_observation", observe)
+
+    lifecycle._open_pidfd(identity)
+
+    assert not lifecycle.close()
+    assert close_attempts.count(101) == 1
+    assert close_attempts.count(102) == 1
+    assert lifecycle.owned_pidfds == set()
+
+
+def test_pidfd_close_never_probes_or_closes_reused_unrelated_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Child:
+        pid = 12345
+        returncode = 0
+
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        Child(),  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        Child.pid,
+    )
+    owned_fd, unrelated_write_fd = os.pipe()
+    lifecycle.owned_pidfds.add(owned_fd)
+    original_close = os.close
+    original_fstat = os.fstat
+    close_attempts: list[int] = []
+    probes: list[int] = []
+    replacement_open = False
+
+    def close_and_reuse(fd: int) -> None:
+        nonlocal replacement_open
+        close_attempts.append(fd)
+        if fd == owned_fd and not replacement_open:
+            original_close(fd)
+            replacement_fd = os.open(os.devnull, os.O_RDONLY)
+            assert replacement_fd == owned_fd
+            replacement_open = True
+            return
+        if fd == owned_fd:
+            replacement_open = False
+        original_close(fd)
+
+    def record_probe(fd: int):
+        probes.append(fd)
+        return original_fstat(fd)
+
+    monkeypatch.setattr(supervisor.os, "close", close_and_reuse)
+    monkeypatch.setattr(supervisor.os, "fstat", record_probe)
+    try:
+        assert lifecycle.close()
+        assert close_attempts == [owned_fd]
+        assert probes == []
+        assert replacement_open
+        original_fstat(owned_fd)
+    finally:
+        if replacement_open:
+            original_close(owned_fd)
+        original_close(unrelated_write_fd)
+
+
+def test_interrupted_pidfd_close_attempts_every_fd_once_without_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Child:
@@ -2064,22 +2348,16 @@ def test_interrupted_fd_verification_retries_close_instead_of_assuming_ebadf(
     lifecycle.owned_pidfds.update((101, 102))
     live = {101, 102}
     close_attempts: list[int] = []
-    close_interrupted = False
-    verify_interrupted = False
+    probes: list[int] = []
 
     def close_fd(fd: int) -> None:
-        nonlocal close_interrupted
         close_attempts.append(fd)
-        if fd == 101 and not close_interrupted:
-            close_interrupted = True
+        if fd == 101:
             raise KeyboardInterrupt("close-secret")
         live.discard(fd)
 
     def verify_fd(fd: int) -> object:
-        nonlocal verify_interrupted
-        if fd == 101 and not verify_interrupted:
-            verify_interrupted = True
-            raise InterruptedError("verify-secret")
+        probes.append(fd)
         if fd in live:
             return object()
         raise OSError(9, "closed")
@@ -2088,8 +2366,9 @@ def test_interrupted_fd_verification_retries_close_instead_of_assuming_ebadf(
     monkeypatch.setattr(supervisor.os, "fstat", verify_fd)
 
     assert not lifecycle.close()
-    assert live == set()
-    assert close_attempts.count(101) == 2
+    assert live == {101}
+    assert sorted(close_attempts) == [101, 102]
+    assert probes == []
     assert lifecycle.owned_pidfds == set()
 
 
@@ -2474,11 +2753,13 @@ def test_captured_descendant_migrating_session_receives_exact_pidfd_term(
 
 
 @pytest.mark.parametrize("recovery", ["exit_event", "handler_restore"])
+@pytest.mark.parametrize("first_final_kind", ["unavailable", "partial"])
 def test_late_fork_is_captured_before_reap_for_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recovery: str,
+    first_final_kind: str,
 ) -> None:
     _require_pidfd_signaling()
     previous = {
@@ -2513,6 +2794,8 @@ def test_late_fork_is_captured_before_reap_for_recovery(
     descendant_handles: list[tuple[model.ProcessIdentity, int]] = []
     released = False
     armed_snapshots = 0
+    strict_attempts = 0
+    strict_attempt_returncodes: list[int | None] = []
 
     class ReleaseAfterSnapshotProcfs(procfs.LinuxProcfs):
         def group_members(self, pgid: int):
@@ -2527,14 +2810,34 @@ def test_late_fork_is_captured_before_reap_for_recovery(
                 while not descendant_ready.exists() or not leader_exiting.exists():
                     assert time.monotonic() < deadline
                     time.sleep(0.01)
-                identity = self.identity(
-                    int(descendant_pid.read_text(encoding="utf-8"))
-                )
-                assert identity is not None
-                pidfd = _open_exact_pidfd(identity)
-                assert pidfd is not None
-                descendant_handles.append((identity, pidfd))
+                while not descendant_handles:
+                    assert time.monotonic() < deadline
+                    identity = self.identity(
+                        int(descendant_pid.read_text(encoding="utf-8"))
+                    )
+                    if identity is not None:
+                        pidfd = _open_exact_pidfd(identity)
+                        if pidfd is not None:
+                            descendant_handles.append((identity, pidfd))
+                            break
+                    time.sleep(0.01)
             return snapshot
+
+        def observe_group_members(self, pgid: int):
+            nonlocal strict_attempts
+            strict_attempts += 1
+            assert children
+            strict_attempt_returncodes.append(children[0].returncode)
+            observation = super().observe_group_members(pgid)
+            if strict_attempts != 1:
+                return observation
+            if first_final_kind == "unavailable":
+                return procfs.GroupMembersObservation("unavailable", (), ())
+            return procfs.GroupMembersObservation(
+                "partial",
+                (),
+                (int(descendant_pid.read_text(encoding="utf-8")),),
+            )
 
     store = state.StateStore(tmp_path / "state")
     if recovery == "exit_event":
@@ -2588,6 +2891,8 @@ def test_late_fork_is_captured_before_reap_for_recovery(
         captured = capsys.readouterr()
         assert result == 0
         assert len(descendant_handles) == 1
+        assert strict_attempts >= 2
+        assert strict_attempt_returncodes[:2] == [None, None]
         descendant_identity = descendant_handles[0][0]
         records = store.load_processes()
         assert len(records) == 1

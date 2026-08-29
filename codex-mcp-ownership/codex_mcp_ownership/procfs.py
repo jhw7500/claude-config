@@ -17,6 +17,7 @@ class ProcfsFormatError(ValueError):
 @dataclass(frozen=True)
 class ProcStat:
     pid: int
+    state: str
     ppid: int
     pgid: int
     start_ticks: int
@@ -26,6 +27,13 @@ class ProcStat:
 class IdentityObservation:
     kind: Literal["live", "missing", "unavailable"]
     identity: ProcessIdentity | None
+
+
+@dataclass(frozen=True)
+class GroupMembersObservation:
+    kind: Literal["complete", "partial", "unavailable"]
+    members: tuple[ProcessIdentity, ...]
+    unavailable_pids: tuple[int, ...]
 
 
 def parse_stat(raw: str) -> ProcStat:
@@ -45,6 +53,7 @@ def parse_stat(raw: str) -> ProcStat:
             raise ValueError("invalid pid")
         return ProcStat(
             pid=pid,
+            state=fields[0],
             ppid=int(fields[1]),
             pgid=int(fields[2]),
             start_ticks=int(fields[19]),
@@ -185,6 +194,54 @@ class LinuxProcfs:
                 members.append(identity)
         return tuple(members)
 
+    def observe_group_members(self, pgid: int) -> GroupMembersObservation:
+        """Strictly observe a group without changing best-effort enumeration."""
+        if type(pgid) is not int or pgid < 1:
+            return GroupMembersObservation("unavailable", (), ())
+        try:
+            entries = sorted(
+                (entry for entry in self.proc_root.iterdir() if entry.name.isdecimal()),
+                key=lambda entry: int(entry.name),
+            )
+        except OSError:
+            return GroupMembersObservation("unavailable", (), ())
+        members: list[ProcessIdentity] = []
+        unavailable_pids: list[int] = []
+        enumeration_unavailable = False
+        for entry in entries:
+            pid = int(entry.name)
+            try:
+                stat = parse_stat(self._read_text(entry / "stat"))
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except (OSError, ProcfsFormatError):
+                enumeration_unavailable = True
+                continue
+            if stat.pid != pid:
+                enumeration_unavailable = True
+                continue
+            if stat.pgid != pgid or stat.state in {"Z", "X", "x"}:
+                continue
+            observation = self.observe_identity(pid)
+            if observation.kind == "missing":
+                continue
+            if observation.kind != "live" or observation.identity is None:
+                unavailable_pids.append(pid)
+                continue
+            if observation.identity.pgid == pgid:
+                members.append(observation.identity)
+        if enumeration_unavailable:
+            kind: Literal["complete", "partial", "unavailable"] = "unavailable"
+        elif unavailable_pids:
+            kind = "partial"
+        else:
+            kind = "complete"
+        return GroupMembersObservation(
+            kind,
+            tuple(members),
+            tuple(unavailable_pids),
+        )
+
     def rss_kib(self, identity: ProcessIdentity) -> int | None:
         if not isinstance(identity, ProcessIdentity):
             return None
@@ -202,7 +259,10 @@ class LinuxProcfs:
         return int(match.group(1))
 
     def open_pidfd(self, identity: ProcessIdentity) -> int:
-        if not isinstance(identity, ProcessIdentity) or self.identity(identity.pid) != identity:
+        if (
+            not isinstance(identity, ProcessIdentity)
+            or self.identity(identity.pid) != identity
+        ):
             raise ProcessLookupError(errno.ESRCH, "process identity is no longer live")
         pidfd_open = getattr(os, "pidfd_open", None)
         if pidfd_open is None:
@@ -211,7 +271,9 @@ class LinuxProcfs:
         try:
             if self.identity(identity.pid) == identity:
                 return descriptor
-            raise ProcessLookupError(errno.ESRCH, "process identity changed while opening pidfd")
+            raise ProcessLookupError(
+                errno.ESRCH, "process identity changed while opening pidfd"
+            )
         except BaseException:
             os.close(descriptor)
             raise

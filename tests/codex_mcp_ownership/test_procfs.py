@@ -194,6 +194,55 @@ def test_group_members_ignores_non_numeric_entries_and_returns_live_members(fake
     assert [identity.pid for identity in tree.group_members(321)] == [321, 322]
 
 
+def test_strict_group_observation_reports_unavailable_enumeration(
+    fake_proc,
+    monkeypatch,
+):
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    original_iterdir = procfs.Path.iterdir
+
+    def unavailable_iterdir(path):
+        if path == fake_proc.root:
+            raise PermissionError("enumeration unavailable")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(procfs.Path, "iterdir", unavailable_iterdir)
+
+    observation = tree.observe_group_members(321)
+
+    assert observation.kind == "unavailable"
+    assert observation.members == ()
+    assert observation.unavailable_pids == ()
+
+
+def test_strict_group_observation_reports_partial_exact_member(
+    fake_proc,
+    monkeypatch,
+):
+    write_proc_entry(
+        fake_proc.root,
+        322,
+        "322 (node) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 22 0 0\n",
+        fake_proc.exe,
+    )
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    original_observe = tree.observe_identity
+
+    def unavailable_member(pid):
+        if pid == 322:
+            return procfs.IdentityObservation("unavailable", None)
+        return original_observe(pid)
+
+    monkeypatch.setattr(tree, "observe_identity", unavailable_member)
+
+    observation = tree.observe_group_members(321)
+
+    assert observation.kind == "partial"
+    assert [identity.pid for identity in observation.members] == [321]
+    assert observation.unavailable_pids == (322,)
+    assert [identity.pid for identity in tree.group_members(321)] == [321, 322]
+
+
 def test_rss_kib_reads_only_vmrss_and_revalidates_identity(fake_proc):
     identity = fake_proc.identity(321)
     assert identity is not None
