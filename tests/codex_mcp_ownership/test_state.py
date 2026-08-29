@@ -71,11 +71,15 @@ def test_session_filename_is_hash_not_untrusted_id(tmp_path):
     store = state.StateStore(tmp_path / "state")
     store.save_session(lease)
     files = list((store.root / "sessions").iterdir())
-    assert [path.name for path in files] == [hashlib.sha256(lease.session_id.encode()).hexdigest() + ".json"]
+    assert [path.name for path in files] == [
+        hashlib.sha256(lease.session_id.encode()).hexdigest() + ".json"
+    ]
     assert lease.session_id not in files[0].name
     assert files[0].stat().st_mode & 0o777 == 0o600
     assert files[0].read_bytes() == (
-        json.dumps(lease.to_dict(), ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+        json.dumps(
+            lease.to_dict(), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode()
         + b"\n"
     )
 
@@ -94,7 +98,9 @@ def test_created_state_paths_have_deterministic_private_modes(tmp_path, umask):
 
 
 @pytest.mark.parametrize("session_id", ["bad/session", "bad\x01session", "", "x" * 129])
-def test_invalid_session_id_is_rejected_before_any_path_is_created(tmp_path, session_id):
+def test_invalid_session_id_is_rejected_before_any_path_is_created(
+    tmp_path, session_id
+):
     root = tmp_path / "state"
     with pytest.raises(ValueError):
         state.StateStore(root).save_session(sample_lease(session_id))
@@ -129,7 +135,9 @@ def test_read_only_store_rejects_mutation_without_creating_root(tmp_path):
 def test_event_log_rejects_sensitive_and_unknown_fields(tmp_path, field):
     root = tmp_path / "state"
     with pytest.raises(ValueError):
-        state.StateStore(root).append_event({"schema_version": 1, "event": "spawn", field: "canary"})
+        state.StateStore(root).append_event(
+            {"schema_version": 1, "event": "spawn", field: "canary"}
+        )
     assert not root.exists()
 
 
@@ -152,7 +160,9 @@ def test_event_log_accepts_only_redacted_allowlisted_fields(tmp_path):
     assert (store.root / "events.jsonl").stat().st_mode & 0o777 == 0o600
 
 
-def _build_unsafe_store(tmp_path: Path, unsafe_kind: str) -> tuple[state.StateStore, Path]:
+def _build_unsafe_store(
+    tmp_path: Path, unsafe_kind: str
+) -> tuple[state.StateStore, Path]:
     root = tmp_path / "state"
     processes = root / "processes"
     make_private_directory(processes)
@@ -247,14 +257,20 @@ def test_atomic_json_failure_preserves_previous_record(tmp_path, monkeypatch):
         original.observed,
         original.observed,
     )
-    monkeypatch.setattr(state.os, "replace", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("stop")))
+    monkeypatch.setattr(
+        state.os,
+        "replace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("stop")),
+    )
     with pytest.raises(OSError, match="stop"):
         store.save_session(updated)
     assert target.read_bytes() == before
     assert [path for path in target.parent.iterdir() if path.name != target.name] == []
 
 
-def test_atomic_json_write_failure_removes_private_temporary_file(tmp_path, monkeypatch):
+def test_atomic_json_write_failure_removes_private_temporary_file(
+    tmp_path, monkeypatch
+):
     store = state.StateStore(tmp_path / "state")
     monkeypatch.setattr(
         state,
@@ -277,7 +293,9 @@ def test_atomic_json_temp_collision_preserves_existing_sentinel(tmp_path, monkey
     assert sentinel.read_bytes() == b"sentinel"
 
 
-def test_atomic_json_cleanup_preserves_temp_after_inode_gains_second_link(tmp_path, monkeypatch):
+def test_atomic_json_cleanup_preserves_temp_after_inode_gains_second_link(
+    tmp_path, monkeypatch
+):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
     temporary = store.root / "sessions" / ".tmp-owned"
@@ -375,7 +393,9 @@ def test_shared_store_serializes_different_threads(tmp_path):
     assert store.load_sessions() == (sample_lease(),)
 
 
-def test_unlock_error_does_not_leave_stale_cross_thread_ownership(tmp_path, monkeypatch):
+def test_unlock_error_does_not_leave_stale_cross_thread_ownership(
+    tmp_path, monkeypatch
+):
     store = state.StateStore(tmp_path / "state", lock_timeout=0.25)
     original_flock = state.fcntl.flock
     fail_unlock = True
@@ -408,7 +428,9 @@ def test_unlock_error_does_not_leave_stale_cross_thread_ownership(tmp_path, monk
     assert errors == []
 
 
-def test_real_unlock_rejects_same_thread_callback_until_release_cleanup(tmp_path, monkeypatch):
+def test_real_unlock_rejects_same_thread_callback_until_release_cleanup(
+    tmp_path, monkeypatch
+):
     store = state.StateStore(tmp_path / "state", lock_timeout=1.0)
     original_flock = state.fcntl.flock
     callback_done = False
@@ -572,9 +594,15 @@ def test_read_only_audit_does_not_rotate_or_age_prune_event_files(tmp_path):
     old_backup = store.root / "events.jsonl.1"
     write_private_file(old_backup, b"old\n")
     os.utime(old_backup, (1, 1))
-    before = {path.name: (path.stat().st_ino, path.read_bytes()) for path in store.root.glob("events.jsonl*")}
+    before = {
+        path.name: (path.stat().st_ino, path.read_bytes())
+        for path in store.root.glob("events.jsonl*")
+    }
     assert state.StateStore(store.root, read_only=True).load_sessions() == ()
-    after = {path.name: (path.stat().st_ino, path.read_bytes()) for path in store.root.glob("events.jsonl*")}
+    after = {
+        path.name: (path.stat().st_ino, path.read_bytes())
+        for path in store.root.glob("events.jsonl*")
+    }
     assert after == before
     store.append_event({"schema_version": 1, "event": "scan-again"})
     assert not old_backup.exists()
@@ -593,7 +621,9 @@ def test_mutation_removes_all_noncanonical_numeric_event_backups(tmp_path):
     )
 
 
-def test_mutation_prunes_completed_transactions_but_preserves_installed_reference(tmp_path):
+def test_mutation_prunes_completed_transactions_but_preserves_installed_reference(
+    tmp_path,
+):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
     transactions = store.root / "transactions"
@@ -620,7 +650,9 @@ def test_mutation_prunes_completed_transactions_but_preserves_installed_referenc
         {"transaction_id": "txn-1", "extra": True},
     ],
 )
-def test_malformed_canonical_install_state_fails_before_transaction_pruning(tmp_path, payload):
+def test_malformed_canonical_install_state_fails_before_transaction_pruning(
+    tmp_path, payload
+):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
     transactions = store.root / "transactions"
@@ -644,7 +676,9 @@ def test_malformed_canonical_install_state_fails_before_transaction_pruning(tmp_
 
 
 @pytest.mark.parametrize("legacy_name", ["install_state.json", "install.json"])
-def test_competing_install_state_alias_fails_before_transaction_pruning(tmp_path, legacy_name):
+def test_competing_install_state_alias_fails_before_transaction_pruning(
+    tmp_path, legacy_name
+):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
     transactions = store.root / "transactions"
@@ -659,17 +693,77 @@ def test_competing_install_state_alias_fails_before_transaction_pruning(tmp_path
         json.dumps(canonical).encode() + b"\n",
     )
     conflicting = {state.INSTALL_STATE_TRANSACTION_FIELD: "txn-1"}
-    write_private_file(store.root / legacy_name, json.dumps(conflicting).encode() + b"\n")
+    write_private_file(
+        store.root / legacy_name, json.dumps(conflicting).encode() + b"\n"
+    )
     with pytest.raises(state.StateCorruption):
         store.append_event({"schema_version": 1, "event": "mutate"})
     assert len(list(transactions.iterdir())) == 4
 
 
 @pytest.mark.parametrize("legacy_name", ["install_state.json", "install.json"])
-def test_legacy_install_state_without_canonical_authority_is_corruption(tmp_path, legacy_name):
+def test_legacy_install_state_without_canonical_authority_is_corruption(
+    tmp_path, legacy_name
+):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
     payload = {state.INSTALL_STATE_TRANSACTION_FIELD: "txn-0"}
     write_private_file(store.root / legacy_name, json.dumps(payload).encode() + b"\n")
     with pytest.raises(state.StateCorruption):
         store.append_event({"schema_version": 1, "event": "mutate"})
+
+
+@pytest.mark.parametrize(
+    ("lease_state", "ended"),
+    [
+        ("active", "present"),
+        ("ended", None),
+    ],
+)
+def test_session_lease_rejects_cross_field_invalid_lifecycle(lease_state, ended):
+    lease = sample_lease()
+    payload = lease.to_dict()
+    payload["state"] = lease_state
+    payload["ended"] = lease.observed.to_dict() if ended == "present" else None
+    with pytest.raises(ValueError):
+        model.SessionLease.from_dict(payload)
+
+
+def test_oversized_record_is_capped_corruption_and_writable_load_quarantines(tmp_path):
+    root = tmp_path / "state"
+    sessions = root / "sessions"
+    make_private_directory(sessions)
+    target = sessions / ("a" * 64 + ".json")
+    write_private_file(target, b"{" + b'"padding":"' + b"x" * 1_100_000 + b'"}\n')
+
+    with pytest.raises(state.StateCorruption):
+        state.StateStore(root, read_only=True).load_sessions()
+    assert target.exists()
+
+    with pytest.raises(state.StateCorruption) as error:
+        state.StateStore(root).load_sessions()
+    assert not target.exists()
+    assert error.value.quarantine_path is not None
+    assert error.value.quarantine_path.exists()
+
+
+def test_deeply_nested_record_is_corruption_without_recursion_traceback(tmp_path):
+    root = tmp_path / "state"
+    sessions = root / "sessions"
+    make_private_directory(sessions)
+    target = sessions / ("a" * 64 + ".json")
+    write_private_file(target, ("[" * 1100 + "0" + "]" * 1100).encode())
+    with pytest.raises(state.StateCorruption):
+        state.StateStore(root, read_only=True).load_sessions()
+
+
+def test_huge_integer_record_is_normalized_to_state_corruption(tmp_path):
+    root = tmp_path / "state"
+    sessions = root / "sessions"
+    make_private_directory(sessions)
+    target = sessions / ("a" * 64 + ".json")
+    raw = sample_lease().to_dict()
+    rendered = json.dumps(raw).replace("12.5", "9" * 5000).encode()
+    write_private_file(target, rendered)
+    with pytest.raises(state.StateCorruption):
+        state.StateStore(root, read_only=True).load_sessions()

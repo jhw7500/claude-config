@@ -510,10 +510,14 @@ def _audit_rss_observation(
 
 
 def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSnapshot:
-    audit_store = StateStore(
-        store.root,
-        read_only=True,
-        lock_timeout=store.lock_timeout,
+    audit_store = (
+        store
+        if store._owns_lock()
+        else StateStore(
+            store.root,
+            read_only=True,
+            lock_timeout=store.lock_timeout,
+        )
     )
     corrupt_count = 0
     sessions_corrupt = False
@@ -528,6 +532,26 @@ def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSn
     except StateCorruption:
         processes = ()
         corrupt_count += 1
+
+    return build_audit_from_records(
+        processes,
+        leases,
+        procfs,
+        clock,
+        corrupt_count=corrupt_count,
+        sessions_corrupt=sessions_corrupt,
+    )
+
+
+def build_audit_from_records(
+    processes: tuple[ManagedProcess, ...],
+    leases: tuple[SessionLease, ...],
+    procfs: LinuxProcfs,
+    clock: Clock,
+    *,
+    corrupt_count: int = 0,
+    sessions_corrupt: bool = False,
+) -> AuditSnapshot:
 
     now_boot = clock.boottime()
     initial_entries = tuple(

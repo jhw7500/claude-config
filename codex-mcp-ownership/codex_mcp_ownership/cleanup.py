@@ -19,10 +19,12 @@ from .model import (
     CleanupAction,
     CleanupOutcome,
     CleanupReport,
+    ManagedProcess,
     ProcessIdentity,
+    SessionLease,
 )
 from .procfs import IdentityObservation, LinuxProcfs
-from .state import StateStore
+from .state import StateStore, UnsafeStatePath
 
 
 SHUTDOWN_GRACE_SECONDS = 10.0
@@ -163,6 +165,113 @@ def issue_force_token(classification: Classification, clock: Clock) -> str:
     return f"{encoded}.{digest}"
 
 
+def select_force_actions(
+    snapshot: AuditSnapshot,
+    token: str | None,
+    clock: Clock,
+) -> tuple[CleanupAction, ...]:
+    """Select the one stubborn classification addressed by a force token."""
+    payload = _decode_force_token(token, clock.boottime())
+    matches: list[Classification] = []
+    for classification in snapshot.classifications:
+        if classification.state != "stubborn":
+            continue
+        try:
+            boot_id, identity_keys, reasons, term_sent = _force_evidence(classification)
+        except InvalidForceConfirmation:
+            continue
+        if (
+            payload["boot_id"] == snapshot.generated.boot_id == boot_id
+            and payload["identity_keys"] == identity_keys
+            and payload["reason_codes"] == reasons
+            and payload["term_sent_boot"] == term_sent
+        ):
+            matches.append(classification)
+    if len(matches) != 1:
+        raise InvalidForceConfirmation(
+            "force confirmation must select one current classification"
+        )
+    selected_key = matches[0].process.wrapper.stable_key()
+    return tuple(
+        action
+        for action in plan_cleanup(snapshot, force=True)
+        if action.process_key == selected_key
+    )
+
+
+def _state_snapshot(
+    store: StateStore,
+    expected_root_token: tuple[int, int] | None = None,
+) -> tuple[tuple[int, int], tuple[ManagedProcess, ...], tuple[SessionLease, ...]]:
+    with store.locked(expected_root_token=expected_root_token):
+        token = store.root_token()
+        leases = store.load_sessions()
+        processes = store.load_processes()
+    return token, processes, leases
+
+
+def _current_authority(
+    store: StateStore,
+    root_token: tuple[int, int],
+    expected: ManagedProcess,
+    expected_lease: SessionLease | None,
+) -> bool:
+    try:
+        lock = store.locked(expected_root_token=root_token)
+        with lock:
+            if store.root_token() != root_token:
+                return False
+            current = store.load_process(expected.wrapper.stable_key())
+            if current != expected:
+                return False
+            if expected.owner_session_id is None:
+                return expected_lease is None
+            return store.load_session(expected.owner_session_id) == expected_lease
+    except (FileNotFoundError, UnsafeStatePath):
+        return False
+
+
+def _cas_process_and_event(
+    store: StateStore,
+    root_token: tuple[int, int],
+    expected: ManagedProcess,
+    updated: ManagedProcess,
+    event: dict[str, object] | None,
+) -> bool:
+    try:
+        lock = store.locked(expected_root_token=root_token)
+        with lock:
+            if store.root_token() != root_token:
+                return False
+            current = store.load_process(expected.wrapper.stable_key())
+            if current != expected:
+                return False
+            if updated != expected:
+                store.save_process(updated, maintenance=False)
+            if event is not None:
+                store.append_event(event, maintenance=False)
+            return True
+    except (FileNotFoundError, UnsafeStatePath):
+        return False
+
+
+def _owner_loss_event(
+    classification: Classification,
+    observed_wall: str,
+) -> dict[str, object]:
+    process = classification.process
+    return {
+        "schema_version": 1,
+        "event": "owner_loss_observed",
+        "observed_wall": observed_wall,
+        "server": process.server,
+        "scope": process.scope,
+        "process_key": process.wrapper.stable_key(),
+        "state": "exiting",
+        "reason_codes": list(classification.reason_codes),
+    }
+
+
 def execute_cleanup(
     actions: tuple[CleanupAction, ...],
     store: StateStore,
@@ -187,6 +296,10 @@ def execute_cleanup(
             survived=0,
             skipped=0,
             outcomes=(),
+            before_state_counts=before.state_counts,
+            after_state_counts=after.state_counts,
+            before_classifications=before.classifications,
+            after_classifications=after.classifications,
         )
 
     has_force = any(action.force for action in actions)
@@ -202,211 +315,286 @@ def execute_cleanup(
         if force_payload["boot_id"] != current_boot_id:
             raise InvalidForceConfirmation("force confirmation boot ID changed")
 
+    root_token, stored_processes, leases = _state_snapshot(store)
+    before = classify.build_audit_from_records(
+        stored_processes,
+        leases,
+        procfs,
+        clock,
+    )
+    before_count, before_rss_kib = _fresh_metrics(before, procfs)
+    lease_by_id = {lease.session_id: lease for lease in leases}
+    stored_by_key = {
+        process.wrapper.stable_key(): process for process in stored_processes
+    }
+    current = {
+        item.process.wrapper.stable_key(): item for item in before.classifications
+    }
+    grouped: dict[str, list[CleanupAction]] = {}
+    for action in actions:
+        grouped.setdefault(action.process_key, []).append(action)
+    if force_payload is not None:
+        _validate_current_force_actions(
+            grouped,
+            current,
+            force_payload,
+            before,
+            clock.boottime(),
+        )
+
+    for process_key, classification in current.items():
+        original = stored_by_key.get(process_key)
+        proposed = classification.process
+        if original is not None and original != proposed:
+            first_loss = bool(
+                original.first_owner_gone_boot is None
+                and proposed.first_owner_gone_boot is not None
+                and classification.state == "exiting"
+            )
+            if _cas_process_and_event(
+                store,
+                root_token,
+                original,
+                proposed,
+                (
+                    _owner_loss_event(classification, before.generated.wall_iso)
+                    if first_loss
+                    else None
+                ),
+            ):
+                stored_by_key[process_key] = proposed
+
     outcomes: list[CleanupOutcome] = []
     attempted = 0
-    with store.locked():
-        before = classify.build_audit(store, procfs, clock)
-        before_count, before_rss_kib = _fresh_metrics(before, procfs)
-        current = {
-            item.process.wrapper.stable_key(): item for item in before.classifications
-        }
-        grouped: dict[str, list[CleanupAction]] = {}
-        for action in actions:
-            grouped.setdefault(action.process_key, []).append(action)
-        if force_payload is not None:
-            _validate_current_force_actions(
-                grouped,
-                current,
-                force_payload,
-                before,
-                clock.boottime(),
-            )
-        for process_key, process_actions in grouped.items():
-            classification = current.get(process_key)
-            survived_term = False
-            terminated_term = False
-            indeterminate_signal = False
-            term_sent_boot: float | None = None
-            term_time_floor = before.generated.boottime
-            term_time_valid = True
-            delivered_keys: set[str] = set()
-            survived_keys: set[str] = set()
-            group_outcomes: list[CleanupOutcome] = []
-            seen: set[str] = set()
-            for action in process_actions:
-                identity_key = action.identity.stable_key()
-                if identity_key in seen:
-                    outcome = CleanupOutcome(action, "skipped", "duplicate_action")
-                    outcomes.append(outcome)
-                    group_outcomes.append(outcome)
-                    continue
-                seen.add(identity_key)
-                if action.force:
-                    matches = _matches_force_action(action, classification)
-                    signum = signal.SIGKILL
-                else:
-                    matches = _matches_automatic_action(action, classification)
-                    signum = signal.SIGTERM
-                if not matches:
-                    outcome = CleanupOutcome(
-                        action, "skipped", "classification_changed"
-                    )
-                    outcomes.append(outcome)
-                    group_outcomes.append(outcome)
-                    continue
-                outcome, was_attempted = _signal_exact(
-                    action,
-                    procfs,
-                    signaler,
-                    signum,
-                )
-                attempted += int(was_attempted)
-                if outcome.status == "survived" and not action.force:
-                    observed, time_reason = _observed_boot_time(clock, term_time_floor)
-                    if time_reason is None:
-                        assert observed is not None
-                        term_sent_boot = observed
-                        term_time_floor = observed
-                    else:
-                        term_time_valid = False
-                        outcome = replace(outcome, reason=time_reason)
+    for process_key, process_actions in grouped.items():
+        classification = current.get(process_key)
+        survived_term = False
+        terminated_term = False
+        indeterminate_signal = False
+        term_sent_boot: float | None = None
+        term_time_floor = before.generated.boottime
+        term_time_valid = True
+        delivered_keys: set[str] = set()
+        survived_keys: set[str] = set()
+        group_outcomes: list[CleanupOutcome] = []
+        seen: set[str] = set()
+        for action in process_actions:
+            identity_key = action.identity.stable_key()
+            if identity_key in seen:
+                outcome = CleanupOutcome(action, "skipped", "duplicate_action")
                 outcomes.append(outcome)
                 group_outcomes.append(outcome)
-                survived_term |= outcome.status == "survived"
-                terminated_term |= outcome.status == "terminated"
-                if outcome.status in {"survived", "terminated"}:
-                    delivered_keys.add(identity_key)
-                if outcome.status == "survived":
-                    survived_keys.add(identity_key)
-                indeterminate_signal |= outcome.reason in {
-                    "identity_unavailable_after_signal",
-                    "identity_changed_after_signal",
-                }
-            forced = process_actions[0].force
-            current_keys = (
-                set()
-                if classification is None
-                else {
-                    identity.stable_key() for identity in classification.live_identities
-                }
+                continue
+            seen.add(identity_key)
+            if action.force:
+                matches = _matches_force_action(action, classification)
+                signum = signal.SIGKILL
+            else:
+                matches = _matches_automatic_action(action, classification)
+                signum = signal.SIGTERM
+            if not matches:
+                outcome = CleanupOutcome(action, "skipped", "classification_changed")
+                outcomes.append(outcome)
+                group_outcomes.append(outcome)
+                continue
+            expected_process = classification.process
+            expected_lease = (
+                None
+                if expected_process.owner_session_id is None
+                else lease_by_id.get(expected_process.owner_session_id)
             )
-            complete_delivery = bool(current_keys) and delivered_keys == current_keys
-            if (
-                survived_term
-                and classification is not None
-                and not forced
-                and complete_delivery
-                and term_time_valid
-                and term_sent_boot is not None
+            if not _current_authority(
+                store,
+                root_token,
+                expected_process,
+                expected_lease,
             ):
-                updated = replace(
-                    classification.process,
-                    term_sent_boot=term_sent_boot,
-                    term_sent_keys=frozenset(survived_keys),
+                outcome = CleanupOutcome(
+                    action,
+                    "skipped",
+                    "state_authority_changed",
                 )
-                store.save_process(updated)
-                store.append_event(
-                    {
-                        "schema_version": 1,
-                        "event": "cleanup_term_sent",
-                        "observed_wall": before.generated.wall_iso,
-                        "server": updated.server,
-                        "scope": updated.scope,
-                        "process_key": process_key,
-                        "state": "exiting",
-                        "reason_codes": list(
-                            classification.reason_codes + ("sigterm_survived",)
-                        ),
-                    }
-                )
-            elif (
-                survived_term
-                and classification is not None
-                and forced
-                and complete_delivery
-            ):
-                store.append_event(
-                    {
-                        "schema_version": 1,
-                        "event": "cleanup_force_sent",
-                        "observed_wall": before.generated.wall_iso,
-                        "server": classification.process.server,
-                        "scope": classification.process.scope,
-                        "process_key": process_key,
-                        "state": "stubborn",
-                        "reason_codes": list(
-                            classification.reason_codes + ("sigkill_survived",)
-                        ),
-                    }
-                )
-            elif (
-                terminated_term
-                and classification is not None
-                and _all_current_identities_terminated(
-                    process_key,
-                    classification,
-                    outcomes,
-                )
-            ):
-                store.append_event(
-                    {
-                        "schema_version": 1,
-                        "event": (
-                            "cleanup_force_terminated"
+                outcomes.append(outcome)
+                group_outcomes.append(outcome)
+                continue
+            outcome, was_attempted = _signal_exact(
+                action,
+                procfs,
+                signaler,
+                signum,
+            )
+            attempted += int(was_attempted)
+            if outcome.status == "survived" and not action.force:
+                observed, time_reason = _observed_boot_time(clock, term_time_floor)
+                if time_reason is None:
+                    assert observed is not None
+                    term_sent_boot = observed
+                    term_time_floor = observed
+                else:
+                    term_time_valid = False
+                    outcome = replace(outcome, reason=time_reason)
+            outcomes.append(outcome)
+            group_outcomes.append(outcome)
+            survived_term |= outcome.status == "survived"
+            terminated_term |= outcome.status == "terminated"
+            if outcome.status in {"survived", "terminated"}:
+                delivered_keys.add(identity_key)
+            if outcome.status == "survived":
+                survived_keys.add(identity_key)
+            indeterminate_signal |= outcome.reason in {
+                "identity_unavailable_after_signal",
+                "identity_changed_after_signal",
+            }
+        forced = process_actions[0].force
+        current_keys = (
+            set()
+            if classification is None
+            else {identity.stable_key() for identity in classification.live_identities}
+        )
+        complete_delivery = bool(current_keys) and delivered_keys == current_keys
+        if (
+            survived_term
+            and classification is not None
+            and not forced
+            and complete_delivery
+            and term_time_valid
+            and term_sent_boot is not None
+        ):
+            updated = replace(
+                classification.process,
+                term_sent_boot=term_sent_boot,
+                term_sent_keys=frozenset(survived_keys),
+            )
+            _cas_process_and_event(
+                store,
+                root_token,
+                classification.process,
+                updated,
+                {
+                    "schema_version": 1,
+                    "event": "cleanup_term_sent",
+                    "observed_wall": before.generated.wall_iso,
+                    "server": updated.server,
+                    "scope": updated.scope,
+                    "process_key": process_key,
+                    "state": "exiting",
+                    "reason_codes": list(
+                        classification.reason_codes + ("sigterm_survived",)
+                    ),
+                },
+            )
+        elif (
+            survived_term
+            and classification is not None
+            and forced
+            and complete_delivery
+        ):
+            _cas_process_and_event(
+                store,
+                root_token,
+                classification.process,
+                classification.process,
+                {
+                    "schema_version": 1,
+                    "event": "cleanup_force_sent",
+                    "observed_wall": before.generated.wall_iso,
+                    "server": classification.process.server,
+                    "scope": classification.process.scope,
+                    "process_key": process_key,
+                    "state": "stubborn",
+                    "reason_codes": list(
+                        classification.reason_codes + ("sigkill_survived",)
+                    ),
+                },
+            )
+        elif (
+            terminated_term
+            and classification is not None
+            and _all_current_identities_terminated(
+                process_key,
+                classification,
+                outcomes,
+            )
+        ):
+            _cas_process_and_event(
+                store,
+                root_token,
+                classification.process,
+                classification.process,
+                {
+                    "schema_version": 1,
+                    "event": (
+                        "cleanup_force_terminated" if forced else "cleanup_terminated"
+                    ),
+                    "observed_wall": before.generated.wall_iso,
+                    "server": classification.process.server,
+                    "scope": classification.process.scope,
+                    "process_key": process_key,
+                    "state": "gone",
+                    "reason_codes": list(
+                        classification.reason_codes
+                        + (
+                            ("sigkill_terminated",)
                             if forced
-                            else "cleanup_terminated"
-                        ),
-                        "observed_wall": before.generated.wall_iso,
-                        "server": classification.process.server,
-                        "scope": classification.process.scope,
-                        "process_key": process_key,
-                        "state": "gone",
-                        "reason_codes": list(
-                            classification.reason_codes
-                            + (
-                                ("sigkill_terminated",)
-                                if forced
-                                else ("sigterm_terminated",)
-                            )
-                        ),
-                    }
-                )
-            elif (
-                terminated_term
-                or indeterminate_signal
-                or (survived_term and not complete_delivery)
-                or (survived_term and not forced and not term_time_valid)
-            ) and classification is not None:
-                store.append_event(
-                    {
-                        "schema_version": 1,
-                        "event": (
-                            "cleanup_force_indeterminate"
-                            if forced
-                            else "cleanup_signal_indeterminate"
-                        ),
-                        "observed_wall": before.generated.wall_iso,
-                        "server": classification.process.server,
-                        "scope": classification.process.scope,
-                        "process_key": process_key,
-                        "state": "unknown",
-                        "reason_codes": list(
-                            classification.reason_codes
-                            + (
-                                (
-                                    "partial_signal_delivery"
-                                    if not complete_delivery
-                                    else "signal_outcome_indeterminate"
-                                ),
-                            )
-                            + tuple(
-                                sorted({outcome.reason for outcome in group_outcomes})
-                            )
-                        ),
-                    }
-                )
-        after = classify.build_audit(store, procfs, clock)
-        after_count, after_rss_kib = _fresh_metrics(after, procfs)
+                            else ("sigterm_terminated",)
+                        )
+                    ),
+                },
+            )
+        elif (
+            terminated_term
+            or indeterminate_signal
+            or (survived_term and not complete_delivery)
+            or (survived_term and not forced and not term_time_valid)
+        ) and classification is not None:
+            _cas_process_and_event(
+                store,
+                root_token,
+                classification.process,
+                classification.process,
+                {
+                    "schema_version": 1,
+                    "event": (
+                        "cleanup_force_indeterminate"
+                        if forced
+                        else "cleanup_signal_indeterminate"
+                    ),
+                    "observed_wall": before.generated.wall_iso,
+                    "server": classification.process.server,
+                    "scope": classification.process.scope,
+                    "process_key": process_key,
+                    "state": "unknown",
+                    "reason_codes": list(
+                        classification.reason_codes
+                        + (
+                            (
+                                "partial_signal_delivery"
+                                if not complete_delivery
+                                else "signal_outcome_indeterminate"
+                            ),
+                        )
+                        + tuple(sorted({outcome.reason for outcome in group_outcomes}))
+                    ),
+                },
+            )
+    try:
+        if store.root_token() != root_token:
+            raise UnsafeStatePath("state root identity changed")
+        after_token, after_processes, after_leases = _state_snapshot(
+            store, expected_root_token=root_token
+        )
+        if after_token != root_token:
+            raise UnsafeStatePath("state root identity changed")
+    except (FileNotFoundError, UnsafeStatePath):
+        after_processes = tuple(stored_by_key.values())
+        after_leases = leases
+    after = classify.build_audit_from_records(
+        after_processes,
+        after_leases,
+        procfs,
+        clock,
+    )
+    after_count, after_rss_kib = _fresh_metrics(after, procfs)
     rendered = tuple(outcomes)
     return CleanupReport(
         before_count=before_count,
@@ -418,6 +606,10 @@ def execute_cleanup(
         survived=sum(item.status == "survived" for item in rendered),
         skipped=sum(item.status == "skipped" for item in rendered),
         outcomes=rendered,
+        before_state_counts=before.state_counts,
+        after_state_counts=after.state_counts,
+        before_classifications=before.classifications,
+        after_classifications=after.classifications,
     )
 
 

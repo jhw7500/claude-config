@@ -4,6 +4,7 @@ from dataclasses import replace
 import math
 import os
 import subprocess
+import time
 import unicodedata
 
 from .cleanup import PidfdSignalBackend, execute_cleanup, plan_cleanup
@@ -21,6 +22,9 @@ _SYSTEMD_COMMAND = [
     "--no-block",
     "codex-mcp-ownership-cleanup.service",
 ]
+FALLBACK_MAX_RECORDS = 64
+FALLBACK_MAX_ACTIONS = 64
+FALLBACK_MAX_ELAPSED_SECONDS = 0.25
 
 
 class SystemdNotifier:
@@ -103,18 +107,95 @@ def _event(name: str, lease: SessionLease) -> dict[str, object]:
     }
 
 
+def _same_generation(
+    current: SessionLease,
+    cwd: str,
+    host_keys: tuple[str, ...],
+    boot_id: str,
+) -> bool:
+    return bool(
+        current.state == "active"
+        and current.cwd == cwd
+        and current.host_keys == host_keys
+        and current.observed.boot_id == boot_id
+    )
+
+
+def _append_event_best_effort(
+    store: StateStore,
+    event: dict[str, object],
+    observed_wall: str,
+) -> None:
+    try:
+        store.append_event(event, maintenance=False)
+    except Exception:
+        try:
+            store.append_event(
+                {
+                    "schema_version": 1,
+                    "event": "hook_event_failed",
+                    "observed_wall": observed_wall,
+                    "state": "unknown",
+                    "reason_codes": ["hook_event_write_failed"],
+                },
+                maintenance=False,
+            )
+        except Exception:
+            pass
+
+
+def _request_cleanup(notifier: SystemdNotifier) -> bool:
+    try:
+        return notifier.request_cleanup() is True
+    except Exception:
+        return False
+
+
 def _opportunistic_cleanup(
     store: StateStore,
     procfs: LinuxProcfs,
     clock: Clock,
 ) -> None:
+    started = time.monotonic()
+    record_count = 0
+    for kind in ("sessions", "processes"):
+        directory = store.root / kind
+        try:
+            for _item in directory.iterdir():
+                record_count += 1
+                if record_count > FALLBACK_MAX_RECORDS:
+                    break
+        except FileNotFoundError:
+            continue
+        if record_count > FALLBACK_MAX_RECORDS:
+            _fallback_deferred(store, clock, "record_budget_exhausted")
+            return
     snapshot = build_audit(store, procfs, clock)
     if snapshot.corrupt_count:
         return
-    actions = plan_cleanup(snapshot)
-    if not actions:
+    if time.monotonic() - started > FALLBACK_MAX_ELAPSED_SECONDS:
+        _fallback_deferred(store, clock, "elapsed_budget_exhausted")
         return
-    signaler = PidfdSignalBackend()
+    actions = plan_cleanup(snapshot)
+    if len(actions) > FALLBACK_MAX_ACTIONS:
+        _fallback_deferred(store, clock, "action_budget_exhausted")
+        return
+    if actions:
+        signaler = PidfdSignalBackend()
+    else:
+
+        class _NoSignal:
+            def open(self, identity):
+                del identity
+                raise AssertionError("empty fallback opened signal backend")
+
+            def send(self, pidfd, signum):
+                del pidfd, signum
+
+            def close(self, pidfd):
+                del pidfd
+
+        signaler = _NoSignal()
     execute_cleanup(
         actions,
         store,
@@ -123,6 +204,22 @@ def _opportunistic_cleanup(
         clock,
         apply=True,
     )
+
+
+def _fallback_deferred(store: StateStore, clock: Clock, reason: str) -> None:
+    try:
+        store.append_event(
+            {
+                "schema_version": 1,
+                "event": "hook_fallback_deferred",
+                "observed_wall": _validated_text(clock.wall_iso(), "wall clock", 128),
+                "state": "unknown",
+                "reason_codes": [reason],
+            },
+            maintenance=False,
+        )
+    except Exception:
+        pass
 
 
 def handle_payload(
@@ -135,6 +232,7 @@ def handle_payload(
     """Handle one lifecycle payload without allowing failures to block Codex."""
     try:
         session_id, cwd, event, source = _validated_payload(payload)
+        cwd = os.path.realpath(cwd)
         if event == "SessionStart":
             parent_pid = os.getppid()
             chain = procfs.ancestor_chain(parent_pid)
@@ -143,29 +241,58 @@ def handle_payload(
             boot_ids = {identity.boot_id for identity in chain}
             if len(boot_ids) != 1:
                 return
-            lease = SessionLease(
+            host_keys = tuple(identity.stable_key() for identity in chain)
+            candidate = SessionLease(
                 schema_version=1,
                 session_id=session_id,
                 cwd=cwd,
                 source=source or "",
-                host_keys=tuple(identity.stable_key() for identity in chain),
+                host_keys=host_keys,
                 state="active",
                 observed=_observed(clock, chain[0].boot_id),
             )
-            lease.to_dict()
+            candidate.to_dict()
             with store.locked():
-                store.save_session(lease)
-                store.append_event(_event("session_started", lease))
-            if not notifier.request_cleanup():
+                current = store.load_session(session_id)
+                lease = (
+                    replace(current, source=source or "")
+                    if current is not None
+                    and _same_generation(
+                        current,
+                        cwd,
+                        host_keys,
+                        chain[0].boot_id,
+                    )
+                    else candidate
+                )
+                store.save_session(lease, maintenance=False)
+            _append_event_best_effort(
+                store,
+                _event("session_started", lease),
+                candidate.observed.wall_iso,
+            )
+            if not _request_cleanup(notifier):
                 try:
                     _opportunistic_cleanup(store, procfs, clock)
                 except Exception:
                     pass
             return
 
+        parent_pid = os.getppid()
+        chain = procfs.ancestor_chain(parent_pid)
+        if not chain or chain[0].pid != parent_pid:
+            return
+        host_keys = tuple(identity.stable_key() for identity in chain)
         with store.locked():
             current = store.load_session(session_id)
             if current is None or current.state == "ended":
+                return
+            if not _same_generation(
+                current,
+                cwd,
+                host_keys,
+                chain[0].boot_id,
+            ):
                 return
             ended_observed = _observed(clock, current.observed.boot_id)
             if ended_observed.boottime < current.observed.boottime:
@@ -176,8 +303,12 @@ def handle_payload(
                 ended=ended_observed,
             )
             ended.to_dict()
-            store.save_session(ended)
-            store.append_event(_event("session_ended", ended))
-        notifier.request_cleanup()
+            store.save_session(ended, maintenance=False)
+        _append_event_best_effort(
+            store,
+            _event("session_ended", ended),
+            ended_observed.wall_iso,
+        )
+        _request_cleanup(notifier)
     except Exception:
         return

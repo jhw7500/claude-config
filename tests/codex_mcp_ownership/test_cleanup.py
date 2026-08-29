@@ -90,6 +90,106 @@ def encode_force_token(payload: dict[str, object]) -> str:
     return f"{encoded}.{hashlib.sha256(canonical).hexdigest()}"
 
 
+def ended_owner_context_without_first_loss(tmp_path, fake_proc):
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    identity = tree.identity(321)
+    assert identity is not None
+    observed = model.ObservedTime("2026-08-29T00:00:00+00:00", identity.boot_id, 50.0)
+    lease = model.SessionLease(
+        1,
+        "session:convergence",
+        "/workspace",
+        "startup",
+        (identity.stable_key(),),
+        "ended",
+        observed,
+        replace(observed, boottime=60.0),
+    )
+    process = model.ManagedProcess(
+        1,
+        identity.stable_key(),
+        "user",
+        "convergence",
+        "/workspace",
+        identity,
+        None,
+        (identity,),
+        identity.pgid,
+        frozenset({identity.stable_key()}),
+        observed,
+        owner_session_id=lease.session_id,
+    )
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(lease)
+    store.save_process(process)
+    return store, tree, process
+
+
+def test_apply_persists_first_owner_loss_once_and_next_scan_converges(
+    tmp_path, fake_proc
+):
+    store, tree, process = ended_owner_context_without_first_loss(tmp_path, fake_proc)
+    clock = FakeClock(boot=200.0)
+    signaler = FakeSignalBackend()
+
+    first = cleanup.execute_cleanup((), store, tree, signaler, clock, apply=True)
+    stored = store.load_processes()[0]
+    assert first.attempted == 0
+    assert stored.first_owner_gone_boot == 200.0
+    events = (store.root / "events.jsonl").read_text().splitlines()
+    assert sum('"event":"owner_loss_observed"' in line for line in events) == 1
+
+    cleanup.execute_cleanup((), store, tree, signaler, clock, apply=True)
+    assert store.load_processes()[0].first_owner_gone_boot == 200.0
+    assert (store.root / "events.jsonl").read_text().splitlines() == events
+
+    clock.advance(121.0)
+    snapshot = classify.build_audit(store, tree, clock)
+    assert snapshot.classifications[0].state == "orphan"
+    assert cleanup.plan_cleanup(snapshot)[0].process_key == process.wrapper.stable_key()
+
+
+def test_build_audit_uses_held_store_pinned_root(tmp_path, fake_proc):
+    store, tree, _process = ended_owner_context_without_first_loss(tmp_path, fake_proc)
+    displaced = tmp_path / "displaced-state"
+    with store.locked():
+        store.root.rename(displaced)
+        store.root.mkdir(mode=0o700)
+        snapshot = classify.build_audit(store, tree, FakeClock(boot=200.0))
+    assert len(snapshot.classifications) == 1
+
+
+def test_apply_never_observes_procfs_or_rss_while_holding_global_lock(
+    orphan_context,
+):
+    store, tree, clock, _snapshot, process, _lease = orphan_context
+    store.save_process(replace(process, first_owner_gone_boot=100.0))
+    snapshot = classify.build_audit(store, tree, clock)
+    assert snapshot.classifications[0].eligible_term is True
+
+    class GuardedProcfs:
+        def __getattr__(self, name):
+            target = getattr(tree, name)
+            if name not in {"observe_identity", "identity", "rss_kib", "boot_id"}:
+                return target
+
+            def guarded(*args, **kwargs):
+                assert not store._owns_lock()
+                return target(*args, **kwargs)
+
+            return guarded
+
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        GuardedProcfs(),
+        FakeSignalBackend(),
+        clock,
+        apply=True,
+    )
+    assert report.attempted == 1
+
+
 def state_tree(root) -> tuple[tuple[str, bytes | None], ...]:
     return tuple(
         (str(path.relative_to(root)), path.read_bytes() if path.is_file() else None)
@@ -312,7 +412,7 @@ def test_apply_reaudits_under_lock_and_persists_term_survivor(orphan_context) ->
 
     class LockCheckingBackend(FakeSignalBackend):
         def open(self, identity: model.ProcessIdentity) -> int:
-            assert store._owns_lock()
+            assert not store._owns_lock()
             return super().open(identity)
 
     signaler = LockCheckingBackend()
@@ -329,6 +429,12 @@ def test_apply_reaudits_under_lock_and_persists_term_survivor(orphan_context) ->
     assert report.survived == 1
     assert report.terminated == 0
     assert report.skipped == 0
+    assert dict(report.before_state_counts)["orphan"] == 1
+    assert sum(dict(report.after_state_counts).values()) == 1
+    assert report.before_classifications[0].state == "orphan"
+    assert report.after_classifications[0].state in {"exiting", "orphan", "stubborn"}
+    assert report.outcomes[0].status == "survived"
+    assert report.outcomes[0].reason == "sigterm_survived"
     assert report.before_count == 1
     assert report.before_rss_kib == 128
     assert report.after_count == 1
@@ -431,18 +537,19 @@ def test_pid_reuse_before_pidfd_open_sends_no_signal(
     monkeypatch,
 ) -> None:
     store, tree, clock, snapshot, process, _lease = orphan_context
-    original_build_audit = cleanup.classify.build_audit
     changed = False
 
-    def mutate_after_reaudit(*args, **kwargs):
+    original_authority = cleanup._current_authority
+
+    def mutate_after_authority(*args, **kwargs):
         nonlocal changed
-        result = original_build_audit(*args, **kwargs)
+        result = original_authority(*args, **kwargs)
         if not changed:
             change_start_ticks(tree, process.wrapper)
             changed = True
         return result
 
-    monkeypatch.setattr(cleanup.classify, "build_audit", mutate_after_reaudit)
+    monkeypatch.setattr(cleanup, "_current_authority", mutate_after_authority)
     signaler = FakeSignalBackend()
 
     report = cleanup.execute_cleanup(
@@ -650,6 +757,8 @@ def test_pidfd_unavailable_is_diagnostic_only(orphan_context) -> None:
     assert report.attempted == 0
     assert report.skipped == 1
     assert report.outcomes[0].reason == "pidfd_unavailable"
+    assert report.before_classifications[0].state == "orphan"
+    assert report.after_classifications[0].state == "orphan"
     assert signaler.calls == [("open", process.wrapper)]
     assert state_tree(store.root) == before
 
@@ -708,6 +817,93 @@ def test_force_token_is_canonical_exact_evidence(stubborn_context) -> None:
     assert payload["issued_boot"] == 300.0
     assert payload["expires_boot"] == 600.0
     assert "=" not in token
+
+
+def test_each_force_token_selects_only_its_stubborn_classification(
+    stubborn_context,
+) -> None:
+    _store, _tree, clock, snapshot, _process, _lease, first = stubborn_context
+    second_identity = replace(first.live_identities[0], pid=654, start_ticks=6540)
+    second_process = replace(
+        first.process,
+        wrapper=second_identity,
+        child=None,
+        members=(second_identity,),
+        host_keys=frozenset({second_identity.stable_key()}),
+        term_sent_keys=frozenset({second_identity.stable_key()}),
+    )
+    second = replace(
+        first,
+        process=second_process,
+        live_identities=(second_identity,),
+    )
+    combined = replace(snapshot, classifications=(first, second))
+
+    first_actions = cleanup.select_force_actions(
+        combined,
+        cleanup.issue_force_token(first, clock),
+        clock,
+    )
+    second_actions = cleanup.select_force_actions(
+        combined,
+        cleanup.issue_force_token(second, clock),
+        clock,
+    )
+
+    assert {action.process_key for action in first_actions} == {
+        first.process.wrapper.stable_key()
+    }
+    assert {action.process_key for action in second_actions} == {
+        second.process.wrapper.stable_key()
+    }
+
+
+def test_two_stubborn_tokens_each_signal_only_their_exact_target(
+    stubborn_context,
+) -> None:
+    store, tree, clock, _snapshot, first_process, first_lease, _first = stubborn_context
+    write_proc_entry(
+        tree.proc_root,
+        654,
+        "654 (second) S 1 654 654 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 6540 0 0\n",
+        tree.proc_root / "node",
+        "VmRSS:\t48 kB\n",
+    )
+    second_identity = tree.identity(654)
+    assert second_identity is not None
+    second_lease = replace(first_lease, session_id="session:second-stubborn")
+    second_process = replace(
+        first_process,
+        record_id=second_identity.stable_key(),
+        wrapper=second_identity,
+        child=None,
+        members=(second_identity,),
+        owner_session_id=second_lease.session_id,
+        term_sent_keys=frozenset({second_identity.stable_key()}),
+    )
+    store.save_session(second_lease)
+    store.save_process(second_process)
+    combined = classify.build_audit(store, tree, clock)
+    stubborn = [item for item in combined.classifications if item.state == "stubborn"]
+    assert len(stubborn) == 2
+
+    for selected in stubborn:
+        token = cleanup.issue_force_token(selected, clock)
+        actions = cleanup.select_force_actions(combined, token, clock)
+        signaler = FakeSignalBackend()
+        report = cleanup.execute_cleanup(
+            actions,
+            store,
+            tree,
+            signaler,
+            clock,
+            apply=True,
+            confirm_token=token,
+        )
+        assert report.attempted == 1
+        assert [call[1] for call in signaler.calls if call[0] == "open"] == [
+            selected.live_identities[0]
+        ]
 
 
 def test_valid_force_confirmation_sends_only_sigkill(stubborn_context) -> None:
@@ -1375,7 +1571,7 @@ def test_new_member_requires_complete_current_set_term_before_force(
         clock,
         apply=True,
     )
-    assert term_report.survived == 2
+    assert term_report.survived == 2, term_report
     current_keys = frozenset({process.wrapper.stable_key(), child.stable_key()})
     refreshed = store.load_processes()[0]
     assert refreshed.term_sent_boot == 310.0
@@ -1403,6 +1599,40 @@ def test_new_member_requires_complete_current_set_term_before_force(
         signal.SIGKILL,
         signal.SIGKILL,
     ]
+
+
+def test_root_rebind_before_signal_skips_without_cross_ledger_mutation(
+    orphan_context, tmp_path, monkeypatch
+) -> None:
+    store, tree, clock, snapshot, _process, _lease = orphan_context
+    displaced = tmp_path / "displaced-state"
+    original_authority = cleanup._current_authority
+    rebound = False
+
+    def rebind_then_check(*args, **kwargs):
+        nonlocal rebound
+        if not rebound:
+            store.root.rename(displaced)
+            store.root.mkdir(mode=0o700)
+            rebound = True
+        return original_authority(*args, **kwargs)
+
+    monkeypatch.setattr(cleanup, "_current_authority", rebind_then_check)
+    signaler = FakeSignalBackend()
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+    )
+
+    assert signaler.calls == []
+    assert report.outcomes[0].reason == "state_authority_changed"
+    assert list(store.root.iterdir()) == []
+    assert not (store.root / "events.jsonl").exists()
+    assert state.StateStore(displaced).load_processes()
 
 
 def test_partial_term_delivery_does_not_make_unsignaled_identity_stubborn(

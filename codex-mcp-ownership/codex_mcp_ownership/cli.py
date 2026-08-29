@@ -15,11 +15,12 @@ from .cleanup import (
     execute_cleanup,
     issue_force_token,
     plan_cleanup,
+    select_force_actions,
 )
 from .clock import SystemClock
 from .hook import SystemdNotifier, handle_payload
-from .model import AuditSnapshot, Classification, CleanupReport
-from .procfs import LinuxProcfs
+from .model import AuditSnapshot, Classification, CleanupReport, ProcessIdentity
+from .procfs import IdentityObservation, LinuxProcfs
 from .state import StateCorruption, StateLockTimeout, StateStore, UnsafeStatePath
 from .supervisor import SupervisorRequest, run_supervisor
 
@@ -29,6 +30,10 @@ class _UsageError(ValueError):
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
     def error(self, message: str) -> None:
         del message
         raise _UsageError("usage error")
@@ -36,7 +41,11 @@ class _SafeArgumentParser(argparse.ArgumentParser):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(prog="codex-mcp-ownership")
-    subparsers = parser.add_subparsers(dest="command_name", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command_name",
+        required=True,
+        parser_class=_SafeArgumentParser,
+    )
     audit_parser = subparsers.add_parser("audit")
     audit_parser.add_argument("--json", action="store_true")
     cleanup_parser = subparsers.add_parser("cleanup")
@@ -92,6 +101,11 @@ def _report_dict(
         after_count = snapshot.process_count
         after_rss = snapshot.rss_kib
         attempted = terminated = survived = skipped = 0
+        before_state_counts = snapshot.state_counts
+        after_state_counts = snapshot.state_counts
+        before_classifications = snapshot.classifications
+        after_classifications = snapshot.classifications
+        outcomes = ()
     else:
         before_count = report.before_count
         before_rss = report.before_rss_kib
@@ -101,6 +115,11 @@ def _report_dict(
         terminated = report.terminated
         survived = report.survived
         skipped = report.skipped
+        before_state_counts = report.before_state_counts
+        after_state_counts = report.after_state_counts
+        before_classifications = report.before_classifications
+        after_classifications = report.after_classifications
+        outcomes = report.outcomes
     return {
         "schema_version": 1,
         "state_counts": dict(snapshot.state_counts),
@@ -115,6 +134,23 @@ def _report_dict(
         "terminated": terminated,
         "survived": survived,
         "skipped": skipped,
+        "before_state_counts": dict(before_state_counts),
+        "after_state_counts": dict(after_state_counts),
+        "before_classifications": [
+            _safe_classification(item) for item in before_classifications
+        ],
+        "after_classifications": [
+            _safe_classification(item) for item in after_classifications
+        ],
+        "outcomes": [
+            {
+                "pid": item.action.identity.pid,
+                "identity": item.action.identity.stable_key()[:16],
+                "status": item.status,
+                "reason": item.reason,
+            }
+            for item in outcomes
+        ],
         "classifications": [
             _safe_classification(item) for item in snapshot.classifications
         ],
@@ -123,9 +159,15 @@ def _report_dict(
 
 def _human_report(snapshot: AuditSnapshot, report: CleanupReport | None = None) -> str:
     values = _report_dict(snapshot, report)
-    counts = " ".join(f"{state}={count}" for state, count in snapshot.state_counts)
+    before_counts = " ".join(
+        f"{state}={count}" for state, count in values["before_state_counts"].items()
+    )
+    after_counts = " ".join(
+        f"{state}={count}" for state, count in values["after_state_counts"].items()
+    )
     lines = [
-        f"states {counts}",
+        f"before_states {before_counts}",
+        f"after_states {after_counts}",
         (
             f"before_count={values['before_count']} "
             f"before_rss_kib={values['before_rss_kib']} "
@@ -137,18 +179,35 @@ def _human_report(snapshot: AuditSnapshot, report: CleanupReport | None = None) 
             f"survived={values['survived']} skipped={values['skipped']}"
         ),
     ]
-    for item in values["classifications"]:
+    for phase in ("before", "after"):
+        classifications = values[f"{phase}_classifications"]
+        assert isinstance(classifications, list)
+        for item in classifications:
+            assert isinstance(item, dict)
+            lines.append(
+                " ".join(
+                    (
+                        f"phase={phase}",
+                        f"scope={item['scope']}",
+                        f"server={item['server']}",
+                        f"pid={item['pid']}",
+                        f"state={item['state']}",
+                        f"owner={item['owner']}",
+                        "workspace=<redacted>",
+                        "reasons=" + ",".join(item["reason_codes"]),
+                    )
+                )
+            )
+    for item in values["outcomes"]:
         assert isinstance(item, dict)
         lines.append(
             " ".join(
                 (
-                    f"scope={item['scope']}",
-                    f"server={item['server']}",
+                    "outcome",
                     f"pid={item['pid']}",
-                    f"state={item['state']}",
-                    f"owner={item['owner']}",
-                    "workspace=<redacted>",
-                    "reasons=" + ",".join(item["reason_codes"]),
+                    f"identity={item['identity']}",
+                    f"status={item['status']}",
+                    f"reason={item['reason']}",
                 )
             )
         )
@@ -182,8 +241,15 @@ def _cleanup_command(apply: bool, force: bool, confirm: str | None) -> int:
     store, procfs, clock = _runtime()
     snapshot = build_audit(store, procfs, clock)
     if snapshot.corrupt_count:
+        if apply:
+            store.load_sessions()
+            store.load_processes()
         return _diagnostic("state unavailable")
-    actions = plan_cleanup(snapshot, force=force)
+    actions = (
+        select_force_actions(snapshot, confirm, clock)
+        if force
+        else plan_cleanup(snapshot)
+    )
     if apply and actions:
         try:
             signaler = PidfdSignalBackend()
@@ -240,30 +306,72 @@ def _explain_command(pid: int) -> int:
     snapshot = build_audit(store, procfs, clock)
     if snapshot.corrupt_count:
         return _diagnostic("state unavailable")
-    matches = [
-        item
-        for item in snapshot.classifications
-        if any(identity.pid == pid for identity in item.live_identities)
-        or item.process.wrapper.pid == pid
-    ]
+    matches: list[tuple[Classification, ProcessIdentity]] = []
+    for item in snapshot.classifications:
+        process = item.process
+        recorded = (
+            (process.wrapper,)
+            + (() if process.child is None else (process.child,))
+            + process.members
+        )
+        for identity in recorded:
+            if identity.pid == pid:
+                matches.append((item, identity))
+                break
     if not matches:
-        identity = procfs.identity(pid)
-        state = "unmanaged" if identity is not None else "gone"
-        sys.stdout.write(f"pid={pid} state={state} signal_allowed=false\n")
+        observation = _explain_observation(procfs, pid)
+        sys.stdout.write(
+            f"pid={pid} state=unmanaged observed={observation.kind} "
+            "recorded=false signal_allowed=false reasons=not_managed\n"
+        )
         return 0
-    for item in matches:
+    for item, recorded_identity in matches:
+        observation = _explain_observation(procfs, pid)
+        exact_live = bool(
+            observation.kind == "live" and observation.identity == recorded_identity
+        )
+        refusal = list(item.reason_codes)
+        if observation.kind == "missing":
+            refusal.append("identity_missing")
+        elif observation.kind == "unavailable":
+            refusal.append("identity_unavailable")
+        elif not exact_live:
+            refusal.append("identity_changed")
         safe = _safe_classification(item)
         sys.stdout.write(
-            f"pid={pid} state={safe['state']} identity={safe['identity']} "
-            f"signal_allowed={'true' if safe['eligible_term'] else 'false'} "
-            f"reasons={','.join(safe['reason_codes'])}\n"
+            f"pid={pid} state={safe['state']} observed={observation.kind} "
+            f"recorded_identity={recorded_identity.stable_key()[:16]} "
+            f"owner={safe['owner']} grace_deadline_boot={safe['grace_deadline_boot']} "
+            f"signal_allowed={'true' if safe['eligible_term'] and exact_live else 'false'} "
+            f"reasons={','.join(refusal)}\n"
         )
     return 0
 
 
+def _explain_observation(procfs: LinuxProcfs, pid: int) -> IdentityObservation:
+    try:
+        observation = procfs.observe_identity(pid)
+    except (OSError, ValueError):
+        return IdentityObservation("unavailable", None)
+    if not isinstance(observation, IdentityObservation):
+        return IdentityObservation("unavailable", None)
+    return observation
+
+
 def _hook_command() -> int:
     try:
-        payload = json.load(sys.stdin)
+        maximum = 65_536
+        binary = getattr(sys.stdin, "buffer", None)
+        if binary is not None:
+            raw = binary.read(maximum + 1)
+            if len(raw) > maximum:
+                return 0
+            payload = json.loads(raw.decode("utf-8"))
+        else:
+            raw_text = sys.stdin.read(maximum + 1)
+            if len(raw_text.encode("utf-8")) > maximum:
+                return 0
+            payload = json.loads(raw_text)
         store, procfs, clock = _runtime()
         handle_payload(payload, store, procfs, clock, SystemdNotifier())
     except BaseException:
@@ -275,6 +383,8 @@ def _supervise_command(scope: str, server: str, command: list[str]) -> int:
     if not command or command[0] != "--" or len(command) == 1:
         raise _UsageError("supervise requires a command separator")
     remainder = command[1:]
+    if not remainder[0]:
+        raise _UsageError("supervise requires a nonempty command")
     request = SupervisorRequest(
         scope=scope,
         server=server,

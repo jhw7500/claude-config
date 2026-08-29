@@ -235,6 +235,16 @@ class SessionLease:
         ended_data = parsed["ended"]
         if ended_data is not None and not isinstance(ended_data, dict):
             raise ValueError("ended must be a record or null")
+        if (state == "active" and ended_data is not None) or (
+            state == "ended" and ended_data is None
+        ):
+            raise ValueError("session state and ended observation disagree")
+        observed = ObservedTime.from_dict(parsed["observed"])
+        ended = None if ended_data is None else ObservedTime.from_dict(ended_data)
+        if ended is not None and (
+            ended.boot_id != observed.boot_id or ended.boottime < observed.boottime
+        ):
+            raise ValueError("invalid session end observation")
         return cls(
             schema_version=schema_version,
             session_id=validate_session_id(parsed["session_id"]),
@@ -242,8 +252,8 @@ class SessionLease:
             source=_string(parsed["source"], "source"),
             host_keys=_strings(parsed["host_keys"], "host_keys"),
             state=state,
-            observed=ObservedTime.from_dict(parsed["observed"]),
-            ended=None if ended_data is None else ObservedTime.from_dict(ended_data),
+            observed=observed,
+            ended=ended,
         )
 
 
@@ -451,3 +461,7 @@ class CleanupReport:
     survived: int
     skipped: int
     outcomes: tuple[CleanupOutcome, ...]
+    before_state_counts: tuple[tuple[str, int], ...] = ()
+    after_state_counts: tuple[tuple[str, int], ...] = ()
+    before_classifications: tuple[Classification, ...] = ()
+    after_classifications: tuple[Classification, ...] = ()

@@ -22,6 +22,9 @@ EVENT_LOG_MAX_BYTES = 1_048_576
 EVENT_LOG_BACKUPS = 3
 EVENT_LOG_RETENTION_SECONDS = 2_592_000
 TRANSACTION_RETENTION = 3
+STATE_RECORD_MAX_BYTES = 1_048_576
+STATE_JSON_MAX_DEPTH = 64
+STATE_JSON_MAX_NODES = 100_000
 EVENT_LOG_BACKUP_FILENAMES = tuple(
     f"events.jsonl.{number}" for number in range(1, EVENT_LOG_BACKUPS + 1)
 )
@@ -130,6 +133,46 @@ def _read_all(fd: int) -> bytes:
         chunks.append(chunk)
 
 
+def _read_state_record(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = STATE_RECORD_MAX_BYTES + 1
+    while remaining:
+        chunk = os.read(fd, min(131072, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
+    if len(raw) > STATE_RECORD_MAX_BYTES:
+        raise ValueError("state record exceeds maximum size")
+    return raw
+
+
+def _validate_json_resources(value: object) -> None:
+    stack: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > STATE_JSON_MAX_NODES or depth > STATE_JSON_MAX_DEPTH:
+            raise ValueError("state JSON exceeds resource limits")
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+
+
+def _parse_state_record(
+    raw: bytes,
+    parser: Callable[[object], _Record],
+) -> _Record:
+    if len(raw) > STATE_RECORD_MAX_BYTES:
+        raise ValueError("state record exceeds maximum size")
+    decoded = json.loads(raw.decode("utf-8"))
+    _validate_json_resources(decoded)
+    return parser(decoded)
+
+
 def _write_all(fd: int, data: bytes) -> None:
     position = 0
     while position < len(data):
@@ -140,7 +183,9 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 class StateStore:
-    def __init__(self, root: Path, read_only: bool = False, lock_timeout: float = 2.0) -> None:
+    def __init__(
+        self, root: Path, read_only: bool = False, lock_timeout: float = 2.0
+    ) -> None:
         converted_timeout = float(lock_timeout)
         if not math.isfinite(converted_timeout) or converted_timeout < 0:
             raise ValueError("lock_timeout must be non-negative")
@@ -175,8 +220,19 @@ class StateStore:
         os.close(fd)
         return True
 
+    def root_token(self) -> tuple[int, int]:
+        """Return the device/inode identity of the current pinned state root."""
+        fd = self._open_root()
+        try:
+            value = os.fstat(fd)
+            return value.st_dev, value.st_ino
+        finally:
+            os.close(fd)
+
     def _walk_root(self, *, create: bool) -> int:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
         flags |= getattr(os, "O_NOFOLLOW", 0)
         parts = self.root.parts
         if not self.root.is_absolute() or not parts:
@@ -252,7 +308,9 @@ class StateStore:
         except FileNotFoundError:
             raise
         except OSError as error:
-            raise UnsafeStatePath(f"cannot safely inspect state file: {path}") from error
+            raise UnsafeStatePath(
+                f"cannot safely inspect state file: {path}"
+            ) from error
         _validate_file(before, path)
         flags = access_flags | os.O_NONBLOCK
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -274,7 +332,9 @@ class StateStore:
 
     def _open_directory(self, root_fd: int, name: str, *, create: bool) -> int | None:
         path = self.root / name
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
         flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(name, flags, dir_fd=root_fd)
@@ -297,7 +357,9 @@ class StateStore:
             fd = os.open(name, flags, dir_fd=root_fd)
             os.fsync(root_fd)
         except OSError as error:
-            raise UnsafeStatePath(f"cannot safely open state directory: {path}") from error
+            raise UnsafeStatePath(
+                f"cannot safely open state directory: {path}"
+            ) from error
         try:
             _validate_directory(os.fstat(fd), path)
         except Exception:
@@ -335,7 +397,9 @@ class StateStore:
     def _validate_lock_binding(self, lock_fd: int, root_fd: int) -> None:
         opened = os.fstat(lock_fd)
         _validate_file(opened, self.root / "state.lock")
-        named_fd = self._open_private_file(root_fd, "state.lock", self.root / "state.lock")
+        named_fd = self._open_private_file(
+            root_fd, "state.lock", self.root / "state.lock"
+        )
         try:
             named = os.fstat(named_fd)
         finally:
@@ -344,7 +408,11 @@ class StateStore:
             raise UnsafeStatePath("state.lock was replaced during lock acquisition")
 
     @contextmanager
-    def locked(self) -> Iterator[StateStore]:
+    def locked(
+        self,
+        *,
+        expected_root_token: tuple[int, int] | None = None,
+    ) -> Iterator[StateStore]:
         self._require_mutable()
         owner = threading.get_ident()
         deadline = time.monotonic() + self.lock_timeout
@@ -355,6 +423,10 @@ class StateStore:
                     raise RuntimeError("state lock is releasing")
                 if self._pinned_root_fd is None or self._lock_depth < 1:
                     raise RuntimeError("invalid reentrant state-lock ownership")
+                if expected_root_token is not None:
+                    pinned = os.fstat(self._pinned_root_fd)
+                    if (pinned.st_dev, pinned.st_ino) != expected_root_token:
+                        raise UnsafeStatePath("state root identity changed")
                 self._lock_depth += 1
                 nested = True
             else:
@@ -378,7 +450,11 @@ class StateStore:
         lock_fd: int | None = None
         flocked = False
         try:
-            root_fd = self._open_root(create=True)
+            root_fd = self._open_root(create=expected_root_token is None)
+            if expected_root_token is not None:
+                root_value = os.fstat(root_fd)
+                if (root_value.st_dev, root_value.st_ino) != expected_root_token:
+                    raise UnsafeStatePath("state root identity changed")
             lock_fd = self._create_lock_file(root_fd)
             while True:
                 try:
@@ -389,11 +465,15 @@ class StateStore:
                 except BlockingIOError as error:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise StateLockTimeout("timed out acquiring state.lock") from error
+                        raise StateLockTimeout(
+                            "timed out acquiring state.lock"
+                        ) from error
                     time.sleep(min(0.01, remaining))
             with self._lock_condition:
                 if self._lock_owner != owner or self._lock_depth != 1:
-                    raise RuntimeError("state-lock ownership changed during acquisition")
+                    raise RuntimeError(
+                        "state-lock ownership changed during acquisition"
+                    )
                 self._lock_fd = lock_fd
                 self._pinned_root_fd = root_fd
             try:
@@ -401,7 +481,9 @@ class StateStore:
             finally:
                 with self._lock_condition:
                     if self._lock_owner != owner or self._lock_depth != 1:
-                        raise RuntimeError("outer state lock exited with nested ownership")
+                        raise RuntimeError(
+                            "outer state lock exited with nested ownership"
+                        )
                     self._lock_releasing = True
         finally:
             try:
@@ -425,7 +507,9 @@ class StateStore:
                                 self._lock_owner = None
                                 self._lock_condition.notify_all()
 
-    def _atomic_json(self, directory_fd: int, directory: Path, name: str, value: object) -> None:
+    def _atomic_json(
+        self, directory_fd: int, directory: Path, name: str, value: object
+    ) -> None:
         if not self._owns_lock():
             raise RuntimeError("atomic state writes require the state lock")
         data = _canonical_json(value)
@@ -464,16 +548,23 @@ class StateStore:
         except Exception:
             if created is not None:
                 try:
-                    current = os.stat(temporary, dir_fd=directory_fd, follow_symlinks=False)
+                    current = os.stat(
+                        temporary, dir_fd=directory_fd, follow_symlinks=False
+                    )
                 except FileNotFoundError:
                     current = None
-                if current is not None and (current.st_dev, current.st_ino) == (
-                    created.st_dev,
-                    created.st_ino,
-                ) and (
-                    stat.S_ISREG(current.st_mode)
-                    and current.st_uid == os.getuid()
-                    and current.st_nlink == 1
+                if (
+                    current is not None
+                    and (current.st_dev, current.st_ino)
+                    == (
+                        created.st_dev,
+                        created.st_ino,
+                    )
+                    and (
+                        stat.S_ISREG(current.st_mode)
+                        and current.st_uid == os.getuid()
+                        and current.st_nlink == 1
+                    )
                 ):
                     os.unlink(temporary, dir_fd=directory_fd)
             raise
@@ -482,46 +573,58 @@ class StateStore:
         self._prune_event_backups_locked()
         self._prune_transactions_locked()
 
-    def save_session(self, lease: SessionLease) -> None:
+    def save_session(self, lease: SessionLease, *, maintenance: bool = True) -> None:
         if not isinstance(lease, SessionLease):
             raise TypeError("lease must be a SessionLease")
         key = session_key(lease.session_id)
         payload = lease.to_dict()
         self._require_mutable()
         with self.locked():
-            self._maintenance_locked()
+            if maintenance:
+                self._maintenance_locked()
             root_fd = self._open_root()
             try:
                 directory_fd = self._open_directory(root_fd, "sessions", create=True)
                 assert directory_fd is not None
                 try:
-                    self._atomic_json(directory_fd, self.root / "sessions", key + ".json", payload)
+                    self._atomic_json(
+                        directory_fd, self.root / "sessions", key + ".json", payload
+                    )
                 finally:
                     os.close(directory_fd)
             finally:
                 os.close(root_fd)
 
-    def save_process(self, process: ManagedProcess) -> None:
+    def save_process(
+        self, process: ManagedProcess, *, maintenance: bool = True
+    ) -> None:
         if not isinstance(process, ManagedProcess):
             raise TypeError("process must be a ManagedProcess")
         key = process.wrapper.stable_key()
         payload = process.to_dict()
         self._require_mutable()
         with self.locked():
-            self._maintenance_locked()
+            if maintenance:
+                self._maintenance_locked()
             root_fd = self._open_root()
             try:
                 directory_fd = self._open_directory(root_fd, "processes", create=True)
                 assert directory_fd is not None
                 try:
-                    self._atomic_json(directory_fd, self.root / "processes", key + ".json", payload)
+                    self._atomic_json(
+                        directory_fd, self.root / "processes", key + ".json", payload
+                    )
                 finally:
                     os.close(directory_fd)
             finally:
                 os.close(root_fd)
 
     def remove_process(self, process: ManagedProcess | str) -> None:
-        key = process.wrapper.stable_key() if isinstance(process, ManagedProcess) else process
+        key = (
+            process.wrapper.stable_key()
+            if isinstance(process, ManagedProcess)
+            else process
+        )
         if not isinstance(key, str) or len(key) != _HEX_DIGEST_LENGTH:
             raise ValueError("invalid process key")
         try:
@@ -541,7 +644,9 @@ class StateStore:
                 try:
                     name = key + ".json"
                     try:
-                        fd = self._open_private_file(directory_fd, name, self.root / "processes" / name)
+                        fd = self._open_private_file(
+                            directory_fd, name, self.root / "processes" / name
+                        )
                     except FileNotFoundError:
                         return
                     os.close(fd)
@@ -562,42 +667,78 @@ class StateStore:
     def load_session(self, session_id: str) -> SessionLease | None:
         """Load only the SHA-256-addressed lease for ``session_id``."""
         key = session_key(session_id)
+        value = self._load_exact_record(
+            "sessions",
+            key,
+            SessionLease.from_dict,
+            lambda item: session_key(item.session_id),
+        )
+        if value is not None and value.session_id != session_id:
+            raise StateCorruption(self.root / "sessions" / f"{key}.json", key)
+        return value
+
+    def load_process(self, process_key: str) -> ManagedProcess | None:
+        if not isinstance(process_key, str) or len(process_key) != _HEX_DIGEST_LENGTH:
+            raise ValueError("invalid process key")
+        try:
+            int(process_key, 16)
+        except ValueError as error:
+            raise ValueError("invalid process key") from error
+        return self._load_exact_record(
+            "processes",
+            process_key,
+            ManagedProcess.from_dict,
+            lambda item: item.wrapper.stable_key(),
+        )
+
+    def _load_exact_record(
+        self,
+        kind: str,
+        key: str,
+        parser: Callable[[object], _Record],
+        key_for: Callable[[_Record], str],
+    ) -> _Record | None:
         if not self._root_exists():
             return None
         if self.read_only:
-            return self._load_session_locked_or_read_only(session_id, key)
+            return self._load_exact_record_locked_or_read_only(
+                kind, key, parser, key_for
+            )
         with self.locked():
-            return self._load_session_locked_or_read_only(session_id, key)
+            return self._load_exact_record_locked_or_read_only(
+                kind, key, parser, key_for
+            )
 
-    def _load_session_locked_or_read_only(
+    def _load_exact_record_locked_or_read_only(
         self,
-        session_id: str,
+        kind: str,
         key: str,
-    ) -> SessionLease | None:
+        parser: Callable[[object], _Record],
+        key_for: Callable[[_Record], str],
+    ) -> _Record | None:
         root_fd = self._open_root()
         try:
-            directory_fd = self._open_directory(root_fd, "sessions", create=False)
+            directory_fd = self._open_directory(root_fd, kind, create=False)
             if directory_fd is None:
                 return None
             try:
                 name = key + ".json"
-                path = self.root / "sessions" / name
+                path = self.root / kind / name
                 try:
                     fd = self._open_private_file(directory_fd, name, path)
                 except FileNotFoundError:
                     return None
                 try:
-                    raw = _read_all(fd)
+                    raw = _read_state_record(fd)
+                except (ValueError, OverflowError, RecursionError):
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    raw = os.read(fd, STATE_RECORD_MAX_BYTES + 1)
                 finally:
                     os.close(fd)
                 digest = hashlib.sha256(raw).hexdigest()
                 try:
-                    decoded = json.loads(raw.decode("utf-8"))
-                    lease = SessionLease.from_dict(decoded)
-                    if (
-                        lease.session_id != session_id
-                        or session_key(lease.session_id) != key
-                    ):
+                    record = _parse_state_record(raw, parser)
+                    if key_for(record) != key:
                         raise ValueError(
                             "state filename does not match record identity"
                         )
@@ -606,13 +747,15 @@ class StateStore:
                     json.JSONDecodeError,
                     ValueError,
                     TypeError,
+                    OverflowError,
+                    RecursionError,
                 ):
                     quarantine = None
                     if not self.read_only:
                         quarantine = self._quarantine_locked(
                             root_fd,
                             directory_fd,
-                            "sessions",
+                            kind,
                             name,
                             raw,
                         )
@@ -621,7 +764,7 @@ class StateStore:
                         digest,
                         quarantine_path=quarantine,
                     ) from None
-                return lease
+                return record
             finally:
                 os.close(directory_fd)
         finally:
@@ -664,22 +807,37 @@ class StateStore:
                     path = self.root / kind / name
                     fd = self._open_private_file(directory_fd, name, path)
                     try:
-                        raw = _read_all(fd)
+                        raw = _read_state_record(fd)
+                    except (ValueError, OverflowError, RecursionError):
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        raw = os.read(fd, STATE_RECORD_MAX_BYTES + 1)
                     finally:
                         os.close(fd)
                     digest = hashlib.sha256(raw).hexdigest()
                     try:
                         if not name.endswith(".json"):
                             raise ValueError("unexpected state filename")
-                        decoded = json.loads(raw.decode("utf-8"))
-                        record = parser(decoded)
+                        record = _parse_state_record(raw, parser)
                         if name != key_for(record) + ".json":
-                            raise ValueError("state filename does not match record identity")
-                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+                            raise ValueError(
+                                "state filename does not match record identity"
+                            )
+                    except (
+                        UnicodeDecodeError,
+                        json.JSONDecodeError,
+                        ValueError,
+                        TypeError,
+                        OverflowError,
+                        RecursionError,
+                    ):
                         quarantine = None
                         if not self.read_only:
-                            quarantine = self._quarantine_locked(root_fd, directory_fd, kind, name, raw)
-                        raise StateCorruption(path, digest, quarantine_path=quarantine) from None
+                            quarantine = self._quarantine_locked(
+                                root_fd, directory_fd, kind, name, raw
+                            )
+                        raise StateCorruption(
+                            path, digest, quarantine_path=quarantine
+                        ) from None
                     records.append(record)
                 return tuple(records)
             finally:
@@ -704,11 +862,15 @@ class StateStore:
         destination_path = self.root / "corrupt" / destination
         try:
             try:
-                existing_fd = self._open_private_file(quarantine_fd, destination, destination_path)
+                existing_fd = self._open_private_file(
+                    quarantine_fd, destination, destination_path
+                )
             except FileNotFoundError:
                 existing_fd = None
             if existing_fd is None:
-                os.replace(name, destination, src_dir_fd=source_fd, dst_dir_fd=quarantine_fd)
+                os.replace(
+                    name, destination, src_dir_fd=source_fd, dst_dir_fd=quarantine_fd
+                )
             else:
                 try:
                     existing_raw = _read_all(existing_fd)
@@ -723,7 +885,9 @@ class StateStore:
         finally:
             os.close(quarantine_fd)
 
-    def append_event(self, event: dict[str, object]) -> None:
+    def append_event(
+        self, event: dict[str, object], *, maintenance: bool = True
+    ) -> None:
         if not isinstance(event, dict):
             raise ValueError("event must be a record")
         unknown = set(event) - EVENT_FIELDS
@@ -736,7 +900,8 @@ class StateStore:
             raise ValueError("event record exceeds maximum log size")
         self._require_mutable()
         with self.locked():
-            self._maintenance_locked()
+            if maintenance:
+                self._maintenance_locked()
             root_fd = self._open_root()
             try:
                 self._append_event_locked(root_fd, record)
@@ -795,7 +960,9 @@ class StateStore:
             os.replace(source, destination, src_dir_fd=root_fd, dst_dir_fd=root_fd)
         if self._validate_named_file_if_present(root_fd, "events.jsonl"):
             self._validate_named_file_if_present(root_fd, "events.jsonl.1")
-            os.replace("events.jsonl", "events.jsonl.1", src_dir_fd=root_fd, dst_dir_fd=root_fd)
+            os.replace(
+                "events.jsonl", "events.jsonl.1", src_dir_fd=root_fd, dst_dir_fd=root_fd
+            )
         os.fsync(root_fd)
 
     def _prune_event_backups_locked(self) -> None:
@@ -867,7 +1034,9 @@ class StateStore:
         root_fd = self._open_root()
         try:
             reference = self._install_transaction_reference(root_fd)
-            transactions_fd = self._open_directory(root_fd, "transactions", create=False)
+            transactions_fd = self._open_directory(
+                root_fd, "transactions", create=False
+            )
             if transactions_fd is None:
                 return
             try:
@@ -880,7 +1049,9 @@ class StateStore:
                     return
                 candidates.sort(reverse=True)
                 keep: set[str] = set()
-                if reference is not None and any(name == reference for _, name in candidates):
+                if reference is not None and any(
+                    name == reference for _, name in candidates
+                ):
                     keep.add(reference)
                 for _, name in candidates:
                     if len(keep) >= TRANSACTION_RETENTION:
@@ -888,7 +1059,9 @@ class StateStore:
                     keep.add(name)
                 for _, name in candidates:
                     if name not in keep:
-                        self._remove_private_tree(transactions_fd, name, self.root / "transactions" / name)
+                        self._remove_private_tree(
+                            transactions_fd, name, self.root / "transactions" / name
+                        )
                 os.fsync(transactions_fd)
             finally:
                 os.close(transactions_fd)
@@ -896,7 +1069,9 @@ class StateStore:
             os.close(root_fd)
 
     def _remove_private_tree(self, parent_fd: int, name: str, path: Path) -> None:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
         flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
             directory_fd = os.open(name, flags, dir_fd=parent_fd)
