@@ -49,6 +49,107 @@ raise SystemExit(
 )
 """
 
+_FINALIZATION_FAULT_RUNNER = """
+import os
+from pathlib import Path
+import signal
+import sys
+
+sys.path.insert(0, sys.argv[1])
+
+from codex_mcp_ownership.clock import SystemClock
+from codex_mcp_ownership.procfs import LinuxProcfs
+from codex_mcp_ownership.state import StateStore
+from codex_mcp_ownership import supervisor
+
+state_root = Path(sys.argv[2])
+cwd = sys.argv[3]
+fault = sys.argv[4]
+trace = Path(sys.argv[5])
+
+def record(value):
+    with trace.open("a", encoding="utf-8") as stream:
+        stream.write(value + "\\n")
+
+if fault == "handler":
+    original_signal = signal.signal
+    previous = {
+        signum: signal.getsignal(signum) for signum in supervisor._FORWARDED_SIGNALS
+    }
+
+    def fail_handler_restore(signum, handler):
+        if signum == signal.SIGINT and handler == previous[signum]:
+            record("handler-restore-SIGINT")
+            raise OSError("handler-finalization-secret")
+        return original_signal(signum, handler)
+
+    supervisor.signal.signal = fail_handler_restore
+elif fault == "mask":
+    original_mask = signal.pthread_sigmask
+
+    def fail_mask_restore(how, mask):
+        if how == signal.SIG_SETMASK:
+            record("mask-restore")
+            raise OSError("mask-finalization-secret")
+        return original_mask(how, mask)
+
+    supervisor.signal.pthread_sigmask = fail_mask_restore
+elif fault == "fd":
+    original_pidfd_open = os.pidfd_open
+    original_close = os.close
+    tracked = set()
+    interrupted = False
+
+    def track_pidfd(pid, flags=0):
+        fd = original_pidfd_open(pid, flags)
+        tracked.add(fd)
+        record(f"opened-{fd}")
+        return fd
+
+    def interrupt_one_close(fd):
+        global interrupted
+        if fd in tracked:
+            record(f"close-attempt-{fd}")
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("fd-finalization-secret")
+            result = original_close(fd)
+            tracked.remove(fd)
+            record(f"closed-{fd}")
+            return result
+        return original_close(fd)
+
+    supervisor.os.pidfd_open = track_pidfd
+    supervisor.os.close = interrupt_one_close
+else:
+    raise AssertionError("unknown fault")
+
+child_code = "import time;time.sleep(.05)"
+if fault == "fd":
+    child_code = (
+        "import subprocess,sys,time;"
+        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(.3)'],"
+        "close_fds=True);time.sleep(.1)"
+    )
+
+request = supervisor.SupervisorRequest(
+    scope="user",
+    server="fake",
+    command=sys.executable,
+    args=("-c", child_code, "finalization-argv-secret"),
+    cwd=cwd,
+)
+raise SystemExit(
+    supervisor.run_supervisor(
+        request,
+        StateStore(state_root),
+        LinuxProcfs(),
+        SystemClock(),
+        sleeper=lambda _delay: None,
+    )
+)
+"""
+
 
 @pytest.fixture
 def supervisor_command(tmp_path: Path) -> list[str]:
@@ -1214,57 +1315,201 @@ def test_forward_failure_during_final_handler_restore_is_not_lost(
         _kill_captured_children(children)
 
 
-def test_persistent_handler_restore_failure_requires_process_exit_boundary(
+def test_post_reap_exact_forward_failure_becomes_sticky_and_cleans_descendant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    _require_pidfd_signaling()
     previous = {
         signum: signal.getsignal(signum) for signum in supervisor._FORWARDED_SIGNALS
     }
     original_signal = signal.signal
-    group_terms: list[tuple[int, int]] = []
+    original_pidfd_send = signal.pidfd_send_signal
+    descendant_pid = tmp_path / "exact-forward-descendant-pid"
+    descendant_ready = tmp_path / "exact-forward-descendant-ready"
+    descendant_term = tmp_path / "exact-forward-descendant-term"
+    descendant_code = (
+        "import os,pathlib,signal,sys,time;"
+        "pid=pathlib.Path(sys.argv[1]);ready=pathlib.Path(sys.argv[2]);"
+        "term=pathlib.Path(sys.argv[3]);pid.write_text(str(os.getpid()));"
+        "signal.signal(signal.SIGTERM,lambda *_:(term.write_text('term'),sys.exit(0)));"
+        "ready.write_text('ready');time.sleep(30)"
+    )
+    leader_code = (
+        "import pathlib,subprocess,sys,time\n"
+        "ready=pathlib.Path(sys.argv[3])\n"
+        "subprocess.Popen([sys.executable,'-c',sys.argv[1],*sys.argv[2:5]],"
+        "close_fds=True)\n"
+        "while not ready.exists(): time.sleep(.01)\n"
+    )
+    children = _capture_real_popen(monkeypatch)
+    descendant_handles: list[tuple[model.ProcessIdentity, int]] = []
+    installed: dict[int, signal.Handlers] = {}
+    injected = False
+    fail_exact_send = False
 
-    def persistently_fail_sigint_restore(signum, handler):
-        if signum == signal.SIGINT and handler == previous[signum]:
-            raise OSError("persistent-restore-secret")
+    class CaptureDescendantProcfs(procfs.LinuxProcfs):
+        def group_members(self, pgid: int):
+            members = super().group_members(pgid)
+            if descendant_ready.exists() and not descendant_handles:
+                identity = self.identity(
+                    int(descendant_pid.read_text(encoding="utf-8"))
+                )
+                assert identity is not None
+                pidfd = _open_exact_pidfd(identity)
+                assert pidfd is not None
+                descendant_handles.append((identity, pidfd))
+            return members
+
+    def capture_and_inject(signum, handler):
+        nonlocal fail_exact_send, injected
+        if handler != previous[signum]:
+            installed[signum] = handler
+        elif not injected:
+            injected = True
+            fail_exact_send = True
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+            fail_exact_send = False
         return original_signal(signum, handler)
 
-    def record_group_term(pgid: int, signum: int) -> None:
-        group_terms.append((pgid, signum))
+    def fail_one_exact_send(pidfd, signum, siginfo, flags):
+        if fail_exact_send:
+            raise PermissionError("exact-forward-secret")
+        return original_pidfd_send(pidfd, signum, siginfo, flags)
 
-    children = _capture_real_popen(monkeypatch)
-    monkeypatch.setattr(supervisor.signal, "signal", persistently_fail_sigint_restore)
-    monkeypatch.setattr(supervisor, "forward_signal", record_group_term)
+    monkeypatch.setattr(supervisor.signal, "signal", capture_and_inject)
+    monkeypatch.setattr(supervisor.signal, "pidfd_send_signal", fail_one_exact_send)
     try:
-        with pytest.raises(BaseException) as caught:
-            supervisor.run_supervisor(
-                supervisor.SupervisorRequest(
-                    "user",
-                    "fake",
-                    sys.executable,
-                    ("-c", "pass", "argv-secret"),
-                    str(tmp_path),
+        result = supervisor.run_supervisor(
+            supervisor.SupervisorRequest(
+                "user",
+                "fake",
+                sys.executable,
+                (
+                    "-c",
+                    leader_code,
+                    descendant_code,
+                    str(descendant_pid),
+                    str(descendant_ready),
+                    str(descendant_term),
                 ),
-                state.StateStore(tmp_path / "state"),
-                procfs.LinuxProcfs(),
-                FakeClock(boot=100.0),
-                sleeper=lambda _delay: None,
-            )
+                str(tmp_path),
+            ),
+            state.StateStore(tmp_path / "state"),
+            CaptureDescendantProcfs(),
+            FakeClock(boot=100.0),
+            sleeper=lambda _delay: None,
+        )
         captured = capsys.readouterr()
-        boundary = getattr(supervisor, "SupervisorProcessExitRequired", None)
-        assert boundary is not None
-        assert type(caught.value) is boundary
-        assert str(caught.value) == ""
+        assert result == 70
+        assert len(descendant_handles) == 1
+        assert descendant_term.read_text(encoding="utf-8") == "term"
+        _wait_exact_identity_gone(descendant_handles[0][0])
         assert captured.err == (
-            "codex-mcp-supervisor: server=fake reason=handler_restore_failed\n"
+            "codex-mcp-supervisor: server=fake reason=signal_forward_failed\n"
         )
         assert "secret" not in captured.err
-        assert group_terms == []
+        assert {
+            signum: signal.getsignal(signum) for signum in supervisor._FORWARDED_SIGNALS
+        } == previous
     finally:
         for signum, handler in previous.items():
             original_signal(signum, handler)
+        if not descendant_handles and descendant_pid.exists():
+            identity = procfs.LinuxProcfs().identity(
+                int(descendant_pid.read_text(encoding="utf-8"))
+            )
+            if identity is not None:
+                pidfd = _open_exact_pidfd(identity)
+                if pidfd is not None:
+                    descendant_handles.append((identity, pidfd))
+        _signal_exact_pidfds(descendant_handles, signal.SIGKILL)
+        for identity, _ in descendant_handles:
+            _wait_exact_identity_gone(identity)
+        for _, pidfd in descendant_handles:
+            os.close(pidfd)
         _kill_captured_children(children)
+
+
+def _run_finalization_fault(
+    tmp_path: Path,
+    fault: str,
+) -> tuple[subprocess.CompletedProcess[bytes], tuple[str, ...]]:
+    _require_pidfd_signaling()
+    trace = tmp_path / f"{fault}-trace"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _FINALIZATION_FAULT_RUNNER,
+            str(PACKAGE_ROOT),
+            str(tmp_path / "state"),
+            str(tmp_path),
+            fault,
+            str(trace),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=tmp_path,
+        close_fds=True,
+        check=False,
+        timeout=5.0,
+    )
+    lines = (
+        tuple(trace.read_text(encoding="utf-8").splitlines()) if trace.exists() else ()
+    )
+    return completed, lines
+
+
+def test_persistent_handler_restore_exits_cleanly_without_manual_repair(
+    tmp_path: Path,
+) -> None:
+    completed, trace = _run_finalization_fault(tmp_path, "handler")
+
+    assert completed.returncode == 70
+    assert completed.stdout == b""
+    assert completed.stderr == (
+        b"codex-mcp-supervisor: server=fake reason=handler_restore_failed\n"
+    )
+    assert b"Traceback" not in completed.stderr
+    assert trace.count("handler-restore-SIGINT") >= 2
+
+
+def test_persistent_signal_mask_restore_exits_after_verified_retries(
+    tmp_path: Path,
+) -> None:
+    completed, trace = _run_finalization_fault(tmp_path, "mask")
+
+    assert completed.returncode == 70
+    assert completed.stdout == b""
+    assert completed.stderr == (
+        b"codex-mcp-supervisor: server=fake reason=signal_mask_restore_failed\n"
+    )
+    assert b"Traceback" not in completed.stderr
+    assert trace.count("mask-restore") >= 2
+
+
+def test_interrupted_pidfd_close_attempts_every_fd_then_exits_stably(
+    tmp_path: Path,
+) -> None:
+    completed, trace = _run_finalization_fault(tmp_path, "fd")
+    opened = {
+        line.removeprefix("opened-") for line in trace if line.startswith("opened-")
+    }
+    closed = {
+        line.removeprefix("closed-") for line in trace if line.startswith("closed-")
+    }
+
+    assert completed.returncode == 70
+    assert completed.stdout == b""
+    assert completed.stderr == (
+        b"codex-mcp-supervisor: server=fake reason=pidfd_close_failed\n"
+    )
+    assert b"Traceback" not in completed.stderr
+    assert opened
+    assert opened == closed
 
 
 def test_child_identity_failure_reaps_spawned_child_and_restores_handlers(
@@ -1626,6 +1871,226 @@ def test_live_signal_forward_captures_exact_group_before_numeric_address(
     lifecycle.forward(signal.SIGTERM)
 
     assert order == ["capture", "signal"]
+
+
+def test_reentrant_pending_term_cannot_repeat_numeric_group_term(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Child:
+        pid = 12345
+        returncode = None
+
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        Child(),  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        Child.pid,
+    )
+    blocked = False
+    pending = False
+    capture_calls = 0
+    group_terms: list[tuple[int, int]] = []
+
+    def fake_mask(how, mask):
+        nonlocal blocked, pending
+        previous = frozenset(supervisor._FORWARDED_SIGNALS) if blocked else frozenset()
+        if how == signal.SIG_BLOCK:
+            blocked = True
+        elif how == signal.SIG_SETMASK:
+            blocked = bool(mask)
+            if not blocked and pending:
+                pending = False
+                lifecycle.forward(signal.SIGTERM)
+        return previous
+
+    def deliver_term() -> None:
+        nonlocal pending
+        if blocked:
+            pending = True
+        else:
+            lifecycle.forward(signal.SIGTERM)
+
+    def capture_with_reentrant_term() -> None:
+        nonlocal capture_calls
+        capture_calls += 1
+        if capture_calls == 1:
+            deliver_term()
+
+    monkeypatch.setattr(supervisor.signal, "pthread_sigmask", fake_mask)
+    monkeypatch.setattr(lifecycle, "capture_group", capture_with_reentrant_term)
+    monkeypatch.setattr(lifecycle, "_send_exact", lambda _signum, **_kwargs: None)
+    monkeypatch.setattr(
+        supervisor,
+        "forward_signal",
+        lambda pgid, signum: group_terms.append((pgid, signum)),
+    )
+
+    lifecycle.forward(signal.SIGTERM)
+
+    assert group_terms == [(Child.pid, signal.SIGTERM)]
+    assert not blocked
+    assert not pending
+
+
+def test_nonreaping_exit_check_and_final_capture_share_one_signal_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+
+    class Child:
+        pid = 12345
+        returncode = None
+        args = ("fixture",)
+
+        def wait(self):
+            order.append("reap")
+            self.returncode = 0
+            return 0
+
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        Child(),  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        Child.pid,
+    )
+
+    def fake_mask(how, _mask):
+        if how == signal.SIG_BLOCK:
+            order.append("block")
+        elif how == signal.SIG_SETMASK:
+            order.append("restore")
+        return frozenset()
+
+    monkeypatch.setattr(supervisor.signal, "pthread_sigmask", fake_mask)
+    monkeypatch.setattr(
+        lifecycle, "_exit_observed", lambda: order.append("check") or True
+    )
+    monkeypatch.setattr(lifecycle, "capture_group", lambda: order.append("capture"))
+
+    assert lifecycle._wait_once(0.05) == 0
+    assert order == ["block", "check", "capture", "reap", "restore"]
+
+
+def test_nonreaping_wait_retries_interrupted_waitid_before_owned_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Child:
+        pid = 12345
+        returncode = None
+        args = ("fixture",)
+        wait_calls = 0
+
+        def wait(self):
+            self.wait_calls += 1
+            self.returncode = 17
+            return 17
+
+    child = Child()
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        child,  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        child.pid,
+    )
+    observations = iter((InterruptedError("waitid-secret"), object()))
+
+    def interrupted_then_exited(*_args):
+        observation = next(observations)
+        if isinstance(observation, BaseException):
+            raise observation
+        return observation
+
+    monkeypatch.setattr(supervisor.os, "waitid", interrupted_then_exited)
+    monkeypatch.setattr(lifecycle, "capture_group", lambda: None)
+
+    assert lifecycle._wait_once(0.05) == 17
+    assert child.wait_calls == 1
+
+
+def test_reentrant_pidfd_publication_closes_duplicate_and_published_fd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = procfs.LinuxProcfs().identity(os.getpid())
+    assert identity is not None
+
+    class Child:
+        pid = 12345
+        returncode = None
+
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        Child(),  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        Child.pid,
+    )
+    opened = iter((101, 102))
+    opened_fds: list[int] = []
+    closed_fds: list[int] = []
+    reentered = False
+    observations = 0
+
+    def open_pidfd(_pid: int, _flags: int) -> int:
+        pidfd = next(opened)
+        opened_fds.append(pidfd)
+        return pidfd
+
+    def observe(_identity: model.ProcessIdentity) -> str:
+        nonlocal observations, reentered
+        observations += 1
+        if observations == 2 and not reentered:
+            reentered = True
+            lifecycle._open_pidfd(identity)
+        return "exact"
+
+    monkeypatch.setattr(supervisor.os, "pidfd_open", open_pidfd)
+    monkeypatch.setattr(supervisor.os, "close", closed_fds.append)
+    monkeypatch.setattr(lifecycle, "_observation", observe)
+
+    lifecycle._open_pidfd(identity)
+    lifecycle.close()
+
+    assert opened_fds == [101, 102]
+    assert sorted(closed_fds) == opened_fds
+
+
+def test_interrupted_fd_verification_retries_close_instead_of_assuming_ebadf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Child:
+        pid = 12345
+        returncode = 0
+
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        Child(),  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        Child.pid,
+    )
+    lifecycle.owned_pidfds.update((101, 102))
+    live = {101, 102}
+    close_attempts: list[int] = []
+    close_interrupted = False
+    verify_interrupted = False
+
+    def close_fd(fd: int) -> None:
+        nonlocal close_interrupted
+        close_attempts.append(fd)
+        if fd == 101 and not close_interrupted:
+            close_interrupted = True
+            raise KeyboardInterrupt("close-secret")
+        live.discard(fd)
+
+    def verify_fd(fd: int) -> object:
+        nonlocal verify_interrupted
+        if fd == 101 and not verify_interrupted:
+            verify_interrupted = True
+            raise InterruptedError("verify-secret")
+        if fd in live:
+            return object()
+        raise OSError(9, "closed")
+
+    monkeypatch.setattr(supervisor.os, "close", close_fd)
+    monkeypatch.setattr(supervisor.os, "fstat", verify_fd)
+
+    assert not lifecycle.close()
+    assert live == set()
+    assert close_attempts.count(101) == 2
+    assert lifecycle.owned_pidfds == set()
 
 
 def test_pending_signal_failure_reaps_exact_spawned_child(
@@ -2000,6 +2465,159 @@ def test_captured_descendant_migrating_session_receives_exact_pidfd_term(
         )
         assert "secret" not in captured.err
     finally:
+        _signal_exact_pidfds(descendant_handles, signal.SIGKILL)
+        for identity, _ in descendant_handles:
+            _wait_exact_identity_gone(identity)
+        for _, pidfd in descendant_handles:
+            os.close(pidfd)
+        _kill_captured_children(children)
+
+
+@pytest.mark.parametrize("recovery", ["exit_event", "handler_restore"])
+def test_late_fork_is_captured_before_reap_for_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recovery: str,
+) -> None:
+    _require_pidfd_signaling()
+    previous = {
+        signum: signal.getsignal(signum) for signum in supervisor._FORWARDED_SIGNALS
+    }
+    original_signal = signal.signal
+    arm = tmp_path / "late-fork-arm"
+    release = tmp_path / "late-fork-release"
+    descendant_pid = tmp_path / "late-fork-descendant-pid"
+    descendant_ready = tmp_path / "late-fork-descendant-ready"
+    descendant_term = tmp_path / "late-fork-descendant-term"
+    leader_exiting = tmp_path / "late-fork-leader-exiting"
+    descendant_code = (
+        "import os,pathlib,signal,sys,time;"
+        "pid=pathlib.Path(sys.argv[1]);ready=pathlib.Path(sys.argv[2]);"
+        "term=pathlib.Path(sys.argv[3]);pid.write_text(str(os.getpid()));"
+        "signal.signal(signal.SIGTERM,lambda *_:(term.write_text('term'),sys.exit(0)));"
+        "ready.write_text('ready');time.sleep(30)"
+    )
+    leader_code = (
+        "import pathlib,subprocess,sys,time\n"
+        "release=pathlib.Path(sys.argv[1])\n"
+        "ready=pathlib.Path(sys.argv[4])\n"
+        "exiting=pathlib.Path(sys.argv[6])\n"
+        "while not release.exists(): time.sleep(.01)\n"
+        "subprocess.Popen([sys.executable,'-c',sys.argv[2],*sys.argv[3:6]],"
+        "close_fds=True)\n"
+        "while not ready.exists(): time.sleep(.01)\n"
+        "exiting.write_text('exiting')\n"
+    )
+    children = _capture_real_popen(monkeypatch)
+    descendant_handles: list[tuple[model.ProcessIdentity, int]] = []
+    released = False
+    armed_snapshots = 0
+
+    class ReleaseAfterSnapshotProcfs(procfs.LinuxProcfs):
+        def group_members(self, pgid: int):
+            nonlocal armed_snapshots, released
+            snapshot = super().group_members(pgid)
+            if arm.exists():
+                armed_snapshots += 1
+            if armed_snapshots == 2 and not released:
+                released = True
+                release.write_text("release", encoding="utf-8")
+                deadline = time.monotonic() + 4.0
+                while not descendant_ready.exists() or not leader_exiting.exists():
+                    assert time.monotonic() < deadline
+                    time.sleep(0.01)
+                identity = self.identity(
+                    int(descendant_pid.read_text(encoding="utf-8"))
+                )
+                assert identity is not None
+                pidfd = _open_exact_pidfd(identity)
+                assert pidfd is not None
+                descendant_handles.append((identity, pidfd))
+            return snapshot
+
+    store = state.StateStore(tmp_path / "state")
+    if recovery == "exit_event":
+        original_append = store.append_event
+
+        def fail_exit_event(event: dict[str, object]) -> None:
+            if event.get("event") == "supervisor_child_exited":
+                raise OSError("exit-event-secret")
+            original_append(event)
+
+        monkeypatch.setattr(store, "append_event", fail_exit_event)
+    else:
+        restore_failed = False
+
+        def fail_first_restore(signum, handler):
+            nonlocal restore_failed
+            if handler == previous[signum] and not restore_failed:
+                restore_failed = True
+                raise OSError("restore-secret")
+            return original_signal(signum, handler)
+
+        monkeypatch.setattr(supervisor.signal, "signal", fail_first_restore)
+
+    def arm_before_wait(delay: float) -> None:
+        if delay == 0.8:
+            arm.write_text("armed", encoding="utf-8")
+
+    try:
+        result = supervisor.run_supervisor(
+            supervisor.SupervisorRequest(
+                "user",
+                "fake",
+                sys.executable,
+                (
+                    "-c",
+                    leader_code,
+                    str(release),
+                    descendant_code,
+                    str(descendant_pid),
+                    str(descendant_ready),
+                    str(descendant_term),
+                    str(leader_exiting),
+                ),
+                str(tmp_path),
+            ),
+            store,
+            ReleaseAfterSnapshotProcfs(),
+            FakeClock(boot=100.0),
+            sleeper=arm_before_wait,
+        )
+        captured = capsys.readouterr()
+        assert result == 0
+        assert len(descendant_handles) == 1
+        descendant_identity = descendant_handles[0][0]
+        records = store.load_processes()
+        assert len(records) == 1
+        assert descendant_identity.stable_key() in {
+            member.stable_key() for member in records[0].members
+        }
+        assert descendant_term.read_text(encoding="utf-8") == "term"
+        _wait_exact_identity_gone(descendant_identity)
+        expected_reason = "state_exit_failed" if recovery == "exit_event" else None
+        if expected_reason is None:
+            assert captured.err == ""
+        else:
+            assert captured.err == (
+                f"codex-mcp-supervisor: server=fake reason={expected_reason}\n"
+            )
+        assert "secret" not in captured.err
+        assert {
+            signum: signal.getsignal(signum) for signum in supervisor._FORWARDED_SIGNALS
+        } == previous
+    finally:
+        for signum, handler in previous.items():
+            original_signal(signum, handler)
+        if not descendant_handles and descendant_pid.exists():
+            identity = procfs.LinuxProcfs().identity(
+                int(descendant_pid.read_text(encoding="utf-8"))
+            )
+            if identity is not None:
+                pidfd = _open_exact_pidfd(identity)
+                if pidfd is not None:
+                    descendant_handles.append((identity, pidfd))
         _signal_exact_pidfds(descendant_handles, signal.SIGKILL)
         for identity, _ in descendant_handles:
             _wait_exact_identity_gone(identity)

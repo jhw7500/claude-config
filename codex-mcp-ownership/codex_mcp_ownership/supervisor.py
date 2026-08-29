@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import errno
 import os
 import select
 import signal
@@ -43,8 +44,11 @@ class _StartupFailure(RuntimeError):
         self.reason_code = reason_code
 
 
-class SupervisorProcessExitRequired(BaseException):
-    """Process-exit-only boundary for a handler that could not be restored."""
+class SupervisorProcessExitRequired(SystemExit):
+    """Process-exit-only boundary for unverifiable supervisor finalization."""
+
+    def __init__(self) -> None:
+        super().__init__(_FATAL_EXIT)
 
 
 class _PersistentHandlerRestoreFailure(RuntimeError):
@@ -80,6 +84,53 @@ class _ChildDisposition:
 
 
 @dataclass
+class _SignalMaskState:
+    original_mask: frozenset[signal.Signals]
+    restore_failed: bool = False
+
+    @classmethod
+    def capture(cls) -> _SignalMaskState:
+        current = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        return cls(frozenset(current))
+
+    def block_forwarded(self) -> frozenset[signal.Signals]:
+        try:
+            previous = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARDED_SIGNALS)
+        except BaseException:
+            self.restore_failed = True
+            raise
+        return frozenset(previous)
+
+    def restore(self, previous: frozenset[signal.Signals]) -> None:
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        except BaseException:
+            self.restore_failed = True
+            raise
+
+    def restore_original(self) -> bool:
+        try:
+            current = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        except BaseException:
+            current = None
+        if current is not None and frozenset(current) == self.original_mask:
+            self.restore_failed = False
+            return True
+        for _attempt in range(2):
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, self.original_mask)
+                current = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+            except BaseException:
+                self.restore_failed = True
+                continue
+            if frozenset(current) == self.original_mask:
+                self.restore_failed = False
+                return True
+            self.restore_failed = True
+        return False
+
+
+@dataclass
 class _OwnedGroupLifecycle:
     """Exact lifecycle for the process group created by this wrapper.
 
@@ -93,11 +144,14 @@ class _OwnedGroupLifecycle:
     procfs: LinuxProcfs
     pgid: int
     leader_reaped: bool = False
+    group_access_closed: bool = False
     group_term_sent: bool = False
     disposed: bool = False
     identities: dict[str, ProcessIdentity] = field(default_factory=dict)
     pidfds: dict[str, int] = field(default_factory=dict)
+    owned_pidfds: set[int] = field(default_factory=set)
     exact_term_sent: set[str] = field(default_factory=set)
+    mask_state: _SignalMaskState = field(default_factory=_SignalMaskState.capture)
 
     def _observation(self, identity: ProcessIdentity) -> str:
         try:
@@ -145,16 +199,19 @@ class _OwnedGroupLifecycle:
             pidfd = opener(identity.pid, 0)
         except BaseException:
             return
+        self.owned_pidfds.add(pidfd)
         try:
             if self._observation(identity) == "exact":
-                self.pidfds[key] = pidfd
-                return
+                published = self.pidfds.setdefault(key, pidfd)
+                if published == pidfd:
+                    return
         except BaseException:
             pass
         try:
             os.close(pidfd)
         except OSError:
-            pass
+            return
+        self.owned_pidfds.discard(pidfd)
 
     def capture_exact(self, identities: tuple[ProcessIdentity, ...]) -> None:
         for identity in identities:
@@ -165,7 +222,7 @@ class _OwnedGroupLifecycle:
     def capture_group(self) -> None:
         if self.child.returncode is not None:
             self.leader_reaped = True
-        if self.leader_reaped:
+        if self.leader_reaped or self.group_access_closed:
             return
         captured: dict[str, ProcessIdentity] = {}
         try:
@@ -193,14 +250,21 @@ class _OwnedGroupLifecycle:
         )
         self.capture_exact(tuple(captured.values()))
 
-    def _send_exact(self, signum: int, *, migrated_only: bool = False) -> None:
+    def _send_exact(
+        self,
+        signum: int,
+        *,
+        migrated_only: bool = False,
+        forwarding: bool = False,
+    ) -> None:
         sender = getattr(signal, "pidfd_send_signal", None)
-        if not callable(sender):
-            return
         for key, identity in tuple(self.identities.items()):
             if signum == signal.SIGTERM and key in self.exact_term_sent:
                 continue
-            if not self._identity_live(identity):
+            if self._pidfd_exited(key):
+                continue
+            observation = self._observation(identity)
+            if observation == "gone":
                 continue
             if migrated_only:
                 try:
@@ -215,37 +279,76 @@ class _OwnedGroupLifecycle:
                 ):
                     continue
             pidfd = self.pidfds.get(key)
-            if pidfd is None:
+            if not callable(sender) or pidfd is None:
+                if forwarding:
+                    raise RuntimeError("exact signal forwarding unavailable")
                 continue
-            if signum == signal.SIGTERM:
-                self.exact_term_sent.add(key)
             try:
                 sender(pidfd, signum, None, 0)
             except BaseException:
-                pass
+                if forwarding and not self._pidfd_exited(key):
+                    if self._observation(identity) != "gone":
+                        raise RuntimeError("exact signal forwarding failed") from None
+                continue
+            if signum == signal.SIGTERM:
+                self.exact_term_sent.add(key)
 
     def forward(self, signum: int) -> None:
-        if self.child.returncode is not None:
-            self.leader_reaped = True
-        if self.leader_reaped or (signum == signal.SIGTERM and self.group_term_sent):
-            self._send_exact(signum)
-            return
-        self.capture_group()
-        if self.leader_reaped:
-            self._send_exact(signum)
-            return
-        if signum == signal.SIGTERM:
-            self.group_term_sent = True
-        forward_signal(self.pgid, signum)
-
-    def _wait_once(self, timeout: float | None) -> int:
-        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARDED_SIGNALS)
+        previous_mask = self.mask_state.block_forwarded()
         try:
-            return self.child.wait(timeout=timeout)
-        finally:
             if self.child.returncode is not None:
                 self.leader_reaped = True
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            if (
+                self.leader_reaped
+                or self.group_access_closed
+                or (signum == signal.SIGTERM and self.group_term_sent)
+            ):
+                self._send_exact(signum, forwarding=True)
+                return
+            self.capture_group()
+            if (
+                self.leader_reaped
+                or self.group_access_closed
+                or (signum == signal.SIGTERM and self.group_term_sent)
+            ):
+                self._send_exact(signum, forwarding=True)
+                return
+            if signum == signal.SIGTERM:
+                self.group_term_sent = True
+            forward_signal(self.pgid, signum)
+        finally:
+            self.mask_state.restore(previous_mask)
+
+    def _exit_observed(self) -> bool:
+        waiter = getattr(os, "waitid", None)
+        if not callable(waiter):
+            raise RuntimeError("non-reaping wait is unavailable")
+        try:
+            result = waiter(
+                os.P_PID,
+                self.child.pid,
+                os.WEXITED | os.WNOWAIT | os.WNOHANG,
+            )
+        except InterruptedError:
+            return False
+        return result is not None
+
+    def _wait_once(self, timeout: float | None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            previous_mask = self.mask_state.block_forwarded()
+            try:
+                if self._exit_observed():
+                    self.capture_group()
+                    self.group_access_closed = True
+                    result = self.child.wait()
+                    self.leader_reaped = True
+                    return result
+            finally:
+                self.mask_state.restore(previous_mask)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.child.args, timeout)
+            time.sleep(0.01)
 
     def wait_for_exit(self, check_forwarding: Callable[[], None]) -> int:
         while True:
@@ -278,19 +381,28 @@ class _OwnedGroupLifecycle:
         if self.child.returncode is not None:
             self.leader_reaped = True
         group_term_failed = False
-        if not self.leader_reaped and not self.group_term_sent:
-            self.capture_group()
-            self.group_term_sent = True
+        if (
+            not self.leader_reaped
+            and not self.group_access_closed
+            and not self.group_term_sent
+        ):
+            previous_mask = self.mask_state.block_forwarded()
             try:
-                forward_signal(self.pgid, signal.SIGTERM)
-            except BaseException:
-                group_term_failed = True
-            self.capture_group()
-            self._send_exact(
-                signal.SIGTERM,
-                migrated_only=not group_term_failed,
-            )
-        elif not self.leader_reaped:
+                self.capture_group()
+                if not self.leader_reaped and not self.group_access_closed:
+                    self.group_term_sent = True
+                    try:
+                        forward_signal(self.pgid, signal.SIGTERM)
+                    except BaseException:
+                        group_term_failed = True
+                    self.capture_group()
+                    self._send_exact(
+                        signal.SIGTERM,
+                        migrated_only=not group_term_failed,
+                    )
+            finally:
+                self.mask_state.restore(previous_mask)
+        elif not self.leader_reaped and not self.group_access_closed:
             self.capture_group()
             self._send_exact(signal.SIGTERM)
         self._reap_after_term()
@@ -309,13 +421,57 @@ class _OwnedGroupLifecycle:
             members=tuple(self.identities[key] for key in sorted(self.identities)),
         )
 
-    def close(self) -> None:
-        for pidfd in reversed(tuple(self.pidfds.values())):
+    def close(self) -> bool:
+        had_failure = False
+        opened = tuple(self.owned_pidfds)
+        for pidfd in reversed(opened):
             try:
                 os.close(pidfd)
-            except OSError:
-                pass
-        self.pidfds.clear()
+            except OSError as error:
+                if error.errno == errno.EBADF:
+                    self.owned_pidfds.discard(pidfd)
+                else:
+                    had_failure = True
+            except BaseException:
+                had_failure = True
+        remaining: set[int] = set()
+        for pidfd in opened:
+            try:
+                os.fstat(pidfd)
+            except OSError as error:
+                if error.errno == errno.EBADF:
+                    self.owned_pidfds.discard(pidfd)
+                else:
+                    had_failure = True
+                    remaining.add(pidfd)
+            except BaseException:
+                had_failure = True
+                remaining.add(pidfd)
+            else:
+                remaining.add(pidfd)
+        for pidfd in tuple(remaining):
+            try:
+                os.close(pidfd)
+            except BaseException:
+                had_failure = True
+        still_open: set[int] = set()
+        for pidfd in remaining:
+            try:
+                os.fstat(pidfd)
+            except OSError as error:
+                if error.errno == errno.EBADF:
+                    self.owned_pidfds.discard(pidfd)
+                else:
+                    had_failure = True
+                    still_open.add(pidfd)
+            except BaseException:
+                had_failure = True
+                still_open.add(pidfd)
+            else:
+                still_open.add(pidfd)
+        if not still_open:
+            self.pidfds.clear()
+        return not had_failure and not still_open
 
 
 def _validated_request(request: SupervisorRequest) -> SupervisorRequest:
@@ -839,6 +995,7 @@ def run_supervisor(
         return _FATAL_EXIT
     safe_server = validated.server
     try:
+        mask_state = _SignalMaskState.capture()
         wrapper, host_keys, spawned = _wrapper_observation(procfs, clock)
         previous, child_ref, pending = _install_signal_handlers()
     except _PersistentHandlerRestoreFailure:
@@ -846,6 +1003,9 @@ def run_supervisor(
         raise SupervisorProcessExitRequired from None
     except _StartupFailure as error:
         _fatal(safe_server, error.reason_code)
+        return _FATAL_EXIT
+    except BaseException:
+        _fatal(safe_server, "signal_mask_unavailable")
         return _FATAL_EXIT
 
     child: subprocess.Popen[bytes] | None = None
@@ -870,7 +1030,12 @@ def run_supervisor(
             fatal_reason = "child_spawn_failed"
         else:
             try:
-                lifecycle = _OwnedGroupLifecycle(child, procfs, child.pid)
+                lifecycle = _OwnedGroupLifecycle(
+                    child,
+                    procfs,
+                    child.pid,
+                    mask_state=mask_state,
+                )
                 child_ref["lifecycle"] = lifecycle
                 _publish_child(child_ref, child)
                 if _forwarding_failed(child_ref):
@@ -906,34 +1071,70 @@ def run_supervisor(
                 record_may_exist = error.record_may_exist
                 known_members = () if process is None else process.members
                 if lifecycle is None:
-                    lifecycle = _OwnedGroupLifecycle(child, procfs, child.pid)
-                disposition = lifecycle.dispose(known_members)
-                process = _persist_terminal_best_effort(
-                    process,
-                    disposition,
-                    error.reason_code,
-                    store,
-                    record_may_exist=record_may_exist,
-                )
+                    lifecycle = _OwnedGroupLifecycle(
+                        child,
+                        procfs,
+                        child.pid,
+                        mask_state=mask_state,
+                    )
+                try:
+                    disposition = lifecycle.dispose(known_members)
+                except BaseException:
+                    pass
+                else:
+                    process = _persist_terminal_best_effort(
+                        process,
+                        disposition,
+                        error.reason_code,
+                        store,
+                        record_may_exist=record_may_exist,
+                    )
                 fatal_reason = error.reason_code
                 result = error.result
     finally:
+        handler_finalization_failed = False
+        mask_finalization_failed = False
+        fd_finalization_failed = False
+        other_finalization_failed = False
+        try:
+            mask_state.block_forwarded()
+        except BaseException:
+            mask_finalization_failed = True
         failed_handlers = _restore_signal_handlers(previous)
         forward_failed = _forwarding_failed(child_ref)
         if forward_failed and fatal_reason is None:
             fatal_reason = "signal_forward_failed"
             result = _FATAL_EXIT
-        if failed_handlers or forward_failed:
+        needs_disposal = (
+            failed_handlers
+            or forward_failed
+            or (
+                lifecycle is not None
+                and fatal_reason is not None
+                and not lifecycle.disposed
+            )
+        )
+        if needs_disposal:
             if lifecycle is not None:
                 known = () if process is None else process.members
-                disposition = lifecycle.dispose(known)
-                process = _persist_terminal_best_effort(
-                    process,
-                    disposition,
-                    fatal_reason or "handler_restore_failed",
-                    store,
-                    record_may_exist=record_may_exist,
-                )
+                disposition: _ChildDisposition | None = None
+                for _attempt in range(2):
+                    try:
+                        disposition = lifecycle.dispose(known)
+                    except BaseException:
+                        other_finalization_failed = True
+                        if mask_state.restore_failed:
+                            mask_finalization_failed = True
+                        continue
+                    break
+                if disposition is not None:
+                    process = _persist_terminal_best_effort(
+                        process,
+                        disposition,
+                        fatal_reason or "handler_restore_failed",
+                        store,
+                        record_may_exist=record_may_exist,
+                    )
         if failed_handlers:
             remaining_handlers = _retry_signal_handlers(
                 previous,
@@ -944,11 +1145,25 @@ def run_supervisor(
                 fatal_reason = "signal_forward_failed"
                 result = _FATAL_EXIT
             if remaining_handlers:
-                fatal_reason = "handler_restore_failed"
-                result = _FATAL_EXIT
-                process_exit_required = True
+                handler_finalization_failed = True
         if lifecycle is not None:
-            lifecycle.close()
+            if not lifecycle.close():
+                fd_finalization_failed = True
+        if not mask_state.restore_original():
+            mask_finalization_failed = True
+        finalization_reason: str | None = None
+        if handler_finalization_failed:
+            finalization_reason = "handler_restore_failed"
+        elif mask_finalization_failed:
+            finalization_reason = "signal_mask_restore_failed"
+        elif fd_finalization_failed:
+            finalization_reason = "pidfd_close_failed"
+        elif other_finalization_failed:
+            finalization_reason = "supervisor_finalization_failed"
+        if finalization_reason is not None:
+            fatal_reason = finalization_reason
+            result = _FATAL_EXIT
+            process_exit_required = True
     if fatal_reason is not None:
         _fatal(safe_server, fatal_reason)
     if process_exit_required:
