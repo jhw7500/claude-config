@@ -238,7 +238,12 @@ def classify_process(
             live_identities,
         )
     if process.owner_session_id is None:
-        return _classification(process, "unknown", ("unmanaged",), live_identities)
+        return _classification(
+            process,
+            "unknown",
+            process.owner_reason_codes or ("unmanaged",),
+            live_identities,
+        )
 
     owner_leases = tuple(
         lease for lease in leases if lease.session_id == process.owner_session_id

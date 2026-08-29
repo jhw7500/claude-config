@@ -10,6 +10,8 @@ from typing import Literal
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", re.ASCII)
 _STABLE_KEY = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
+_SCOPE = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", re.ASCII)
+_REASON_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
 
 
 def validate_session_id(value: object) -> str:
@@ -17,6 +19,25 @@ def validate_session_id(value: object) -> str:
     if _SESSION_ID.fullmatch(session_id) is None:
         raise ValueError("invalid session_id")
     return session_id
+
+
+def validate_scope(value: object) -> str:
+    scope = _string(value, "scope")
+    if _SCOPE.fullmatch(scope) is None:
+        raise ValueError("invalid scope")
+    return scope
+
+
+def validate_server_name(value: object) -> str:
+    server = _string(value, "server")
+    if (
+        not server
+        or len(server) > 128
+        or server.strip() != server
+        or not server.isprintable()
+    ):
+        raise ValueError("invalid server")
+    return server
 
 
 def _require_exact_keys(data: object, keys: set[str]) -> dict[str, object]:
@@ -59,6 +80,15 @@ def _stable_key_set(value: object, field: str) -> frozenset[str]:
     ):
         raise ValueError(f"{field} must be a sorted unique list of stable keys")
     return frozenset(keys)
+
+
+def _reason_code_tuple(value: object, field: str) -> tuple[str, ...]:
+    codes = _strings(value, field)
+    if len(set(codes)) != len(codes) or any(
+        _REASON_CODE.fullmatch(code) is None for code in codes
+    ):
+        raise ValueError(f"{field} must contain unique stable reason codes")
+    return codes
 
 
 @dataclass(frozen=True)
@@ -239,6 +269,7 @@ class ManagedProcess:
     term_sent_boot: float | None = None
     exit_code: int | None = None
     term_sent_keys: frozenset[str] = frozenset()
+    owner_reason_codes: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         if not isinstance(self.wrapper, ProcessIdentity):
@@ -257,6 +288,8 @@ class ManagedProcess:
             raise ValueError("host_keys must be a frozenset of strings")
         if type(self.term_sent_keys) is not frozenset:
             raise ValueError("term_sent_keys must be a frozenset")
+        if type(self.owner_reason_codes) is not tuple:
+            raise ValueError("owner_reason_codes must be a tuple")
         data: dict[str, object] = {
             "schema_version": self.schema_version,
             "record_id": self.record_id,
@@ -275,6 +308,7 @@ class ManagedProcess:
             "term_sent_boot": self.term_sent_boot,
             "term_sent_keys": sorted(self.term_sent_keys),
             "exit_code": self.exit_code,
+            "owner_reason_codes": list(self.owner_reason_codes),
         }
         self.from_dict(data)
         return data
@@ -301,6 +335,7 @@ class ManagedProcess:
                 "term_sent_boot",
                 "term_sent_keys",
                 "exit_code",
+                "owner_reason_codes",
             },
         )
         schema_version = _integer(parsed["schema_version"], "schema_version")
@@ -324,8 +359,8 @@ class ManagedProcess:
         return cls(
             schema_version=schema_version,
             record_id=_string(parsed["record_id"], "record_id"),
-            scope=_string(parsed["scope"], "scope"),
-            server=_string(parsed["server"], "server"),
+            scope=validate_scope(parsed["scope"]),
+            server=validate_server_name(parsed["server"]),
             cwd=_string(parsed["cwd"], "cwd"),
             wrapper=ProcessIdentity.from_dict(parsed["wrapper"]),
             child=None if child_data is None else ProcessIdentity.from_dict(child_data),
@@ -347,6 +382,10 @@ class ManagedProcess:
             ),
             term_sent_keys=_stable_key_set(parsed["term_sent_keys"], "term_sent_keys"),
             exit_code=None if exit_code is None else _integer(exit_code, "exit_code"),
+            owner_reason_codes=_reason_code_tuple(
+                parsed["owner_reason_codes"],
+                "owner_reason_codes",
+            ),
         )
 
 
