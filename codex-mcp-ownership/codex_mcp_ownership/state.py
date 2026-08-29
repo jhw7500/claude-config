@@ -559,6 +559,74 @@ class StateStore:
             lambda value: session_key(value.session_id),
         )
 
+    def load_session(self, session_id: str) -> SessionLease | None:
+        """Load only the SHA-256-addressed lease for ``session_id``."""
+        key = session_key(session_id)
+        if not self._root_exists():
+            return None
+        if self.read_only:
+            return self._load_session_locked_or_read_only(session_id, key)
+        with self.locked():
+            return self._load_session_locked_or_read_only(session_id, key)
+
+    def _load_session_locked_or_read_only(
+        self,
+        session_id: str,
+        key: str,
+    ) -> SessionLease | None:
+        root_fd = self._open_root()
+        try:
+            directory_fd = self._open_directory(root_fd, "sessions", create=False)
+            if directory_fd is None:
+                return None
+            try:
+                name = key + ".json"
+                path = self.root / "sessions" / name
+                try:
+                    fd = self._open_private_file(directory_fd, name, path)
+                except FileNotFoundError:
+                    return None
+                try:
+                    raw = _read_all(fd)
+                finally:
+                    os.close(fd)
+                digest = hashlib.sha256(raw).hexdigest()
+                try:
+                    decoded = json.loads(raw.decode("utf-8"))
+                    lease = SessionLease.from_dict(decoded)
+                    if (
+                        lease.session_id != session_id
+                        or session_key(lease.session_id) != key
+                    ):
+                        raise ValueError(
+                            "state filename does not match record identity"
+                        )
+                except (
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    ValueError,
+                    TypeError,
+                ):
+                    quarantine = None
+                    if not self.read_only:
+                        quarantine = self._quarantine_locked(
+                            root_fd,
+                            directory_fd,
+                            "sessions",
+                            name,
+                            raw,
+                        )
+                    raise StateCorruption(
+                        path,
+                        digest,
+                        quarantine_path=quarantine,
+                    ) from None
+                return lease
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(root_fd)
+
     def load_processes(self) -> tuple[ManagedProcess, ...]:
         return self._load_records(
             "processes",
