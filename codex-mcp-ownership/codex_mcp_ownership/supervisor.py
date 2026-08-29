@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -25,7 +26,6 @@ from .state import StateCorruption, StateLockTimeout, StateStore, UnsafeStatePat
 _RECONCILE_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
 _FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 _FATAL_EXIT = 70
-_ABORT_WAIT_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,14 @@ class _StartupFailure(RuntimeError):
     def __init__(self, reason_code: str) -> None:
         super().__init__(reason_code)
         self.reason_code = reason_code
+
+
+class SupervisorProcessExitRequired(BaseException):
+    """Process-exit-only boundary for a handler that could not be restored."""
+
+
+class _PersistentHandlerRestoreFailure(RuntimeError):
+    pass
 
 
 class _ReconciliationPersistenceFailure(RuntimeError):
@@ -69,6 +77,245 @@ class _PostSpawnFailure(RuntimeError):
 class _ChildDisposition:
     exit_code: int | None
     members: tuple[ProcessIdentity, ...]
+
+
+@dataclass
+class _OwnedGroupLifecycle:
+    """Exact lifecycle for the process group created by this wrapper.
+
+    The unreaped direct leader is the only authority for numeric PGID actions.
+    Once the leader is reaped, cleanup uses only pidfds captured and revalidated
+    while identities were exact. A TERM-resistant exact identity is supervised
+    indefinitely; a reused PID or PGID is never treated as owned.
+    """
+
+    child: subprocess.Popen[bytes]
+    procfs: LinuxProcfs
+    pgid: int
+    leader_reaped: bool = False
+    group_term_sent: bool = False
+    disposed: bool = False
+    identities: dict[str, ProcessIdentity] = field(default_factory=dict)
+    pidfds: dict[str, int] = field(default_factory=dict)
+    exact_term_sent: set[str] = field(default_factory=set)
+
+    def _observation(self, identity: ProcessIdentity) -> str:
+        try:
+            observed = self.procfs.observe_identity(identity.pid)
+        except BaseException:
+            return "unavailable"
+        if observed.kind == "missing":
+            return "gone"
+        if observed.kind == "live":
+            if (
+                observed.identity is not None
+                and observed.identity.stable_key() == identity.stable_key()
+            ):
+                return "exact"
+            return "gone"
+        return "unavailable"
+
+    def _pidfd_exited(self, stable_key: str) -> bool:
+        pidfd = self.pidfds.get(stable_key)
+        if pidfd is None:
+            return False
+        try:
+            readable, _, _ = select.select((pidfd,), (), (), 0)
+        except BaseException:
+            return False
+        return bool(readable)
+
+    def _identity_live(self, identity: ProcessIdentity) -> bool:
+        key = identity.stable_key()
+        if self._pidfd_exited(key):
+            return False
+        observation = self._observation(identity)
+        if observation == "gone":
+            return False
+        return True
+
+    def _open_pidfd(self, identity: ProcessIdentity) -> None:
+        key = identity.stable_key()
+        if key in self.pidfds or self._observation(identity) != "exact":
+            return
+        opener = getattr(os, "pidfd_open", None)
+        if not callable(opener):
+            return
+        try:
+            pidfd = opener(identity.pid, 0)
+        except BaseException:
+            return
+        try:
+            if self._observation(identity) == "exact":
+                self.pidfds[key] = pidfd
+                return
+        except BaseException:
+            pass
+        try:
+            os.close(pidfd)
+        except OSError:
+            pass
+
+    def capture_exact(self, identities: tuple[ProcessIdentity, ...]) -> None:
+        for identity in identities:
+            key = identity.stable_key()
+            self.identities.setdefault(key, identity)
+            self._open_pidfd(identity)
+
+    def capture_group(self) -> None:
+        if self.child.returncode is not None:
+            self.leader_reaped = True
+        if self.leader_reaped:
+            return
+        captured: dict[str, ProcessIdentity] = {}
+        try:
+            leader_observation = self.procfs.observe_identity(self.child.pid)
+        except BaseException:
+            leader_observation = None
+        if (
+            leader_observation is not None
+            and leader_observation.kind == "live"
+            and leader_observation.identity is not None
+            and leader_observation.identity.pgid == self.pgid
+        ):
+            leader = leader_observation.identity
+            captured[leader.stable_key()] = leader
+        try:
+            members = self.procfs.group_members(self.pgid)
+        except BaseException:
+            members = ()
+        captured.update(
+            {
+                member.stable_key(): member
+                for member in members
+                if member.pgid == self.pgid
+            }
+        )
+        self.capture_exact(tuple(captured.values()))
+
+    def _send_exact(self, signum: int, *, migrated_only: bool = False) -> None:
+        sender = getattr(signal, "pidfd_send_signal", None)
+        if not callable(sender):
+            return
+        for key, identity in tuple(self.identities.items()):
+            if signum == signal.SIGTERM and key in self.exact_term_sent:
+                continue
+            if not self._identity_live(identity):
+                continue
+            if migrated_only:
+                try:
+                    observed = self.procfs.observe_identity(identity.pid)
+                except BaseException:
+                    continue
+                if (
+                    observed.kind != "live"
+                    or observed.identity is None
+                    or observed.identity.stable_key() != identity.stable_key()
+                    or observed.identity.pgid == self.pgid
+                ):
+                    continue
+            pidfd = self.pidfds.get(key)
+            if pidfd is None:
+                continue
+            if signum == signal.SIGTERM:
+                self.exact_term_sent.add(key)
+            try:
+                sender(pidfd, signum, None, 0)
+            except BaseException:
+                pass
+
+    def forward(self, signum: int) -> None:
+        if self.child.returncode is not None:
+            self.leader_reaped = True
+        if self.leader_reaped or (signum == signal.SIGTERM and self.group_term_sent):
+            self._send_exact(signum)
+            return
+        self.capture_group()
+        if self.leader_reaped:
+            self._send_exact(signum)
+            return
+        if signum == signal.SIGTERM:
+            self.group_term_sent = True
+        forward_signal(self.pgid, signum)
+
+    def _wait_once(self, timeout: float | None) -> int:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARDED_SIGNALS)
+        try:
+            return self.child.wait(timeout=timeout)
+        finally:
+            if self.child.returncode is not None:
+                self.leader_reaped = True
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    def wait_for_exit(self, check_forwarding: Callable[[], None]) -> int:
+        while True:
+            self.capture_group()
+            try:
+                result = self._wait_once(0.05)
+            except subprocess.TimeoutExpired:
+                check_forwarding()
+                continue
+            check_forwarding()
+            return result
+
+    def _reap_after_term(self) -> None:
+        while not self.leader_reaped:
+            self.capture_group()
+            try:
+                self._wait_once(0.05)
+            except subprocess.TimeoutExpired:
+                continue
+            except BaseException:
+                _cleanup_pause()
+
+    def dispose(
+        self,
+        known_members: tuple[ProcessIdentity, ...] = (),
+    ) -> _ChildDisposition:
+        if self.disposed:
+            return self.disposition()
+        self.capture_exact(known_members)
+        if self.child.returncode is not None:
+            self.leader_reaped = True
+        group_term_failed = False
+        if not self.leader_reaped and not self.group_term_sent:
+            self.capture_group()
+            self.group_term_sent = True
+            try:
+                forward_signal(self.pgid, signal.SIGTERM)
+            except BaseException:
+                group_term_failed = True
+            self.capture_group()
+            self._send_exact(
+                signal.SIGTERM,
+                migrated_only=not group_term_failed,
+            )
+        elif not self.leader_reaped:
+            self.capture_group()
+            self._send_exact(signal.SIGTERM)
+        self._reap_after_term()
+        self._send_exact(signal.SIGTERM)
+        while any(
+            self._identity_live(identity) for identity in self.identities.values()
+        ):
+            self._send_exact(signal.SIGTERM)
+            _cleanup_pause()
+        self.disposed = True
+        return self.disposition()
+
+    def disposition(self) -> _ChildDisposition:
+        return _ChildDisposition(
+            exit_code=self.child.returncode,
+            members=tuple(self.identities[key] for key in sorted(self.identities)),
+        )
+
+    def close(self) -> None:
+        for pidfd in reversed(tuple(self.pidfds.values())):
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
+        self.pidfds.clear()
 
 
 def _validated_request(request: SupervisorRequest) -> SupervisorRequest:
@@ -148,24 +395,33 @@ def forward_signal(child_pgid: int, signum: int) -> None:
 
 def _install_signal_handlers() -> tuple[
     dict[int, signal.Handlers],
-    dict[str, subprocess.Popen[bytes] | None],
+    dict[str, object],
     list[int],
 ]:
     previous: dict[int, signal.Handlers] = {}
-    child_ref: dict[str, subprocess.Popen[bytes] | None] = {"child": None}
+    child_ref: dict[str, object] = {
+        "child": None,
+        "lifecycle": None,
+        "forward_failed": False,
+    }
     pending: list[int] = []
 
     def handle(signum: int, _frame: object) -> None:
-        child = child_ref["child"]
-        if child is None:
-            pending.append(signum)
-            return
         try:
-            live = child.poll() is None
-        except OSError:
-            live = False
-        if live:
-            forward_signal(child.pid, signum)
+            child = child_ref["child"]
+            if child is None:
+                pending.append(signum)
+                return
+            lifecycle = child_ref["lifecycle"]
+            if isinstance(lifecycle, _OwnedGroupLifecycle):
+                lifecycle.forward(signum)
+                return
+            child_pid = getattr(child, "pid", None)
+            if type(child_pid) is not int:
+                raise RuntimeError("child publication is incomplete")
+            forward_signal(child_pid, signum)
+        except BaseException:
+            child_ref["forward_failed"] = True
 
     installed: list[int] = []
     try:
@@ -174,8 +430,9 @@ def _install_signal_handlers() -> tuple[
             signal.signal(signum, handle)
             installed.append(signum)
     except BaseException:
-        if not _restore_signal_handlers(previous, tuple(installed)):
-            raise _StartupFailure("handler_restore_failed") from None
+        failed = _restore_signal_handlers(previous, tuple(installed))
+        if failed and _retry_signal_handlers(previous, tuple(installed), failed):
+            raise _PersistentHandlerRestoreFailure from None
         raise _StartupFailure("handler_install_failed") from None
     return previous, child_ref, pending
 
@@ -183,15 +440,59 @@ def _install_signal_handlers() -> tuple[
 def _restore_signal_handlers(
     previous: dict[int, signal.Handlers],
     installed: tuple[int, ...] = _FORWARDED_SIGNALS,
-) -> bool:
-    restored = True
+) -> tuple[int, ...]:
+    failed: set[int] = set()
     for signum in reversed(installed):
         if signum in previous:
             try:
                 signal.signal(signum, previous[signum])
             except BaseException:
-                restored = False
-    return restored
+                failed.add(signum)
+    for signum in reversed(installed):
+        if signum not in previous:
+            continue
+        try:
+            current = signal.getsignal(signum)
+        except BaseException:
+            failed.add(signum)
+            continue
+        if current != previous[signum]:
+            failed.add(signum)
+    return tuple(signum for signum in reversed(installed) if signum in failed)
+
+
+def _retry_signal_handlers(
+    previous: dict[int, signal.Handlers],
+    installed: tuple[int, ...],
+    failed: tuple[int, ...],
+) -> tuple[int, ...]:
+    for signum in failed:
+        try:
+            signal.signal(signum, previous[signum])
+        except BaseException:
+            pass
+    remaining: list[int] = []
+    for signum in reversed(installed):
+        if signum not in previous:
+            continue
+        try:
+            current = signal.getsignal(signum)
+        except BaseException:
+            remaining.append(signum)
+            continue
+        if current != previous[signum]:
+            remaining.append(signum)
+    return tuple(remaining)
+
+
+def _publish_child(
+    child_ref: dict[str, object], child: subprocess.Popen[bytes]
+) -> None:
+    child_ref["child"] = child
+
+
+def _forwarding_failed(child_ref: dict[str, object]) -> bool:
+    return child_ref.get("forward_failed") is True
 
 
 def _child_observation(
@@ -347,82 +648,11 @@ def _exit_event(process: ManagedProcess, observed_wall: str) -> dict[str, object
     return event
 
 
-def _group_snapshot(
-    procfs: LinuxProcfs,
-    child_pgid: int,
-) -> tuple[ProcessIdentity, ...] | None:
-    try:
-        return tuple(
-            member
-            for member in procfs.group_members(child_pgid)
-            if member.pgid == child_pgid
-        )
-    except BaseException:
-        return None
-
-
-def _owned_group_is_gone(child_pgid: int) -> bool | None:
-    try:
-        os.killpg(child_pgid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    except OSError:
-        return None
-    return False
-
-
 def _cleanup_pause() -> None:
     try:
         time.sleep(0.05)
     except BaseException:
         pass
-
-
-def _dispose_child_group(
-    child: subprocess.Popen[bytes],
-    child_pgid: int,
-    procfs: LinuxProcfs,
-    known_members: tuple[ProcessIdentity, ...] = (),
-) -> _ChildDisposition:
-    """TERM and supervise the owned group until it is observably gone.
-
-    There is intentionally no SIGKILL fallback. A TERM-resistant owned group keeps
-    this wrapper supervising indefinitely instead of being abandoned or killed
-    outside the automatic-cleanup policy.
-    """
-    members = {member.stable_key(): member for member in known_members}
-    before = _group_snapshot(procfs, child_pgid)
-    if before is not None:
-        members.update({member.stable_key(): member for member in before})
-    try:
-        forward_signal(child_pgid, signal.SIGTERM)
-    except BaseException:
-        pass
-
-    first_wait = True
-    while child.returncode is None:
-        try:
-            child.wait(timeout=_ABORT_WAIT_SECONDS if first_wait else None)
-            break
-        except subprocess.TimeoutExpired:
-            first_wait = False
-        except BaseException:
-            _cleanup_pause()
-    exit_code = child.returncode
-
-    while True:
-        current = _group_snapshot(procfs, child_pgid)
-        if current is not None:
-            members.update({member.stable_key(): member for member in current})
-        if _owned_group_is_gone(child_pgid) is True:
-            break
-        _cleanup_pause()
-    return _ChildDisposition(
-        exit_code=exit_code,
-        members=tuple(members[key] for key in sorted(members)),
-    )
 
 
 def _terminal_process(
@@ -460,27 +690,10 @@ def _persist_terminal_best_effort(
     return terminal
 
 
-def _merge_members(
-    process: ManagedProcess,
-    procfs: LinuxProcfs,
-) -> tuple[ProcessIdentity, ...]:
-    identities = {member.stable_key(): member for member in process.members}
-    try:
-        current = procfs.group_members(process.pgid)
-    except BaseException:
-        current = ()
-    identities.update(
-        {
-            member.stable_key(): member
-            for member in current
-            if member.pgid == process.pgid
-        }
-    )
-    return tuple(identities[key] for key in sorted(identities))
-
-
 def _run_spawned_child(
     child: subprocess.Popen[bytes],
+    lifecycle: _OwnedGroupLifecycle,
+    child_ref: dict[str, object],
     pending: list[int],
     validated: SupervisorRequest,
     wrapper: ProcessIdentity,
@@ -493,9 +706,21 @@ def _run_spawned_child(
 ) -> tuple[int, ManagedProcess, bool]:
     process: ManagedProcess | None = None
     record_may_exist = False
+
+    def fail_if_forwarding_failed() -> None:
+        if _forwarding_failed(child_ref):
+            raise _PostSpawnFailure(
+                "signal_forward_failed",
+                process,
+                record_may_exist=record_may_exist,
+            )
+
     try:
         for signum in pending:
-            forward_signal(child.pid, signum)
+            lifecycle.forward(signum)
+        fail_if_forwarding_failed()
+    except _PostSpawnFailure:
+        raise
     except BaseException:
         raise _PostSpawnFailure(
             "signal_forward_failed",
@@ -505,6 +730,8 @@ def _run_spawned_child(
 
     try:
         child_identity, members = _child_observation(child, procfs)
+        lifecycle.capture_exact(members)
+        lifecycle.capture_group()
         process = ManagedProcess(
             schema_version=1,
             record_id=wrapper.stable_key(),
@@ -520,6 +747,9 @@ def _run_spawned_child(
             owner_reason_codes=("association_pending",),
         )
         process.to_dict()
+        fail_if_forwarding_failed()
+    except _PostSpawnFailure:
+        raise
     except BaseException:
         raise _PostSpawnFailure(
             "child_identity_unavailable",
@@ -532,6 +762,9 @@ def _run_spawned_child(
         with store.locked():
             store.save_process(process)
             store.append_event(_spawn_event(process))
+        fail_if_forwarding_failed()
+    except _PostSpawnFailure:
+        raise
     except BaseException:
         raise _PostSpawnFailure(
             "state_spawn_failed",
@@ -541,6 +774,7 @@ def _run_spawned_child(
 
     try:
         process = _reconcile_owner(process, store, clock, sleeper)
+        fail_if_forwarding_failed()
     except _ReconciliationPersistenceFailure as error:
         process = error.process
         raise _PostSpawnFailure(
@@ -548,6 +782,8 @@ def _run_spawned_child(
             process,
             record_may_exist=record_may_exist,
         ) from None
+    except _PostSpawnFailure:
+        raise
     except BaseException:
         raise _PostSpawnFailure(
             "owner_reconcile_failed",
@@ -556,7 +792,10 @@ def _run_spawned_child(
         ) from None
 
     try:
-        exit_code = child.wait()
+        lifecycle.capture_group()
+        exit_code = lifecycle.wait_for_exit(fail_if_forwarding_failed)
+    except _PostSpawnFailure:
+        raise
     except BaseException:
         raise _PostSpawnFailure(
             "child_wait_failed",
@@ -566,13 +805,16 @@ def _run_spawned_child(
 
     updated = replace(
         process,
-        members=_merge_members(process, procfs),
+        members=lifecycle.disposition().members,
         exit_code=exit_code,
     )
     try:
         with store.locked():
             store.save_process(updated)
             store.append_event(_exit_event(updated, clock.wall_iso()))
+        fail_if_forwarding_failed()
+    except _PostSpawnFailure:
+        raise
     except BaseException:
         raise _PostSpawnFailure(
             "state_exit_failed",
@@ -599,15 +841,20 @@ def run_supervisor(
     try:
         wrapper, host_keys, spawned = _wrapper_observation(procfs, clock)
         previous, child_ref, pending = _install_signal_handlers()
+    except _PersistentHandlerRestoreFailure:
+        _fatal(safe_server, "handler_restore_failed")
+        raise SupervisorProcessExitRequired from None
     except _StartupFailure as error:
         _fatal(safe_server, error.reason_code)
         return _FATAL_EXIT
 
     child: subprocess.Popen[bytes] | None = None
+    lifecycle: _OwnedGroupLifecycle | None = None
     process: ManagedProcess | None = None
     record_may_exist = False
     result = _FATAL_EXIT
     fatal_reason: str | None = None
+    process_exit_required = False
     try:
         try:
             child = subprocess.Popen(
@@ -622,10 +869,20 @@ def run_supervisor(
         except BaseException:
             fatal_reason = "child_spawn_failed"
         else:
-            child_ref["child"] = child
             try:
+                lifecycle = _OwnedGroupLifecycle(child, procfs, child.pid)
+                child_ref["lifecycle"] = lifecycle
+                _publish_child(child_ref, child)
+                if _forwarding_failed(child_ref):
+                    raise _PostSpawnFailure(
+                        "signal_forward_failed",
+                        process,
+                        record_may_exist=record_may_exist,
+                    )
                 result, process, record_may_exist = _run_spawned_child(
                     child,
+                    lifecycle,
+                    child_ref,
                     pending,
                     validated,
                     wrapper,
@@ -636,16 +893,21 @@ def run_supervisor(
                     clock,
                     sleeper,
                 )
-            except _PostSpawnFailure as error:
+            except BaseException as caught:
+                if isinstance(caught, _PostSpawnFailure):
+                    error = caught
+                else:
+                    error = _PostSpawnFailure(
+                        "signal_forward_failed",
+                        process,
+                        record_may_exist=record_may_exist,
+                    )
                 process = error.process
                 record_may_exist = error.record_may_exist
                 known_members = () if process is None else process.members
-                disposition = _dispose_child_group(
-                    child,
-                    child.pid,
-                    procfs,
-                    known_members,
-                )
+                if lifecycle is None:
+                    lifecycle = _OwnedGroupLifecycle(child, procfs, child.pid)
+                disposition = lifecycle.dispose(known_members)
                 process = _persist_terminal_best_effort(
                     process,
                     disposition,
@@ -656,20 +918,39 @@ def run_supervisor(
                 fatal_reason = error.reason_code
                 result = error.result
     finally:
-        if not _restore_signal_handlers(previous):
-            if child is not None:
+        failed_handlers = _restore_signal_handlers(previous)
+        forward_failed = _forwarding_failed(child_ref)
+        if forward_failed and fatal_reason is None:
+            fatal_reason = "signal_forward_failed"
+            result = _FATAL_EXIT
+        if failed_handlers or forward_failed:
+            if lifecycle is not None:
                 known = () if process is None else process.members
-                disposition = _dispose_child_group(child, child.pid, procfs, known)
+                disposition = lifecycle.dispose(known)
                 process = _persist_terminal_best_effort(
                     process,
                     disposition,
-                    "handler_restore_failed",
+                    fatal_reason or "handler_restore_failed",
                     store,
                     record_may_exist=record_may_exist,
                 )
-            fatal_reason = "handler_restore_failed"
-            result = _FATAL_EXIT
+        if failed_handlers:
+            remaining_handlers = _retry_signal_handlers(
+                previous,
+                _FORWARDED_SIGNALS,
+                failed_handlers,
+            )
+            if _forwarding_failed(child_ref) and fatal_reason is None:
+                fatal_reason = "signal_forward_failed"
+                result = _FATAL_EXIT
+            if remaining_handlers:
+                fatal_reason = "handler_restore_failed"
+                result = _FATAL_EXIT
+                process_exit_required = True
+        if lifecycle is not None:
+            lifecycle.close()
     if fatal_reason is not None:
         _fatal(safe_server, fatal_reason)
-        return result
+    if process_exit_required:
+        raise SupervisorProcessExitRequired from None
     return result
