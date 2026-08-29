@@ -330,3 +330,41 @@ class ManagedProcess:
             ),
             exit_code=None if exit_code is None else _integer(exit_code, "exit_code"),
         )
+
+
+@dataclass(frozen=True)
+class Association:
+    kind: Literal["session", "shared", "unknown"]
+    session_id: str | None
+    shared_owner: str | None
+    reason_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Classification:
+    process: ManagedProcess
+    state: Literal[
+        "active",
+        "shared",
+        "exiting",
+        "orphan",
+        "unknown",
+        "stubborn",
+        "gone",
+    ]
+    reason_codes: tuple[str, ...]
+    live_identities: tuple[ProcessIdentity, ...]
+    grace_deadline_boot: float | None
+    eligible_term: bool
+
+
+@dataclass(frozen=True)
+class AuditSnapshot:
+    schema_version: int
+    generated: ObservedTime
+    classifications: tuple[Classification, ...]
+    state_counts: tuple[tuple[str, int], ...]
+    process_count: int
+    rss_kib: int
+    ownership_coverage: tuple[tuple[str, int], ...]
+    corrupt_count: int
