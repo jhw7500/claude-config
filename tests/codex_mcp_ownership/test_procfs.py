@@ -10,8 +10,7 @@ from helpers import write_proc_entry
 
 def test_parse_stat_uses_last_closing_parenthesis():
     raw = (
-        "321 (node worker) extra) S 77 88 88 0 -1 0 0 0 0 0 "
-        "0 0 0 0 20 0 1 0 424242 0 0"
+        "321 (node worker) extra) S 77 88 88 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 424242 0 0"
     )
     parsed = procfs.parse_stat(raw)
     assert parsed.pid == 321
@@ -230,7 +229,9 @@ def test_models_reject_boolean_integers_and_non_finite_floats(fake_proc):
     bad_identity = {**identity.to_dict(), "pid": True}
     with pytest.raises(ValueError):
         model.ProcessIdentity.from_dict(bad_identity)
-    observed = model.ObservedTime("2026-08-29T00:00:00+00:00", "test-boot-id", float("inf"))
+    observed = model.ObservedTime(
+        "2026-08-29T00:00:00+00:00", "test-boot-id", float("inf")
+    )
     with pytest.raises(ValueError):
         model.ObservedTime.from_dict(observed.to_dict())
 
@@ -240,7 +241,13 @@ def test_session_and_managed_process_round_trip_with_schema_v1(fake_proc):
     assert identity is not None
     observed = model.ObservedTime("2026-08-29T00:00:00+00:00", identity.boot_id, 12.5)
     lease = model.SessionLease(
-        1, "session", "/workspace", "SessionStart", (identity.stable_key(),), "active", observed
+        1,
+        "session",
+        "/workspace",
+        "SessionStart",
+        (identity.stable_key(),),
+        "active",
+        observed,
     )
     assert model.SessionLease.from_dict(lease.to_dict()) == lease
     managed = model.ManagedProcess(
@@ -259,6 +266,47 @@ def test_session_and_managed_process_round_trip_with_schema_v1(fake_proc):
     assert model.ManagedProcess.from_dict(managed.to_dict()) == managed
     with pytest.raises(ValueError):
         model.SessionLease.from_dict({**lease.to_dict(), "schema_version": 2})
+
+
+def test_managed_process_term_sent_keys_are_a_strict_immutable_stable_key_set(
+    fake_proc,
+):
+    identity = fake_proc.identity(321)
+    assert identity is not None
+    observed = model.ObservedTime("2026-08-29T00:00:00+00:00", identity.boot_id, 12.5)
+    managed = model.ManagedProcess(
+        schema_version=1,
+        record_id="record",
+        scope="user",
+        server="server",
+        cwd="/workspace",
+        wrapper=identity,
+        child=None,
+        members=(identity,),
+        pgid=identity.pgid,
+        host_keys=frozenset(),
+        spawned=observed,
+        term_sent_boot=20.0,
+        term_sent_keys=frozenset({identity.stable_key()}),
+    )
+
+    payload = managed.to_dict()
+    assert payload["term_sent_keys"] == [identity.stable_key()]
+    assert model.ManagedProcess.from_dict(payload) == managed
+    missing = dict(payload)
+    missing.pop("term_sent_keys")
+    with pytest.raises(ValueError):
+        model.ManagedProcess.from_dict(missing)
+
+    invalid_values = (
+        (identity.stable_key(),),
+        [identity.stable_key(), identity.stable_key()],
+        ["not-a-stable-key"],
+        ["f" * 64, "0" * 64],
+    )
+    for invalid in invalid_values:
+        with pytest.raises(ValueError):
+            model.ManagedProcess.from_dict({**payload, "term_sent_keys": invalid})
 
 
 def test_open_pidfd_returns_revalidated_descriptor(fake_proc, monkeypatch):

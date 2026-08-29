@@ -36,16 +36,6 @@ class FakeSignalBackend:
         self.calls.append(("close", pidfd))
 
 
-class DryRunStore:
-    def __init__(self) -> None:
-        self.lock_count = 0
-        self.mutation_count = 0
-
-    def locked(self):
-        self.lock_count += 1
-        raise AssertionError("dry run must not acquire the state lock")
-
-
 class ExactProcfs:
     def __init__(self, identities: tuple[model.ProcessIdentity, ...]) -> None:
         self.identities = {identity.pid: identity for identity in identities}
@@ -185,7 +175,11 @@ def orphan_context(tmp_path, fake_proc):
 @pytest.fixture
 def stubborn_context(orphan_context):
     store, tree, clock, _snapshot, process, lease = orphan_context
-    stubborn_process = replace(process, term_sent_boot=280.0)
+    stubborn_process = replace(
+        process,
+        term_sent_boot=280.0,
+        term_sent_keys=frozenset({process.wrapper.stable_key()}),
+    )
     store.save_process(stubborn_process)
     snapshot = classify.build_audit(store, tree, clock)
     classification = snapshot.classifications[0]
@@ -193,29 +187,87 @@ def stubborn_context(orphan_context):
     return store, tree, clock, snapshot, stubborn_process, lease, classification
 
 
-def test_dry_run_never_locks_store_or_opens_pidfd() -> None:
+def test_dry_run_never_locks_store_or_opens_pidfd(tmp_path, monkeypatch) -> None:
     snapshot = snapshot_for("orphan", eligible_term=True)
     signaler = FakeSignalBackend()
-    store = DryRunStore()
     identity = snapshot.classifications[0].live_identities[0]
+    second = replace(identity, pid=322, start_ticks=424243)
+    unrelated = replace(
+        snapshot.classifications[0].process,
+        record_id="shared-record",
+        wrapper=second,
+        members=(second,),
+        pgid=second.pgid,
+        shared_owner="user:shared",
+    )
+    store = state.StateStore(tmp_path / "state")
+    store.save_process(snapshot.classifications[0].process)
+    store.save_process(unrelated)
+    before = state_tree(store.root)
+
+    def forbidden_lock():
+        raise AssertionError("dry run must not acquire the state lock")
+
+    monkeypatch.setattr(store, "locked", forbidden_lock)
 
     report = cleanup.execute_cleanup(
         cleanup.plan_cleanup(snapshot),
         store,
-        ExactProcfs((identity,)),
+        ExactProcfs((identity, second)),
         signaler,
         FakeClock(boot=300.0),
         apply=False,
     )
 
     assert report.attempted == 0
-    assert report.before_count == 1
-    assert report.before_rss_kib == 64
-    assert report.after_count == 1
-    assert report.after_rss_kib == 64
+    assert report.before_count == 2
+    assert report.before_rss_kib == 128
+    assert report.after_count == 2
+    assert report.after_rss_kib == 128
     assert signaler.calls == []
-    assert store.lock_count == 0
-    assert store.mutation_count == 0
+    assert state_tree(store.root) == before
+
+
+def test_no_action_preview_reports_all_exact_managed_processes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    process = sample_process()
+    identity = process.wrapper
+    second = replace(identity, pid=322, start_ticks=424243)
+    unrelated = replace(
+        process,
+        record_id="shared-record",
+        wrapper=second,
+        members=(second,),
+        pgid=second.pgid,
+        shared_owner="user:shared",
+    )
+    store = state.StateStore(tmp_path / "state")
+    store.save_process(process)
+    store.save_process(unrelated)
+    before = state_tree(store.root)
+    monkeypatch.setattr(
+        store,
+        "locked",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("dry run must not acquire the state lock")
+        ),
+    )
+
+    report = cleanup.execute_cleanup(
+        (),
+        store,
+        ExactProcfs((identity, second)),
+        FakeSignalBackend(),
+        FakeClock(boot=300.0),
+        apply=False,
+    )
+
+    assert (report.before_count, report.before_rss_kib) == (2, 128)
+    assert (report.after_count, report.after_rss_kib) == (2, 128)
+    assert report.outcomes == ()
+    assert state_tree(store.root) == before
 
 
 @pytest.mark.parametrize(
@@ -281,7 +333,11 @@ def test_apply_reaudits_under_lock_and_persists_term_survivor(orphan_context) ->
     assert report.before_rss_kib == 128
     assert report.after_count == 1
     assert report.after_rss_kib == 128
-    assert store.load_processes()[0] == replace(process, term_sent_boot=300.0)
+    assert store.load_processes()[0] == replace(
+        process,
+        term_sent_boot=300.0,
+        term_sent_keys=frozenset({process.wrapper.stable_key()}),
+    )
     events = [
         json.loads(line)
         for line in (store.root / "events.jsonl").read_text().splitlines()
@@ -302,6 +358,48 @@ def test_apply_reaudits_under_lock_and_persists_term_survivor(orphan_context) ->
             "state": "exiting",
         }
     ]
+
+
+def test_apply_metrics_include_unrelated_exact_shared_process(orphan_context) -> None:
+    store, tree, clock, _snapshot, process, _lease = orphan_context
+    write_proc_entry(
+        tree.proc_root,
+        322,
+        "322 (shared) S 1 322 322 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 3220 0 0\n",
+        tree.proc_root / "node",
+        "VmRSS:\t32 kB\n",
+    )
+    shared_identity = tree.identity(322)
+    assert shared_identity is not None
+    shared = replace(
+        process,
+        record_id="shared-record",
+        wrapper=shared_identity,
+        child=None,
+        members=(shared_identity,),
+        pgid=shared_identity.pgid,
+        owner_session_id=None,
+        shared_owner="user:shared",
+        first_owner_gone_boot=None,
+    )
+    store.save_process(shared)
+    snapshot = classify.build_audit(store, tree, clock)
+    assert {item.state for item in snapshot.classifications} == {"orphan", "shared"}
+
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        FakeSignalBackend(),
+        clock,
+        apply=True,
+    )
+
+    assert report.attempted == 1
+    assert (report.before_count, report.before_rss_kib) == (2, 160)
+    assert (report.after_count, report.after_rss_kib) == (2, 160)
+    stored = {item.record_id: item for item in store.load_processes()}
+    assert stored["shared-record"] == shared
 
 
 def test_apply_skips_action_when_locked_reaudit_is_no_longer_orphan(
@@ -574,6 +672,17 @@ def test_force_plan_contains_only_stubborn_exact_identities(stubborn_context) ->
     )
 
 
+def test_force_plan_and_token_reject_fabricated_stubborn_without_term_keys() -> None:
+    snapshot = snapshot_for("stubborn")
+    classification = snapshot.classifications[0]
+    assert classification.process.term_sent_boot is None
+    assert classification.process.term_sent_keys == frozenset()
+
+    assert cleanup.plan_cleanup(snapshot, force=True) == ()
+    with pytest.raises(cleanup.InvalidForceConfirmation):
+        cleanup.issue_force_token(classification, FakeClock(boot=300.0))
+
+
 def test_force_token_is_canonical_exact_evidence(stubborn_context) -> None:
     _store, _tree, clock, _snapshot, _process, _lease, classification = stubborn_context
 
@@ -587,6 +696,7 @@ def test_force_token_is_canonical_exact_evidence(stubborn_context) -> None:
         "issued_boot",
         "reason_codes",
         "schema_version",
+        "term_sent_boot",
     }
     assert payload["schema_version"] == 1
     assert payload["boot_id"] == "test-boot-id"
@@ -594,6 +704,7 @@ def test_force_token_is_canonical_exact_evidence(stubborn_context) -> None:
         identity.stable_key() for identity in classification.live_identities
     )
     assert payload["reason_codes"] == list(classification.reason_codes)
+    assert payload["term_sent_boot"] == classification.process.term_sent_boot
     assert payload["issued_boot"] == 300.0
     assert payload["expires_boot"] == 600.0
     assert "=" not in token
@@ -680,6 +791,35 @@ def test_force_token_is_rejected_when_current_classification_changed(
     assert state_tree(store.root) == before
 
 
+def test_force_token_cannot_replay_across_new_term_delivery_time(
+    stubborn_context,
+) -> None:
+    store, tree, clock, snapshot, process, _lease, classification = stubborn_context
+    actions = cleanup.plan_cleanup(snapshot, force=True)
+    token = cleanup.issue_force_token(classification, clock)
+    store.save_process(replace(process, term_sent_boot=290.0))
+    refreshed = classify.build_audit(store, tree, clock).classifications[0]
+    assert refreshed.state == "stubborn"
+    assert refreshed.live_identities == classification.live_identities
+    assert refreshed.reason_codes == classification.reason_codes
+    signaler = FakeSignalBackend()
+    before = state_tree(store.root)
+
+    with pytest.raises(cleanup.InvalidForceConfirmation):
+        cleanup.execute_cleanup(
+            actions,
+            store,
+            tree,
+            signaler,
+            clock,
+            apply=True,
+            confirm_token=token,
+        )
+
+    assert signaler.calls == []
+    assert state_tree(store.root) == before
+
+
 def test_dry_run_does_not_parse_or_consume_force_token(stubborn_context) -> None:
     store, tree, clock, snapshot, _process, _lease, _classification = stubborn_context
     signaler = FakeSignalBackend()
@@ -708,6 +848,7 @@ def test_dry_run_does_not_parse_or_consume_force_token(stubborn_context) -> None
         ("issued_boot", 301.0),
         ("boot_id", "different-boot"),
         ("reason_codes", ["different_reason"]),
+        ("term_sent_boot", 279.0),
     ],
 )
 def test_well_digested_but_malformed_or_mismatched_force_payload_is_rejected(
@@ -879,7 +1020,12 @@ def test_force_partial_subtree_survival_is_not_falsely_evented_as_gone(
     )
     child = tree.identity(322)
     assert child is not None
-    expanded = replace(process, child=child, members=(process.wrapper, child))
+    expanded = replace(
+        process,
+        child=child,
+        members=(process.wrapper, child),
+        term_sent_keys=frozenset({process.wrapper.stable_key(), child.stable_key()}),
+    )
     store.save_process(expanded)
     snapshot = classify.build_audit(store, tree, clock)
     classification = snapshot.classifications[0]
@@ -920,7 +1066,16 @@ def test_force_batch_is_fully_validated_before_any_pidfd_open(stubborn_context) 
     )
     child = tree.identity(322)
     assert child is not None
-    store.save_process(replace(process, child=child, members=(process.wrapper, child)))
+    store.save_process(
+        replace(
+            process,
+            child=child,
+            members=(process.wrapper, child),
+            term_sent_keys=frozenset(
+                {process.wrapper.stable_key(), child.stable_key()}
+            ),
+        )
+    )
     snapshot = classify.build_audit(store, tree, clock)
     classification = snapshot.classifications[0]
     actions = list(cleanup.plan_cleanup(snapshot, force=True))
@@ -1091,6 +1246,165 @@ def test_term_sent_time_is_observed_after_signal_not_from_reaudit(
     assert store.load_processes()[0].term_sent_boot == 305.0
 
 
+@pytest.mark.parametrize(
+    ("invalid_observation", "expected_reason"),
+    [
+        (OSError("clock unavailable"), "post_signal_time_unavailable"),
+        (float("nan"), "post_signal_time_unavailable"),
+        (float("inf"), "post_signal_time_unavailable"),
+        (-1.0, "post_signal_time_unavailable"),
+        (299.999, "post_signal_time_regressed"),
+    ],
+    ids=("oserror", "nan", "infinity", "negative", "regression"),
+)
+def test_invalid_post_term_clock_never_advances_lifecycle_or_force_eligibility(
+    orphan_context,
+    invalid_observation,
+    expected_reason,
+) -> None:
+    store, tree, _clock, snapshot, process, _lease = orphan_context
+
+    class DelayedInvalidClock:
+        def __init__(self) -> None:
+            self.current = 300.0
+            self.invalid_pending = False
+
+        def wall_iso(self) -> str:
+            return "2026-08-29T00:00:00+00:00"
+
+        def boottime(self) -> float:
+            if self.invalid_pending:
+                self.invalid_pending = False
+                if isinstance(invalid_observation, BaseException):
+                    raise invalid_observation
+                return invalid_observation
+            return self.current
+
+        def signal_completed_after_delay(self, _identity, _signum) -> None:
+            self.current += 20.0
+            self.invalid_pending = True
+
+    clock = DelayedInvalidClock()
+    signaler = FakeSignalBackend(on_send=clock.signal_completed_after_delay)
+
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+    )
+
+    assert report.attempted == 1
+    assert report.survived == 1
+    assert report.outcomes[0].reason == expected_reason
+    assert store.load_processes()[0] == process
+    event = json.loads((store.root / "events.jsonl").read_text())
+    assert event["event"] == "cleanup_signal_indeterminate"
+    assert expected_reason in event["reason_codes"]
+    fresh = classify.build_audit(store, tree, clock)
+    assert fresh.classifications[0].state == "orphan"
+    assert cleanup.plan_cleanup(fresh, force=True) == ()
+
+
+def test_new_member_requires_complete_current_set_term_before_force(
+    orphan_context,
+) -> None:
+    store, tree, clock, snapshot, process, _lease = orphan_context
+    first_signaler = FakeSignalBackend()
+    cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        first_signaler,
+        clock,
+        apply=True,
+    )
+    first_term = store.load_processes()[0]
+    assert first_term.term_sent_keys == frozenset({process.wrapper.stable_key()})
+    clock.advance(10.0)
+    prior_stubborn = classify.build_audit(store, tree, clock)
+    prior_classification = prior_stubborn.classifications[0]
+    assert prior_classification.state == "stubborn"
+    stale_actions = cleanup.plan_cleanup(prior_stubborn, force=True)
+    stale_token = cleanup.issue_force_token(prior_classification, clock)
+
+    write_proc_entry(
+        tree.proc_root,
+        322,
+        "322 (child) S 321 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 3220 0 0\n",
+        tree.proc_root / "node",
+        "VmRSS:\t32 kB\n",
+    )
+    child = tree.identity(322)
+    assert child is not None
+    store.save_process(
+        replace(
+            first_term,
+            child=child,
+            members=(process.wrapper, child),
+        )
+    )
+    changed = classify.build_audit(store, tree, clock)
+    changed_classification = changed.classifications[0]
+    assert changed_classification.state == "orphan"
+    assert changed_classification.eligible_term is True
+    assert cleanup.plan_cleanup(changed, force=True) == ()
+    with pytest.raises(cleanup.InvalidForceConfirmation):
+        cleanup.issue_force_token(changed_classification, clock)
+    rejected_signaler = FakeSignalBackend()
+    with pytest.raises(cleanup.InvalidForceConfirmation):
+        cleanup.execute_cleanup(
+            stale_actions,
+            store,
+            tree,
+            rejected_signaler,
+            clock,
+            apply=True,
+            confirm_token=stale_token,
+        )
+    assert rejected_signaler.calls == []
+
+    term_signaler = FakeSignalBackend()
+    term_report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(changed),
+        store,
+        tree,
+        term_signaler,
+        clock,
+        apply=True,
+    )
+    assert term_report.survived == 2
+    current_keys = frozenset({process.wrapper.stable_key(), child.stable_key()})
+    refreshed = store.load_processes()[0]
+    assert refreshed.term_sent_boot == 310.0
+    assert refreshed.term_sent_keys == current_keys
+
+    clock.advance(10.0)
+    stubborn = classify.build_audit(store, tree, clock)
+    stubborn_classification = stubborn.classifications[0]
+    assert stubborn_classification.state == "stubborn"
+    force_actions = cleanup.plan_cleanup(stubborn, force=True)
+    assert {action.identity.stable_key() for action in force_actions} == current_keys
+    token = cleanup.issue_force_token(stubborn_classification, clock)
+    force_signaler = FakeSignalBackend()
+    force_report = cleanup.execute_cleanup(
+        force_actions,
+        store,
+        tree,
+        force_signaler,
+        clock,
+        apply=True,
+        confirm_token=token,
+    )
+    assert force_report.survived == 2
+    assert [call[2] for call in force_signaler.calls if call[0] == "send"] == [
+        signal.SIGKILL,
+        signal.SIGKILL,
+    ]
+
+
 def test_partial_term_delivery_does_not_make_unsignaled_identity_stubborn(
     orphan_context,
 ) -> None:
@@ -1130,3 +1444,60 @@ def test_partial_term_delivery_does_not_make_unsignaled_identity_stubborn(
     event = json.loads((store.root / "events.jsonl").read_text())
     assert event["event"] == "cleanup_signal_indeterminate"
     assert event["state"] == "unknown"
+    assert "partial_signal_delivery" in event["reason_codes"]
+    assert "pidfd_unavailable" in event["reason_codes"]
+    assert "sigterm_survived" in event["reason_codes"]
+    assert "identity_unavailable_after_signal" not in event["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    "failure_reason",
+    ["signal_failed", "identity_changed_after_signal"],
+)
+def test_partial_term_event_reports_the_actual_failed_identity_outcome(
+    orphan_context,
+    failure_reason,
+) -> None:
+    store, tree, clock, _snapshot, process, _lease = orphan_context
+    write_proc_entry(
+        tree.proc_root,
+        322,
+        "322 (child) S 321 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 3220 0 0\n",
+        tree.proc_root / "node",
+    )
+    child = tree.identity(322)
+    assert child is not None
+    expanded = replace(process, child=child, members=(process.wrapper, child))
+    store.save_process(expanded)
+    snapshot = classify.build_audit(store, tree, clock)
+
+    class PartialFailure(FakeSignalBackend):
+        def send(self, pidfd: int, signum: int) -> None:
+            identity = self._identities_by_pidfd[pidfd]
+            super().send(pidfd, signum)
+            if identity != child:
+                return
+            if failure_reason == "signal_failed":
+                raise PermissionError("denied")
+            change_start_ticks(tree, identity)
+
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        PartialFailure(),
+        clock,
+        apply=True,
+    )
+
+    assert report.survived == 1
+    assert report.skipped == 1
+    assert failure_reason in {outcome.reason for outcome in report.outcomes}
+    assert store.load_processes()[0].term_sent_boot is None
+    assert store.load_processes()[0].term_sent_keys == frozenset()
+    event = json.loads((store.root / "events.jsonl").read_text())
+    assert event["event"] == "cleanup_signal_indeterminate"
+    assert "partial_signal_delivery" in event["reason_codes"]
+    assert failure_reason in event["reason_codes"]
+    assert "sigterm_survived" in event["reason_codes"]
+    assert "identity_unavailable_after_signal" not in event["reason_codes"]

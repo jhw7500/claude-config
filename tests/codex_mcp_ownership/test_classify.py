@@ -7,7 +7,12 @@ import sys
 import pytest
 
 from codex_mcp_ownership import classify, model, procfs, state
-from helpers import FakeClock, make_private_directory, write_private_file, write_proc_entry
+from helpers import (
+    FakeClock,
+    make_private_directory,
+    write_private_file,
+    write_proc_entry,
+)
 
 
 @pytest.fixture
@@ -118,7 +123,9 @@ def test_incomplete_lease_evidence_is_unknown(process, matching_lease, lease_cha
     assert association.reason_codes == ("no_matching_session",)
 
 
-def test_association_window_includes_exact_thirty_second_boundary(process, matching_lease):
+def test_association_window_includes_exact_thirty_second_boundary(
+    process, matching_lease
+):
     boundary = replace(
         matching_lease,
         observed=replace(matching_lease.observed, boottime=130.0),
@@ -127,7 +134,9 @@ def test_association_window_includes_exact_thirty_second_boundary(process, match
     assert association.kind == "session"
 
 
-def test_explicit_shared_owner_does_not_depend_on_session_match(process, matching_lease):
+def test_explicit_shared_owner_does_not_depend_on_session_match(
+    process, matching_lease
+):
     shared = replace(process, shared_owner="user:shared-example")
     association = classify.associate_owner(shared, (matching_lease,), now_boot=105.0)
     assert association.kind == "shared"
@@ -186,7 +195,9 @@ class ClassificationScenario:
         )
         host_path = self.fake_proc.root / str(self.host_identity.pid)
         if host_live and not host_path.exists():
-            raise AssertionError("scenario host cannot be restored with the same identity")
+            raise AssertionError(
+                "scenario host cannot be restored with the same identity"
+            )
         if not host_live and host_path.exists():
             for child in host_path.iterdir():
                 child.unlink()
@@ -312,10 +323,7 @@ def test_concrete_unreadable_managed_identity_is_unknown(
     def read_text(path):
         if unreadable == "boot" and path == scenario.fake_proc.boot_id_path:
             raise PermissionError("unreadable boot id")
-        if (
-            unreadable == "stat"
-            and path == scenario.fake_proc.root / "321" / "stat"
-        ):
+        if unreadable == "stat" and path == scenario.fake_proc.root / "321" / "stat":
             raise PermissionError("unreadable stat")
         return original_read(path)
 
@@ -578,6 +586,11 @@ def test_impossible_term_time_is_unknown(scenario, first_gone, term_sent):
         scenario.process,
         first_owner_gone_boot=first_gone,
         term_sent_boot=term_sent,
+        term_sent_keys=(
+            frozenset()
+            if term_sent is None
+            else frozenset({scenario.process.wrapper.stable_key()})
+        ),
     )
     result = classify.classify_process(
         managed,
@@ -601,6 +614,7 @@ def test_term_at_orphan_deadline_is_valid(scenario):
         scenario.process,
         first_owner_gone_boot=150.0,
         term_sent_boot=270.0,
+        term_sent_keys=frozenset({scenario.process.wrapper.stable_key()}),
     )
     result = classify.classify_process(
         managed,
@@ -641,6 +655,7 @@ def test_term_survivor_threshold_is_inclusive(scenario, term_elapsed, expected):
         scenario.process,
         first_owner_gone_boot=105.0,
         term_sent_boot=scenario.now_boot - term_elapsed,
+        term_sent_keys=frozenset({scenario.process.wrapper.stable_key()}),
     )
     result = classify.classify_process(
         managed,
@@ -650,6 +665,87 @@ def test_term_survivor_threshold_is_inclusive(scenario, term_elapsed, expected):
     )
     assert result.state == expected
     assert result.eligible_term is False
+
+
+@pytest.mark.parametrize(
+    ("term_sent_boot", "term_sent_keys"),
+    [
+        (280.0, frozenset()),
+        (None, frozenset({"0" * 64})),
+    ],
+)
+def test_term_timestamp_and_exact_delivery_keys_must_be_mutually_consistent(
+    scenario,
+    term_sent_boot,
+    term_sent_keys,
+):
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=replace(scenario.matching_lease.observed, boottime=105.0),
+    )
+    managed = replace(
+        scenario.process,
+        first_owner_gone_boot=105.0,
+        term_sent_boot=term_sent_boot,
+        term_sent_keys=term_sent_keys,
+    )
+
+    result = classify.classify_process(
+        managed,
+        (ended,),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+
+    assert result.state == "unknown"
+    assert result.reason_codes == ("invalid_lifecycle_time",)
+    assert result.process == managed
+    assert result.eligible_term is False
+
+
+def test_new_exact_member_invalidates_prior_term_evidence_and_reproposes_term(scenario):
+    ended = replace(
+        scenario.matching_lease,
+        state="ended",
+        ended=replace(scenario.matching_lease.observed, boottime=105.0),
+    )
+    wrapper = scenario.process.wrapper
+    write_proc_entry(
+        scenario.fake_proc.root,
+        322,
+        "322 (node) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 22 0 0\n",
+        scenario.fake_proc.exe,
+    )
+    second = scenario.procfs.identity(322)
+    assert second is not None
+    managed = replace(
+        scenario.process,
+        members=(wrapper, second),
+        first_owner_gone_boot=105.0,
+        term_sent_boot=280.0,
+        term_sent_keys=frozenset({wrapper.stable_key()}),
+    )
+
+    result = classify.classify_process(
+        managed,
+        (ended,),
+        scenario.procfs,
+        scenario.now_boot,
+    )
+
+    assert result.state == "orphan"
+    assert result.reason_codes == (
+        "owner_session_ended",
+        "term_evidence_membership_changed",
+    )
+    assert result.eligible_term is True
+    assert result.process.term_sent_boot is None
+    assert result.process.term_sent_keys == frozenset()
+    assert {identity.stable_key() for identity in result.live_identities} == {
+        wrapper.stable_key(),
+        second.stable_key(),
+    }
 
 
 def _state_tree(root: Path) -> tuple[tuple[str, bytes | None], ...]:

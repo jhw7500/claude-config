@@ -35,6 +35,7 @@ _FORCE_TOKEN_KEYS = {
     "issued_boot",
     "reason_codes",
     "schema_version",
+    "term_sent_boot",
 }
 
 
@@ -76,6 +77,22 @@ class PidfdSignalBackend:
         os.close(pidfd)
 
 
+def _has_exact_term_evidence(classification: Classification) -> bool:
+    term_sent_boot = classification.process.term_sent_boot
+    live_keys = [identity.stable_key() for identity in classification.live_identities]
+    return bool(
+        classification.state == "stubborn"
+        and not classification.eligible_term
+        and not isinstance(term_sent_boot, bool)
+        and isinstance(term_sent_boot, (int, float))
+        and math.isfinite(float(term_sent_boot))
+        and float(term_sent_boot) >= 0
+        and live_keys
+        and len(live_keys) == len(set(live_keys))
+        and classification.process.term_sent_keys == frozenset(live_keys)
+    )
+
+
 def plan_cleanup(
     snapshot: AuditSnapshot,
     force: bool = False,
@@ -87,7 +104,7 @@ def plan_cleanup(
             and classification.state == "orphan"
             and classification.eligible_term
         )
-        forced = force and classification.state == "stubborn"
+        forced = force and _has_exact_term_evidence(classification)
         if not (automatic or forced):
             continue
         process_key = classification.process.wrapper.stable_key()
@@ -105,9 +122,8 @@ def plan_cleanup(
 
 
 def issue_force_token(classification: Classification, clock: Clock) -> str:
-    if (
-        not isinstance(classification, Classification)
-        or classification.state != "stubborn"
+    if not isinstance(classification, Classification) or not _has_exact_term_evidence(
+        classification
     ):
         raise InvalidForceConfirmation("force confirmation requires stubborn evidence")
     identity_keys = sorted(
@@ -123,6 +139,12 @@ def issue_force_token(classification: Classification, clock: Clock) -> str:
             "force confirmation requires exact live identities"
         )
     issued_boot = _finite_boot_time(clock.boottime(), "issued_boot")
+    term_sent_boot = _finite_boot_time(
+        classification.process.term_sent_boot,
+        "term_sent_boot",
+    )
+    if issued_boot < term_sent_boot:
+        raise InvalidForceConfirmation("force confirmation predates TERM evidence")
     expires_boot = issued_boot + FORCE_TOKEN_TTL_SECONDS
     if not math.isfinite(expires_boot):
         raise InvalidForceConfirmation("force confirmation window is invalid")
@@ -131,6 +153,7 @@ def issue_force_token(classification: Classification, clock: Clock) -> str:
         "boot_id": next(iter(boot_ids)),
         "identity_keys": identity_keys,
         "reason_codes": list(classification.reason_codes),
+        "term_sent_boot": term_sent_boot,
         "issued_boot": issued_boot,
         "expires_boot": expires_boot,
     }
@@ -150,8 +173,10 @@ def execute_cleanup(
     confirm_token: str | None = None,
 ) -> CleanupReport:
     if not apply:
-        before_count, before_rss_kib = _fresh_action_metrics(actions, procfs)
-        after_count, after_rss_kib = _fresh_action_metrics(actions, procfs)
+        before = classify.build_audit(store, procfs, clock)
+        before_count, before_rss_kib = _fresh_metrics(before, procfs)
+        after = classify.build_audit(store, procfs, clock)
+        after_count, after_rss_kib = _fresh_metrics(after, procfs)
         return CleanupReport(
             before_count=before_count,
             before_rss_kib=before_rss_kib,
@@ -201,15 +226,19 @@ def execute_cleanup(
             survived_term = False
             terminated_term = False
             indeterminate_signal = False
-            term_sent_boot = before.generated.boottime
+            term_sent_boot: float | None = None
+            term_time_floor = before.generated.boottime
+            term_time_valid = True
             delivered_keys: set[str] = set()
+            survived_keys: set[str] = set()
+            group_outcomes: list[CleanupOutcome] = []
             seen: set[str] = set()
             for action in process_actions:
                 identity_key = action.identity.stable_key()
                 if identity_key in seen:
-                    outcomes.append(
-                        CleanupOutcome(action, "skipped", "duplicate_action")
-                    )
+                    outcome = CleanupOutcome(action, "skipped", "duplicate_action")
+                    outcomes.append(outcome)
+                    group_outcomes.append(outcome)
                     continue
                 seen.add(identity_key)
                 if action.force:
@@ -219,9 +248,11 @@ def execute_cleanup(
                     matches = _matches_automatic_action(action, classification)
                     signum = signal.SIGTERM
                 if not matches:
-                    outcomes.append(
-                        CleanupOutcome(action, "skipped", "classification_changed")
+                    outcome = CleanupOutcome(
+                        action, "skipped", "classification_changed"
                     )
+                    outcomes.append(outcome)
+                    group_outcomes.append(outcome)
                     continue
                 outcome, was_attempted = _signal_exact(
                     action,
@@ -230,13 +261,23 @@ def execute_cleanup(
                     signum,
                 )
                 attempted += int(was_attempted)
+                if outcome.status == "survived" and not action.force:
+                    observed, time_reason = _observed_boot_time(clock, term_time_floor)
+                    if time_reason is None:
+                        assert observed is not None
+                        term_sent_boot = observed
+                        term_time_floor = observed
+                    else:
+                        term_time_valid = False
+                        outcome = replace(outcome, reason=time_reason)
                 outcomes.append(outcome)
+                group_outcomes.append(outcome)
                 survived_term |= outcome.status == "survived"
                 terminated_term |= outcome.status == "terminated"
                 if outcome.status in {"survived", "terminated"}:
                     delivered_keys.add(identity_key)
-                if outcome.status == "survived" and not action.force:
-                    term_sent_boot = _observed_boot_time(clock, term_sent_boot)
+                if outcome.status == "survived":
+                    survived_keys.add(identity_key)
                 indeterminate_signal |= outcome.reason in {
                     "identity_unavailable_after_signal",
                     "identity_changed_after_signal",
@@ -255,10 +296,13 @@ def execute_cleanup(
                 and classification is not None
                 and not forced
                 and complete_delivery
+                and term_time_valid
+                and term_sent_boot is not None
             ):
                 updated = replace(
                     classification.process,
                     term_sent_boot=term_sent_boot,
+                    term_sent_keys=frozenset(survived_keys),
                 )
                 store.save_process(updated)
                 store.append_event(
@@ -275,7 +319,12 @@ def execute_cleanup(
                         ),
                     }
                 )
-            elif survived_term and classification is not None and forced:
+            elif (
+                survived_term
+                and classification is not None
+                and forced
+                and complete_delivery
+            ):
                 store.append_event(
                     {
                         "schema_version": 1,
@@ -326,6 +375,7 @@ def execute_cleanup(
                 terminated_term
                 or indeterminate_signal
                 or (survived_term and not complete_delivery)
+                or (survived_term and not forced and not term_time_valid)
             ) and classification is not None:
                 store.append_event(
                     {
@@ -342,7 +392,16 @@ def execute_cleanup(
                         "state": "unknown",
                         "reason_codes": list(
                             classification.reason_codes
-                            + ("identity_unavailable_after_signal",)
+                            + (
+                                (
+                                    "partial_signal_delivery"
+                                    if not complete_delivery
+                                    else "signal_outcome_indeterminate"
+                                ),
+                            )
+                            + tuple(
+                                sorted({outcome.reason for outcome in group_outcomes})
+                            )
                         ),
                     }
                 )
@@ -403,17 +462,22 @@ def _finite_boot_time(value: object, field: str) -> float:
     return converted
 
 
-def _observed_boot_time(clock: Clock, floor: float) -> float:
+def _observed_boot_time(
+    clock: Clock,
+    floor: float,
+) -> tuple[float | None, str | None]:
     try:
         observed = clock.boottime()
     except (OSError, ValueError):
-        return floor
+        return None, "post_signal_time_unavailable"
     if isinstance(observed, bool) or not isinstance(observed, (int, float)):
-        return floor
+        return None, "post_signal_time_unavailable"
     converted = float(observed)
-    if not math.isfinite(converted) or converted < floor:
-        return floor
-    return converted
+    if not math.isfinite(converted) or converted < 0:
+        return None, "post_signal_time_unavailable"
+    if converted < floor:
+        return None, "post_signal_time_regressed"
+    return converted, None
 
 
 def _decode_force_token(
@@ -469,11 +533,14 @@ def _decode_force_token(
         raise InvalidForceConfirmation("invalid force confirmation reasons")
     issued_boot = _finite_boot_time(payload["issued_boot"], "issued_boot")
     expires_boot = _finite_boot_time(payload["expires_boot"], "expires_boot")
+    term_sent_boot = _finite_boot_time(payload["term_sent_boot"], "term_sent_boot")
     now_boot = _finite_boot_time(now_boot_value, "current_boot")
     if expires_boot != issued_boot + FORCE_TOKEN_TTL_SECONDS:
         raise InvalidForceConfirmation("invalid force confirmation window")
     if now_boot < issued_boot or now_boot > expires_boot:
         raise InvalidForceConfirmation("force confirmation expired or not yet valid")
+    if term_sent_boot > issued_boot:
+        raise InvalidForceConfirmation("force confirmation predates TERM evidence")
     return payload
 
 
@@ -485,7 +552,11 @@ def _not_hex_digest(value: str) -> bool:
     return False
 
 
-def _force_evidence(classification: Classification) -> tuple[str, list[str], list[str]]:
+def _force_evidence(
+    classification: Classification,
+) -> tuple[str, list[str], list[str], float]:
+    if not _has_exact_term_evidence(classification):
+        raise InvalidForceConfirmation("current stubborn TERM evidence is incomplete")
     identities = list(classification.live_identities)
     boot_ids = {identity.boot_id for identity in identities}
     if not identities or len(boot_ids) != 1:
@@ -494,6 +565,7 @@ def _force_evidence(classification: Classification) -> tuple[str, list[str], lis
         next(iter(boot_ids)),
         sorted(identity.stable_key() for identity in identities),
         list(classification.reason_codes),
+        _finite_boot_time(classification.process.term_sent_boot, "term_sent_boot"),
     )
 
 
@@ -521,12 +593,15 @@ def _validate_current_force_actions(
         _matches_force_action(action, classification) for action in actions
     ):
         raise InvalidForceConfirmation("force action does not match current evidence")
-    boot_id, identity_keys, reason_codes = _force_evidence(classification)
+    boot_id, identity_keys, reason_codes, term_sent_boot = _force_evidence(
+        classification
+    )
     if (
         payload["boot_id"] != snapshot.generated.boot_id
         or payload["boot_id"] != boot_id
         or payload["identity_keys"] != identity_keys
         or payload["reason_codes"] != reason_codes
+        or payload["term_sent_boot"] != term_sent_boot
     ):
         raise InvalidForceConfirmation("force confirmation evidence changed")
 
@@ -544,14 +619,6 @@ def _fresh_metrics(
         recorded += process.members
         for identity in recorded:
             identities[identity.stable_key()] = identity
-    return _fresh_identity_metrics(tuple(identities.values()), procfs)
-
-
-def _fresh_action_metrics(
-    actions: tuple[CleanupAction, ...],
-    procfs: LinuxProcfs,
-) -> tuple[int, int]:
-    identities = {action.identity.stable_key(): action.identity for action in actions}
     return _fresh_identity_metrics(tuple(identities.values()), procfs)
 
 
@@ -606,8 +673,7 @@ def _matches_force_action(
         classification is not None
         and action.force
         and action.classification_state == "stubborn"
-        and classification.state == "stubborn"
-        and not classification.eligible_term
+        and _has_exact_term_evidence(classification)
         and action.reason_codes == classification.reason_codes
         and action.identity in classification.live_identities
     )

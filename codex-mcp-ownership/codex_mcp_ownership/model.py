@@ -9,6 +9,7 @@ from typing import Literal
 
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", re.ASCII)
+_STABLE_KEY = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 
 
 def validate_session_id(value: object) -> str:
@@ -49,6 +50,15 @@ def _strings(value: object, field: str) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise ValueError(f"{field} must be a list")
     return tuple(_string(item, field) for item in value)
+
+
+def _stable_key_set(value: object, field: str) -> frozenset[str]:
+    keys = _strings(value, field)
+    if tuple(sorted(set(keys))) != keys or any(
+        _STABLE_KEY.fullmatch(key) is None for key in keys
+    ):
+        raise ValueError(f"{field} must be a sorted unique list of stable keys")
+    return frozenset(keys)
 
 
 @dataclass(frozen=True)
@@ -228,6 +238,7 @@ class ManagedProcess:
     first_owner_gone_boot: float | None = None
     term_sent_boot: float | None = None
     exit_code: int | None = None
+    term_sent_keys: frozenset[str] = frozenset()
 
     def to_dict(self) -> dict[str, object]:
         if not isinstance(self.wrapper, ProcessIdentity):
@@ -244,6 +255,8 @@ class ManagedProcess:
             isinstance(key, str) for key in self.host_keys
         ):
             raise ValueError("host_keys must be a frozenset of strings")
+        if type(self.term_sent_keys) is not frozenset:
+            raise ValueError("term_sent_keys must be a frozenset")
         data: dict[str, object] = {
             "schema_version": self.schema_version,
             "record_id": self.record_id,
@@ -260,6 +273,7 @@ class ManagedProcess:
             "shared_owner": self.shared_owner,
             "first_owner_gone_boot": self.first_owner_gone_boot,
             "term_sent_boot": self.term_sent_boot,
+            "term_sent_keys": sorted(self.term_sent_keys),
             "exit_code": self.exit_code,
         }
         self.from_dict(data)
@@ -285,6 +299,7 @@ class ManagedProcess:
                 "shared_owner",
                 "first_owner_gone_boot",
                 "term_sent_boot",
+                "term_sent_keys",
                 "exit_code",
             },
         )
@@ -326,8 +341,11 @@ class ManagedProcess:
                 else _float(first_owner_gone_boot, "first_owner_gone_boot")
             ),
             term_sent_boot=(
-                None if term_sent_boot is None else _float(term_sent_boot, "term_sent_boot")
+                None
+                if term_sent_boot is None
+                else _float(term_sent_boot, "term_sent_boot")
             ),
+            term_sent_keys=_stable_key_set(parsed["term_sent_keys"], "term_sent_keys"),
             exit_code=None if exit_code is None else _integer(exit_code, "exit_code"),
         )
 

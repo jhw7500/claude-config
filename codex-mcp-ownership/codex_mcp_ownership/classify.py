@@ -98,7 +98,9 @@ def associate_owner(
 
 
 def _recorded_identities(process: ManagedProcess) -> tuple[ProcessIdentity, ...]:
-    identities = (process.wrapper,) + (() if process.child is None else (process.child,))
+    identities = (process.wrapper,) + (
+        () if process.child is None else (process.child,)
+    )
     identities += process.members
     unique = {identity.stable_key(): identity for identity in identities}
     return tuple(unique[key] for key in sorted(unique))
@@ -306,6 +308,14 @@ def classify_process(
 
     first_gone = process.first_owner_gone_boot
     term_sent = process.term_sent_boot
+    term_sent_keys = process.term_sent_keys
+    if (term_sent is None) != (not term_sent_keys):
+        return _classification(
+            process,
+            "unknown",
+            ("invalid_lifecycle_time",),
+            live_identities,
+        )
     if first_gone is not None and (
         not _valid_boot_time(first_gone, now_boot) or first_gone < owner_time_floor
     ):
@@ -397,6 +407,21 @@ def classify_process(
             )
     assert grace_deadline is not None
     if term_sent is not None:
+        live_keys = frozenset(identity.stable_key() for identity in live_identities)
+        if live_keys != term_sent_keys:
+            process = replace(
+                process,
+                term_sent_boot=None,
+                term_sent_keys=frozenset(),
+            )
+            return _classification(
+                process,
+                "orphan",
+                (owner_loss_reason, "term_evidence_membership_changed"),
+                live_identities,
+                grace_deadline,
+                eligible_term=True,
+            )
         if now_boot - term_sent >= _TERM_SURVIVOR_SECONDS:
             return _classification(
                 process,
