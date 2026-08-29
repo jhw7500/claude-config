@@ -10,7 +10,9 @@ from typing import Literal
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", re.ASCII)
 _STABLE_KEY = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
-_SCOPE = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", re.ASCII)
+# Persisted/logged labels use this bounded ASCII identifier grammar so they are
+# safe as single tokens in state and fatal diagnostics.
+_SAFE_LABEL = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z", re.ASCII)
 _REASON_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
 
 
@@ -23,19 +25,14 @@ def validate_session_id(value: object) -> str:
 
 def validate_scope(value: object) -> str:
     scope = _string(value, "scope")
-    if _SCOPE.fullmatch(scope) is None:
+    if _SAFE_LABEL.fullmatch(scope) is None:
         raise ValueError("invalid scope")
     return scope
 
 
 def validate_server_name(value: object) -> str:
     server = _string(value, "server")
-    if (
-        not server
-        or len(server) > 128
-        or server.strip() != server
-        or not server.isprintable()
-    ):
+    if _SAFE_LABEL.fullmatch(server) is None:
         raise ValueError("invalid server")
     return server
 

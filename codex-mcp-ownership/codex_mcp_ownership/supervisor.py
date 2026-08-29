@@ -19,7 +19,7 @@ from .model import (
     validate_server_name,
 )
 from .procfs import LinuxProcfs
-from .state import StateCorruption, StateStore
+from .state import StateCorruption, StateLockTimeout, StateStore, UnsafeStatePath
 
 
 _RECONCILE_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)
@@ -41,6 +41,34 @@ class _StartupFailure(RuntimeError):
     def __init__(self, reason_code: str) -> None:
         super().__init__(reason_code)
         self.reason_code = reason_code
+
+
+class _ReconciliationPersistenceFailure(RuntimeError):
+    def __init__(self, process: ManagedProcess) -> None:
+        super().__init__("owner_reconcile_failed")
+        self.process = process
+
+
+class _PostSpawnFailure(RuntimeError):
+    def __init__(
+        self,
+        reason_code: str,
+        process: ManagedProcess | None,
+        *,
+        record_may_exist: bool,
+        result: int = _FATAL_EXIT,
+    ) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.process = process
+        self.record_may_exist = record_may_exist
+        self.result = result
+
+
+@dataclass(frozen=True)
+class _ChildDisposition:
+    exit_code: int | None
+    members: tuple[ProcessIdentity, ...]
 
 
 def _validated_request(request: SupervisorRequest) -> SupervisorRequest:
@@ -146,16 +174,24 @@ def _install_signal_handlers() -> tuple[
             signal.signal(signum, handle)
             installed.append(signum)
     except BaseException:
-        for signum in reversed(installed):
-            signal.signal(signum, previous[signum])
+        if not _restore_signal_handlers(previous, tuple(installed)):
+            raise _StartupFailure("handler_restore_failed") from None
         raise _StartupFailure("handler_install_failed") from None
     return previous, child_ref, pending
 
 
-def _restore_signal_handlers(previous: dict[int, signal.Handlers]) -> None:
-    for signum in reversed(_FORWARDED_SIGNALS):
+def _restore_signal_handlers(
+    previous: dict[int, signal.Handlers],
+    installed: tuple[int, ...] = _FORWARDED_SIGNALS,
+) -> bool:
+    restored = True
+    for signum in reversed(installed):
         if signum in previous:
-            signal.signal(signum, previous[signum])
+            try:
+                signal.signal(signum, previous[signum])
+            except BaseException:
+                restored = False
+    return restored
 
 
 def _child_observation(
@@ -219,32 +255,66 @@ def _reconcile_owner(
     sleeper: Callable[[float], None] = time.sleep,
 ) -> ManagedProcess:
     delays = (None, *_RECONCILE_DELAYS)
+    sticky_reason: str | None = None
     for attempt, delay in enumerate(delays):
         if delay is not None:
             sleeper(delay)
-        with store.locked():
-            try:
-                leases = store.load_sessions()
-            except StateCorruption:
+        updated: ManagedProcess | None = None
+        try:
+            with store.locked():
+                try:
+                    leases = store.load_sessions()
+                except StateCorruption:
+                    sticky_reason = "corrupt_session_state"
+                    association = Association(
+                        kind="unknown",
+                        session_id=None,
+                        shared_owner=None,
+                        reason_codes=("corrupt_session_state",),
+                    )
+                except (OSError, StateLockTimeout, UnsafeStatePath):
+                    if sticky_reason is None:
+                        sticky_reason = "session_state_unavailable"
+                    association = Association(
+                        kind="unknown",
+                        session_id=None,
+                        shared_owner=None,
+                        reason_codes=("session_state_unavailable",),
+                    )
+                else:
+                    association = associate_owner(process, leases, clock.boottime())
+                final = attempt == len(delays) - 1
+                if association.kind != "unknown" or final:
+                    if association.kind == "unknown" and sticky_reason is not None:
+                        association = replace(
+                            association,
+                            reason_codes=(sticky_reason,),
+                        )
+                    updated = _apply_association(process, association)
+                    try:
+                        store.save_process(updated)
+                        store.append_event(
+                            _association_event(updated, association, clock.wall_iso())
+                        )
+                    except BaseException:
+                        raise _ReconciliationPersistenceFailure(updated) from None
+        except (OSError, StateLockTimeout, UnsafeStatePath):
+            if updated is not None:
+                raise _ReconciliationPersistenceFailure(updated) from None
+            if sticky_reason is None:
+                sticky_reason = "session_state_unavailable"
+            final = attempt == len(delays) - 1
+            if final:
                 association = Association(
                     kind="unknown",
                     session_id=None,
                     shared_owner=None,
-                    reason_codes=("corrupt_session_state",),
+                    reason_codes=(sticky_reason,),
                 )
-            else:
-                association = associate_owner(process, leases, clock.boottime())
-            final = attempt == len(delays) - 1
-            evidence_unavailable = association.reason_codes == (
-                "corrupt_session_state",
-            )
-            if association.kind != "unknown" or final or evidence_unavailable:
-                updated = _apply_association(process, association)
-                store.save_process(updated)
-                store.append_event(
-                    _association_event(updated, association, clock.wall_iso())
-                )
-                return updated
+                return _apply_association(process, association)
+            continue
+        if updated is not None:
+            return updated
     raise AssertionError("unreachable reconciliation state")
 
 
@@ -277,15 +347,117 @@ def _exit_event(process: ManagedProcess, observed_wall: str) -> dict[str, object
     return event
 
 
-def _stop_spawned_child(child: subprocess.Popen[bytes]) -> None:
-    if child.poll() is not None:
-        child.wait()
-        return
-    forward_signal(child.pid, signal.SIGTERM)
+def _group_snapshot(
+    procfs: LinuxProcfs,
+    child_pgid: int,
+) -> tuple[ProcessIdentity, ...] | None:
     try:
-        child.wait(timeout=_ABORT_WAIT_SECONDS)
-    except subprocess.TimeoutExpired:
-        child.wait()
+        return tuple(
+            member
+            for member in procfs.group_members(child_pgid)
+            if member.pgid == child_pgid
+        )
+    except BaseException:
+        return None
+
+
+def _owned_group_is_gone(child_pgid: int) -> bool | None:
+    try:
+        os.killpg(child_pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return None
+    return False
+
+
+def _cleanup_pause() -> None:
+    try:
+        time.sleep(0.05)
+    except BaseException:
+        pass
+
+
+def _dispose_child_group(
+    child: subprocess.Popen[bytes],
+    child_pgid: int,
+    procfs: LinuxProcfs,
+    known_members: tuple[ProcessIdentity, ...] = (),
+) -> _ChildDisposition:
+    """TERM and supervise the owned group until it is observably gone.
+
+    There is intentionally no SIGKILL fallback. A TERM-resistant owned group keeps
+    this wrapper supervising indefinitely instead of being abandoned or killed
+    outside the automatic-cleanup policy.
+    """
+    members = {member.stable_key(): member for member in known_members}
+    before = _group_snapshot(procfs, child_pgid)
+    if before is not None:
+        members.update({member.stable_key(): member for member in before})
+    try:
+        forward_signal(child_pgid, signal.SIGTERM)
+    except BaseException:
+        pass
+
+    first_wait = True
+    while child.returncode is None:
+        try:
+            child.wait(timeout=_ABORT_WAIT_SECONDS if first_wait else None)
+            break
+        except subprocess.TimeoutExpired:
+            first_wait = False
+        except BaseException:
+            _cleanup_pause()
+    exit_code = child.returncode
+
+    while True:
+        current = _group_snapshot(procfs, child_pgid)
+        if current is not None:
+            members.update({member.stable_key(): member for member in current})
+        if _owned_group_is_gone(child_pgid) is True:
+            break
+        _cleanup_pause()
+    return _ChildDisposition(
+        exit_code=exit_code,
+        members=tuple(members[key] for key in sorted(members)),
+    )
+
+
+def _terminal_process(
+    process: ManagedProcess,
+    disposition: _ChildDisposition,
+    failure_reason: str,
+) -> ManagedProcess:
+    reason_codes = process.owner_reason_codes
+    if reason_codes == ("association_pending",):
+        reason_codes = (failure_reason,)
+    return replace(
+        process,
+        members=disposition.members,
+        exit_code=disposition.exit_code,
+        owner_reason_codes=reason_codes,
+    )
+
+
+def _persist_terminal_best_effort(
+    process: ManagedProcess | None,
+    disposition: _ChildDisposition,
+    failure_reason: str,
+    store: StateStore,
+    *,
+    record_may_exist: bool,
+) -> ManagedProcess | None:
+    if process is None or not record_may_exist:
+        return process
+    terminal = _terminal_process(process, disposition, failure_reason)
+    try:
+        with store.locked():
+            store.save_process(terminal)
+    except BaseException:
+        pass
+    return terminal
 
 
 def _merge_members(
@@ -305,6 +477,110 @@ def _merge_members(
         }
     )
     return tuple(identities[key] for key in sorted(identities))
+
+
+def _run_spawned_child(
+    child: subprocess.Popen[bytes],
+    pending: list[int],
+    validated: SupervisorRequest,
+    wrapper: ProcessIdentity,
+    host_keys: frozenset[str],
+    spawned: ObservedTime,
+    store: StateStore,
+    procfs: LinuxProcfs,
+    clock: Clock,
+    sleeper: Callable[[float], None],
+) -> tuple[int, ManagedProcess, bool]:
+    process: ManagedProcess | None = None
+    record_may_exist = False
+    try:
+        for signum in pending:
+            forward_signal(child.pid, signum)
+    except BaseException:
+        raise _PostSpawnFailure(
+            "signal_forward_failed",
+            process,
+            record_may_exist=record_may_exist,
+        ) from None
+
+    try:
+        child_identity, members = _child_observation(child, procfs)
+        process = ManagedProcess(
+            schema_version=1,
+            record_id=wrapper.stable_key(),
+            scope=validated.scope,
+            server=validated.server,
+            cwd=validated.cwd,
+            wrapper=wrapper,
+            child=child_identity,
+            members=members,
+            pgid=child_identity.pgid,
+            host_keys=host_keys,
+            spawned=spawned,
+            owner_reason_codes=("association_pending",),
+        )
+        process.to_dict()
+    except BaseException:
+        raise _PostSpawnFailure(
+            "child_identity_unavailable",
+            process,
+            record_may_exist=record_may_exist,
+        ) from None
+
+    record_may_exist = True
+    try:
+        with store.locked():
+            store.save_process(process)
+            store.append_event(_spawn_event(process))
+    except BaseException:
+        raise _PostSpawnFailure(
+            "state_spawn_failed",
+            process,
+            record_may_exist=record_may_exist,
+        ) from None
+
+    try:
+        process = _reconcile_owner(process, store, clock, sleeper)
+    except _ReconciliationPersistenceFailure as error:
+        process = error.process
+        raise _PostSpawnFailure(
+            "owner_reconcile_failed",
+            process,
+            record_may_exist=record_may_exist,
+        ) from None
+    except BaseException:
+        raise _PostSpawnFailure(
+            "owner_reconcile_failed",
+            process,
+            record_may_exist=record_may_exist,
+        ) from None
+
+    try:
+        exit_code = child.wait()
+    except BaseException:
+        raise _PostSpawnFailure(
+            "child_wait_failed",
+            process,
+            record_may_exist=record_may_exist,
+        ) from None
+
+    updated = replace(
+        process,
+        members=_merge_members(process, procfs),
+        exit_code=exit_code,
+    )
+    try:
+        with store.locked():
+            store.save_process(updated)
+            store.append_event(_exit_event(updated, clock.wall_iso()))
+    except BaseException:
+        raise _PostSpawnFailure(
+            "state_exit_failed",
+            updated,
+            record_may_exist=record_may_exist,
+            result=exit_code,
+        ) from None
+    return exit_code, updated, record_may_exist
 
 
 def run_supervisor(
@@ -329,6 +605,9 @@ def run_supervisor(
 
     child: subprocess.Popen[bytes] | None = None
     process: ManagedProcess | None = None
+    record_may_exist = False
+    result = _FATAL_EXIT
+    fatal_reason: str | None = None
     try:
         try:
             child = subprocess.Popen(
@@ -341,77 +620,56 @@ def run_supervisor(
                 close_fds=True,
             )
         except BaseException:
-            _fatal(safe_server, "child_spawn_failed")
-            return _FATAL_EXIT
-        child_ref["child"] = child
-        try:
-            for signum in pending:
-                forward_signal(child.pid, signum)
-        except BaseException:
-            _stop_spawned_child(child)
-            _fatal(safe_server, "signal_forward_failed")
-            return _FATAL_EXIT
-
-        try:
-            child_identity, members = _child_observation(child, procfs)
-            process = ManagedProcess(
-                schema_version=1,
-                record_id=wrapper.stable_key(),
-                scope=validated.scope,
-                server=validated.server,
-                cwd=validated.cwd,
-                wrapper=wrapper,
-                child=child_identity,
-                members=members,
-                pgid=child_identity.pgid,
-                host_keys=host_keys,
-                spawned=spawned,
-                owner_reason_codes=("association_pending",),
-            )
-            process.to_dict()
-        except (OSError, TypeError, ValueError, _StartupFailure):
-            _stop_spawned_child(child)
-            _fatal(safe_server, "child_identity_unavailable")
-            return _FATAL_EXIT
-
-        try:
-            with store.locked():
-                store.save_process(process)
-                store.append_event(_spawn_event(process))
-        except BaseException:
-            _stop_spawned_child(child)
-            _fatal(safe_server, "state_spawn_failed")
-            return _FATAL_EXIT
-
-        try:
-            process = _reconcile_owner(process, store, clock, sleeper)
-        except BaseException:
-            _stop_spawned_child(child)
-            _fatal(safe_server, "owner_reconcile_failed")
-            return _FATAL_EXIT
-
-        try:
-            exit_code = child.wait()
-        except BaseException:
-            _stop_spawned_child(child)
-            _fatal(safe_server, "child_wait_failed")
-            return _FATAL_EXIT
-
-        updated = replace(
-            process,
-            members=_merge_members(process, procfs),
-            exit_code=exit_code,
-        )
-        try:
-            with store.locked():
-                store.save_process(updated)
-                store.append_event(_exit_event(updated, clock.wall_iso()))
-        except BaseException:
-            _fatal(safe_server, "state_exit_failed")
-        return exit_code
+            fatal_reason = "child_spawn_failed"
+        else:
+            child_ref["child"] = child
+            try:
+                result, process, record_may_exist = _run_spawned_child(
+                    child,
+                    pending,
+                    validated,
+                    wrapper,
+                    host_keys,
+                    spawned,
+                    store,
+                    procfs,
+                    clock,
+                    sleeper,
+                )
+            except _PostSpawnFailure as error:
+                process = error.process
+                record_may_exist = error.record_may_exist
+                known_members = () if process is None else process.members
+                disposition = _dispose_child_group(
+                    child,
+                    child.pid,
+                    procfs,
+                    known_members,
+                )
+                process = _persist_terminal_best_effort(
+                    process,
+                    disposition,
+                    error.reason_code,
+                    store,
+                    record_may_exist=record_may_exist,
+                )
+                fatal_reason = error.reason_code
+                result = error.result
     finally:
-        try:
-            _restore_signal_handlers(previous)
-        except BaseException:
-            if child is not None and child.poll() is None:
-                _stop_spawned_child(child)
+        if not _restore_signal_handlers(previous):
+            if child is not None:
+                known = () if process is None else process.members
+                disposition = _dispose_child_group(child, child.pid, procfs, known)
+                process = _persist_terminal_best_effort(
+                    process,
+                    disposition,
+                    "handler_restore_failed",
+                    store,
+                    record_may_exist=record_may_exist,
+                )
+            fatal_reason = "handler_restore_failed"
+            result = _FATAL_EXIT
+    if fatal_reason is not None:
+        _fatal(safe_server, fatal_reason)
+        return result
+    return result

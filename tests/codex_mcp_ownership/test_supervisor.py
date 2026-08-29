@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import json
 import os
@@ -67,38 +68,86 @@ def _exact_processes(store: state.StateStore) -> tuple[model.ManagedProcess, ...
         return ()
 
 
+def _require_pidfd_signaling() -> None:
+    if not callable(getattr(os, "pidfd_open", None)) or not callable(
+        getattr(signal, "pidfd_send_signal", None)
+    ):
+        pytest.skip("exact pidfd fixture cleanup is unavailable")
+
+
+def _open_exact_pidfd(identity: model.ProcessIdentity) -> int | None:
+    live_procfs = procfs.LinuxProcfs()
+    if live_procfs.identity(identity.pid) != identity:
+        return None
+    pidfd = live_procfs.open_pidfd(identity)
+    if live_procfs.identity(identity.pid) != identity:
+        os.close(pidfd)
+        return None
+    return pidfd
+
+
+def _wait_exact_identity_gone(
+    identity: model.ProcessIdentity,
+    timeout: float = 2.0,
+) -> None:
+    live_procfs = procfs.LinuxProcfs()
+    deadline = time.monotonic() + timeout
+    while live_procfs.identity(identity.pid) == identity:
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"exact fixture identity {identity.stable_key()} did not exit"
+            )
+        time.sleep(0.01)
+
+
+def _signal_exact_pidfds(
+    opened: list[tuple[model.ProcessIdentity, int]],
+    signum: int,
+) -> None:
+    sender = signal.pidfd_send_signal
+    for _, pidfd in opened:
+        try:
+            sender(pidfd, signum, None, 0)
+        except ProcessLookupError:
+            pass
+
+
 def _stop_exact_process(
     process: subprocess.Popen[bytes],
     store: state.StateStore,
 ) -> None:
+    _require_pidfd_signaling()
     records = _exact_processes(store)
-    if process.poll() is None:
-        os.kill(process.pid, signal.SIGKILL)
-    try:
-        process.wait(timeout=2.0)
-    except subprocess.TimeoutExpired:
-        raise AssertionError(f"test wrapper PID {process.pid} did not exit") from None
-    live_procfs = procfs.LinuxProcfs()
-    signaled: dict[str, model.ProcessIdentity] = {}
+    identities: dict[str, model.ProcessIdentity] = {}
     for record in records:
-        identities = (() if record.child is None else (record.child,)) + record.members
-        for identity in identities:
-            if (
-                identity.pid != process.pid
-                and live_procfs.identity(identity.pid) == identity
-            ):
-                os.kill(identity.pid, signal.SIGKILL)
-                signaled[identity.stable_key()] = identity
-    deadline = time.monotonic() + 2.0
-    while signaled and time.monotonic() < deadline:
-        signaled = {
-            key: identity
-            for key, identity in signaled.items()
-            if live_procfs.identity(identity.pid) == identity
-        }
-        if signaled:
-            time.sleep(0.01)
-    assert not signaled
+        recorded = (() if record.child is None else (record.child,)) + record.members
+        identities.update(
+            {
+                identity.stable_key(): identity
+                for identity in recorded
+                if identity.pid != process.pid
+            }
+        )
+    opened: list[tuple[model.ProcessIdentity, int]] = []
+    try:
+        for identity in identities.values():
+            pidfd = _open_exact_pidfd(identity)
+            if pidfd is not None:
+                opened.append((identity, pidfd))
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(
+                f"test wrapper PID {process.pid} did not exit"
+            ) from None
+        _signal_exact_pidfds(opened, signal.SIGKILL)
+        for identity, _ in opened:
+            _wait_exact_identity_gone(identity)
+    finally:
+        for _, pidfd in reversed(opened):
+            os.close(pidfd)
 
 
 def _run_wrapper(
@@ -109,6 +158,7 @@ def _run_wrapper(
     input_bytes: bytes = b"",
     timeout: float = 5.0,
 ) -> tuple[int, bytes, bytes]:
+    _require_pidfd_signaling()
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -376,7 +426,7 @@ def test_shared_reconciliation_stops_immediately_without_loading_leases_again(
     assert reconciled.owner_reason_codes == ("explicit_shared_owner",)
 
 
-def test_corrupt_lease_evidence_is_persisted_as_unknown_without_retry(
+def test_corrupt_lease_evidence_retries_all_observations_and_stays_unknown(
     tmp_path: Path,
 ) -> None:
     live_procfs = procfs.LinuxProcfs()
@@ -422,16 +472,146 @@ def test_corrupt_lease_evidence_is_persisted_as_unknown_without_retry(
         FakeClock(boot=100.0),
         delays.append,
     )
-    assert delays == []
+    assert delays == [0.05, 0.1, 0.2, 0.4, 0.8]
     assert reconciled.owner_session_id is None
     assert reconciled.owner_reason_codes == ("corrupt_session_state",)
     assert store.load_processes() == (reconciled,)
+
+
+def test_temporarily_unavailable_lease_evidence_can_later_associate_exact_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_procfs = procfs.LinuxProcfs()
+    wrapper = live_procfs.identity(os.getpid())
+    chain = live_procfs.ancestor_chain(os.getpid())
+    assert wrapper is not None
+    assert chain and chain[0] == wrapper
+    host_keys = frozenset(identity.stable_key() for identity in chain[1:])
+    observed = model.ObservedTime(
+        "2026-08-29T00:00:00+00:00",
+        wrapper.boot_id,
+        100.0,
+    )
+    managed = model.ManagedProcess(
+        schema_version=1,
+        record_id=wrapper.stable_key(),
+        scope="user",
+        server="fake",
+        cwd=str(tmp_path),
+        wrapper=wrapper,
+        child=None,
+        members=(wrapper,),
+        pgid=wrapper.pgid,
+        host_keys=host_keys,
+        spawned=observed,
+        owner_reason_codes=("association_pending",),
+    )
+    lease = model.SessionLease(
+        schema_version=1,
+        session_id="session:after-unavailable",
+        cwd=str(tmp_path),
+        source="SessionStart",
+        host_keys=(next(iter(host_keys)),),
+        state="active",
+        observed=observed,
+    )
+    store = state.StateStore(tmp_path / "state")
+    original_load = store.load_sessions
+    loads = 0
+
+    def temporarily_unavailable() -> tuple[model.SessionLease, ...]:
+        nonlocal loads
+        loads += 1
+        if loads == 1:
+            raise state.StateLockTimeout("temporary-secret")
+        return original_load()
+
+    def add_lease(_delay: float) -> None:
+        store.save_session(lease)
+
+    monkeypatch.setattr(store, "load_sessions", temporarily_unavailable)
+    reconciled = supervisor._reconcile_owner(
+        managed,
+        store,
+        FakeClock(boot=100.0),
+        add_lease,
+    )
+    assert loads == 2
+    assert reconciled.owner_session_id == lease.session_id
+    assert reconciled.owner_reason_codes == ("unique_matching_session",)
+
+
+def test_temporarily_unavailable_lock_retries_and_later_exact_owner_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_procfs = procfs.LinuxProcfs()
+    wrapper = live_procfs.identity(os.getpid())
+    chain = live_procfs.ancestor_chain(os.getpid())
+    assert wrapper is not None
+    assert chain and chain[0] == wrapper
+    host_keys = frozenset(identity.stable_key() for identity in chain[1:])
+    observed = model.ObservedTime(
+        "2026-08-29T00:00:00+00:00",
+        wrapper.boot_id,
+        100.0,
+    )
+    managed = model.ManagedProcess(
+        schema_version=1,
+        record_id=wrapper.stable_key(),
+        scope="user",
+        server="fake",
+        cwd=str(tmp_path),
+        wrapper=wrapper,
+        child=None,
+        members=(wrapper,),
+        pgid=wrapper.pgid,
+        host_keys=host_keys,
+        spawned=observed,
+        owner_reason_codes=("association_pending",),
+    )
+    lease = model.SessionLease(
+        schema_version=1,
+        session_id="session:after-lock-unavailable",
+        cwd=str(tmp_path),
+        source="SessionStart",
+        host_keys=(next(iter(host_keys)),),
+        state="active",
+        observed=observed,
+    )
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(lease)
+    original_locked = store.locked
+    observations = 0
+
+    @contextmanager
+    def temporarily_unavailable_lock():
+        nonlocal observations
+        observations += 1
+        if observations == 1:
+            raise state.StateLockTimeout("temporary-secret")
+        with original_locked():
+            yield store
+
+    monkeypatch.setattr(store, "locked", temporarily_unavailable_lock)
+    delays: list[float] = []
+    reconciled = supervisor._reconcile_owner(
+        managed,
+        store,
+        FakeClock(boot=100.0),
+        delays.append,
+    )
+    assert delays == [0.05]
+    assert reconciled.owner_session_id == lease.session_id
+    assert reconciled.owner_reason_codes == ("unique_matching_session",)
 
 
 def test_wrapper_sigterm_reaches_only_its_child_group(
     supervisor_command: list[str],
     tmp_path: Path,
 ) -> None:
+    _require_pidfd_signaling()
     marker = tmp_path / "term-received"
     ready = tmp_path / "child-ready"
     child_code = (
@@ -461,7 +641,7 @@ def test_wrapper_sigterm_reaches_only_its_child_group(
                 break
             time.sleep(0.01)
         assert child_pgid is not None
-        os.kill(process.pid, signal.SIGTERM)
+        process.send_signal(signal.SIGTERM)
         process.wait(timeout=4.0)
         assert marker.read_text(encoding="utf-8") == "term"
     finally:
@@ -543,9 +723,64 @@ def test_invalid_server_is_rejected_before_spawn_without_echoing_input(
     assert not (tmp_path / "state").exists()
 
 
+@pytest.mark.parametrize("field", ["scope", "server"])
+@pytest.mark.parametrize(
+    "rejected",
+    [
+        "unsafe label",
+        "unsafe=label",
+        'unsafe"label',
+        "unsafe\tlabel",
+        "안전하지않음",
+    ],
+)
+def test_unsafe_labels_are_rejected_by_bounded_ascii_grammar_without_echo(
+    field: str,
+    rejected: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    spawned = False
+
+    def forbidden_popen(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("Popen must not be called")
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", forbidden_popen)
+    request_values = {
+        "scope": "user",
+        "server": "fake",
+    }
+    request_values[field] = rejected
+    result = supervisor.run_supervisor(
+        supervisor.SupervisorRequest(
+            scope=request_values["scope"],
+            server=request_values["server"],
+            command="command-secret",
+            args=("argument-secret",),
+            cwd=str(tmp_path),
+        ),
+        state.StateStore(tmp_path / "state"),
+        procfs.LinuxProcfs(),
+        FakeClock(),
+    )
+    captured = capsys.readouterr()
+    assert result == 70
+    assert not spawned
+    assert captured.out == ""
+    assert captured.err == (
+        "codex-mcp-supervisor: server=<invalid> reason=invalid_request\n"
+    )
+    assert rejected not in captured.err
+    assert not (tmp_path / "state").exists()
+
+
 def _capture_real_popen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[subprocess.Popen[bytes]]:
+    _require_pidfd_signaling()
     original = subprocess.Popen
     spawned: list[subprocess.Popen[bytes]] = []
 
@@ -561,7 +796,7 @@ def _capture_real_popen(
 def _kill_captured_children(children: list[subprocess.Popen[bytes]]) -> None:
     for child in children:
         if child.poll() is None:
-            os.kill(child.pid, signal.SIGKILL)
+            child.kill()
         child.wait(timeout=2.0)
 
 
@@ -714,6 +949,120 @@ def test_handler_install_failure_restores_partial_install_and_never_spawns(
     } == previous
 
 
+def test_install_rollback_restore_failure_uses_stable_reason_and_never_spawns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    previous = {
+        signum: signal.getsignal(signum) for signum in supervisor._FORWARDED_SIGNALS
+    }
+    original_signal = signal.signal
+    attempts: list[tuple[str, int]] = []
+    spawned = False
+
+    def fail_install_then_restore(signum, handler):
+        if signum == signal.SIGINT and handler != previous[signum]:
+            attempts.append(("install", signum))
+            raise ValueError("install-secret")
+        if signum == signal.SIGTERM and handler == previous[signum]:
+            attempts.append(("restore", signum))
+            raise OSError("restore-secret")
+        attempts.append(("install", signum))
+        return original_signal(signum, handler)
+
+    def forbidden_popen(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("child must not spawn")
+
+    monkeypatch.setattr(supervisor.signal, "signal", fail_install_then_restore)
+    monkeypatch.setattr(supervisor.subprocess, "Popen", forbidden_popen)
+    try:
+        result = supervisor.run_supervisor(
+            supervisor.SupervisorRequest(
+                "user",
+                "fake",
+                sys.executable,
+                ("-c", "pass", "argv-secret"),
+                str(tmp_path),
+            ),
+            state.StateStore(tmp_path / "state"),
+            procfs.LinuxProcfs(),
+            FakeClock(boot=100.0),
+        )
+        captured = capsys.readouterr()
+        assert result == 70
+        assert not spawned
+        assert attempts == [
+            ("install", signal.SIGTERM),
+            ("install", signal.SIGINT),
+            ("restore", signal.SIGTERM),
+        ]
+        assert captured.err == (
+            "codex-mcp-supervisor: server=fake reason=handler_restore_failed\n"
+        )
+        assert "secret" not in captured.err
+    finally:
+        for signum, handler in previous.items():
+            original_signal(signum, handler)
+
+
+@pytest.mark.parametrize("failed_restore", [signal.SIGHUP, signal.SIGINT])
+def test_final_handler_restore_failure_attempts_every_signal_and_surfaces_stably(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failed_restore: int,
+) -> None:
+    previous = {
+        signum: signal.getsignal(signum) for signum in supervisor._FORWARDED_SIGNALS
+    }
+    original_signal = signal.signal
+    restore_attempts: list[int] = []
+    failed_once = False
+
+    def fail_one_restore(signum, handler):
+        nonlocal failed_once
+        if handler == previous[signum]:
+            restore_attempts.append(signum)
+            if signum == failed_restore and not failed_once:
+                failed_once = True
+                raise OSError("restore-secret")
+        return original_signal(signum, handler)
+
+    children = _capture_real_popen(monkeypatch)
+    monkeypatch.setattr(supervisor.signal, "signal", fail_one_restore)
+    try:
+        result = supervisor.run_supervisor(
+            supervisor.SupervisorRequest(
+                "user",
+                "fake",
+                sys.executable,
+                ("-c", "pass", "argv-secret"),
+                str(tmp_path),
+            ),
+            state.StateStore(tmp_path / "state"),
+            procfs.LinuxProcfs(),
+            FakeClock(boot=100.0),
+            sleeper=lambda _delay: None,
+        )
+        captured = capsys.readouterr()
+        assert result == 70
+        assert restore_attempts == [signal.SIGHUP, signal.SIGINT, signal.SIGTERM]
+        assert captured.err == (
+            "codex-mcp-supervisor: server=fake reason=handler_restore_failed\n"
+        )
+        assert "secret" not in captured.err
+        for signum in supervisor._FORWARDED_SIGNALS:
+            if signum != failed_restore:
+                assert signal.getsignal(signum) == previous[signum]
+    finally:
+        for signum, handler in previous.items():
+            original_signal(signum, handler)
+        _kill_captured_children(children)
+
+
 def test_child_identity_failure_reaps_spawned_child_and_restores_handlers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -838,6 +1187,112 @@ def test_exit_state_failure_keeps_child_exit_code_and_exact_record(
         _kill_captured_children(children)
 
 
+def test_spawn_event_failure_persists_terminal_replacement_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    children = _capture_real_popen(monkeypatch)
+    store = state.StateStore(tmp_path / "state")
+    original_append = store.append_event
+
+    def fail_spawn_event(event: dict[str, object]) -> None:
+        if event.get("event") == "supervisor_spawned":
+            raise OSError("spawn-event-secret")
+        original_append(event)
+
+    monkeypatch.setattr(store, "append_event", fail_spawn_event)
+    try:
+        result = supervisor.run_supervisor(
+            supervisor.SupervisorRequest(
+                "user",
+                "fake",
+                sys.executable,
+                ("-c", "import time; time.sleep(30)", "argv-secret"),
+                str(tmp_path),
+            ),
+            store,
+            procfs.LinuxProcfs(),
+            FakeClock(boot=100.0),
+            sleeper=lambda _delay: None,
+        )
+        captured = capsys.readouterr()
+        records = store.load_processes()
+        assert result == 70
+        assert len(records) == 1
+        assert records[0].exit_code is not None
+        assert records[0].owner_reason_codes == ("state_spawn_failed",)
+        assert captured.err == (
+            "codex-mcp-supervisor: server=fake reason=state_spawn_failed\n"
+        )
+        assert "secret" not in captured.err
+    finally:
+        _kill_captured_children(children)
+
+
+def test_reconciliation_event_failure_preserves_owner_and_terminal_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    children = _capture_real_popen(monkeypatch)
+    store = state.StateStore(tmp_path / "state")
+    live_procfs = procfs.LinuxProcfs()
+    wrapper_chain = live_procfs.ancestor_chain(os.getpid())
+    boot_id = live_procfs.boot_id()
+    assert len(wrapper_chain) > 1
+    assert boot_id is not None
+    lease = model.SessionLease(
+        schema_version=1,
+        session_id="session:event-failure",
+        cwd=str(tmp_path),
+        source="SessionStart",
+        host_keys=(wrapper_chain[1].stable_key(),),
+        state="active",
+        observed=model.ObservedTime(
+            "2026-08-29T00:00:00+00:00",
+            boot_id,
+            100.0,
+        ),
+    )
+    store.save_session(lease)
+    original_append = store.append_event
+
+    def fail_owner_event(event: dict[str, object]) -> None:
+        if event.get("event") == "owner_reconciled":
+            raise OSError("owner-event-secret")
+        original_append(event)
+
+    monkeypatch.setattr(store, "append_event", fail_owner_event)
+    try:
+        result = supervisor.run_supervisor(
+            supervisor.SupervisorRequest(
+                "user",
+                "fake",
+                sys.executable,
+                ("-c", "import time; time.sleep(30)", "argv-secret"),
+                str(tmp_path),
+            ),
+            store,
+            live_procfs,
+            FakeClock(boot=100.0),
+            sleeper=lambda _delay: None,
+        )
+        captured = capsys.readouterr()
+        records = store.load_processes()
+        assert result == 70
+        assert len(records) == 1
+        assert records[0].exit_code is not None
+        assert records[0].owner_session_id == lease.session_id
+        assert records[0].owner_reason_codes == ("unique_matching_session",)
+        assert captured.err == (
+            "codex-mcp-supervisor: server=fake reason=owner_reconcile_failed\n"
+        )
+        assert "secret" not in captured.err
+    finally:
+        _kill_captured_children(children)
+
+
 def test_forward_signal_tolerates_child_group_already_gone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -937,4 +1392,93 @@ def test_keyboard_interrupt_during_reconciliation_reaps_child_and_restores_handl
             signum: signal.getsignal(signum) for signum in supervisor._FORWARDED_SIGNALS
         } == previous
     finally:
+        _kill_captured_children(children)
+
+
+def test_post_spawn_failure_terms_group_after_leader_exits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    descendant_pid = tmp_path / "descendant-pid"
+    descendant_ready = tmp_path / "descendant-ready"
+    descendant_term = tmp_path / "descendant-term"
+    release_leader = tmp_path / "release-leader"
+    leader_exiting = tmp_path / "leader-exiting"
+    descendant_code = (
+        "import os,pathlib,signal,sys,time;"
+        "pid=pathlib.Path(sys.argv[1]);ready=pathlib.Path(sys.argv[2]);"
+        "term=pathlib.Path(sys.argv[3]);pid.write_text(str(os.getpid()));"
+        "signal.signal(signal.SIGTERM,lambda *_:(term.write_text('term'),sys.exit(0)));"
+        "ready.write_text('ready');time.sleep(30)"
+    )
+    leader_code = (
+        "import pathlib,subprocess,sys,time;"
+        "subprocess.Popen([sys.executable,'-c',sys.argv[1],*sys.argv[2:5]],close_fds=True);"
+        "release=pathlib.Path(sys.argv[5]);exiting=pathlib.Path(sys.argv[6]);"
+        "deadline=time.monotonic()+4;"
+        "\nwhile not pathlib.Path(sys.argv[3]).exists():\n"
+        "  assert time.monotonic()<deadline\n  time.sleep(0.01)\n"
+        "\nwhile not release.exists():\n  time.sleep(0.01)\n"
+        "exiting.write_text('exiting')"
+    )
+    children = _capture_real_popen(monkeypatch)
+    descendant_handles: list[tuple[model.ProcessIdentity, int]] = []
+
+    def fail_after_leader_exit(delay: float) -> None:
+        assert delay == 0.05
+        deadline = time.monotonic() + 4.0
+        while not descendant_ready.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        pid = int(descendant_pid.read_text(encoding="utf-8"))
+        identity = procfs.LinuxProcfs().identity(pid)
+        assert identity is not None
+        pidfd = _open_exact_pidfd(identity)
+        assert pidfd is not None
+        descendant_handles.append((identity, pidfd))
+        release_leader.write_text("release", encoding="utf-8")
+        while not leader_exiting.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        time.sleep(0.05)
+        raise KeyboardInterrupt("post-spawn-secret")
+
+    try:
+        result = supervisor.run_supervisor(
+            supervisor.SupervisorRequest(
+                "user",
+                "fake",
+                sys.executable,
+                (
+                    "-c",
+                    leader_code,
+                    descendant_code,
+                    str(descendant_pid),
+                    str(descendant_ready),
+                    str(descendant_term),
+                    str(release_leader),
+                    str(leader_exiting),
+                ),
+                str(tmp_path),
+            ),
+            state.StateStore(tmp_path / "state"),
+            procfs.LinuxProcfs(),
+            FakeClock(boot=100.0),
+            sleeper=fail_after_leader_exit,
+        )
+        captured = capsys.readouterr()
+        assert result == 70
+        assert descendant_term.read_text(encoding="utf-8") == "term"
+        _wait_exact_identity_gone(descendant_handles[0][0])
+        assert captured.err == (
+            "codex-mcp-supervisor: server=fake reason=owner_reconcile_failed\n"
+        )
+        assert "secret" not in captured.err
+    finally:
+        _signal_exact_pidfds(descendant_handles, signal.SIGKILL)
+        for identity, _ in descendant_handles:
+            _wait_exact_identity_gone(identity)
+        for _, pidfd in descendant_handles:
+            os.close(pidfd)
         _kill_captured_children(children)
