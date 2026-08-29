@@ -392,6 +392,7 @@ def test_unique_session_lease_is_persisted_as_owner(
     record = store.load_processes()[0]
     assert returncode == 0
     assert record.owner_session_id == lease.session_id
+    assert record.owner_generation == model.lease_generation_digest(lease)
     assert record.owner_reason_codes == ("unique_matching_session",)
 
 

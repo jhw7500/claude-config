@@ -706,6 +706,7 @@ def _apply_association(
     return replace(
         process,
         owner_session_id=association.session_id,
+        owner_generation=association.owner_generation,
         shared_owner=association.shared_owner,
         owner_reason_codes=association.reason_codes,
     )

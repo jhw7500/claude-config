@@ -747,6 +747,32 @@ def test_oversized_record_is_capped_corruption_and_writable_load_quarantines(tmp
     assert error.value.quarantine_path.exists()
 
 
+def test_common_prefix_oversized_records_quarantine_to_unique_bounded_destinations(
+    tmp_path,
+):
+    root = tmp_path / "state"
+    sessions = root / "sessions"
+    make_private_directory(sessions)
+    prefix = b"x" * (state.STATE_RECORD_MAX_BYTES + 1)
+    first = sessions / ("a" * 64 + ".json")
+    second = sessions / ("b" * 64 + ".json")
+    write_private_file(first, prefix + b"first")
+    write_private_file(second, prefix + b"second")
+    store = state.StateStore(root)
+
+    with pytest.raises(state.StateCorruption):
+        store.load_sessions()
+    with pytest.raises(state.StateCorruption):
+        store.load_sessions()
+
+    assert not first.exists()
+    assert not second.exists()
+    quarantined = list((root / "corrupt").iterdir())
+    assert len(quarantined) == 2
+    assert any(path.read_bytes().endswith(b"first") for path in quarantined)
+    assert any(path.read_bytes().endswith(b"second") for path in quarantined)
+
+
 def test_deeply_nested_record_is_corruption_without_recursion_traceback(tmp_path):
     root = tmp_path / "state"
     sessions = root / "sessions"

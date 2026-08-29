@@ -11,7 +11,12 @@ import threading
 import pytest
 
 from codex_mcp_ownership import classify, cleanup, cli, hook
-from codex_mcp_ownership.model import ManagedProcess, ObservedTime, SessionLease
+from codex_mcp_ownership.model import (
+    ManagedProcess,
+    ObservedTime,
+    SessionLease,
+    lease_generation_digest,
+)
 from codex_mcp_ownership.state import StateStore, session_key
 from codex_mcp_ownership.supervisor import SupervisorRequest
 from helpers import FakeClock, FakeProcTree, make_private_directory, write_private_file
@@ -117,6 +122,7 @@ def test_same_generation_refresh_after_association_window_keeps_owner_active(
         frozenset({identity.stable_key()}),
         lease.observed,
         owner_session_id=lease.session_id,
+        owner_generation=lease_generation_digest(lease),
     )
     store.save_process(process)
     clock.advance(31.0)
@@ -149,6 +155,7 @@ def test_session_end_from_different_generation_is_ignored_and_term_ineligible(
         frozenset({identity.stable_key()}),
         lease.observed,
         owner_session_id=lease.session_id,
+        owner_generation=lease_generation_digest(lease),
     )
     store.save_process(process)
     monkeypatch.setattr(hook.os, "getppid", lambda: 999)
@@ -404,6 +411,7 @@ def test_opportunistic_fallback_applies_actionless_owner_loss_transition(
         frozenset({identity.stable_key()}),
         observed,
         owner_session_id=lease.session_id,
+        owner_generation=lease_generation_digest(lease),
     )
     store.save_session(lease)
     store.save_process(process)
@@ -482,6 +490,39 @@ def test_opportunistic_fallback_elapsed_budget_defers_after_external_audit(
     assert "elapsed_budget_exhausted" in event
 
 
+def test_opportunistic_fallback_deadline_after_backend_construction_defers(
+    hook_runtime, monkeypatch
+):
+    _runtime, store, clock, _notifier, procfs = hook_runtime
+    now = [10.0]
+    snapshot = classify.build_audit(store, procfs, clock)
+
+    class FakeMonotonic:
+        @staticmethod
+        def monotonic():
+            return now[0]
+
+    def construct_backend():
+        now[0] += hook.FALLBACK_MAX_ELAPSED_SECONDS + 0.001
+        return object()
+
+    monkeypatch.setattr(hook, "time", FakeMonotonic)
+    monkeypatch.setattr(hook, "build_audit", lambda *_args: snapshot)
+    monkeypatch.setattr(hook, "plan_cleanup", lambda _snapshot: (object(),))
+    monkeypatch.setattr(hook, "PidfdSignalBackend", construct_backend)
+    monkeypatch.setattr(
+        hook,
+        "execute_cleanup",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("execution began after deadline")
+        ),
+    )
+
+    hook._opportunistic_cleanup(store, procfs, clock)
+
+    assert "elapsed_budget_exhausted" in (store.root / "events.jsonl").read_text()
+
+
 def test_durable_start_notifies_and_falls_back_after_event_append_failure(
     hook_runtime, monkeypatch
 ):
@@ -519,6 +560,103 @@ def test_notifier_exception_is_failed_start_request_with_exactly_one_fallback(
     runtime.start()
     assert notifier.calls == 1
     assert len(fallback) == 1
+
+
+def test_durable_start_notifies_even_when_state_lock_exit_raises(
+    hook_runtime, monkeypatch
+):
+    runtime, store, _clock, notifier, _procfs = hook_runtime
+    original_locked = store.locked
+
+    class ExitFailure:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+
+        def __enter__(self):
+            entered = self.inner.__enter__()
+            self.raise_on_exit = store._lock_depth == 1
+            return entered
+
+        def __exit__(self, exc_type, exc, traceback):
+            result = self.inner.__exit__(exc_type, exc, traceback)
+            if exc_type is None and self.raise_on_exit:
+                raise OSError("LOCK-EXIT-CANARY")
+            return result
+
+    monkeypatch.setattr(
+        store,
+        "locked",
+        lambda *args, **kwargs: ExitFailure(original_locked(*args, **kwargs)),
+    )
+
+    runtime.start()
+
+    assert notifier.calls == 1
+    monkeypatch.setattr(store, "locked", original_locked)
+    assert store.load_sessions()[0].state == "active"
+
+
+def test_notifier_and_fallback_failures_emit_only_constant_diagnostics(
+    hook_runtime, monkeypatch
+):
+    runtime, store, _clock, notifier, _procfs = hook_runtime
+    notifier.result = False
+    monkeypatch.setattr(
+        hook,
+        "_opportunistic_cleanup",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("FALLBACK-CANARY")),
+    )
+
+    runtime.start(source="SOURCE-CANARY")
+
+    events = (store.root / "events.jsonl").read_text()
+    assert '"event":"hook_notifier_failed"' in events
+    assert '"event":"hook_fallback_failed"' in events
+    assert "FALLBACK-CANARY" not in events
+    assert "SOURCE-CANARY" not in events
+
+
+def test_concurrent_start_end_events_follow_locked_state_order(
+    hook_runtime, monkeypatch
+):
+    runtime, store, clock, _notifier, _procfs = hook_runtime
+    original_append = store.append_event
+    start_event_entered = threading.Event()
+    release_start_event = threading.Event()
+
+    def delayed_append(event, **kwargs):
+        if event.get("event") == "session_started":
+            start_event_entered.set()
+            assert release_start_event.wait(2.0)
+        return original_append(event, **kwargs)
+
+    monkeypatch.setattr(store, "append_event", delayed_append)
+    start_thread = threading.Thread(target=runtime.start)
+    start_thread.start()
+    assert start_event_entered.wait(2.0)
+    clock.advance(1.0)
+    end_thread = threading.Thread(
+        target=lambda: runtime.handle(
+            {
+                "session_id": "thr_123",
+                "cwd": "/workspace",
+                "hook_event_name": "SessionEnd",
+                "reason": "other",
+            }
+        )
+    )
+    end_thread.start()
+    release_start_event.set()
+    start_thread.join(2.0)
+    end_thread.join(2.0)
+    assert not start_thread.is_alive()
+    assert not end_thread.is_alive()
+
+    events = [
+        json.loads(line)["event"]
+        for line in (store.root / "events.jsonl").read_text().splitlines()
+    ]
+    assert events == ["session_started", "session_ended"]
 
 
 def test_durable_end_notifies_after_event_append_failure(hook_runtime, monkeypatch):
@@ -564,6 +702,7 @@ def test_stalled_cleanup_procfs_does_not_hold_lock_against_session_end(
             frozenset(lease.host_keys),
             lease.observed,
             owner_session_id=lease.session_id,
+            owner_generation=lease_generation_digest(lease),
         )
     )
     entered = threading.Event()
@@ -772,6 +911,7 @@ def test_cleanup_dry_run_issues_short_lived_force_evidence_for_stubborn_process(
         frozenset({identity.stable_key()}),
         observed,
         owner_session_id=lease.session_id,
+        owner_generation=lease_generation_digest(lease),
         first_owner_gone_boot=50.0,
         term_sent_boot=200.0,
         term_sent_keys=frozenset({identity.stable_key()}),
@@ -814,6 +954,7 @@ def _seed_cli_orphan(cli_runtime):
         frozenset({identity.stable_key()}),
         observed,
         owner_session_id=lease.session_id,
+        owner_generation=lease_generation_digest(lease),
         first_owner_gone_boot=100.0,
     )
     store = StateStore(root)
@@ -905,6 +1046,36 @@ def test_corrupt_state_is_nonzero_and_never_constructs_signaler(
     assert len(list((root / "corrupt").iterdir())) == 1
 
 
+def test_corrupt_apply_root_rebind_quarantines_neither_replacement_ledger(
+    cli_runtime, monkeypatch, capsys, tmp_path
+):
+    root, _tree, _procfs, _clock = cli_runtime
+    sessions = root / "sessions"
+    make_private_directory(sessions)
+    audited = sessions / ("a" * 64 + ".json")
+    write_private_file(audited, b"{audited-corrupt}\n")
+    displaced = tmp_path / "audited-root"
+    replacement = root / "sessions" / ("b" * 64 + ".json")
+    original_build = cli.build_audit
+
+    def audit_then_rebind(*args, **kwargs):
+        snapshot = original_build(*args, **kwargs)
+        root.rename(displaced)
+        make_private_directory(root / "sessions")
+        write_private_file(replacement, b"{replacement-corrupt}\n")
+        return snapshot
+
+    monkeypatch.setattr(cli, "build_audit", audit_then_rebind)
+    assert cli.main(["cleanup", "--apply"]) != 0
+    captured = capsys.readouterr()
+
+    assert (displaced / "sessions" / audited.name).exists()
+    assert replacement.exists()
+    assert not (root / "corrupt").exists()
+    assert "audited-corrupt" not in captured.out + captured.err
+    assert "replacement-corrupt" not in captured.out + captured.err
+
+
 def test_audit_redacts_session_cwd_and_environment_canaries(
     cli_runtime, monkeypatch, capsys
 ):
@@ -934,6 +1105,7 @@ def test_audit_redacts_session_cwd_and_environment_canaries(
         frozenset({identity.stable_key()}),
         observed,
         owner_session_id=lease.session_id,
+        owner_generation=lease_generation_digest(lease),
     )
     store = StateStore(root)
     store.save_session(lease)
@@ -1066,6 +1238,7 @@ def test_explain_matches_recorded_child_and_preserves_unavailable_tri_state(
         frozenset({wrapper.stable_key()}),
         observed,
         owner_session_id=lease.session_id,
+        owner_generation=lease_generation_digest(lease),
     )
     store = StateStore(root)
     store.save_session(lease)

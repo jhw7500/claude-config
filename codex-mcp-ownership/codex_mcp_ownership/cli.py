@@ -120,16 +120,20 @@ def _report_dict(
         before_classifications = report.before_classifications
         after_classifications = report.after_classifications
         outcomes = report.outcomes
-    return {
+        after_state_available = report.after_state_available
+        authority_lost = report.authority_lost
+    if report is None:
+        after_state_available = True
+        authority_lost = False
+    rendered = {
         "schema_version": 1,
-        "state_counts": dict(snapshot.state_counts),
-        "process_count": snapshot.process_count,
-        "rss_kib": snapshot.rss_kib,
         "ownership_coverage": dict(snapshot.ownership_coverage),
         "before_count": before_count,
         "before_rss_kib": before_rss,
         "after_count": after_count,
         "after_rss_kib": after_rss,
+        "after_state_available": after_state_available,
+        "authority_lost": authority_lost,
         "attempted": attempted,
         "terminated": terminated,
         "survived": survived,
@@ -155,6 +159,11 @@ def _report_dict(
             _safe_classification(item) for item in snapshot.classifications
         ],
     }
+    prefix = "" if report is None else "preflight_"
+    rendered[prefix + "state_counts"] = dict(snapshot.state_counts)
+    rendered[prefix + "process_count"] = snapshot.process_count
+    rendered[prefix + "rss_kib"] = snapshot.rss_kib
+    return rendered
 
 
 def _human_report(snapshot: AuditSnapshot, report: CleanupReport | None = None) -> str:
@@ -177,6 +186,10 @@ def _human_report(snapshot: AuditSnapshot, report: CleanupReport | None = None) 
         (
             f"attempted={values['attempted']} terminated={values['terminated']} "
             f"survived={values['survived']} skipped={values['skipped']}"
+        ),
+        (
+            f"after_state_available={str(values['after_state_available']).lower()} "
+            f"authority_lost={str(values['authority_lost']).lower()}"
         ),
     ]
     for phase in ("before", "after"):
@@ -239,11 +252,16 @@ def _cleanup_command(apply: bool, force: bool, confirm: str | None) -> int:
     if force and not apply:
         raise _UsageError("force requires apply")
     store, procfs, clock = _runtime()
+    try:
+        audited_root_token = store.root_token()
+    except FileNotFoundError:
+        audited_root_token = None
     snapshot = build_audit(store, procfs, clock)
     if snapshot.corrupt_count:
-        if apply:
-            store.load_sessions()
-            store.load_processes()
+        if apply and audited_root_token is not None:
+            with store.locked(expected_root_token=audited_root_token):
+                store.load_sessions()
+                store.load_processes()
         return _diagnostic("state unavailable")
     actions = (
         select_force_actions(snapshot, confirm, clock)

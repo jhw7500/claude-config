@@ -172,6 +172,10 @@ class ClassificationScenario:
             matching_lease,
             host_keys=(live_host.stable_key(),),
         )
+        self.process = replace(
+            self.process,
+            owner_generation=model.lease_generation_digest(self.matching_lease),
+        )
         self.procfs = tree
         self.now_boot = 300.0
 
@@ -213,6 +217,34 @@ class ClassificationScenario:
 @pytest.fixture
 def scenario(fake_proc, process, matching_lease, host_identity):
     return ClassificationScenario(fake_proc, process, matching_lease, host_identity)
+
+
+def test_partial_overlap_generation_does_not_inherit_recorded_owner(scenario):
+    old_lease = scenario.matching_lease
+    old_parent = replace(scenario.host_identity, pid=90, start_ticks=900).stable_key()
+    shared = scenario.host_identity.stable_key()
+    new_parent = replace(scenario.host_identity, pid=91, start_ticks=910).stable_key()
+    old_lease = replace(old_lease, host_keys=(old_parent, shared))
+    new_lease = replace(
+        old_lease,
+        host_keys=(new_parent, shared),
+        observed=replace(old_lease.observed, boottime=110.0),
+    )
+    recorded = replace(
+        scenario.process,
+        host_keys=frozenset({old_parent, shared}),
+        owner_generation=model.lease_generation_digest(old_lease),
+    )
+
+    classification = classify.classify_process(
+        recorded,
+        (new_lease,),
+        scenario.procfs,
+        now_boot=110.0,
+    )
+
+    assert classification.state == "unknown"
+    assert classification.reason_codes == ("owner_generation_mismatch",)
 
 
 @pytest.mark.parametrize(

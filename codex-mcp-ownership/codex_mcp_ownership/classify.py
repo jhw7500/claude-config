@@ -14,6 +14,7 @@ from .model import (
     ObservedTime,
     ProcessIdentity,
     SessionLease,
+    lease_generation_digest,
 )
 from .procfs import IdentityObservation, LinuxProcfs
 from .state import StateCorruption, StateStore
@@ -50,6 +51,16 @@ def _lease_has_owner_evidence(process: ManagedProcess, lease: SessionLease) -> b
     return same_host and same_cwd and within_window
 
 
+def _lease_matches_recorded_generation(
+    process: ManagedProcess,
+    lease: SessionLease,
+) -> bool:
+    return bool(
+        process.owner_generation is not None
+        and process.owner_generation == lease_generation_digest(lease)
+    )
+
+
 def _active_owner_candidates(
     process: ManagedProcess,
     leases: tuple[SessionLease, ...],
@@ -81,6 +92,7 @@ def associate_owner(
             session_id=matches[0].session_id,
             shared_owner=None,
             reason_codes=("unique_matching_session",),
+            owner_generation=lease_generation_digest(matches[0]),
         )
     if len(matches) > 1:
         return Association(
@@ -303,6 +315,13 @@ def classify_process(
             ("invalid_lifecycle_time",),
             live_identities,
         )
+    if not _lease_matches_recorded_generation(process, owner):
+        return _classification(
+            process,
+            "unknown",
+            ("owner_generation_mismatch",),
+            live_identities,
+        )
     if not _lease_has_owner_evidence(process, owner):
         return _classification(
             process,
@@ -314,6 +333,13 @@ def classify_process(
     first_gone = process.first_owner_gone_boot
     term_sent = process.term_sent_boot
     term_sent_keys = process.term_sent_keys
+    if "signal_term_pending" in process.owner_reason_codes:
+        return _classification(
+            process,
+            "unknown",
+            ("state_persistence_pending",),
+            live_identities,
+        )
     if (term_sent is None) != (not term_sent_keys):
         return _classification(
             process,
@@ -510,14 +536,12 @@ def _audit_rss_observation(
 
 
 def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSnapshot:
-    audit_store = (
-        store
-        if store._owns_lock()
-        else StateStore(
-            store.root,
-            read_only=True,
-            lock_timeout=store.lock_timeout,
-        )
+    if store._owns_lock():
+        raise ValueError("audit cannot run under a mutable lock")
+    audit_store = StateStore(
+        store.root,
+        read_only=True,
+        lock_timeout=store.lock_timeout,
     )
     corrupt_count = 0
     sessions_corrupt = False

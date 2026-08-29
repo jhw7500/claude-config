@@ -7,7 +7,12 @@ import subprocess
 import time
 import unicodedata
 
-from .cleanup import PidfdSignalBackend, execute_cleanup, plan_cleanup
+from .cleanup import (
+    CleanupDeadlineExceeded,
+    PidfdSignalBackend,
+    execute_cleanup,
+    plan_cleanup,
+)
 from .clock import Clock
 from .classify import build_audit
 from .model import ObservedTime, SessionLease, validate_session_id
@@ -156,12 +161,30 @@ def _opportunistic_cleanup(
     procfs: LinuxProcfs,
     clock: Clock,
 ) -> None:
-    started = time.monotonic()
+    try:
+        _opportunistic_cleanup_bounded(store, procfs, clock)
+    except CleanupDeadlineExceeded:
+        _fallback_deferred(store, clock, "elapsed_budget_exhausted")
+
+
+def _opportunistic_cleanup_bounded(
+    store: StateStore,
+    procfs: LinuxProcfs,
+    clock: Clock,
+) -> None:
+    deadline = time.monotonic() + FALLBACK_MAX_ELAPSED_SECONDS
+
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise CleanupDeadlineExceeded("fallback deadline exhausted")
+
     record_count = 0
     for kind in ("sessions", "processes"):
+        check_deadline()
         directory = store.root / kind
         try:
             for _item in directory.iterdir():
+                check_deadline()
                 record_count += 1
                 if record_count > FALLBACK_MAX_RECORDS:
                     break
@@ -170,17 +193,18 @@ def _opportunistic_cleanup(
         if record_count > FALLBACK_MAX_RECORDS:
             _fallback_deferred(store, clock, "record_budget_exhausted")
             return
+    check_deadline()
     snapshot = build_audit(store, procfs, clock)
+    check_deadline()
     if snapshot.corrupt_count:
         return
-    if time.monotonic() - started > FALLBACK_MAX_ELAPSED_SECONDS:
-        _fallback_deferred(store, clock, "elapsed_budget_exhausted")
-        return
     actions = plan_cleanup(snapshot)
+    check_deadline()
     if len(actions) > FALLBACK_MAX_ACTIONS:
         _fallback_deferred(store, clock, "action_budget_exhausted")
         return
     if actions:
+        check_deadline()
         signaler = PidfdSignalBackend()
     else:
 
@@ -196,6 +220,7 @@ def _opportunistic_cleanup(
                 del pidfd
 
         signaler = _NoSignal()
+    check_deadline()
     execute_cleanup(
         actions,
         store,
@@ -203,6 +228,8 @@ def _opportunistic_cleanup(
         signaler,
         clock,
         apply=True,
+        deadline=deadline,
+        monotonic=time.monotonic,
     )
 
 
@@ -220,6 +247,35 @@ def _fallback_deferred(store: StateStore, clock: Clock, reason: str) -> None:
         )
     except Exception:
         pass
+
+
+def _hook_diagnostic(store: StateStore, clock: Clock, event: str, reason: str) -> None:
+    try:
+        store.append_event(
+            {
+                "schema_version": 1,
+                "event": event,
+                "observed_wall": _validated_text(clock.wall_iso(), "wall clock", 128),
+                "state": "unknown",
+                "reason_codes": [reason],
+            },
+            maintenance=False,
+        )
+    except Exception:
+        pass
+
+
+def _save_session_milestone(store: StateStore, lease: SessionLease) -> bool:
+    try:
+        store.save_session(lease, maintenance=False)
+    except Exception:
+        try:
+            if store.load_session(lease.session_id) == lease:
+                return True
+        except Exception:
+            pass
+        raise
+    return True
 
 
 def handle_payload(
@@ -252,30 +308,52 @@ def handle_payload(
                 observed=_observed(clock, chain[0].boot_id),
             )
             candidate.to_dict()
-            with store.locked():
-                current = store.load_session(session_id)
-                lease = (
-                    replace(current, source=source or "")
-                    if current is not None
-                    and _same_generation(
-                        current,
-                        cwd,
-                        host_keys,
-                        chain[0].boot_id,
+            durable = False
+            try:
+                with store.locked():
+                    current = store.load_session(session_id)
+                    lease = (
+                        replace(current, source=source or "")
+                        if current is not None
+                        and _same_generation(
+                            current,
+                            cwd,
+                            host_keys,
+                            chain[0].boot_id,
+                        )
+                        else candidate
                     )
-                    else candidate
+                    durable = _save_session_milestone(store, lease)
+                    _append_event_best_effort(
+                        store,
+                        _event("session_started", lease),
+                        candidate.observed.wall_iso,
+                    )
+            finally:
+                notified = durable and _request_cleanup(notifier)
+            if durable and not notified:
+                _hook_diagnostic(
+                    store,
+                    clock,
+                    "hook_notifier_failed",
+                    "notifier_request_failed",
                 )
-                store.save_session(lease, maintenance=False)
-            _append_event_best_effort(
-                store,
-                _event("session_started", lease),
-                candidate.observed.wall_iso,
-            )
-            if not _request_cleanup(notifier):
                 try:
                     _opportunistic_cleanup(store, procfs, clock)
+                except CleanupDeadlineExceeded:
+                    _hook_diagnostic(
+                        store,
+                        clock,
+                        "hook_fallback_deferred",
+                        "elapsed_budget_exhausted",
+                    )
                 except Exception:
-                    pass
+                    _hook_diagnostic(
+                        store,
+                        clock,
+                        "hook_fallback_failed",
+                        "fallback_execution_failed",
+                    )
             return
 
         parent_pid = os.getppid()
@@ -283,32 +361,42 @@ def handle_payload(
         if not chain or chain[0].pid != parent_pid:
             return
         host_keys = tuple(identity.stable_key() for identity in chain)
-        with store.locked():
-            current = store.load_session(session_id)
-            if current is None or current.state == "ended":
-                return
-            if not _same_generation(
-                current,
-                cwd,
-                host_keys,
-                chain[0].boot_id,
-            ):
-                return
-            ended_observed = _observed(clock, current.observed.boot_id)
-            if ended_observed.boottime < current.observed.boottime:
-                return
-            ended = replace(
-                current,
-                state="ended",
-                ended=ended_observed,
+        durable = False
+        try:
+            with store.locked():
+                current = store.load_session(session_id)
+                if current is None or current.state == "ended":
+                    return
+                if not _same_generation(
+                    current,
+                    cwd,
+                    host_keys,
+                    chain[0].boot_id,
+                ):
+                    return
+                ended_observed = _observed(clock, current.observed.boot_id)
+                if ended_observed.boottime < current.observed.boottime:
+                    return
+                ended = replace(
+                    current,
+                    state="ended",
+                    ended=ended_observed,
+                )
+                ended.to_dict()
+                durable = _save_session_milestone(store, ended)
+                _append_event_best_effort(
+                    store,
+                    _event("session_ended", ended),
+                    ended_observed.wall_iso,
+                )
+        finally:
+            notified = durable and _request_cleanup(notifier)
+        if durable and not notified:
+            _hook_diagnostic(
+                store,
+                clock,
+                "hook_notifier_failed",
+                "notifier_request_failed",
             )
-            ended.to_dict()
-            store.save_session(ended, maintenance=False)
-        _append_event_best_effort(
-            store,
-            _event("session_ended", ended),
-            ended_observed.wall_iso,
-        )
-        _request_cleanup(notifier)
     except Exception:
         return

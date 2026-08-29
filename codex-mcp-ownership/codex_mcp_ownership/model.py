@@ -257,6 +257,24 @@ class SessionLease:
         )
 
 
+def lease_generation_digest(lease: SessionLease) -> str:
+    if not isinstance(lease, SessionLease):
+        raise TypeError("lease must be a SessionLease")
+    canonical = json.dumps(
+        {
+            "boot_id": lease.observed.boot_id,
+            "cwd": lease.cwd,
+            "host_keys": list(lease.host_keys),
+            "observed": lease.observed.to_dict(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 @dataclass(frozen=True)
 class ManagedProcess:
     schema_version: int
@@ -271,6 +289,7 @@ class ManagedProcess:
     host_keys: frozenset[str]
     spawned: ObservedTime
     owner_session_id: str | None = None
+    owner_generation: str | None = None
     shared_owner: str | None = None
     first_owner_gone_boot: float | None = None
     term_sent_boot: float | None = None
@@ -310,6 +329,7 @@ class ManagedProcess:
             "host_keys": sorted(self.host_keys),
             "spawned": self.spawned.to_dict(),
             "owner_session_id": self.owner_session_id,
+            "owner_generation": self.owner_generation,
             "shared_owner": self.shared_owner,
             "first_owner_gone_boot": self.first_owner_gone_boot,
             "term_sent_boot": self.term_sent_boot,
@@ -337,6 +357,7 @@ class ManagedProcess:
                 "host_keys",
                 "spawned",
                 "owner_session_id",
+                "owner_generation",
                 "shared_owner",
                 "first_owner_gone_boot",
                 "term_sent_boot",
@@ -355,9 +376,14 @@ class ManagedProcess:
         if not isinstance(members_data, list):
             raise ValueError("members must be a list")
         owner_session_id = parsed["owner_session_id"]
+        owner_generation = parsed["owner_generation"]
         shared_owner = parsed["shared_owner"]
         if owner_session_id is not None:
             owner_session_id = validate_session_id(owner_session_id)
+        if owner_generation is not None:
+            owner_generation = _string(owner_generation, "owner_generation")
+            if _STABLE_KEY.fullmatch(owner_generation) is None:
+                raise ValueError("invalid owner_generation")
         if shared_owner is not None:
             shared_owner = _string(shared_owner, "shared_owner")
         first_owner_gone_boot = parsed["first_owner_gone_boot"]
@@ -376,6 +402,7 @@ class ManagedProcess:
             host_keys=frozenset(_strings(parsed["host_keys"], "host_keys")),
             spawned=ObservedTime.from_dict(parsed["spawned"]),
             owner_session_id=owner_session_id,
+            owner_generation=owner_generation,
             shared_owner=shared_owner,
             first_owner_gone_boot=(
                 None
@@ -402,6 +429,7 @@ class Association:
     session_id: str | None
     shared_owner: str | None
     reason_codes: tuple[str, ...]
+    owner_generation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -465,3 +493,5 @@ class CleanupReport:
     after_state_counts: tuple[tuple[str, int], ...] = ()
     before_classifications: tuple[Classification, ...] = ()
     after_classifications: tuple[Classification, ...] = ()
+    after_state_available: bool = True
+    authority_lost: bool = False

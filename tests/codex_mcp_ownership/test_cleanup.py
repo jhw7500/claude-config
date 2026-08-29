@@ -90,6 +90,11 @@ def encode_force_token(payload: dict[str, object]) -> str:
     return f"{encoded}.{hashlib.sha256(canonical).hexdigest()}"
 
 
+def encode_force_token_bytes(canonical: bytes) -> str:
+    encoded = base64.urlsafe_b64encode(canonical).rstrip(b"=").decode()
+    return f"{encoded}.{hashlib.sha256(canonical).hexdigest()}"
+
+
 def ended_owner_context_without_first_loss(tmp_path, fake_proc):
     tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
     identity = tree.identity(321)
@@ -118,6 +123,7 @@ def ended_owner_context_without_first_loss(tmp_path, fake_proc):
         frozenset({identity.stable_key()}),
         observed,
         owner_session_id=lease.session_id,
+        owner_generation=model.lease_generation_digest(lease),
     )
     store = state.StateStore(tmp_path / "state")
     store.save_session(lease)
@@ -149,14 +155,97 @@ def test_apply_persists_first_owner_loss_once_and_next_scan_converges(
     assert cleanup.plan_cleanup(snapshot)[0].process_key == process.wrapper.stable_key()
 
 
-def test_build_audit_uses_held_store_pinned_root(tmp_path, fake_proc):
+def test_first_owner_loss_cas_rejects_concurrent_lease_switch(
+    tmp_path, fake_proc, monkeypatch
+):
+    store, tree, process = ended_owner_context_without_first_loss(tmp_path, fake_proc)
+    ended = store.load_sessions()[0]
+    original = cleanup._cas_process_and_event
+    switched = False
+
+    def switch_lease_then_cas(*args, **kwargs):
+        nonlocal switched
+        if not switched:
+            store.save_session(replace(ended, state="active", ended=None))
+            switched = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cleanup, "_cas_process_and_event", switch_lease_then_cas)
+    cleanup.execute_cleanup(
+        (),
+        store,
+        tree,
+        FakeSignalBackend(),
+        FakeClock(boot=200.0),
+        apply=True,
+    )
+
+    assert store.load_processes()[0] == process
+    assert not (store.root / "events.jsonl").exists()
+
+
+def test_first_owner_loss_outbox_retries_append_failure_exactly_once(
+    tmp_path, fake_proc, monkeypatch
+):
     store, tree, _process = ended_owner_context_without_first_loss(tmp_path, fake_proc)
-    displaced = tmp_path / "displaced-state"
+    original_append = store.append_event
+    failed = False
+
+    def fail_owner_loss_once(event, **kwargs):
+        nonlocal failed
+        if event.get("event") == "owner_loss_observed" and not failed:
+            failed = True
+            raise OSError("OUTBOX-CANARY")
+        return original_append(event, **kwargs)
+
+    monkeypatch.setattr(store, "append_event", fail_owner_loss_once)
+    cleanup.execute_cleanup(
+        (), store, tree, FakeSignalBackend(), FakeClock(boot=200.0), apply=True
+    )
+    assert store.load_processes()[0].first_owner_gone_boot == 200.0
+
+    monkeypatch.setattr(store, "append_event", original_append)
+    cleanup.execute_cleanup(
+        (), store, tree, FakeSignalBackend(), FakeClock(boot=200.0), apply=True
+    )
+
+    events = [
+        json.loads(line)
+        for line in (store.root / "events.jsonl").read_text().splitlines()
+    ]
+    assert [event["event"] for event in events] == ["owner_loss_observed"]
+    assert len(list((store.root / "outbox").iterdir())) == 0
+
+
+def test_build_audit_rejects_caller_held_mutable_lock_without_external_work(
+    tmp_path, fake_proc
+):
+    store, tree, _process = ended_owner_context_without_first_loss(tmp_path, fake_proc)
     with store.locked():
-        store.root.rename(displaced)
-        store.root.mkdir(mode=0o700)
-        snapshot = classify.build_audit(store, tree, FakeClock(boot=200.0))
-    assert len(snapshot.classifications) == 1
+        with pytest.raises(ValueError, match="mutable lock"):
+            classify.build_audit(store, tree, FakeClock(boot=200.0))
+
+
+def test_build_audit_held_mutable_lock_never_quarantines_corrupt_record(
+    tmp_path, fake_proc
+):
+    root = tmp_path / "state"
+    sessions = root / "sessions"
+    sessions.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    sessions.chmod(0o700)
+    corrupt = sessions / ("a" * 64 + ".json")
+    corrupt.write_bytes(b"{corrupt}\n")
+    corrupt.chmod(0o600)
+    store = state.StateStore(root)
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+
+    with store.locked():
+        with pytest.raises(ValueError, match="mutable lock"):
+            classify.build_audit(store, tree, FakeClock(boot=200.0))
+
+    assert corrupt.exists()
+    assert not (root / "corrupt").exists()
 
 
 def test_apply_never_observes_procfs_or_rss_while_holding_global_lock(
@@ -261,6 +350,7 @@ def orphan_context(tmp_path, fake_proc):
         host_keys=frozenset({identity.stable_key()}),
         spawned=observed,
         owner_session_id=lease.session_id,
+        owner_generation=model.lease_generation_digest(lease),
         first_owner_gone_boot=100.0,
     )
     store = state.StateStore(tmp_path / "state")
@@ -448,6 +538,8 @@ def test_apply_reaudits_under_lock_and_persists_term_survivor(orphan_context) ->
         json.loads(line)
         for line in (store.root / "events.jsonl").read_text().splitlines()
     ]
+    event_id = events[0].pop("event_id")
+    assert len(event_id) == 64
     assert events == [
         {
             "event": "cleanup_term_sent",
@@ -463,6 +555,46 @@ def test_apply_reaudits_under_lock_and_persists_term_survivor(orphan_context) ->
             "server": "example",
             "state": "exiting",
         }
+    ]
+
+
+def test_concurrent_process_update_during_term_is_durably_conflicted(
+    orphan_context,
+) -> None:
+    store, tree, clock, snapshot, _process, _lease = orphan_context
+
+    def supervisor_refresh(_identity, _signum) -> None:
+        current = store.load_processes()[0]
+        store.save_process(
+            replace(
+                current,
+                owner_reason_codes=current.owner_reason_codes + ("supervisor_refresh",),
+            ),
+            maintenance=False,
+        )
+
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        FakeSignalBackend(on_send=supervisor_refresh),
+        clock,
+        apply=True,
+    )
+
+    assert report.attempted == 1
+    assert report.outcomes[0].reason == "state_persistence_conflict"
+    persisted = store.load_processes()[0]
+    assert "signal_term_pending" in persisted.owner_reason_codes
+    followup = classify.build_audit(store, tree, clock)
+    assert followup.classifications[0].state == "unknown"
+    assert followup.classifications[0].eligible_term is False
+    events = [
+        json.loads(line)
+        for line in (store.root / "events.jsonl").read_text().splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "cleanup_state_persistence_conflict"
     ]
 
 
@@ -539,17 +671,16 @@ def test_pid_reuse_before_pidfd_open_sends_no_signal(
     store, tree, clock, snapshot, process, _lease = orphan_context
     changed = False
 
-    original_authority = cleanup._current_authority
+    original_observe = cleanup._observe_identity
 
-    def mutate_after_authority(*args, **kwargs):
+    def mutate_before_observe(*args, **kwargs):
         nonlocal changed
-        result = original_authority(*args, **kwargs)
         if not changed:
             change_start_ticks(tree, process.wrapper)
             changed = True
-        return result
+        return original_observe(*args, **kwargs)
 
-    monkeypatch.setattr(cleanup, "_current_authority", mutate_after_authority)
+    monkeypatch.setattr(cleanup, "_observe_identity", mutate_before_observe)
     signaler = FakeSignalBackend()
 
     report = cleanup.execute_cleanup(
@@ -595,6 +726,81 @@ def test_pid_reuse_after_pidfd_open_closes_once_and_sends_no_signal(
     ]
     assert store.load_processes()[0] == process
     assert not (store.root / "events.jsonl").exists()
+
+
+def test_lease_switch_after_pidfd_preparation_prevents_term(orphan_context) -> None:
+    store, tree, clock, snapshot, _process, lease = orphan_context
+
+    def activate_owner(_identity):
+        store.save_session(replace(lease, state="active", ended=None))
+
+    signaler = FakeSignalBackend(on_open=activate_owner)
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+    )
+
+    assert [call for call in signaler.calls if call[0] == "send"] == []
+    assert report.attempted == 0
+    assert report.outcomes[0].reason == "state_authority_changed"
+
+
+def test_root_rebind_after_pidfd_preparation_prevents_term(
+    orphan_context, tmp_path
+) -> None:
+    store, tree, clock, snapshot, _process, _lease = orphan_context
+    displaced = tmp_path / "prepared-root"
+
+    def rebind(_identity):
+        store.root.rename(displaced)
+        store.root.mkdir(mode=0o700)
+
+    signaler = FakeSignalBackend(on_open=rebind)
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+    )
+
+    assert [call for call in signaler.calls if call[0] == "send"] == []
+    assert report.attempted == 0
+    assert report.outcomes[0].reason == "state_authority_changed"
+    assert list(store.root.iterdir()) == []
+
+
+def test_authority_loss_after_signal_reports_after_state_unavailable(
+    orphan_context, tmp_path
+) -> None:
+    store, tree, clock, snapshot, _process, _lease = orphan_context
+    displaced = tmp_path / "signaled-root"
+
+    def rebind_after_send(_identity, _signum) -> None:
+        store.root.rename(displaced)
+        store.root.mkdir(mode=0o700)
+
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        FakeSignalBackend(on_send=rebind_after_send),
+        clock,
+        apply=True,
+    )
+
+    assert report.attempted == 1
+    assert report.after_state_available is False
+    assert report.authority_lost is True
+    assert report.after_classifications == ()
+    assert report.after_state_counts == ()
+    assert report.after_count == 0
+    assert report.after_rss_kib == 0
 
 
 def test_partial_subtree_reuse_skips_only_changed_identity(orphan_context) -> None:
@@ -819,6 +1025,127 @@ def test_force_token_is_canonical_exact_evidence(stubborn_context) -> None:
     assert "=" not in token
 
 
+@pytest.mark.parametrize(
+    "canonical",
+    [
+        ("[" * 1100 + "0" + "]" * 1100).encode(),
+        b'{"schema_version":' + b"9" * 5000 + b"}",
+        b'"' + b"x" * 20_000 + b'"',
+    ],
+    ids=("deep", "huge-number", "oversized"),
+)
+def test_force_token_resource_failures_are_invalid_confirmation(canonical) -> None:
+    token = encode_force_token_bytes(canonical)
+    with pytest.raises(cleanup.InvalidForceConfirmation):
+        cleanup._decode_force_token(token, 300.0)
+
+
+def test_fallback_deadline_crossed_in_second_audit_starts_no_backend(
+    orphan_context, monkeypatch
+) -> None:
+    store, tree, clock, snapshot, _process, _lease = orphan_context
+    now = [0.0]
+    original = classify.build_audit_from_records
+
+    def expire_during_audit(*args, **kwargs):
+        result = original(*args, **kwargs)
+        now[0] = 1.0
+        return result
+
+    monkeypatch.setattr(classify, "build_audit_from_records", expire_during_audit)
+    signaler = FakeSignalBackend()
+    with pytest.raises(cleanup.CleanupDeadlineExceeded):
+        cleanup.execute_cleanup(
+            cleanup.plan_cleanup(snapshot),
+            store,
+            tree,
+            signaler,
+            clock,
+            apply=True,
+            deadline=0.5,
+            monotonic=lambda: now[0],
+        )
+    assert signaler.calls == []
+
+
+def test_fallback_deadline_crossed_after_first_loss_cas_starts_no_backend(
+    tmp_path, fake_proc, monkeypatch
+) -> None:
+    store, tree, _process = ended_owner_context_without_first_loss(tmp_path, fake_proc)
+    now = [0.0]
+    original = cleanup._cas_process_and_event
+
+    def expire_after_cas(*args, **kwargs):
+        result = original(*args, **kwargs)
+        now[0] = 1.0
+        return result
+
+    monkeypatch.setattr(cleanup, "_cas_process_and_event", expire_after_cas)
+    signaler = FakeSignalBackend()
+    with pytest.raises(cleanup.CleanupDeadlineExceeded):
+        cleanup.execute_cleanup(
+            (),
+            store,
+            tree,
+            signaler,
+            FakeClock(boot=200.0),
+            apply=True,
+            deadline=0.5,
+            monotonic=lambda: now[0],
+        )
+    assert signaler.calls == []
+
+
+def test_fallback_deadline_crossed_during_pidfd_open_closes_without_send(
+    orphan_context,
+) -> None:
+    store, tree, clock, snapshot, _process, _lease = orphan_context
+    now = [0.0]
+    signaler = FakeSignalBackend(on_open=lambda _identity: now.__setitem__(0, 1.0))
+    with pytest.raises(cleanup.CleanupDeadlineExceeded):
+        cleanup.execute_cleanup(
+            cleanup.plan_cleanup(snapshot),
+            store,
+            tree,
+            signaler,
+            clock,
+            apply=True,
+            deadline=0.5,
+            monotonic=lambda: now[0],
+        )
+    assert [call[0] for call in signaler.calls] == ["open", "close"]
+
+
+def test_fallback_deadline_crossed_during_term_intent_starts_no_send(
+    orphan_context, monkeypatch
+) -> None:
+    store, tree, clock, snapshot, _process, _lease = orphan_context
+    now = [0.0]
+    original = store.save_process
+
+    def expire_after_save(process, **kwargs):
+        result = original(process, **kwargs)
+        if "signal_term_pending" in process.owner_reason_codes:
+            now[0] = 1.0
+        return result
+
+    monkeypatch.setattr(store, "save_process", expire_after_save)
+    signaler = FakeSignalBackend()
+    with pytest.raises(cleanup.CleanupDeadlineExceeded):
+        cleanup.execute_cleanup(
+            cleanup.plan_cleanup(snapshot),
+            store,
+            tree,
+            signaler,
+            clock,
+            apply=True,
+            deadline=0.5,
+            monotonic=lambda: now[0],
+        )
+    assert [call[0] for call in signaler.calls] == ["open", "close"]
+    assert "signal_term_pending" in store.load_processes()[0].owner_reason_codes
+
+
 def test_each_force_token_selects_only_its_stubborn_classification(
     stubborn_context,
 ) -> None:
@@ -928,6 +1255,30 @@ def test_valid_force_confirmation_sends_only_sigkill(stubborn_context) -> None:
         ("send", process.wrapper.pid + 1000, signal.SIGKILL)
     ]
     assert store.load_processes()[0] == process
+
+
+def test_force_expiry_during_pidfd_preparation_prevents_sigkill(
+    stubborn_context,
+) -> None:
+    store, tree, clock, snapshot, _process, _lease, classification = stubborn_context
+    actions = cleanup.plan_cleanup(snapshot, force=True)
+    token = cleanup.issue_force_token(classification, clock)
+    clock.advance(cleanup.FORCE_TOKEN_TTL_SECONDS - 0.1)
+    signaler = FakeSignalBackend(on_open=lambda _identity: clock.advance(1.0))
+
+    with pytest.raises(cleanup.InvalidForceConfirmation):
+        cleanup.execute_cleanup(
+            actions,
+            store,
+            tree,
+            signaler,
+            clock,
+            apply=True,
+            confirm_token=token,
+        )
+
+    assert [call for call in signaler.calls if call[0] == "send"] == []
+    assert [call for call in signaler.calls if call[0] == "close"]
 
 
 @pytest.mark.parametrize("token_kind", ["missing", "expired", "bad_digest"])
@@ -1165,7 +1516,9 @@ def test_post_signal_unavailable_is_conservative_and_records_no_term_time(
     assert report.attempted == 1
     assert report.skipped == 1
     assert report.outcomes[0].reason == "identity_unavailable_after_signal"
-    assert store.load_processes()[0] == process
+    persisted = store.load_processes()[0]
+    assert persisted.term_sent_boot is None
+    assert "signal_term_pending" in persisted.owner_reason_codes
     event = json.loads((store.root / "events.jsonl").read_text())
     assert event["event"] == "cleanup_signal_indeterminate"
     assert event["state"] == "unknown"
@@ -1495,12 +1848,14 @@ def test_invalid_post_term_clock_never_advances_lifecycle_or_force_eligibility(
     assert report.attempted == 1
     assert report.survived == 1
     assert report.outcomes[0].reason == expected_reason
-    assert store.load_processes()[0] == process
+    persisted = store.load_processes()[0]
+    assert persisted.term_sent_boot is None
+    assert "signal_term_pending" in persisted.owner_reason_codes
     event = json.loads((store.root / "events.jsonl").read_text())
     assert event["event"] == "cleanup_signal_indeterminate"
     assert expected_reason in event["reason_codes"]
     fresh = classify.build_audit(store, tree, clock)
-    assert fresh.classifications[0].state == "orphan"
+    assert fresh.classifications[0].state == "unknown"
     assert cleanup.plan_cleanup(fresh, force=True) == ()
 
 
@@ -1606,19 +1961,16 @@ def test_root_rebind_before_signal_skips_without_cross_ledger_mutation(
 ) -> None:
     store, tree, clock, snapshot, _process, _lease = orphan_context
     displaced = tmp_path / "displaced-state"
-    original_authority = cleanup._current_authority
     rebound = False
 
-    def rebind_then_check(*args, **kwargs):
+    def rebind_after_open(_identity):
         nonlocal rebound
         if not rebound:
             store.root.rename(displaced)
             store.root.mkdir(mode=0o700)
             rebound = True
-        return original_authority(*args, **kwargs)
 
-    monkeypatch.setattr(cleanup, "_current_authority", rebind_then_check)
-    signaler = FakeSignalBackend()
+    signaler = FakeSignalBackend(on_open=rebind_after_open)
     report = cleanup.execute_cleanup(
         cleanup.plan_cleanup(snapshot),
         store,
@@ -1628,7 +1980,7 @@ def test_root_rebind_before_signal_skips_without_cross_ledger_mutation(
         apply=True,
     )
 
-    assert signaler.calls == []
+    assert [call for call in signaler.calls if call[0] == "send"] == []
     assert report.outcomes[0].reason == "state_authority_changed"
     assert list(store.root.iterdir()) == []
     assert not (store.root / "events.jsonl").exists()
@@ -1723,8 +2075,13 @@ def test_partial_term_event_reports_the_actual_failed_identity_outcome(
     assert report.survived == 1
     assert report.skipped == 1
     assert failure_reason in {outcome.reason for outcome in report.outcomes}
-    assert store.load_processes()[0].term_sent_boot is None
-    assert store.load_processes()[0].term_sent_keys == frozenset()
+    persisted = store.load_processes()[0]
+    assert persisted.term_sent_boot is None
+    assert "signal_term_pending" in persisted.owner_reason_codes
+    assert persisted.term_sent_keys == frozenset(
+        identity.stable_key()
+        for identity in snapshot.classifications[0].live_identities
+    )
     event = json.loads((store.root / "events.jsonl").read_text())
     assert event["event"] == "cleanup_signal_indeterminate"
     assert "partial_signal_delivery" in event["reason_codes"]

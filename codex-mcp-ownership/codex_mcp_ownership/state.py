@@ -45,6 +45,7 @@ EVENT_FIELDS = {
     "state",
     "reason_codes",
     "rss_kib",
+    "event_id",
 }
 
 _DIRECTORY_MODE = 0o700
@@ -84,6 +85,16 @@ class StateCorruption(RuntimeError):
 def session_key(session_id: str) -> str:
     validated = model.validate_session_id(session_id)
     return hashlib.sha256(validated.encode("utf-8")).hexdigest()
+
+
+def _is_hex_digest(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != _HEX_DIGEST_LENGTH:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
 
 
 def _canonical_json(value: object) -> bytes:
@@ -858,29 +869,28 @@ class StateStore:
         digest = hashlib.sha256(raw).hexdigest()
         quarantine_fd = self._open_directory(root_fd, "corrupt", create=True)
         assert quarantine_fd is not None
-        destination = f"{kind}-{digest}.json"
-        destination_path = self.root / "corrupt" / destination
         try:
-            try:
-                existing_fd = self._open_private_file(
-                    quarantine_fd, destination, destination_path
-                )
-            except FileNotFoundError:
-                existing_fd = None
-            if existing_fd is None:
-                os.replace(
-                    name, destination, src_dir_fd=source_fd, dst_dir_fd=quarantine_fd
-                )
-            else:
+            destination = ""
+            for _attempt in range(16):
+                candidate = f"{kind}-{digest}-{secrets.token_hex(8)}.json"
                 try:
-                    existing_raw = _read_all(existing_fd)
-                finally:
-                    os.close(existing_fd)
-                if existing_raw != raw:
-                    raise StateCorruption(self.root / kind / name, digest)
-                os.unlink(name, dir_fd=source_fd)
+                    os.link(
+                        name,
+                        candidate,
+                        src_dir_fd=source_fd,
+                        dst_dir_fd=quarantine_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    continue
+                destination = candidate
+                break
+            if not destination:
+                raise StateCorruption(self.root / kind / name, digest)
+            os.unlink(name, dir_fd=source_fd)
             os.fsync(source_fd)
             os.fsync(quarantine_fd)
+            destination_path = self.root / "corrupt" / destination
             return destination_path
         finally:
             os.close(quarantine_fd)
@@ -895,6 +905,8 @@ class StateStore:
             raise ValueError("event contains forbidden fields")
         if "session_id" in event:
             model.validate_session_id(event["session_id"])
+        if "event_id" in event and not _is_hex_digest(event["event_id"]):
+            raise ValueError("invalid event ID")
         record = _canonical_json(event)
         if len(record) > EVENT_LOG_MAX_BYTES:
             raise ValueError("event record exceeds maximum log size")
@@ -907,6 +919,108 @@ class StateStore:
                 self._append_event_locked(root_fd, record)
             finally:
                 os.close(root_fd)
+
+    def stage_event(self, event: dict[str, object]) -> str:
+        if not isinstance(event, dict):
+            raise ValueError("event must be a record")
+        payload = dict(event)
+        payload.pop("event_id", None)
+        event_id = hashlib.sha256(_canonical_json(payload)).hexdigest()
+        payload["event_id"] = event_id
+        self._require_mutable()
+        with self.locked():
+            root_fd = self._open_root()
+            try:
+                directory_fd = self._open_directory(root_fd, "outbox", create=True)
+                assert directory_fd is not None
+                try:
+                    self._atomic_json(
+                        directory_fd,
+                        self.root / "outbox",
+                        event_id + ".json",
+                        payload,
+                    )
+                finally:
+                    os.close(directory_fd)
+            finally:
+                os.close(root_fd)
+        return event_id
+
+    def discard_staged_event(self, event_id: str) -> None:
+        if not _is_hex_digest(event_id):
+            raise ValueError("invalid event ID")
+        self._require_mutable()
+        with self.locked():
+            root_fd = self._open_root()
+            try:
+                directory_fd = self._open_directory(root_fd, "outbox", create=False)
+                if directory_fd is None:
+                    return
+                try:
+                    try:
+                        os.unlink(event_id + ".json", dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        return
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                os.close(root_fd)
+
+    def flush_staged_events(self, limit: int = 64) -> None:
+        if type(limit) is not int or limit < 0:
+            raise ValueError("invalid outbox limit")
+        self._require_mutable()
+        with self.locked():
+            root_fd = self._open_root()
+            try:
+                directory_fd = self._open_directory(root_fd, "outbox", create=False)
+                if directory_fd is None:
+                    return
+                try:
+                    for name in sorted(os.listdir(directory_fd))[:limit]:
+                        if not name.endswith(".json"):
+                            raise UnsafeStatePath("invalid outbox entry")
+                        event_id = name[:-5]
+                        if not _is_hex_digest(event_id):
+                            raise UnsafeStatePath("invalid outbox event ID")
+                        fd = self._open_private_file(
+                            directory_fd,
+                            name,
+                            self.root / "outbox" / name,
+                        )
+                        try:
+                            raw = _read_state_record(fd)
+                        finally:
+                            os.close(fd)
+                        payload = json.loads(raw.decode("utf-8"))
+                        if (
+                            not isinstance(payload, dict)
+                            or payload.get("event_id") != event_id
+                        ):
+                            raise UnsafeStatePath("invalid outbox payload")
+                        if not self._event_logged_locked(root_fd, event_id):
+                            self.append_event(payload, maintenance=False)
+                        os.unlink(name, dir_fd=directory_fd)
+                        os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                os.close(root_fd)
+
+    def _event_logged_locked(self, root_fd: int, event_id: str) -> bool:
+        try:
+            fd = self._open_private_file(
+                root_fd, "events.jsonl", self.root / "events.jsonl"
+            )
+        except FileNotFoundError:
+            return False
+        try:
+            raw = _read_all(fd)
+        finally:
+            os.close(fd)
+        needle = f'"event_id":"{event_id}"'.encode("ascii")
+        return needle in raw
 
     def _append_event_locked(self, root_fd: int, record: bytes) -> None:
         name = "events.jsonl"

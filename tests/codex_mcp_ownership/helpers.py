@@ -7,7 +7,9 @@ from codex_mcp_ownership import model, procfs
 
 
 class FakeClock:
-    def __init__(self, wall: str = "2026-08-29T00:00:00+00:00", boot: float = 0.0) -> None:
+    def __init__(
+        self, wall: str = "2026-08-29T00:00:00+00:00", boot: float = 0.0
+    ) -> None:
         self._wall = wall
         self._boot = boot
 
@@ -51,6 +53,7 @@ def sample_lease(session_id: str = "session:test_1") -> model.SessionLease:
 def sample_process() -> model.ManagedProcess:
     identity = sample_identity()
     observed = model.ObservedTime("2026-08-29T00:00:00+00:00", identity.boot_id, 12.5)
+    lease = sample_lease()
     return model.ManagedProcess(
         1,
         identity.stable_key(),
@@ -64,6 +67,7 @@ def sample_process() -> model.ManagedProcess:
         frozenset({identity.stable_key()}),
         observed,
         owner_session_id="session:test_1",
+        owner_generation=model.lease_generation_digest(lease),
     )
 
 
@@ -124,7 +128,9 @@ class FakeProcTree:
         right = raw.rfind(")")
         fields = raw[right + 1 :].strip().split()
         fields[19] = str(value)
-        stat_path.write_text(raw[: right + 1] + " " + " ".join(fields) + "\n", encoding="utf-8")
+        stat_path.write_text(
+            raw[: right + 1] + " " + " ".join(fields) + "\n", encoding="utf-8"
+        )
 
     def rss_kib(self, identity):
         return procfs.LinuxProcfs(self.root, self.boot_id_path).rss_kib(identity)
