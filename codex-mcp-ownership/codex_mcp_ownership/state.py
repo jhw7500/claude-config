@@ -149,6 +149,7 @@ class StateStore:
         self.lock_timeout = converted_timeout
         self._lock_condition = threading.Condition()
         self._lock_owner: int | None = None
+        self._lock_releasing = False
         self._lock_fd: int | None = None
         self._pinned_root_fd: int | None = None
         self._lock_depth = 0
@@ -161,6 +162,7 @@ class StateStore:
         with self._lock_condition:
             return (
                 self._lock_owner == threading.get_ident()
+                and not self._lock_releasing
                 and self._lock_depth > 0
                 and self._pinned_root_fd is not None
             )
@@ -228,7 +230,11 @@ class StateStore:
     def _open_root(self, *, create: bool = False) -> int:
         owner = threading.get_ident()
         with self._lock_condition:
-            if self._lock_owner == owner and self._pinned_root_fd is not None:
+            if (
+                self._lock_owner == owner
+                and not self._lock_releasing
+                and self._pinned_root_fd is not None
+            ):
                 fd = os.dup(self._pinned_root_fd)
                 _validate_directory(os.fstat(fd), self.root)
                 return fd
@@ -345,6 +351,8 @@ class StateStore:
         nested = False
         with self._lock_condition:
             if self._lock_owner == owner:
+                if self._lock_releasing:
+                    raise RuntimeError("state lock is releasing")
                 if self._pinned_root_fd is None or self._lock_depth < 1:
                     raise RuntimeError("invalid reentrant state-lock ownership")
                 self._lock_depth += 1
@@ -394,6 +402,7 @@ class StateStore:
                 with self._lock_condition:
                     if self._lock_owner != owner or self._lock_depth != 1:
                         raise RuntimeError("outer state lock exited with nested ownership")
+                    self._lock_releasing = True
         finally:
             try:
                 if flocked and lock_fd is not None:
@@ -412,6 +421,7 @@ class StateStore:
                                 self._lock_depth = 0
                                 self._lock_fd = None
                                 self._pinned_root_fd = None
+                                self._lock_releasing = False
                                 self._lock_owner = None
                                 self._lock_condition.notify_all()
 

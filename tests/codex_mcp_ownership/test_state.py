@@ -408,6 +408,61 @@ def test_unlock_error_does_not_leave_stale_cross_thread_ownership(tmp_path, monk
     assert errors == []
 
 
+def test_real_unlock_rejects_same_thread_callback_until_release_cleanup(tmp_path, monkeypatch):
+    store = state.StateStore(tmp_path / "state", lock_timeout=1.0)
+    original_flock = state.fcntl.flock
+    callback_done = False
+    callback_errors: list[BaseException] = []
+    contender_errors: list[BaseException] = []
+    contender_started = threading.Event()
+    contender_done = threading.Event()
+    contender_was_blocked: list[bool] = []
+    contender_thread: list[threading.Thread] = []
+
+    callback_lease = sample_lease("session:release-callback")
+    contender_lease = sample_lease("session:release-contender")
+
+    def contend():
+        try:
+            contender_started.set()
+            store.save_session(contender_lease)
+        except BaseException as error:
+            contender_errors.append(error)
+        finally:
+            contender_done.set()
+
+    def injected_flock(fd, operation):
+        nonlocal callback_done
+        result = original_flock(fd, operation)
+        if operation == fcntl.LOCK_UN and not callback_done:
+            callback_done = True
+            try:
+                store.save_session(callback_lease)
+            except BaseException as error:
+                callback_errors.append(error)
+            worker = threading.Thread(target=contend)
+            contender_thread.append(worker)
+            worker.start()
+            assert contender_started.wait(1.0)
+            contender_was_blocked.append(not contender_done.wait(0.05))
+        return result
+
+    monkeypatch.setattr(state.fcntl, "flock", injected_flock)
+    with store.locked():
+        pass
+
+    contender_thread[0].join(1.0)
+    assert contender_was_blocked == [True]
+    assert contender_done.is_set()
+    assert contender_errors == []
+    assert len(callback_errors) == 1
+    assert isinstance(callback_errors[0], RuntimeError)
+
+    final_lease = sample_lease("session:after-release")
+    store.save_session(final_lease)
+    assert set(store.load_sessions()) == {contender_lease, final_lease}
+
+
 @pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf, -0.01])
 def test_lock_timeout_must_be_finite_and_nonnegative(tmp_path, timeout):
     with pytest.raises(ValueError):
