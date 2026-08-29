@@ -2753,6 +2753,280 @@ def test_captured_descendant_migrating_session_receives_exact_pidfd_term(
 
 
 @pytest.mark.parametrize("recovery", ["exit_event", "handler_restore"])
+def test_late_fork_migrated_inside_final_scan_is_anchored_before_reap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recovery: str,
+) -> None:
+    _require_pidfd_signaling()
+    previous = {
+        signum: signal.getsignal(signum) for signum in supervisor._FORWARDED_SIGNALS
+    }
+    original_signal = signal.signal
+    original_popen = subprocess.Popen
+    original_open_owned_pidfd = supervisor._OwnedGroupLifecycle._open_pidfd
+    original_pidfd_send_signal = signal.pidfd_send_signal
+    arm = tmp_path / "scan-migration-arm"
+    release = tmp_path / "scan-migration-release"
+    migrate = tmp_path / "scan-migration-request"
+    descendant_pid = tmp_path / "scan-migration-descendant-pid"
+    descendant_ready = tmp_path / "scan-migration-descendant-ready"
+    descendant_migrated = tmp_path / "scan-migration-descendant-migrated"
+    descendant_term = tmp_path / "scan-migration-descendant-term"
+    leader_exiting = tmp_path / "scan-migration-leader-exiting"
+    descendant_code = (
+        "import os,pathlib,signal,sys,time\n"
+        "pid=pathlib.Path(sys.argv[1])\n"
+        "ready=pathlib.Path(sys.argv[2])\n"
+        "migrate=pathlib.Path(sys.argv[3])\n"
+        "migrated=pathlib.Path(sys.argv[4])\n"
+        "term=pathlib.Path(sys.argv[5])\n"
+        "signal.signal(signal.SIGTERM,lambda *_:(term.write_text('term'),sys.exit(0)))\n"
+        "pid.write_text(str(os.getpid()))\n"
+        "ready.write_text('ready')\n"
+        "while not migrate.exists(): time.sleep(.01)\n"
+        "os.setsid()\n"
+        "migrated.write_text('migrated')\n"
+        "time.sleep(30)\n"
+    )
+    leader_code = (
+        "import pathlib,subprocess,sys,time\n"
+        "release=pathlib.Path(sys.argv[1])\n"
+        "ready=pathlib.Path(sys.argv[4])\n"
+        "exiting=pathlib.Path(sys.argv[8])\n"
+        "while not release.exists(): time.sleep(.01)\n"
+        "subprocess.Popen([sys.executable,'-c',sys.argv[2],*sys.argv[3:8]],"
+        "close_fds=True)\n"
+        "while not ready.exists(): time.sleep(.01)\n"
+        "exiting.write_text('exiting')\n"
+    )
+    leader_handles: list[tuple[model.ProcessIdentity, int]] = []
+    descendant_handles: list[tuple[model.ProcessIdentity, int]] = []
+    children: list[subprocess.Popen[bytes]] = []
+    armed_snapshots = 0
+    released = False
+    inside_strict_scan = False
+    migration_requested = False
+    candidate_stat: procfs.ProcStat | None = None
+    exact_observations: list[model.ProcessIdentity] = []
+    anchor_returncodes: list[int | None] = []
+    supervisor_descendant_pidfds: set[int] = set()
+    supervisor_pidfd_terms: list[int] = []
+
+    def capture_fixture(*args, **kwargs):
+        child = original_popen(*args, **kwargs)
+        children.append(child)
+        deadline = time.monotonic() + 2.0
+        while True:
+            identity = procfs.LinuxProcfs().identity(child.pid)
+            if identity is not None:
+                pidfd = _open_exact_pidfd(identity)
+                if pidfd is not None:
+                    leader_handles.append((identity, pidfd))
+                    break
+            assert child.poll() is None
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        return child
+
+    class MigrateInsideStrictScanProcfs(procfs.LinuxProcfs):
+        def group_members(self, pgid: int):
+            nonlocal armed_snapshots, released
+            snapshot = super().group_members(pgid)
+            if arm.exists():
+                armed_snapshots += 1
+            if armed_snapshots == 2 and not released:
+                released = True
+                release.write_text("release", encoding="utf-8")
+                deadline = time.monotonic() + 4.0
+                while not descendant_ready.exists() or not leader_exiting.exists():
+                    assert time.monotonic() < deadline
+                    time.sleep(0.01)
+                identity = self.identity(
+                    int(descendant_pid.read_text(encoding="utf-8"))
+                )
+                while identity is None or not descendant_handles:
+                    if identity is not None:
+                        pidfd = _open_exact_pidfd(identity)
+                        if pidfd is not None:
+                            descendant_handles.append((identity, pidfd))
+                            break
+                    assert time.monotonic() < deadline
+                    time.sleep(0.01)
+                    identity = self.identity(
+                        int(descendant_pid.read_text(encoding="utf-8"))
+                    )
+            return snapshot
+
+        def _read_text(self, path: Path) -> str:
+            nonlocal candidate_stat
+            raw = super()._read_text(path)
+            if (
+                inside_strict_scan
+                and descendant_pid.exists()
+                and path
+                == self.proc_root
+                / descendant_pid.read_text(encoding="utf-8").strip()
+                / "stat"
+                and candidate_stat is None
+            ):
+                candidate_stat = procfs.parse_stat(raw)
+            return raw
+
+        def observe_identity(self, pid: int):
+            nonlocal migration_requested
+            if (
+                inside_strict_scan
+                and descendant_pid.exists()
+                and pid == int(descendant_pid.read_text(encoding="utf-8"))
+                and not migration_requested
+            ):
+                assert candidate_stat is not None
+                migration_requested = True
+                migrate.write_text("migrate", encoding="utf-8")
+                deadline = time.monotonic() + 4.0
+                while not descendant_migrated.exists():
+                    assert time.monotonic() < deadline
+                    time.sleep(0.01)
+                observation = super().observe_identity(pid)
+                assert observation.kind == "live"
+                assert observation.identity is not None
+                exact_observations.append(observation.identity)
+                return observation
+            return super().observe_identity(pid)
+
+        def observe_group_members(self, pgid: int):
+            nonlocal inside_strict_scan
+            assert children and children[0].returncode is None
+            inside_strict_scan = True
+            try:
+                return super().observe_group_members(pgid)
+            finally:
+                inside_strict_scan = False
+
+    def track_owned_pidfd(
+        lifecycle: supervisor._OwnedGroupLifecycle,
+        identity: model.ProcessIdentity,
+    ) -> None:
+        key = identity.stable_key()
+        was_anchored = key in lifecycle.pidfds
+        original_open_owned_pidfd(lifecycle, identity)
+        if (
+            not was_anchored
+            and descendant_handles
+            and key == descendant_handles[0][0].stable_key()
+            and key in lifecycle.pidfds
+        ):
+            pidfd = lifecycle.pidfds[key]
+            supervisor_descendant_pidfds.add(pidfd)
+            anchor_returncodes.append(lifecycle.child.returncode)
+
+    def record_pidfd_term(pidfd, signum, siginfo, flags):
+        if pidfd in supervisor_descendant_pidfds and signum == signal.SIGTERM:
+            supervisor_pidfd_terms.append(pidfd)
+        return original_pidfd_send_signal(pidfd, signum, siginfo, flags)
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", capture_fixture)
+    monkeypatch.setattr(
+        supervisor._OwnedGroupLifecycle,
+        "_open_pidfd",
+        track_owned_pidfd,
+    )
+    monkeypatch.setattr(supervisor.signal, "pidfd_send_signal", record_pidfd_term)
+    store = state.StateStore(tmp_path / "state")
+    if recovery == "exit_event":
+        original_append = store.append_event
+
+        def fail_exit_event(event: dict[str, object]) -> None:
+            if event.get("event") == "supervisor_child_exited":
+                raise OSError("exit-event-secret")
+            original_append(event)
+
+        monkeypatch.setattr(store, "append_event", fail_exit_event)
+    else:
+        restore_failed = False
+
+        def fail_first_restore(signum, handler):
+            nonlocal restore_failed
+            if handler == previous[signum] and not restore_failed:
+                restore_failed = True
+                raise OSError("restore-secret")
+            return original_signal(signum, handler)
+
+        monkeypatch.setattr(supervisor.signal, "signal", fail_first_restore)
+
+    def arm_before_wait(delay: float) -> None:
+        if delay == 0.8:
+            arm.write_text("armed", encoding="utf-8")
+
+    try:
+        result = supervisor.run_supervisor(
+            supervisor.SupervisorRequest(
+                "user",
+                "fake",
+                sys.executable,
+                (
+                    "-c",
+                    leader_code,
+                    str(release),
+                    descendant_code,
+                    str(descendant_pid),
+                    str(descendant_ready),
+                    str(migrate),
+                    str(descendant_migrated),
+                    str(descendant_term),
+                    str(leader_exiting),
+                ),
+                str(tmp_path),
+            ),
+            store,
+            MigrateInsideStrictScanProcfs(),
+            FakeClock(boot=100.0),
+            sleeper=arm_before_wait,
+        )
+        captured = capsys.readouterr()
+        assert result == 0
+        assert len(descendant_handles) == 1
+        assert candidate_stat is not None
+        assert len(exact_observations) == 1
+        exact = exact_observations[0]
+        assert (candidate_stat.pid, candidate_stat.start_ticks) == (
+            exact.pid,
+            exact.start_ticks,
+        )
+        assert candidate_stat.pgid != exact.pgid
+        assert anchor_returncodes == [None]
+        assert supervisor_pidfd_terms
+        records = store.load_processes()
+        assert len(records) == 1
+        assert exact in records[0].members
+        assert descendant_term.read_text(encoding="utf-8") == "term"
+        _wait_exact_identity_gone(exact)
+        expected_reason = "state_exit_failed" if recovery == "exit_event" else None
+        if expected_reason is None:
+            assert captured.err == ""
+        else:
+            assert captured.err == (
+                f"codex-mcp-supervisor: server=fake reason={expected_reason}\n"
+            )
+        assert "secret" not in captured.err
+    finally:
+        for signum, handler in previous.items():
+            original_signal(signum, handler)
+        fixture_handles = [*leader_handles, *descendant_handles]
+        try:
+            _signal_exact_pidfds(fixture_handles, signal.SIGTERM)
+            for child in children:
+                child.wait(timeout=2.0)
+            for identity, _ in fixture_handles:
+                _wait_exact_identity_gone(identity)
+        finally:
+            for _, pidfd in reversed(fixture_handles):
+                os.close(pidfd)
+
+
+@pytest.mark.parametrize("recovery", ["exit_event", "handler_restore"])
 @pytest.mark.parametrize("first_final_kind", ["unavailable", "partial"])
 def test_late_fork_is_captured_before_reap_for_recovery(
     tmp_path: Path,

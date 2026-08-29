@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 import pytest
@@ -241,6 +242,82 @@ def test_strict_group_observation_reports_partial_exact_member(
     assert [identity.pid for identity in observation.members] == [321]
     assert observation.unavailable_pids == (322,)
     assert [identity.pid for identity in tree.group_members(321)] == [321, 322]
+
+
+def test_strict_group_observation_keeps_same_identity_migrated_during_scan(
+    fake_proc,
+    monkeypatch,
+):
+    write_proc_entry(
+        fake_proc.root,
+        322,
+        "322 (node) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 22 0 0\n",
+        fake_proc.exe,
+    )
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    original_observe = tree.observe_identity
+    candidate = original_observe(322).identity
+    assert candidate is not None
+
+    def migrate_before_exact_observation(pid):
+        if pid == 322:
+            write_proc_entry(
+                fake_proc.root,
+                322,
+                "322 (node) S 1 999 999 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 22 0 0\n",
+                fake_proc.exe,
+            )
+        return original_observe(pid)
+
+    monkeypatch.setattr(tree, "observe_identity", migrate_before_exact_observation)
+
+    observation = tree.observe_group_members(321)
+
+    migrated = next(member for member in observation.members if member.pid == 322)
+    assert observation.kind == "complete"
+    assert (migrated.pid, migrated.start_ticks) == (
+        candidate.pid,
+        candidate.start_ticks,
+    )
+    assert migrated.pgid == 999
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement_value"),
+    (("pid", 999), ("start_ticks", 23)),
+)
+def test_strict_group_observation_retries_unbound_exact_identity(
+    fake_proc,
+    monkeypatch,
+    field,
+    replacement_value,
+):
+    write_proc_entry(
+        fake_proc.root,
+        322,
+        "322 (node) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 22 0 0\n",
+        fake_proc.exe,
+    )
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    original_observe = tree.observe_identity
+    exact = original_observe(322).identity
+    assert exact is not None
+
+    def replaced_before_exact_observation(pid):
+        if pid == 322:
+            return procfs.IdentityObservation(
+                "live",
+                replace(exact, **{field: replacement_value}),
+            )
+        return original_observe(pid)
+
+    monkeypatch.setattr(tree, "observe_identity", replaced_before_exact_observation)
+
+    observation = tree.observe_group_members(321)
+
+    assert observation.kind == "partial"
+    assert [identity.pid for identity in observation.members] == [321]
+    assert observation.unavailable_pids == (322,)
 
 
 def test_rss_kib_reads_only_vmrss_and_revalidates_identity(fake_proc):

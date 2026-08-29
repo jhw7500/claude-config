@@ -228,8 +228,15 @@ class LinuxProcfs:
             if observation.kind != "live" or observation.identity is None:
                 unavailable_pids.append(pid)
                 continue
-            if observation.identity.pgid == pgid:
-                members.append(observation.identity)
+            identity = observation.identity
+            if not isinstance(identity, ProcessIdentity) or (
+                identity.pid,
+                identity.start_ticks,
+            ) != (stat.pid, stat.start_ticks):
+                unavailable_pids.append(pid)
+                continue
+            # The candidate stat established ownership before this exact read.
+            members.append(identity)
         if enumeration_unavailable:
             kind: Literal["complete", "partial", "unavailable"] = "unavailable"
         elif unavailable_pids:
