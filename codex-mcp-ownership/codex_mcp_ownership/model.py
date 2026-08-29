@@ -368,3 +368,32 @@ class AuditSnapshot:
     rss_kib: int
     ownership_coverage: tuple[tuple[str, int], ...]
     corrupt_count: int
+
+
+@dataclass(frozen=True)
+class CleanupAction:
+    process_key: str
+    identity: ProcessIdentity
+    classification_state: str
+    reason_codes: tuple[str, ...]
+    force: bool = False
+
+
+@dataclass(frozen=True)
+class CleanupOutcome:
+    action: CleanupAction
+    status: Literal["terminated", "survived", "skipped"]
+    reason: str
+
+
+@dataclass(frozen=True)
+class CleanupReport:
+    before_count: int
+    before_rss_kib: int
+    after_count: int
+    after_rss_kib: int
+    attempted: int
+    terminated: int
+    survived: int
+    skipped: int
+    outcomes: tuple[CleanupOutcome, ...]

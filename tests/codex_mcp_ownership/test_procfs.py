@@ -178,6 +178,11 @@ def test_identity_includes_boot_id(fake_proc):
     assert first.stable_key() != second.stable_key()
 
 
+def test_current_boot_id_is_exposed_without_process_lookup(fake_proc):
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    assert tree.boot_id() == "test-boot-id"
+
+
 def test_group_members_ignores_non_numeric_entries_and_returns_live_members(fake_proc):
     write_proc_entry(
         fake_proc.root,

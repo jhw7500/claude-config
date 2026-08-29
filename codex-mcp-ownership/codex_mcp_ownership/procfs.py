@@ -73,6 +73,10 @@ class LinuxProcfs:
             return None
         return boot_id or None
 
+    def boot_id(self) -> str | None:
+        """Return the current kernel boot ID without inspecting a process."""
+        return self._boot_id()
+
     def identity(self, pid: int) -> ProcessIdentity | None:
         if type(pid) is not int or pid < 1:
             return None
