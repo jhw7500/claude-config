@@ -10,11 +10,11 @@ import unicodedata
 from .cleanup import (
     CleanupDeadlineExceeded,
     PidfdSignalBackend,
+    capture_authorized_audit,
     execute_cleanup,
     plan_cleanup,
 )
 from .clock import Clock
-from .classify import build_audit
 from .model import ObservedTime, SessionLease, validate_session_id
 from .procfs import LinuxProcfs
 from .state import StateStore, session_key
@@ -126,29 +126,6 @@ def _same_generation(
     )
 
 
-def _append_event_best_effort(
-    store: StateStore,
-    event: dict[str, object],
-    observed_wall: str,
-) -> None:
-    try:
-        store.append_event(event, maintenance=False)
-    except Exception:
-        try:
-            store.append_event(
-                {
-                    "schema_version": 1,
-                    "event": "hook_event_failed",
-                    "observed_wall": observed_wall,
-                    "state": "unknown",
-                    "reason_codes": ["hook_event_write_failed"],
-                },
-                maintenance=False,
-            )
-        except Exception:
-            pass
-
-
 def _request_cleanup(notifier: SystemdNotifier) -> bool:
     try:
         return notifier.request_cleanup() is True
@@ -181,8 +158,20 @@ def _opportunistic_cleanup_bounded(
         if time.monotonic() >= deadline:
             raise CleanupDeadlineExceeded("fallback deadline exhausted")
 
+    check_deadline()
+    with store.locked(remaining_timeout=_remaining_budget(deadline)):
+        initial_binding = store.root_binding()
+    check_deadline()
     record_count = 0
-    for kind in ("sessions", "processes"):
+    for kind in (
+        "sessions",
+        "processes",
+        "signal-intents",
+        "force-receipts",
+        "event-journal",
+        "event-receipts",
+        "outbox",
+    ):
         check_deadline()
         directory = store.root / kind
         try:
@@ -197,7 +186,15 @@ def _opportunistic_cleanup_bounded(
             _fallback_deferred(store, clock, "record_budget_exhausted", deadline)
             return
     check_deadline()
-    snapshot = build_audit(store, procfs, clock)
+    authority = capture_authorized_audit(
+        store,
+        procfs,
+        clock,
+        expected_root_binding=initial_binding,
+        deadline=deadline,
+        monotonic=time.monotonic,
+    )
+    snapshot = authority.snapshot
     check_deadline()
     if snapshot.corrupt_count:
         return
@@ -233,6 +230,7 @@ def _opportunistic_cleanup_bounded(
         apply=True,
         deadline=deadline,
         monotonic=time.monotonic,
+        authority=authority,
     )
 
 
@@ -305,28 +303,29 @@ def _save_session_milestone(
     lease: SessionLease,
     event: dict[str, object],
 ) -> bool:
-    event_id = store.prepare_transition_event(
-        "sessions",
-        session_key(lease.session_id),
-        expected,
-        lease,
-        event,
-    )
+    binding = store.root_binding()
+    revision = store.ledger_revision()
+    sessions_digest = store.sessions_digest()
     try:
-        store.save_session(lease, maintenance=False)
-    except Exception:
+        store.transition(
+            "sessions",
+            session_key(lease.session_id),
+            expected,
+            lease,
+            event,
+            expected_revision=revision,
+            expected_sessions_digest=sessions_digest,
+            expected_root_binding=binding,
+        )
+    except Exception as error:
         try:
-            store.recover_transition_events()
-            if store.load_session(lease.session_id) == lease:
+            store.validate_root_binding(binding)
+            saved = store.load_session(lease.session_id)
+            if saved == lease:
                 return True
         except Exception:
             pass
-        raise
-    try:
-        store.mark_transition_committed(event_id)
-        store.recover_transition_events()
-    except Exception:
-        pass
+        raise error
     return True
 
 

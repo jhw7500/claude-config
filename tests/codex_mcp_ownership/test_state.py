@@ -784,10 +784,10 @@ def test_quarantine_rename_failure_leaves_single_diagnosable_source(
     make_private_directory(sessions)
     path = sessions / ("a" * 64 + ".json")
     write_private_file(path, b"not-json\n")
-    original = state.os.rename
+    original = state._rename_noreplace
     monkeypatch.setattr(
-        state.os,
-        "rename",
+        state,
+        "_rename_noreplace",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("rename failed")),
     )
 
@@ -796,7 +796,7 @@ def test_quarantine_rename_failure_leaves_single_diagnosable_source(
 
     assert path.exists()
     assert path.stat().st_nlink == 1
-    monkeypatch.setattr(state.os, "rename", original)
+    monkeypatch.setattr(state, "_rename_noreplace", original)
     with pytest.raises(state.StateCorruption) as error:
         store.load_sessions()
     assert error.value.quarantine_path is not None
@@ -902,3 +902,197 @@ def test_huge_integer_record_is_normalized_to_state_corruption(tmp_path):
     write_private_file(target, rendered)
     with pytest.raises(state.StateCorruption):
         state.StateStore(root, read_only=True).load_sessions()
+
+
+def test_transition_rejects_a_same_digest_wrong_target_journal(tmp_path) -> None:
+    store = state.StateStore(tmp_path / "state")
+    intent = model.SignalIntent(
+        1,
+        sample_process().wrapper.stable_key(),
+        "1" * 64,
+        (sample_process().wrapper.stable_key(),),
+        "term",
+        "pending",
+    )
+    store.save_signal_intent(intent)
+
+    with pytest.raises(ValueError, match="transition must change raw state"):
+        store.prepare_transition_event(
+            "signal-intents",
+            intent.process_key,
+            intent,
+            intent,
+            {
+                "schema_version": 1,
+                "event": "cleanup_terminated",
+                "observed_wall": sample_process().spawned.wall_iso,
+                "process_key": intent.process_key,
+                "state": "gone",
+                "reason_codes": ["sigterm_terminated"],
+            },
+        )
+
+
+def test_transition_service_persists_rotation_independent_event_receipt(
+    tmp_path,
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    event = {
+        "schema_version": 1,
+        "event": "owner_loss_observed",
+        "observed_wall": expected.spawned.wall_iso,
+        "process_key": expected.wrapper.stable_key(),
+        "state": "exiting",
+        "reason_codes": ["owner_session_ended"],
+    }
+
+    store.transition(
+        "processes",
+        expected.wrapper.stable_key(),
+        expected,
+        updated,
+        event,
+    )
+
+    receipts = list((store.root / "event-receipts").glob("*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["event"]["event"] == "owner_loss_observed"
+    assert receipt["event"]["event_id"] == receipts[0].stem
+
+
+def test_later_writer_recovers_committed_transition_before_advancing_state(
+    tmp_path, monkeypatch
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    later = replace(updated, exit_code=0)
+    store.save_process(expected)
+    event = {
+        "schema_version": 1,
+        "event": "owner_loss_observed",
+        "observed_wall": expected.spawned.wall_iso,
+        "process_key": expected.wrapper.stable_key(),
+        "state": "exiting",
+        "reason_codes": ["owner_session_ended"],
+    }
+    original_append = store.append_event
+    failed = False
+
+    def fail_once(payload, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("EVENT-CACHE-FAILURE")
+        return original_append(payload, **kwargs)
+
+    monkeypatch.setattr(store, "append_event", fail_once)
+    store.transition(
+        "processes",
+        expected.wrapper.stable_key(),
+        expected,
+        updated,
+        event,
+    )
+    monkeypatch.setattr(store, "append_event", original_append)
+
+    store.save_process(later)
+
+    assert store.load_process(expected.wrapper.stable_key()) == later
+    events = [
+        json.loads(line)
+        for line in (store.root / "events.jsonl").read_text().splitlines()
+    ]
+    assert [item["event"] for item in events] == ["owner_loss_observed"]
+    assert list((store.root / "event-journal").iterdir()) == []
+
+
+def test_corrupt_event_receipt_blocks_recovery_and_later_writer(
+    tmp_path, monkeypatch
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    later = replace(updated, exit_code=0)
+    store.save_process(expected)
+    event = {
+        "schema_version": 1,
+        "event": "owner_loss_observed",
+        "observed_wall": expected.spawned.wall_iso,
+        "process_key": expected.wrapper.stable_key(),
+        "state": "exiting",
+        "reason_codes": ["owner_session_ended"],
+    }
+
+    original_append = store.append_event
+    monkeypatch.setattr(
+        store,
+        "append_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("CACHE-FAIL")),
+    )
+    store.transition(
+        "processes",
+        expected.wrapper.stable_key(),
+        expected,
+        updated,
+        event,
+    )
+    monkeypatch.setattr(store, "append_event", original_append)
+    receipt = next((store.root / "event-receipts").iterdir())
+    corrupt_receipt = json.loads(receipt.read_text(encoding="utf-8"))
+    del corrupt_receipt["schema_version"]
+    write_private_file(receipt, json.dumps(corrupt_receipt).encode() + b"\n")
+
+    with pytest.raises(state.StateCorruption):
+        store.save_process(later)
+
+    assert store.load_raw_process(expected.wrapper.stable_key()) == updated
+
+
+def test_quarantine_race_cannot_overwrite_a_new_destination(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "state"
+    sessions = root / "sessions"
+    make_private_directory(sessions)
+    target = sessions / (("a" * 64) + ".json")
+    raw = b"{corrupt}\n"
+    write_private_file(target, raw)
+    original_rename = state._rename_noreplace
+    sentinel = b"existing-quarantine-evidence\n"
+    injected = False
+
+    def inject_collision(source_fd, source, destination_fd, destination):
+        nonlocal injected
+        if not injected:
+            fd = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=destination_fd,
+            )
+            try:
+                os.write(fd, sentinel)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            injected = True
+            raise FileExistsError(destination)
+        return original_rename(source_fd, source, destination_fd, destination)
+
+    monkeypatch.setattr(state, "_rename_noreplace", inject_collision)
+
+    with pytest.raises(state.StateCorruption):
+        state.StateStore(root).load_sessions()
+
+    assert injected is True
+    quarantined_files = [
+        path for path in (root / "corrupt").rglob("*") if path.is_file()
+    ]
+    assert any(path.read_bytes() == sentinel for path in quarantined_files)
+    assert any(path.read_bytes() == raw for path in quarantined_files)
+    assert all(path.stat().st_nlink == 1 for path in quarantined_files)

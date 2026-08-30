@@ -5,10 +5,11 @@ from dataclasses import replace
 import hashlib
 import json
 import signal
+import shutil
 
 import pytest
 
-from codex_mcp_ownership import classify, cleanup, model, procfs, state
+from codex_mcp_ownership import classify, cleanup, cli, model, procfs, state
 from helpers import FakeClock, sample_process, write_proc_entry
 
 
@@ -311,6 +312,19 @@ def state_tree(root) -> tuple[tuple[str, bytes | None], ...]:
     )
 
 
+def cleanup_events(store: state.StateStore) -> list[dict[str, object]]:
+    path = store.root / "events.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def cleanup_event(store: state.StateStore, name: str) -> dict[str, object]:
+    matches = [event for event in cleanup_events(store) if event["event"] == name]
+    assert len(matches) == 1
+    return matches[0]
+
+
 def snapshot_for(
     state_name: str,
     *,
@@ -559,28 +573,29 @@ def test_apply_reaudits_under_lock_and_persists_term_survivor(orphan_context) ->
         term_sent_boot=300.0,
         term_sent_keys=frozenset({process.wrapper.stable_key()}),
     )
-    events = [
-        json.loads(line)
-        for line in (store.root / "events.jsonl").read_text().splitlines()
+    events = cleanup_events(store)
+    assert [event["event"] for event in events] == [
+        "cleanup_term_pending",
+        "cleanup_term_delivery_receipt",
+        "cleanup_term_sent",
     ]
-    event_id = events[0].pop("event_id")
+    final = dict(events[-1])
+    event_id = final.pop("event_id")
     assert len(event_id) == 64
-    assert events == [
-        {
-            "event": "cleanup_term_sent",
-            "observed_wall": "2026-08-29T00:00:00+00:00",
-            "process_key": process.wrapper.stable_key(),
-            "reason_codes": [
-                "owner_session_ended",
-                "owner_grace_elapsed",
-                "sigterm_survived",
-            ],
-            "schema_version": 1,
-            "scope": "user",
-            "server": "example",
-            "state": "exiting",
-        }
-    ]
+    assert final == {
+        "event": "cleanup_term_sent",
+        "observed_wall": "2026-08-29T00:00:00+00:00",
+        "process_key": process.wrapper.stable_key(),
+        "reason_codes": [
+            "owner_session_ended",
+            "owner_grace_elapsed",
+            "sigterm_survived",
+        ],
+        "schema_version": 1,
+        "scope": "user",
+        "server": "example",
+        "state": "exiting",
+    }
 
 
 def test_concurrent_stale_supervisor_update_cannot_erase_term_receipt(
@@ -615,17 +630,14 @@ def test_concurrent_stale_supervisor_update_cannot_erase_term_receipt(
     followup = classify.build_audit(store, tree, clock)
     assert followup.classifications[0].state == "exiting"
     assert followup.classifications[0].eligible_term is False
-    events = [
-        json.loads(line)
-        for line in (store.root / "events.jsonl").read_text().splitlines()
-    ]
-    assert [event["event"] for event in events] == ["cleanup_term_sent"]
+    events = cleanup_events(store)
+    assert events[-1]["event"] == "cleanup_term_sent"
 
 
 def test_persistence_conflict_is_journaled_against_separate_intent(
     orphan_context,
 ) -> None:
-    store, _tree, _clock, snapshot, process, lease = orphan_context
+    store, tree, clock, snapshot, process, _lease = orphan_context
     classification = snapshot.classifications[0]
     intent = model.SignalIntent(
         1,
@@ -639,14 +651,33 @@ def test_persistence_conflict_is_journaled_against_separate_intent(
         (),
     )
     store.save_signal_intent(intent)
-
-    cleanup._mark_persistence_conflict(
+    authority = cleanup.capture_authorized_audit(
         store,
-        store.root_token(),
-        classification,
-        lease,
+        tree,
+        clock,
+        expected_root_binding=store.root_binding(),
+    )
+    conflicted = replace(intent, status="conflict")
+
+    revision = cleanup._persist_intent_status(
+        store,
+        authority,
+        authority.revision,
+        intent,
+        conflicted,
+        {
+            "schema_version": 1,
+            "event": "cleanup_state_persistence_conflict",
+            "observed_wall": process.spawned.wall_iso,
+            "server": process.server,
+            "scope": process.scope,
+            "process_key": process.wrapper.stable_key(),
+            "state": "unknown",
+            "reason_codes": ["state_persistence_conflict"],
+        },
     )
 
+    assert revision is not None
     persisted = store.load_signal_intent(process.wrapper.stable_key())
     assert persisted is not None
     assert persisted.status == "conflict"
@@ -839,7 +870,13 @@ def test_audited_root_replacement_with_same_records_has_no_authority(
     orphan_context, tmp_path
 ) -> None:
     store, tree, clock, _snapshot, _process, _lease = orphan_context
-    snapshot, authority = cleanup.capture_authorized_audit(store, tree, clock)
+    authority = cleanup.capture_authorized_audit(
+        store,
+        tree,
+        clock,
+        expected_root_binding=store.root_binding(),
+    )
+    snapshot = authority.snapshot
     records = state_tree(store.root)
     displaced = tmp_path / "audited-root"
     store.root.rename(displaced)
@@ -874,15 +911,26 @@ def test_lexical_rebind_during_intent_save_prevents_delivery(
 ) -> None:
     store, tree, clock, snapshot, _process, _lease = orphan_context
     displaced = tmp_path / "intent-root"
-    original = store.save_signal_intent
+    original = store.transition
+    rebound = False
 
-    def save_then_rebind(intent):
-        revision = original(intent)
-        store.root.rename(displaced)
-        store.root.mkdir(mode=0o700)
+    def save_then_rebind(*args, **kwargs):
+        nonlocal rebound
+        revision = original(*args, **kwargs)
+        updated = args[3]
+        if (
+            not rebound
+            and isinstance(updated, model.SignalIntent)
+            and updated.action == "term"
+            and updated.status == "pending"
+            and not updated.delivered_keys
+        ):
+            store.root.rename(displaced)
+            store.root.mkdir(mode=0o700)
+            rebound = True
         return revision
 
-    monkeypatch.setattr(store, "save_signal_intent", save_then_rebind)
+    monkeypatch.setattr(store, "transition", save_then_rebind)
     signaler = FakeSignalBackend()
     report = cleanup.execute_cleanup(
         cleanup.plan_cleanup(snapshot),
@@ -1035,7 +1083,7 @@ def test_sigterm_process_disappearance_is_immediately_terminated(
     assert report.after_count == 0
     assert report.after_rss_kib == 0
     assert store.load_processes()[0].term_sent_boot is None
-    event = json.loads((store.root / "events.jsonl").read_text())
+    event = cleanup_event(store, "cleanup_terminated")
     assert event["event"] == "cleanup_terminated"
     assert event["state"] == "gone"
 
@@ -1415,14 +1463,21 @@ def test_fallback_deadline_crossed_during_term_intent_starts_no_send(
 ) -> None:
     store, tree, clock, snapshot, _process, _lease = orphan_context
     now = [0.0]
-    original = store.save_signal_intent
+    original = store.transition
 
-    def expire_after_save(intent):
-        result = original(intent)
-        now[0] = 1.0
+    def expire_after_save(*args, **kwargs):
+        result = original(*args, **kwargs)
+        updated = args[3]
+        if (
+            isinstance(updated, model.SignalIntent)
+            and updated.action == "term"
+            and updated.status == "pending"
+            and not updated.delivered_keys
+        ):
+            now[0] = 1.0
         return result
 
-    monkeypatch.setattr(store, "save_signal_intent", expire_after_save)
+    monkeypatch.setattr(store, "transition", expire_after_save)
     signaler = FakeSignalBackend()
     with pytest.raises(cleanup.CleanupDeadlineExceeded):
         cleanup.execute_cleanup(
@@ -1600,7 +1655,13 @@ def test_valid_force_confirmation_sends_only_sigkill(stubborn_context) -> None:
     assert [call for call in signaler.calls if call[0] == "send"] == [
         ("send", process.wrapper.pid + 1000, signal.SIGKILL)
     ]
-    assert store.load_processes()[0] == process
+    assert store.load_raw_processes()[0] == process
+    receipt = store.load_force_intent(process.wrapper.stable_key())
+    assert receipt is not None
+    assert receipt.status == "delivered"
+    assert (
+        cleanup.plan_cleanup(classify.build_audit(store, tree, clock), force=True) == ()
+    )
 
 
 def test_force_expiry_during_pidfd_preparation_prevents_sigkill(
@@ -1865,7 +1926,7 @@ def test_post_signal_unavailable_is_conservative_and_records_no_term_time(
     persisted = store.load_processes()[0]
     assert persisted.term_sent_boot is None
     assert "signal_term_pending" in persisted.owner_reason_codes
-    event = json.loads((store.root / "events.jsonl").read_text())
+    event = cleanup_event(store, "cleanup_signal_indeterminate")
     assert event["event"] == "cleanup_signal_indeterminate"
     assert event["state"] == "unknown"
 
@@ -1898,8 +1959,11 @@ def test_signal_failure_closes_pidfd_once_without_lifecycle_mutation(
         ("send", process.wrapper.pid + 1000, signal.SIGTERM),
         ("close", process.wrapper.pid + 1000),
     ]
-    assert store.load_processes()[0] == process
-    assert not (store.root / "events.jsonl").exists()
+    assert store.load_raw_processes()[0] == process
+    intent = store.load_signal_intent(process.wrapper.stable_key())
+    assert intent is not None
+    assert intent.status == "conflict"
+    assert cleanup_event(store, "cleanup_signal_indeterminate")["state"] == "unknown"
 
 
 def test_force_partial_subtree_survival_is_not_falsely_evented_as_gone(
@@ -1946,7 +2010,7 @@ def test_force_partial_subtree_survival_is_not_falsely_evented_as_gone(
     assert report.attempted == 2
     assert report.terminated == 1
     assert report.survived == 1
-    event = json.loads((store.root / "events.jsonl").read_text())
+    event = cleanup_event(store, "cleanup_force_sent")
     assert event["event"] == "cleanup_force_sent"
     assert event["state"] == "stubborn"
 
@@ -2197,7 +2261,7 @@ def test_invalid_post_term_clock_never_advances_lifecycle_or_force_eligibility(
     persisted = store.load_processes()[0]
     assert persisted.term_sent_boot is None
     assert "signal_term_pending" in persisted.owner_reason_codes
-    event = json.loads((store.root / "events.jsonl").read_text())
+    event = cleanup_event(store, "cleanup_signal_indeterminate")
     assert event["event"] == "cleanup_signal_indeterminate"
     assert expected_reason in event["reason_codes"]
     fresh = classify.build_audit(store, tree, clock)
@@ -2369,7 +2433,7 @@ def test_partial_term_delivery_does_not_make_unsignaled_identity_stubborn(
     assert report.survived == 1
     assert report.skipped == 1
     assert store.load_processes()[0].term_sent_boot is None
-    event = json.loads((store.root / "events.jsonl").read_text())
+    event = cleanup_event(store, "cleanup_signal_indeterminate")
     assert event["event"] == "cleanup_signal_indeterminate"
     assert event["state"] == "unknown"
     assert "partial_signal_delivery" in event["reason_codes"]
@@ -2428,9 +2492,312 @@ def test_partial_term_event_reports_the_actual_failed_identity_outcome(
         identity.stable_key()
         for identity in snapshot.classifications[0].live_identities
     )
-    event = json.loads((store.root / "events.jsonl").read_text())
+    event = cleanup_event(store, "cleanup_signal_indeterminate")
     assert event["event"] == "cleanup_signal_indeterminate"
     assert "partial_signal_delivery" in event["reason_codes"]
     assert failure_reason in event["reason_codes"]
     assert "sigterm_survived" in event["reason_codes"]
     assert "identity_unavailable_after_signal" not in event["reason_codes"]
+
+
+def test_cli_apply_never_recaptures_a_replacement_initial_root(
+    orphan_context, tmp_path, monkeypatch, capsys
+) -> None:
+    store, tree, clock, _snapshot, _process, _lease = orphan_context
+    displaced = tmp_path / "initial-audited-root"
+    original_capture = cli.capture_authorized_audit
+    replaced = False
+
+    def replace_before_authorized_capture(*args, **kwargs):
+        nonlocal replaced
+        if not replaced:
+            store.root.rename(displaced)
+            shutil.copytree(displaced, store.root)
+            replaced = True
+        return original_capture(*args, **kwargs)
+
+    signaler = FakeSignalBackend()
+    monkeypatch.setattr(cli, "_runtime", lambda: (store, tree, clock))
+    monkeypatch.setattr(
+        cli,
+        "capture_authorized_audit",
+        replace_before_authorized_capture,
+    )
+    monkeypatch.setattr(cli, "PidfdSignalBackend", lambda: signaler)
+
+    result = cli._cleanup_command(True, False, None)
+
+    assert result != 0
+    assert [call for call in signaler.calls if call[0] == "send"] == []
+    assert state_tree(store.root) == state_tree(displaced)
+    captured = capsys.readouterr()
+    assert "state unavailable" in captured.err
+
+
+def test_first_loss_cas_rejects_a_competing_full_session_set_revision(
+    tmp_path, fake_proc, monkeypatch
+) -> None:
+    store, tree, process = ended_owner_context_without_first_loss(tmp_path, fake_proc)
+    owner = store.load_sessions()[0]
+    competitor = replace(
+        owner,
+        session_id="session:competing",
+        state="active",
+        ended=None,
+    )
+    original = cleanup._cas_process_and_event
+    inserted = False
+
+    def insert_competitor_then_cas(*args, **kwargs):
+        nonlocal inserted
+        if not inserted:
+            store.save_session(competitor)
+            inserted = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cleanup, "_cas_process_and_event", insert_competitor_then_cas)
+
+    report = cleanup.execute_cleanup(
+        (),
+        store,
+        tree,
+        FakeSignalBackend(),
+        FakeClock(boot=200.0),
+        apply=True,
+    )
+
+    assert report.authority_lost is True
+    assert store.load_process(process.wrapper.stable_key()) == process
+    assert not (store.root / "events.jsonl").exists()
+
+
+def test_delivered_term_receipt_projects_over_the_exact_live_subset(
+    orphan_context,
+) -> None:
+    store, tree, clock, _snapshot, process, _lease = orphan_context
+    missing = replace(process.wrapper, pid=654, start_ticks=6540)
+    expanded = replace(process, members=(process.wrapper, missing))
+    store.save_process(expanded)
+    store.save_signal_intent(
+        model.SignalIntent(
+            1,
+            process.wrapper.stable_key(),
+            process.owner_generation,
+            (process.wrapper.stable_key(),),
+            "term",
+            "delivered",
+            (process.wrapper.stable_key(),),
+            290.0,
+        )
+    )
+
+    snapshot = classify.build_audit(store, tree, clock)
+
+    assert snapshot.classifications[0].state == "stubborn"
+    assert snapshot.classifications[0].eligible_term is False
+    assert cleanup.plan_cleanup(snapshot) == ()
+
+
+@pytest.mark.parametrize("status", ["pending", "conflict", "delivered"])
+def test_force_receipt_terminal_and_ambiguous_states_block_replanning(
+    stubborn_context, status
+) -> None:
+    store, tree, clock, _snapshot, process, _lease, classification = stubborn_context
+    keys = tuple(
+        sorted(identity.stable_key() for identity in classification.live_identities)
+    )
+    store.save_signal_intent(
+        model.SignalIntent(
+            1,
+            process.wrapper.stable_key(),
+            process.owner_generation,
+            keys,
+            "force",
+            status,
+            keys if status == "delivered" else (),
+        )
+    )
+
+    snapshot = classify.build_audit(store, tree, clock)
+
+    assert cleanup.plan_cleanup(snapshot, force=True) == ()
+
+
+def test_force_rejects_a_caller_supplied_subset_before_any_pidfd(
+    stubborn_context,
+) -> None:
+    store, tree, clock, _snapshot, process, _lease, _classification = stubborn_context
+    write_proc_entry(
+        tree.proc_root,
+        654,
+        "654 (second) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 6540 0 0\n",
+        tree.proc_root / "node",
+        "VmRSS:\t48 kB\n",
+    )
+    second = tree.identity(654)
+    assert second is not None
+    expanded = replace(
+        process,
+        members=(process.wrapper, second),
+        term_sent_keys=frozenset({process.wrapper.stable_key(), second.stable_key()}),
+    )
+    store.save_process(expanded)
+    snapshot = classify.build_audit(store, tree, clock)
+    classification = snapshot.classifications[0]
+    token = cleanup.issue_force_token(classification, clock)
+    actions = cleanup.plan_cleanup(snapshot, force=True)
+    signaler = FakeSignalBackend()
+
+    with pytest.raises(cleanup.InvalidForceConfirmation):
+        cleanup.execute_cleanup(
+            actions[:1],
+            store,
+            tree,
+            signaler,
+            clock,
+            apply=True,
+            confirm_token=token,
+        )
+
+    assert signaler.calls == []
+
+
+def test_force_ttl_is_rechecked_after_pending_intent_persistence(
+    stubborn_context, monkeypatch
+) -> None:
+    store, tree, clock, snapshot, _process, _lease, classification = stubborn_context
+    token = cleanup.issue_force_token(classification, clock)
+    original = store.transition
+
+    def expire_after_pending(*args, **kwargs):
+        revision = original(*args, **kwargs)
+        updated = args[3]
+        if (
+            isinstance(updated, model.SignalIntent)
+            and updated.action == "force"
+            and updated.status == "pending"
+            and not updated.delivered_keys
+        ):
+            clock.advance(cleanup.FORCE_TOKEN_TTL_SECONDS + 1.0)
+        return revision
+
+    monkeypatch.setattr(store, "transition", expire_after_pending)
+    signaler = FakeSignalBackend()
+
+    with pytest.raises(cleanup.InvalidForceConfirmation):
+        cleanup.execute_cleanup(
+            cleanup.plan_cleanup(snapshot, force=True),
+            store,
+            tree,
+            signaler,
+            clock,
+            apply=True,
+            confirm_token=token,
+        )
+
+    assert [call for call in signaler.calls if call[0] == "send"] == []
+
+
+def test_malformed_transition_journal_blocks_apply_before_backend_use(
+    orphan_context,
+) -> None:
+    store, tree, clock, snapshot, _process, _lease = orphan_context
+    journal = store.root / "event-journal"
+    journal.mkdir(mode=0o700)
+    malformed = journal / (("a" * 64) + ".json")
+    malformed.write_bytes(b'{"schema_version":1,"phase":"prepared"}\n')
+    malformed.chmod(0o600)
+    signaler = FakeSignalBackend()
+
+    with pytest.raises((state.StateCorruption, state.UnsafeStatePath)):
+        cleanup.execute_cleanup(
+            cleanup.plan_cleanup(snapshot),
+            store,
+            tree,
+            signaler,
+            clock,
+            apply=True,
+        )
+
+    assert signaler.calls == []
+
+
+def test_deadline_stops_classification_before_the_next_observation(
+    orphan_context,
+) -> None:
+    store, tree, clock, _snapshot, process, lease = orphan_context
+    now = [0.0]
+
+    class ExpiringProcfs(ExactProcfs):
+        def __init__(self):
+            super().__init__((process.wrapper,))
+            self.observations = 0
+
+        def observe_identity(self, pid):
+            if now[0] >= 0.5:
+                raise AssertionError("observation started after deadline")
+            self.observations += 1
+            result = super().observe_identity(pid)
+            now[0] = 1.0
+            return result
+
+    expiring = ExpiringProcfs()
+
+    with pytest.raises(cleanup.CleanupDeadlineExceeded):
+        classify.build_audit_from_records(
+            (process,),
+            (lease,),
+            expiring,
+            clock,
+            deadline=0.5,
+            monotonic=lambda: now[0],
+        )
+
+    assert expiring.observations == 1
+
+
+def test_force_deadline_after_first_delivery_is_partial_and_accounts_for_all(
+    stubborn_context,
+) -> None:
+    store, tree, clock, _snapshot, process, _lease, _classification = stubborn_context
+    write_proc_entry(
+        tree.proc_root,
+        654,
+        "654 (second) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 6540 0 0\n",
+        tree.proc_root / "node",
+        "VmRSS:\t48 kB\n",
+    )
+    second = tree.identity(654)
+    assert second is not None
+    expanded = replace(
+        process,
+        members=(process.wrapper, second),
+        term_sent_keys=frozenset({process.wrapper.stable_key(), second.stable_key()}),
+    )
+    store.save_process(expanded)
+    snapshot = classify.build_audit(store, tree, clock)
+    classification = snapshot.classifications[0]
+    token = cleanup.issue_force_token(classification, clock)
+    actions = cleanup.plan_cleanup(snapshot, force=True)
+    now = [0.0]
+    signaler = FakeSignalBackend(
+        on_send=lambda _identity, _signum: now.__setitem__(0, 1.0)
+    )
+
+    report = cleanup.execute_cleanup(
+        actions,
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+        confirm_token=token,
+        deadline=0.5,
+        monotonic=lambda: now[0],
+    )
+
+    assert report.partial_force is True
+    assert report.attempted == 1
+    assert len(report.outcomes) == len(actions)
+    assert report.skipped == len(actions) - 1
+    assert [call[0] for call in signaler.calls].count("send") == 1

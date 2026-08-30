@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import replace
+import ctypes
+from dataclasses import dataclass, replace
 import errno
 import fcntl
 import hashlib
@@ -22,7 +23,12 @@ from .model import ManagedProcess, SessionLease, SignalIntent
 EVENT_LOG_MAX_BYTES = 1_048_576
 EVENT_LOG_BACKUPS = 3
 EVENT_LOG_RETENTION_SECONDS = 2_592_000
+EVENT_RECEIPT_RETENTION = 1_024
+TRANSITION_JOURNAL_LIMIT = 256
+LEGACY_OUTBOX_DRAIN_LIMIT = 64
+LEGACY_OUTBOX_CAPACITY = 256
 TRANSACTION_RETENTION = 3
+STATE_DIRECTORY_MAX_ENTRIES = 4_096
 STATE_RECORD_MAX_BYTES = 1_048_576
 STATE_JSON_MAX_DEPTH = 64
 STATE_JSON_MAX_NODES = 100_000
@@ -64,6 +70,10 @@ class StateLockTimeout(TimeoutError):
     """The state flock could not be acquired before its deadline."""
 
 
+class OperationDeadlineExceeded(RuntimeError):
+    """The absolute deadline expired before the next bounded operation."""
+
+
 class ReadOnlyStateError(PermissionError):
     """A mutation was attempted through an audit-only store."""
 
@@ -82,6 +92,60 @@ class StateCorruption(RuntimeError):
         self.path = path
         self.digest = digest
         self.quarantine_path = quarantine_path
+
+
+@dataclass(frozen=True)
+class RootBinding:
+    root_token: tuple[int, int]
+    parent_token: tuple[int, int]
+    name: str
+
+
+def _deadline_check(
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> None:
+    if deadline is not None and monotonic() >= deadline:
+        raise OperationDeadlineExceeded("operation deadline exhausted")
+
+
+def _remaining_timeout(
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - monotonic())
+
+
+def _bounded_directory_names(
+    directory_fd: int,
+    path: Path,
+    limit: int,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[str, ...]:
+    """Enumerate a private directory with item, time, and memory bounds."""
+    _deadline_check(deadline, monotonic)
+    names: list[str] = []
+    with os.scandir(directory_fd) as entries:
+        iterator = iter(entries)
+        while True:
+            _deadline_check(deadline, monotonic)
+            try:
+                entry = next(iterator)
+            except StopIteration:
+                break
+            _deadline_check(deadline, monotonic)
+            if len(names) >= limit:
+                raise StateCorruption(
+                    path,
+                    hashlib.sha256(b"directory_capacity").hexdigest(),
+                )
+            names.append(entry.name)
+    _deadline_check(deadline, monotonic)
+    return tuple(sorted(names))
 
 
 def session_key(session_id: str) -> str:
@@ -137,20 +201,39 @@ def _validate_file(value: os.stat_result, path: Path) -> None:
         raise UnsafeStatePath(f"state file mode is not 0600: {path}")
 
 
-def _read_all(fd: int) -> bytes:
+def _read_all(
+    fd: int,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    max_bytes: int | None = None,
+) -> bytes:
     chunks: list[bytes] = []
+    total = 0
     while True:
+        _deadline_check(deadline, monotonic)
         chunk = os.read(fd, 131072)
+        _deadline_check(deadline, monotonic)
         if not chunk:
             return b"".join(chunks)
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise ValueError("file exceeds scan limit")
         chunks.append(chunk)
 
 
-def _read_state_record(fd: int) -> bytes:
+def _read_state_record(
+    fd: int,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> bytes:
     chunks: list[bytes] = []
     remaining = STATE_RECORD_MAX_BYTES + 1
     while remaining:
+        _deadline_check(deadline, monotonic)
         chunk = os.read(fd, min(131072, remaining))
+        _deadline_check(deadline, monotonic)
         if not chunk:
             break
         chunks.append(chunk)
@@ -193,6 +276,37 @@ def _write_all(fd: int, data: bytes) -> None:
         if written <= 0:
             raise OSError(errno.EIO, "short state write")
         position += written
+
+
+def _rename_noreplace(
+    source_fd: int,
+    source: str,
+    destination_fd: int,
+    destination: str,
+) -> None:
+    """Use Linux renameat2(RENAME_NOREPLACE) without a replace-capable gap."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_fd,
+        os.fsencode(source),
+        destination_fd,
+        os.fsencode(destination),
+        1,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), destination)
 
 
 class StateStore:
@@ -241,6 +355,69 @@ class StateStore:
             return value.st_dev, value.st_ino
         finally:
             os.close(fd)
+
+    def _open_lexical_parent(self) -> int:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        parent = self.root.parent
+        parts = parent.parts
+        if not parent.is_absolute() or not parts:
+            raise UnsafeStatePath("state root parent must be absolute")
+        try:
+            current_fd = os.open(parts[0], flags)
+        except OSError as error:
+            raise UnsafeStatePath("cannot open filesystem root") from error
+        transferred = False
+        try:
+            for component in parts[1:]:
+                try:
+                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                except OSError as error:
+                    raise UnsafeStatePath(
+                        "cannot safely open state root parent"
+                    ) from error
+                os.close(current_fd)
+                current_fd = next_fd
+            value = os.fstat(current_fd)
+            if not stat.S_ISDIR(value.st_mode):
+                raise UnsafeStatePath("state root parent is not a directory")
+            transferred = True
+            return current_fd
+        finally:
+            if not transferred:
+                os.close(current_fd)
+
+    def root_binding(self) -> RootBinding:
+        """Capture the exact root and its immediate lexical parent/name binding."""
+        parent_fd = self._open_lexical_parent()
+        try:
+            parent = os.fstat(parent_fd)
+            try:
+                root = os.stat(
+                    self.root.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise UnsafeStatePath(
+                    "state root lexical binding is unavailable"
+                ) from error
+            _validate_directory(root, self.root)
+            return RootBinding(
+                (root.st_dev, root.st_ino),
+                (parent.st_dev, parent.st_ino),
+                self.root.name,
+            )
+        finally:
+            os.close(parent_fd)
+
+    def validate_root_binding(self, expected: RootBinding) -> None:
+        if not isinstance(expected, RootBinding) or self.root_binding() != expected:
+            raise UnsafeStatePath("state root lexical binding changed")
 
     def lexical_root_token(self) -> tuple[int, int]:
         """Return the inode currently bound to the configured root pathname."""
@@ -597,6 +774,7 @@ class StateStore:
 
     def _maintenance_locked(self) -> None:
         self._prune_event_backups_locked()
+        self._prune_event_receipts_locked()
         self._prune_transactions_locked()
 
     def ledger_revision(self) -> int:
@@ -688,6 +866,36 @@ class StateStore:
             os.close(root_fd)
         return revision
 
+    def _save_record_locked(
+        self,
+        kind: str,
+        key: str,
+        payload: dict[str, object],
+        *,
+        maintenance: bool,
+    ) -> int:
+        if not self._owns_lock():
+            raise RuntimeError("state record write requires the state lock")
+        if maintenance:
+            self._maintenance_locked()
+        root_fd = self._open_root()
+        try:
+            directory_fd = self._open_directory(root_fd, kind, create=True)
+            assert directory_fd is not None
+            try:
+                revision = self._bump_ledger_revision_locked()
+                self._atomic_json(
+                    directory_fd,
+                    self.root / kind,
+                    key + ".json",
+                    payload,
+                )
+                return revision
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(root_fd)
+
     def save_session(self, lease: SessionLease, *, maintenance: bool = True) -> None:
         if not isinstance(lease, SessionLease):
             raise TypeError("lease must be a SessionLease")
@@ -695,21 +903,13 @@ class StateStore:
         payload = lease.to_dict()
         self._require_mutable()
         with self.locked():
-            if maintenance:
-                self._maintenance_locked()
-            root_fd = self._open_root()
-            try:
-                directory_fd = self._open_directory(root_fd, "sessions", create=True)
-                assert directory_fd is not None
-                try:
-                    self._bump_ledger_revision_locked()
-                    self._atomic_json(
-                        directory_fd, self.root / "sessions", key + ".json", payload
-                    )
-                finally:
-                    os.close(directory_fd)
-            finally:
-                os.close(root_fd)
+            self._recover_before_write_locked()
+            self._save_record_locked(
+                "sessions",
+                key,
+                payload,
+                maintenance=maintenance,
+            )
 
     def save_process(
         self, process: ManagedProcess, *, maintenance: bool = True
@@ -720,21 +920,13 @@ class StateStore:
         payload = process.to_dict()
         self._require_mutable()
         with self.locked():
-            if maintenance:
-                self._maintenance_locked()
-            root_fd = self._open_root()
-            try:
-                directory_fd = self._open_directory(root_fd, "processes", create=True)
-                assert directory_fd is not None
-                try:
-                    self._bump_ledger_revision_locked()
-                    self._atomic_json(
-                        directory_fd, self.root / "processes", key + ".json", payload
-                    )
-                finally:
-                    os.close(directory_fd)
-            finally:
-                os.close(root_fd)
+            self._recover_before_write_locked()
+            self._save_record_locked(
+                "processes",
+                key,
+                payload,
+                maintenance=maintenance,
+            )
 
     def remove_process(self, process: ManagedProcess | str) -> None:
         key = (
@@ -752,6 +944,7 @@ class StateStore:
         if not self._root_exists():
             return
         with self.locked():
+            self._recover_before_write_locked()
             self._maintenance_locked()
             self._bump_ledger_revision_locked()
             root_fd = self._open_root()
@@ -775,12 +968,41 @@ class StateStore:
             finally:
                 os.close(root_fd)
 
-    def load_sessions(self) -> tuple[SessionLease, ...]:
+    def load_sessions(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> tuple[SessionLease, ...]:
         return self._load_records(
             "sessions",
             SessionLease.from_dict,
             lambda value: session_key(value.session_id),
+            deadline=deadline,
+            monotonic=monotonic,
         )
+
+    def sessions_digest(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> str:
+        _deadline_check(deadline, monotonic)
+        leases = self.load_sessions(deadline=deadline, monotonic=monotonic)
+        _deadline_check(deadline, monotonic)
+        payload = [
+            lease.to_dict()
+            for lease in sorted(leases, key=lambda item: item.session_id)
+        ]
+        rendered = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(rendered).hexdigest()
 
     def load_session(self, session_id: str) -> SessionLease | None:
         """Load only the SHA-256-addressed lease for ``session_id``."""
@@ -796,6 +1018,12 @@ class StateStore:
         return value
 
     def load_process(self, process_key: str) -> ManagedProcess | None:
+        process = self.load_raw_process(process_key)
+        if process is None:
+            return None
+        return self._overlay_signal_intent(process)
+
+    def load_raw_process(self, process_key: str) -> ManagedProcess | None:
         if not isinstance(process_key, str) or len(process_key) != _HEX_DIGEST_LENGTH:
             raise ValueError("invalid process key")
         try:
@@ -811,7 +1039,7 @@ class StateStore:
         if process is None:
             return None
         assert isinstance(process, ManagedProcess)
-        return self._overlay_signal_intent(process)
+        return process
 
     def load_signal_intent(self, process_key: str) -> SignalIntent | None:
         if not _is_hex_digest(process_key):
@@ -837,34 +1065,92 @@ class StateStore:
         assert value is None or isinstance(value, SignalIntent)
         return value
 
+    def load_signal_intents(
+        self,
+        action: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> tuple[SignalIntent, ...]:
+        if action not in {"term", "force"}:
+            raise ValueError("invalid signal intent action")
+        kind = "force-receipts" if action == "force" else "signal-intents"
+        values = self._load_records(
+            kind,
+            SignalIntent.from_dict,
+            lambda item: item.process_key,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        intents = tuple(value for value in values if isinstance(value, SignalIntent))
+        if any(intent.action != action for intent in intents):
+            raise StateCorruption(
+                self.root / kind,
+                hashlib.sha256(b"intent_action_mismatch").hexdigest(),
+            )
+        return intents
+
     def save_signal_intent(self, intent: SignalIntent) -> int:
         if not isinstance(intent, SignalIntent):
             raise TypeError("intent must be a SignalIntent")
-        payload = intent.to_dict()
         directory_name = (
             "force-receipts" if intent.action == "force" else "signal-intents"
         )
         self._require_mutable()
         with self.locked():
-            root_fd = self._open_root()
-            try:
-                directory_fd = self._open_directory(
-                    root_fd, directory_name, create=True
-                )
-                assert directory_fd is not None
-                try:
-                    revision = self._bump_ledger_revision_locked()
-                    self._atomic_json(
-                        directory_fd,
-                        self.root / directory_name,
-                        intent.process_key + ".json",
-                        payload,
-                    )
-                finally:
-                    os.close(directory_fd)
-            finally:
-                os.close(root_fd)
-        return revision
+            self._recover_before_write_locked()
+            existing = (
+                self.load_force_intent(intent.process_key)
+                if intent.action == "force"
+                else self.load_signal_intent(intent.process_key)
+            )
+            merged = self._merge_signal_intent(existing, intent)
+            if merged == existing:
+                return self.ledger_revision()
+            return self._save_record_locked(
+                directory_name,
+                intent.process_key,
+                merged.to_dict(),
+                maintenance=False,
+            )
+
+    @staticmethod
+    def _merge_signal_intent(
+        existing: SignalIntent | None,
+        proposed: SignalIntent,
+    ) -> SignalIntent:
+        if existing is None:
+            return proposed
+        same_authority = bool(
+            existing.process_key == proposed.process_key
+            and existing.owner_generation == proposed.owner_generation
+            and existing.identity_keys == proposed.identity_keys
+            and existing.action == proposed.action
+        )
+        if not same_authority:
+            if existing.action == "force" and existing.delivered_keys:
+                raise ValueError("delivered force receipt cannot be replaced")
+            return proposed
+        delivered = tuple(
+            sorted(set(existing.delivered_keys) | set(proposed.delivered_keys))
+        )
+        if existing.status in {"delivered", "conflict"}:
+            status = existing.status
+        else:
+            status = proposed.status
+        term_sent_boot = None
+        if status == "delivered" and proposed.action == "term":
+            term_sent_boot = (
+                existing.term_sent_boot
+                if existing.term_sent_boot is not None
+                else proposed.term_sent_boot
+            )
+        return replace(
+            existing,
+            status=status,
+            delivered_keys=delivered,
+            term_sent_boot=term_sent_boot,
+        )
 
     def remove_signal_intent(self, process_key: str, *, action: str = "term") -> int:
         if not _is_hex_digest(process_key):
@@ -874,6 +1160,7 @@ class StateStore:
         directory_name = "force-receipts" if action == "force" else "signal-intents"
         self._require_mutable()
         with self.locked():
+            self._recover_before_write_locked()
             root_fd = self._open_root()
             try:
                 directory_fd = self._open_directory(
@@ -896,39 +1183,62 @@ class StateStore:
 
     def _overlay_signal_intent(self, process: ManagedProcess) -> ManagedProcess:
         intent = self.load_signal_intent(process.wrapper.stable_key())
-        if (
-            intent is None
-            or intent.action != "term"
-            or process.owner_generation is None
-            or intent.owner_generation != process.owner_generation
-        ):
-            return process
         recorded_keys = {
             process.wrapper.stable_key(),
             *(member.stable_key() for member in process.members),
         }
         if process.child is not None:
             recorded_keys.add(process.child.stable_key())
-        if frozenset(intent.identity_keys) != frozenset(recorded_keys):
-            return process
-        keys = frozenset(intent.identity_keys)
-        if intent.status == "delivered" and intent.term_sent_boot is not None:
-            return replace(
-                process,
-                term_sent_boot=intent.term_sent_boot,
-                term_sent_keys=keys,
-                owner_reason_codes=tuple(
-                    reason
-                    for reason in process.owner_reason_codes
-                    if reason != "signal_term_pending"
-                ),
+        if (
+            intent is not None
+            and intent.action == "term"
+            and process.owner_generation is not None
+            and intent.owner_generation == process.owner_generation
+            and frozenset(intent.identity_keys).issubset(recorded_keys)
+        ):
+            keys = frozenset(
+                intent.delivered_keys
+                if intent.status == "delivered"
+                else intent.identity_keys
             )
+            if intent.status == "delivered" and intent.term_sent_boot is not None:
+                process = replace(
+                    process,
+                    term_sent_boot=intent.term_sent_boot,
+                    term_sent_keys=keys,
+                    owner_reason_codes=tuple(
+                        reason
+                        for reason in process.owner_reason_codes
+                        if reason != "signal_term_pending"
+                    ),
+                )
+            else:
+                process = replace(
+                    process,
+                    term_sent_boot=None,
+                    term_sent_keys=keys,
+                    owner_reason_codes=tuple(
+                        dict.fromkeys(
+                            process.owner_reason_codes + ("signal_term_pending",)
+                        )
+                    ),
+                )
+        force = self.load_force_intent(process.wrapper.stable_key())
+        if (
+            force is None
+            or process.owner_generation is None
+            or force.owner_generation != process.owner_generation
+        ):
+            return process
+        force_reason = {
+            "pending": "signal_force_pending",
+            "conflict": "signal_force_conflict",
+            "delivered": "signal_force_delivered",
+        }[force.status]
         return replace(
             process,
-            term_sent_boot=None,
-            term_sent_keys=keys,
             owner_reason_codes=tuple(
-                dict.fromkeys(process.owner_reason_codes + ("signal_term_pending",))
+                dict.fromkeys(process.owner_reason_codes + (force_reason,))
             ),
         )
 
@@ -1011,33 +1321,81 @@ class StateStore:
         finally:
             os.close(root_fd)
 
-    def load_processes(self) -> tuple[ManagedProcess, ...]:
+    def load_processes(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> tuple[ManagedProcess, ...]:
+        return tuple(
+            self._overlay_signal_intent(process)
+            for process in self.load_raw_processes(
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+        )
+
+    def load_raw_processes(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> tuple[ManagedProcess, ...]:
         records = self._load_records(
             "processes",
             ManagedProcess.from_dict,
             lambda value: value.wrapper.stable_key(),
+            deadline=deadline,
+            monotonic=monotonic,
         )
-        return tuple(self._overlay_signal_intent(process) for process in records)
+        return tuple(records)
 
     def _load_records(
         self,
         kind: str,
         parser: Callable[[object], _Record],
         key_for: Callable[[_Record], str],
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> tuple[_Record, ...]:
+        _deadline_check(deadline, monotonic)
         if not self._root_exists():
             return ()
         if self.read_only:
-            return self._load_records_locked_or_read_only(kind, parser, key_for)
-        with self.locked():
-            return self._load_records_locked_or_read_only(kind, parser, key_for)
+            return self._load_records_locked_or_read_only(
+                kind,
+                parser,
+                key_for,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+        lock = (
+            self.locked()
+            if deadline is None
+            else self.locked(
+                remaining_timeout=_remaining_timeout(deadline, monotonic),
+            )
+        )
+        with lock:
+            return self._load_records_locked_or_read_only(
+                kind,
+                parser,
+                key_for,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
 
     def _load_records_locked_or_read_only(
         self,
         kind: str,
         parser: Callable[[object], _Record],
         key_for: Callable[[_Record], str],
+        *,
+        deadline: float | None,
+        monotonic: Callable[[], float],
     ) -> tuple[_Record, ...]:
+        _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
         try:
             directory_fd = self._open_directory(root_fd, kind, create=False)
@@ -1045,14 +1403,29 @@ class StateStore:
                 return ()
             try:
                 records: list[_Record] = []
-                for name in sorted(os.listdir(directory_fd)):
+                names = _bounded_directory_names(
+                    directory_fd,
+                    self.root / kind,
+                    STATE_DIRECTORY_MAX_ENTRIES,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+                for name in names:
+                    _deadline_check(deadline, monotonic)
                     path = self.root / kind / name
                     fd = self._open_private_file(directory_fd, name, path)
                     try:
-                        raw = _read_state_record(fd)
+                        raw = _read_state_record(
+                            fd,
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        )
                     except (ValueError, OverflowError, RecursionError):
+                        _deadline_check(deadline, monotonic)
                         os.lseek(fd, 0, os.SEEK_SET)
+                        _deadline_check(deadline, monotonic)
                         raw = os.read(fd, STATE_RECORD_MAX_BYTES + 1)
+                        _deadline_check(deadline, monotonic)
                     finally:
                         os.close(fd)
                     digest = hashlib.sha256(raw).hexdigest()
@@ -1081,6 +1454,7 @@ class StateStore:
                             path, digest, quarantine_path=quarantine
                         ) from None
                     records.append(record)
+                    _deadline_check(deadline, monotonic)
                 return tuple(records)
             finally:
                 os.close(directory_fd)
@@ -1105,17 +1479,9 @@ class StateStore:
             for _attempt in range(16):
                 candidate = f"{kind}-{digest}-{secrets.token_hex(8)}.json"
                 try:
-                    os.stat(candidate, dir_fd=quarantine_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    pass
-                else:
+                    _rename_noreplace(source_fd, name, quarantine_fd, candidate)
+                except FileExistsError:
                     continue
-                os.rename(
-                    name,
-                    candidate,
-                    src_dir_fd=source_fd,
-                    dst_dir_fd=quarantine_fd,
-                )
                 destination = candidate
                 break
             if not destination:
@@ -1208,6 +1574,8 @@ class StateStore:
         updated_payload = updated.to_dict()
         expected_digest = hashlib.sha256(_canonical_json(expected_payload)).hexdigest()
         updated_digest = hashlib.sha256(_canonical_json(updated_payload)).hexdigest()
+        if expected_digest == updated_digest:
+            raise ValueError("transition must change raw state")
         event_id = hashlib.sha256(
             _canonical_json(
                 {
@@ -1232,88 +1600,495 @@ class StateStore:
         }
         self._require_mutable()
         with self.locked():
-            root_fd = self._open_root()
-            try:
-                directory_fd = self._open_directory(
-                    root_fd, "event-journal", create=True
-                )
-                assert directory_fd is not None
-                try:
-                    self._atomic_json(
-                        directory_fd,
-                        self.root / "event-journal",
-                        event_id + ".json",
-                        journal,
-                    )
-                finally:
-                    os.close(directory_fd)
-            finally:
-                os.close(root_fd)
+            self._recover_before_write_locked()
+            self._write_transition_journal_locked(event_id, journal)
         return event_id
+
+    def transition(
+        self,
+        record_kind: str,
+        record_key: str,
+        expected: SessionLease | ManagedProcess | SignalIntent | None,
+        updated: SessionLease | ManagedProcess | SignalIntent,
+        event: dict[str, object],
+        *,
+        expected_revision: int | None = None,
+        expected_sessions_digest: str | None = None,
+        expected_root_binding: RootBinding | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        before_effect: Callable[[], None] | None = None,
+        effect: Callable[[], None] | None = None,
+    ) -> int:
+        """Commit one exact raw-state mutation and its logical event receipt."""
+        _deadline_check(deadline, monotonic)
+        self._require_mutable()
+        root_token = (
+            None if expected_root_binding is None else expected_root_binding.root_token
+        )
+        with self.locked(
+            expected_root_token=root_token,
+            remaining_timeout=_remaining_timeout(deadline, monotonic),
+        ):
+            self._recover_before_write_locked(deadline, monotonic)
+            _deadline_check(deadline, monotonic)
+            self._validate_transition_authority_locked(
+                record_kind,
+                record_key,
+                expected,
+                expected_revision,
+                expected_sessions_digest,
+                expected_root_binding,
+                deadline,
+                monotonic,
+            )
+            if isinstance(updated, SignalIntent):
+                existing_intent = (
+                    expected if isinstance(expected, SignalIntent) else None
+                )
+                if self._merge_signal_intent(existing_intent, updated) != updated:
+                    raise UnsafeStatePath("signal intent transition is not monotonic")
+            event_id, journal = self._build_transition_journal(
+                record_kind,
+                record_key,
+                expected,
+                updated,
+                event,
+            )
+            self._write_transition_journal_locked(event_id, journal)
+            _deadline_check(deadline, monotonic)
+            self._validate_transition_authority_locked(
+                record_kind,
+                record_key,
+                expected,
+                expected_revision,
+                expected_sessions_digest,
+                expected_root_binding,
+                deadline,
+                monotonic,
+            )
+            try:
+                if before_effect is not None:
+                    before_effect()
+                    _deadline_check(deadline, monotonic)
+                if effect is not None:
+                    effect()
+            except Exception:
+                self._recover_known_transition_locked(
+                    event_id,
+                    journal,
+                    materialize_existing=False,
+                )
+                raise
+            try:
+                revision = self._write_transition_record_locked(
+                    record_kind,
+                    record_key,
+                    updated,
+                )
+            except Exception:
+                recovery_failed = False
+                try:
+                    self._recover_known_transition_locked(
+                        event_id,
+                        journal,
+                        materialize_existing=False,
+                    )
+                except Exception:
+                    recovery_failed = True
+                if (
+                    not recovery_failed
+                    and self._transition_record_locked(record_kind, record_key)
+                    == updated
+                ):
+                    return self.ledger_revision()
+                raise
+            try:
+                self._mark_transition_committed_locked(event_id)
+            except OSError:
+                try:
+                    self._recover_known_transition_locked(
+                        event_id,
+                        journal,
+                        materialize_existing=False,
+                    )
+                except OSError:
+                    pass
+                if self._transition_record_locked(record_kind, record_key) == updated:
+                    return self.ledger_revision()
+                raise
+            try:
+                self._recover_known_transition_locked(
+                    event_id,
+                    journal,
+                    materialize_existing=False,
+                )
+            except OSError:
+                pass
+            return revision
+
+    def _validate_transition_authority_locked(
+        self,
+        record_kind: str,
+        record_key: str,
+        expected: SessionLease | ManagedProcess | SignalIntent | None,
+        expected_revision: int | None,
+        expected_sessions_digest: str | None,
+        expected_root_binding: RootBinding | None,
+        deadline: float | None,
+        monotonic: Callable[[], float],
+    ) -> None:
+        if expected_root_binding is not None:
+            self.validate_root_binding(expected_root_binding)
+        if (
+            expected_revision is not None
+            and self.ledger_revision() != expected_revision
+        ):
+            raise UnsafeStatePath("authorized ledger revision changed")
+        if expected_sessions_digest is not None and (
+            self.sessions_digest(deadline=deadline, monotonic=monotonic)
+            != expected_sessions_digest
+        ):
+            raise UnsafeStatePath("authorized session set changed")
+        current = self._transition_record_locked(record_kind, record_key)
+        if current != expected:
+            raise UnsafeStatePath("transition raw state changed")
+
+    def _build_transition_journal(
+        self,
+        record_kind: str,
+        record_key: str,
+        expected: SessionLease | ManagedProcess | SignalIntent | None,
+        updated: SessionLease | ManagedProcess | SignalIntent,
+        event: dict[str, object],
+    ) -> tuple[str, dict[str, object]]:
+        if record_kind not in {
+            "sessions",
+            "processes",
+            "signal-intents",
+            "force-receipts",
+        }:
+            raise ValueError("invalid transition record kind")
+        event_payload = dict(event)
+        event_payload.pop("event_id", None)
+        expected_payload = None if expected is None else expected.to_dict()
+        updated_payload = updated.to_dict()
+        expected_digest = hashlib.sha256(_canonical_json(expected_payload)).hexdigest()
+        updated_digest = hashlib.sha256(_canonical_json(updated_payload)).hexdigest()
+        if expected_digest == updated_digest:
+            raise ValueError("transition must change raw state")
+        event_id = hashlib.sha256(
+            _canonical_json(
+                {
+                    "record_kind": record_kind,
+                    "record_key": record_key,
+                    "expected_digest": expected_digest,
+                    "updated_digest": updated_digest,
+                    "event": event_payload,
+                }
+            )
+        ).hexdigest()
+        event_payload["event_id"] = event_id
+        return event_id, {
+            "schema_version": 1,
+            "phase": "prepared",
+            "record_kind": record_kind,
+            "record_key": record_key,
+            "expected_digest": expected_digest,
+            "updated_digest": updated_digest,
+            "event_id": event_id,
+            "event": event_payload,
+        }
+
+    def _write_transition_record_locked(
+        self,
+        record_kind: str,
+        record_key: str,
+        updated: SessionLease | ManagedProcess | SignalIntent,
+    ) -> int:
+        if record_kind == "sessions" and isinstance(updated, SessionLease):
+            if session_key(updated.session_id) != record_key:
+                raise ValueError("session transition key mismatch")
+        elif record_kind == "processes" and isinstance(updated, ManagedProcess):
+            if updated.wrapper.stable_key() != record_key:
+                raise ValueError("process transition key mismatch")
+        elif record_kind == "signal-intents" and isinstance(updated, SignalIntent):
+            if updated.action != "term" or updated.process_key != record_key:
+                raise ValueError("TERM transition key mismatch")
+        elif record_kind == "force-receipts" and isinstance(updated, SignalIntent):
+            if updated.action != "force" or updated.process_key != record_key:
+                raise ValueError("force transition key mismatch")
+        else:
+            raise ValueError("transition record type mismatch")
+        return self._save_record_locked(
+            record_kind,
+            record_key,
+            updated.to_dict(),
+            maintenance=False,
+        )
+
+    def _transition_record_locked(
+        self,
+        kind: str,
+        key: str,
+    ) -> SessionLease | ManagedProcess | SignalIntent | None:
+        if kind == "sessions":
+            records = self.load_sessions()
+            return next(
+                (item for item in records if session_key(item.session_id) == key),
+                None,
+            )
+        if kind == "processes":
+            return self.load_raw_process(key)
+        if kind == "signal-intents":
+            return self.load_signal_intent(key)
+        if kind == "force-receipts":
+            return self.load_force_intent(key)
+        raise UnsafeStatePath("invalid journal record kind")
+
+    def _write_transition_journal_locked(
+        self,
+        event_id: str,
+        journal: dict[str, object],
+    ) -> None:
+        if not self._owns_lock():
+            raise RuntimeError("transition journal write requires the state lock")
+        root_fd = self._open_root()
+        try:
+            directory_fd = self._open_directory(root_fd, "event-journal", create=True)
+            assert directory_fd is not None
+            try:
+                names = _bounded_directory_names(
+                    directory_fd,
+                    self.root / "event-journal",
+                    TRANSITION_JOURNAL_LIMIT,
+                )
+                if (
+                    len(names) >= TRANSITION_JOURNAL_LIMIT
+                    and (event_id + ".json") not in names
+                ):
+                    raise StateCorruption(
+                        self.root / "event-journal",
+                        hashlib.sha256(b"journal_capacity").hexdigest(),
+                    )
+                self._atomic_json(
+                    directory_fd,
+                    self.root / "event-journal",
+                    event_id + ".json",
+                    journal,
+                )
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(root_fd)
 
     def mark_transition_committed(self, event_id: str) -> None:
         if not _is_hex_digest(event_id):
             raise ValueError("invalid event ID")
         self._require_mutable()
         with self.locked():
-            journal = self._load_journal_locked(event_id)
-            if journal is None:
-                return
-            journal["phase"] = "committed"
-            root_fd = self._open_root()
-            try:
-                directory_fd = self._open_directory(
-                    root_fd, "event-journal", create=False
-                )
-                assert directory_fd is not None
-                try:
-                    self._atomic_json(
-                        directory_fd,
-                        self.root / "event-journal",
-                        event_id + ".json",
-                        journal,
-                    )
-                finally:
-                    os.close(directory_fd)
-            finally:
-                os.close(root_fd)
+            self._mark_transition_committed_locked(event_id)
 
-    def recover_transition_events(self, limit: int = 64) -> None:
+    def _mark_transition_committed_locked(self, event_id: str) -> None:
+        journal = self._load_journal_locked(event_id)
+        if journal is None:
+            return
+        journal["phase"] = "committed"
+        root_fd = self._open_root()
+        try:
+            directory_fd = self._open_directory(root_fd, "event-journal", create=False)
+            assert directory_fd is not None
+            try:
+                self._atomic_json(
+                    directory_fd,
+                    self.root / "event-journal",
+                    event_id + ".json",
+                    journal,
+                )
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(root_fd)
+
+    def recover_transition_events(
+        self,
+        limit: int = 64,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if type(limit) is not int or limit < 0 or limit > TRANSITION_JOURNAL_LIMIT:
+            raise ValueError("invalid transition recovery limit")
+        _deadline_check(deadline, monotonic)
         self._require_mutable()
-        with self.locked():
-            root_fd = self._open_root()
-            try:
-                directory_fd = self._open_directory(
-                    root_fd, "event-journal", create=False
-                )
-                if directory_fd is None:
-                    return
-                try:
-                    for name in sorted(os.listdir(directory_fd))[:limit]:
-                        if not name.endswith(".json") or not _is_hex_digest(name[:-5]):
-                            raise UnsafeStatePath("invalid event journal entry")
-                        event_id = name[:-5]
-                        journal = self._load_journal_locked(event_id)
-                        if journal is None:
-                            continue
-                        current_digest = self._transition_record_digest_locked(
-                            journal["record_kind"], journal["record_key"]
-                        )
-                        if current_digest == journal["updated_digest"]:
-                            if journal["phase"] == "prepared":
-                                journal["phase"] = "committed"
-                            if not self._event_logged_locked(root_fd, event_id):
-                                self.append_event(journal["event"], maintenance=False)
-                        elif current_digest != journal["expected_digest"]:
-                            pass
-                        os.unlink(name, dir_fd=directory_fd)
-                        os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            finally:
-                os.close(root_fd)
+        with self.locked(
+            remaining_timeout=_remaining_timeout(deadline, monotonic),
+        ):
+            self._recover_transition_events_locked(
+                limit=limit,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
 
-    def _load_journal_locked(self, event_id: str) -> dict[str, object] | None:
+    def _recover_before_write_locked(
+        self,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._recover_transition_events_locked(
+            limit=TRANSITION_JOURNAL_LIMIT,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        self._flush_staged_events_locked(
+            LEGACY_OUTBOX_DRAIN_LIMIT,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+
+    def _recover_transition_events_locked(
+        self,
+        *,
+        limit: int,
+        deadline: float | None,
+        monotonic: Callable[[], float],
+    ) -> None:
+        _deadline_check(deadline, monotonic)
+        root_fd = self._open_root()
+        try:
+            directory_fd = self._open_directory(root_fd, "event-journal", create=False)
+            if directory_fd is None:
+                return
+            try:
+                names = _bounded_directory_names(
+                    directory_fd,
+                    self.root / "event-journal",
+                    TRANSITION_JOURNAL_LIMIT,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+                for name in names[:limit]:
+                    _deadline_check(deadline, monotonic)
+                    if not name.endswith(".json") or not _is_hex_digest(name[:-5]):
+                        raise UnsafeStatePath("invalid event journal entry")
+                    event_id = name[:-5]
+                    journal = self._load_journal_locked(
+                        event_id,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    )
+                    if journal is None:
+                        continue
+                    self._recover_one_transition_locked(
+                        root_fd,
+                        directory_fd,
+                        event_id,
+                        journal,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        materialize_existing=True,
+                    )
+                    _deadline_check(deadline, monotonic)
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(root_fd)
+
+    def _recover_one_transition_locked(
+        self,
+        root_fd: int,
+        directory_fd: int,
+        event_id: str,
+        journal: dict[str, object],
+        *,
+        deadline: float | None,
+        monotonic: Callable[[], float],
+        materialize_existing: bool,
+    ) -> bool:
+        """Recover one known journal without enumerating unrelated state."""
+        _deadline_check(deadline, monotonic)
+        current_digest = self._transition_record_digest_locked(
+            journal["record_kind"], journal["record_key"]
+        )
+        _deadline_check(deadline, monotonic)
+        has_receipt = self._event_receipt_exists_locked(
+            root_fd,
+            event_id,
+            journal["event"],
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        committed = bool(
+            journal["phase"] == "committed"
+            or current_digest == journal["updated_digest"]
+            or has_receipt
+        )
+        if committed:
+            created = self._write_event_receipt_locked(
+                root_fd,
+                event_id,
+                journal["event"],
+                self.ledger_revision(),
+            )
+            if created or (
+                materialize_existing
+                and not self._event_logged_locked(
+                    root_fd,
+                    event_id,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+            ):
+                self.append_event(journal["event"], maintenance=False)
+        elif current_digest != journal["expected_digest"]:
+            raise StateCorruption(
+                self.root / "event-journal" / (event_id + ".json"),
+                hashlib.sha256(_canonical_json(journal)).hexdigest(),
+            )
+        os.unlink(event_id + ".json", dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        _deadline_check(deadline, monotonic)
+        return committed
+
+    def _recover_known_transition_locked(
+        self,
+        event_id: str,
+        journal: dict[str, object],
+        *,
+        materialize_existing: bool,
+    ) -> bool:
+        """Finish the active transition without a post-deadline journal scan."""
+        root_fd = self._open_root()
+        try:
+            directory_fd = self._open_directory(root_fd, "event-journal", create=False)
+            if directory_fd is None:
+                raise StateCorruption(
+                    self.root / "event-journal",
+                    hashlib.sha256(b"missing_active_journal").hexdigest(),
+                )
+            try:
+                return self._recover_one_transition_locked(
+                    root_fd,
+                    directory_fd,
+                    event_id,
+                    journal,
+                    deadline=None,
+                    monotonic=time.monotonic,
+                    materialize_existing=materialize_existing,
+                )
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(root_fd)
+
+    def _load_journal_locked(
+        self,
+        event_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> dict[str, object] | None:
+        _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
         try:
             directory_fd = self._open_directory(root_fd, "event-journal", create=False)
@@ -1329,14 +2104,32 @@ class StateStore:
                 except FileNotFoundError:
                     return None
                 try:
-                    raw = _read_state_record(fd)
+                    raw = _read_state_record(
+                        fd,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    )
                 finally:
                     os.close(fd)
             finally:
                 os.close(directory_fd)
         finally:
             os.close(root_fd)
-        payload = json.loads(raw.decode("utf-8"))
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            _validate_json_resources(payload)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            TypeError,
+            OverflowError,
+            RecursionError,
+        ) as error:
+            raise StateCorruption(
+                self.root / "event-journal" / (event_id + ".json"),
+                hashlib.sha256(raw).hexdigest(),
+            ) from error
         required = {
             "schema_version",
             "phase",
@@ -1353,8 +2146,18 @@ class StateStore:
             or payload["schema_version"] != 1
             or payload["phase"] not in {"prepared", "committed"}
             or payload["event_id"] != event_id
+            or payload["record_kind"]
+            not in {"sessions", "processes", "signal-intents", "force-receipts"}
+            or not _is_hex_digest(payload["record_key"])
+            or not _is_hex_digest(payload["expected_digest"])
+            or not _is_hex_digest(payload["updated_digest"])
+            or not isinstance(payload["event"], dict)
+            or payload["event"].get("event_id") != event_id
         ):
-            raise UnsafeStatePath("invalid event journal payload")
+            raise StateCorruption(
+                self.root / "event-journal" / (event_id + ".json"),
+                hashlib.sha256(raw).hexdigest(),
+            )
         return payload
 
     def _transition_record_digest_locked(self, kind: str, key: str) -> str:
@@ -1365,7 +2168,7 @@ class StateStore:
                 None,
             )
         elif kind == "processes":
-            current = self.load_process(key)
+            current = self.load_raw_process(key)
         elif kind == "signal-intents":
             current = self.load_signal_intent(key)
         elif kind == "force-receipts":
@@ -1374,6 +2177,147 @@ class StateStore:
             raise UnsafeStatePath("invalid journal record kind")
         payload = None if current is None else current.to_dict()
         return hashlib.sha256(_canonical_json(payload)).hexdigest()
+
+    def _load_event_receipt_locked(
+        self,
+        root_fd: int,
+        event_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> dict[str, object] | None:
+        _deadline_check(deadline, monotonic)
+        if not _is_hex_digest(event_id):
+            raise UnsafeStatePath("invalid event receipt ID")
+        directory_fd = self._open_directory(root_fd, "event-receipts", create=False)
+        if directory_fd is None:
+            return None
+        try:
+            try:
+                fd = self._open_private_file(
+                    directory_fd,
+                    event_id + ".json",
+                    self.root / "event-receipts" / (event_id + ".json"),
+                )
+            except FileNotFoundError:
+                return None
+            try:
+                raw = _read_state_record(
+                    fd,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+            finally:
+                os.close(fd)
+        finally:
+            os.close(directory_fd)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            _validate_json_resources(payload)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            TypeError,
+            OverflowError,
+            RecursionError,
+        ) as error:
+            raise StateCorruption(
+                self.root / "event-receipts" / (event_id + ".json"),
+                hashlib.sha256(raw).hexdigest(),
+            ) from error
+        required = {
+            "schema_version",
+            "transition_id",
+            "event_id",
+            "committed_revision",
+            "event",
+        }
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != required
+            or payload["schema_version"] != 1
+            or payload["transition_id"] != event_id
+            or payload["event_id"] != event_id
+            or type(payload["committed_revision"]) is not int
+            or payload["committed_revision"] < 0
+            or not isinstance(payload["event"], dict)
+            or payload["event"].get("event_id") != event_id
+        ):
+            raise StateCorruption(
+                self.root / "event-receipts" / (event_id + ".json"),
+                hashlib.sha256(raw).hexdigest(),
+            )
+        return payload
+
+    def _event_receipt_exists_locked(
+        self,
+        root_fd: int,
+        event_id: str,
+        expected_event: object | None = None,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> bool:
+        receipt = self._load_event_receipt_locked(
+            root_fd,
+            event_id,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        if receipt is None:
+            return False
+        if expected_event is not None and receipt["event"] != expected_event:
+            raise StateCorruption(
+                self.root / "event-receipts" / (event_id + ".json"),
+                hashlib.sha256(_canonical_json(receipt)).hexdigest(),
+            )
+        return True
+
+    def _write_event_receipt_locked(
+        self,
+        root_fd: int,
+        event_id: str,
+        event: object,
+        committed_revision: int,
+    ) -> bool:
+        if not _is_hex_digest(event_id) or not isinstance(event, dict):
+            raise StateCorruption(
+                self.root / "event-receipts",
+                hashlib.sha256(b"invalid_event_receipt").hexdigest(),
+            )
+        if event.get("event_id") != event_id:
+            raise StateCorruption(
+                self.root / "event-receipts" / (event_id + ".json"),
+                hashlib.sha256(_canonical_json(event)).hexdigest(),
+            )
+        current = self._load_event_receipt_locked(root_fd, event_id)
+        if current is not None:
+            if current["event"] != event:
+                raise StateCorruption(
+                    self.root / "event-receipts" / (event_id + ".json"),
+                    hashlib.sha256(_canonical_json(current)).hexdigest(),
+                )
+            return False
+        directory_fd = self._open_directory(root_fd, "event-receipts", create=True)
+        assert directory_fd is not None
+        try:
+            receipt = {
+                "schema_version": 1,
+                "transition_id": event_id,
+                "event_id": event_id,
+                "committed_revision": committed_revision,
+                "event": event,
+            }
+            self._atomic_json(
+                directory_fd,
+                self.root / "event-receipts",
+                event_id + ".json",
+                receipt,
+            )
+            return True
+        finally:
+            os.close(directory_fd)
 
     def discard_staged_event(self, event_id: str) -> None:
         if not _is_hex_digest(event_id):
@@ -1396,60 +2340,143 @@ class StateStore:
             finally:
                 os.close(root_fd)
 
-    def flush_staged_events(self, limit: int = 64) -> None:
-        if type(limit) is not int or limit < 0:
+    def flush_staged_events(
+        self,
+        limit: int = LEGACY_OUTBOX_DRAIN_LIMIT,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if type(limit) is not int or limit < 0 or limit > LEGACY_OUTBOX_DRAIN_LIMIT:
             raise ValueError("invalid outbox limit")
+        _deadline_check(deadline, monotonic)
         self._require_mutable()
-        with self.locked():
-            root_fd = self._open_root()
-            try:
-                directory_fd = self._open_directory(root_fd, "outbox", create=False)
-                if directory_fd is None:
-                    return
-                try:
-                    for name in sorted(os.listdir(directory_fd))[:limit]:
-                        if not name.endswith(".json"):
-                            raise UnsafeStatePath("invalid outbox entry")
-                        event_id = name[:-5]
-                        if not _is_hex_digest(event_id):
-                            raise UnsafeStatePath("invalid outbox event ID")
-                        fd = self._open_private_file(
-                            directory_fd,
-                            name,
-                            self.root / "outbox" / name,
-                        )
-                        try:
-                            raw = _read_state_record(fd)
-                        finally:
-                            os.close(fd)
-                        payload = json.loads(raw.decode("utf-8"))
-                        if (
-                            not isinstance(payload, dict)
-                            or payload.get("event_id") != event_id
-                        ):
-                            raise UnsafeStatePath("invalid outbox payload")
-                        if not self._event_logged_locked(root_fd, event_id):
-                            self.append_event(payload, maintenance=False)
-                        os.unlink(name, dir_fd=directory_fd)
-                        os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            finally:
-                os.close(root_fd)
+        with self.locked(
+            remaining_timeout=_remaining_timeout(deadline, monotonic),
+        ):
+            self._flush_staged_events_locked(
+                limit,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
 
-    def _event_logged_locked(self, root_fd: int, event_id: str) -> bool:
+    def _flush_staged_events_locked(
+        self,
+        limit: int,
+        *,
+        deadline: float | None,
+        monotonic: Callable[[], float],
+    ) -> None:
+        _deadline_check(deadline, monotonic)
+        root_fd = self._open_root()
+        try:
+            directory_fd = self._open_directory(root_fd, "outbox", create=False)
+            if directory_fd is None:
+                return
+            try:
+                names = _bounded_directory_names(
+                    directory_fd,
+                    self.root / "outbox",
+                    LEGACY_OUTBOX_CAPACITY,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+                for name in names[:limit]:
+                    _deadline_check(deadline, monotonic)
+                    if not name.endswith(".json"):
+                        raise UnsafeStatePath("invalid outbox entry")
+                    event_id = name[:-5]
+                    if not _is_hex_digest(event_id):
+                        raise UnsafeStatePath("invalid outbox event ID")
+                    fd = self._open_private_file(
+                        directory_fd,
+                        name,
+                        self.root / "outbox" / name,
+                    )
+                    try:
+                        raw = _read_state_record(
+                            fd,
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        )
+                    finally:
+                        os.close(fd)
+                    try:
+                        payload = json.loads(raw.decode("utf-8"))
+                        _validate_json_resources(payload)
+                    except (
+                        UnicodeDecodeError,
+                        json.JSONDecodeError,
+                        ValueError,
+                        TypeError,
+                        OverflowError,
+                        RecursionError,
+                    ) as error:
+                        raise StateCorruption(
+                            self.root / "outbox" / name,
+                            hashlib.sha256(raw).hexdigest(),
+                        ) from error
+                    if (
+                        not isinstance(payload, dict)
+                        or payload.get("event_id") != event_id
+                    ):
+                        raise StateCorruption(
+                            self.root / "outbox" / name,
+                            hashlib.sha256(raw).hexdigest(),
+                        )
+                    self._write_event_receipt_locked(
+                        root_fd,
+                        event_id,
+                        payload,
+                        self.ledger_revision(),
+                    )
+                    if not self._event_logged_locked(
+                        root_fd,
+                        event_id,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    ):
+                        self.append_event(payload, maintenance=False)
+                    os.unlink(name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+                    _deadline_check(deadline, monotonic)
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(root_fd)
+
+    def _event_logged_locked(
+        self,
+        root_fd: int,
+        event_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> bool:
         needle = f'"event_id":"{event_id}"'.encode("ascii")
         for name in ("events.jsonl",) + EVENT_LOG_BACKUP_FILENAMES:
+            _deadline_check(deadline, monotonic)
             try:
                 fd = self._open_private_file(root_fd, name, self.root / name)
             except FileNotFoundError:
                 continue
             try:
-                raw = _read_all(fd)
+                raw = _read_all(
+                    fd,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    max_bytes=EVENT_LOG_MAX_BYTES + STATE_RECORD_MAX_BYTES,
+                )
+            except ValueError as error:
+                raise StateCorruption(
+                    self.root / name,
+                    hashlib.sha256(b"event_log_scan_limit").hexdigest(),
+                ) from error
             finally:
                 os.close(fd)
             if needle in raw:
                 return True
+            _deadline_check(deadline, monotonic)
         return False
 
     def _append_event_locked(self, root_fd: int, record: bytes) -> None:
@@ -1536,6 +2563,62 @@ class StateStore:
                     changed = True
             if changed:
                 os.fsync(root_fd)
+        finally:
+            os.close(root_fd)
+
+    def _prune_event_receipts_locked(self) -> None:
+        if not self._root_exists():
+            return
+        root_fd = self._open_root()
+        try:
+            receipt_fd = self._open_directory(root_fd, "event-receipts", create=False)
+            if receipt_fd is None:
+                return
+            journal_fd = self._open_directory(root_fd, "event-journal", create=False)
+            try:
+                protected = (
+                    set()
+                    if journal_fd is None
+                    else {
+                        name[:-5]
+                        for name in os.listdir(journal_fd)
+                        if name.endswith(".json") and _is_hex_digest(name[:-5])
+                    }
+                )
+                candidates: list[tuple[int, str]] = []
+                for name in os.listdir(receipt_fd):
+                    if not name.endswith(".json") or not _is_hex_digest(name[:-5]):
+                        raise UnsafeStatePath("invalid event receipt entry")
+                    fd = self._open_private_file(
+                        receipt_fd,
+                        name,
+                        self.root / "event-receipts" / name,
+                    )
+                    try:
+                        candidates.append((os.fstat(fd).st_mtime_ns, name))
+                    finally:
+                        os.close(fd)
+                excess = max(0, len(candidates) - EVENT_RECEIPT_RETENTION)
+                changed = False
+                for _mtime, name in sorted(candidates):
+                    if excess == 0:
+                        break
+                    if name[:-5] in protected:
+                        continue
+                    os.unlink(name, dir_fd=receipt_fd)
+                    excess -= 1
+                    changed = True
+                if excess:
+                    raise StateCorruption(
+                        self.root / "event-receipts",
+                        hashlib.sha256(b"receipt_capacity").hexdigest(),
+                    )
+                if changed:
+                    os.fsync(receipt_fd)
+            finally:
+                if journal_fd is not None:
+                    os.close(journal_fd)
+                os.close(receipt_fd)
         finally:
             os.close(root_fd)
 

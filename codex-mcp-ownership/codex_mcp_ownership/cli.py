@@ -257,20 +257,23 @@ def _cleanup_command(apply: bool, force: bool, confirm: str | None) -> int:
     if force and not apply:
         raise _UsageError("force requires apply")
     store, procfs, clock = _runtime()
-    try:
-        audited_root_token = store.root_token()
-    except FileNotFoundError:
-        audited_root_token = None
-    snapshot = build_audit(store, procfs, clock)
-    if snapshot.corrupt_count:
-        if apply and audited_root_token is not None:
-            with store.locked(expected_root_token=audited_root_token):
-                store.load_sessions()
-                store.load_processes()
-        return _diagnostic("state unavailable")
     authority = None
     if apply:
-        snapshot, authority = capture_authorized_audit(store, procfs, clock)
+        try:
+            initial_binding = store.root_binding()
+            authority = capture_authorized_audit(
+                store,
+                procfs,
+                clock,
+                expected_root_binding=initial_binding,
+            )
+        except (FileNotFoundError, UnsafeStatePath, StateCorruption):
+            return _diagnostic("state unavailable")
+        snapshot = authority.snapshot
+    else:
+        snapshot = build_audit(store, procfs, clock)
+    if snapshot.corrupt_count:
+        return _diagnostic("state unavailable")
     actions = (
         select_force_actions(snapshot, confirm, clock)
         if force
@@ -325,7 +328,13 @@ def _cleanup_command(apply: bool, force: bool, confirm: str | None) -> int:
                 sys.stdout.write(
                     f"pid={item.process.wrapper.pid} force_confirmation={token}\n"
                 )
-    return 1 if report.partial_force else 0
+    return (
+        1
+        if report.partial_force
+        or report.authority_lost
+        or not report.after_state_available
+        else 0
+    )
 
 
 def _explain_command(pid: int) -> int:

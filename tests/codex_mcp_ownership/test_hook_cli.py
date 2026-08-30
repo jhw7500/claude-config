@@ -17,7 +17,7 @@ from codex_mcp_ownership.model import (
     SessionLease,
     lease_generation_digest,
 )
-from codex_mcp_ownership.state import StateStore, session_key
+from codex_mcp_ownership.state import StateStore, UnsafeStatePath, session_key
 from codex_mcp_ownership.supervisor import SupervisorRequest
 from helpers import FakeClock, FakeProcTree, make_private_directory, write_private_file
 
@@ -433,8 +433,10 @@ def test_opportunistic_fallback_record_budget_defers_before_audit(
         write_private_file(sessions / f"{index:064x}.json", b"{}\n")
     monkeypatch.setattr(
         hook,
-        "build_audit",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("audit exceeded budget")),
+        "capture_authorized_audit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("audit exceeded budget")
+        ),
     )
 
     hook._opportunistic_cleanup(store, procfs, clock)
@@ -507,7 +509,12 @@ def test_opportunistic_fallback_deadline_after_backend_construction_defers(
         return object()
 
     monkeypatch.setattr(hook, "time", FakeMonotonic)
-    monkeypatch.setattr(hook, "build_audit", lambda *_args: snapshot)
+    authority = type("Authority", (), {"snapshot": snapshot})()
+    monkeypatch.setattr(
+        hook,
+        "capture_authorized_audit",
+        lambda *_args, **_kwargs: authority,
+    )
     monkeypatch.setattr(hook, "plan_cleanup", lambda _snapshot: (object(),))
     monkeypatch.setattr(hook, "PidfdSignalBackend", construct_backend)
     monkeypatch.setattr(
@@ -777,11 +784,22 @@ def test_stalled_cleanup_procfs_does_not_hold_lock_against_session_end(
         def close(self, _pidfd):
             raise AssertionError("active process must not be signaled")
 
-    cleanup_thread = threading.Thread(
-        target=cleanup.execute_cleanup,
-        args=((), store, BlockingProcfs(), NoSignal(), clock),
-        kwargs={"apply": True},
-    )
+    cleanup_errors: list[Exception] = []
+
+    def run_cleanup() -> None:
+        try:
+            cleanup.execute_cleanup(
+                (),
+                store,
+                BlockingProcfs(),
+                NoSignal(),
+                clock,
+                apply=True,
+            )
+        except UnsafeStatePath as error:
+            cleanup_errors.append(error)
+
+    cleanup_thread = threading.Thread(target=run_cleanup)
     cleanup_thread.start()
     assert entered.wait(1.0)
     clock.advance(1.0)
@@ -803,6 +821,7 @@ def test_stalled_cleanup_procfs_does_not_hold_lock_against_session_end(
     release.set()
     cleanup_thread.join(2.0)
     assert not cleanup_thread.is_alive()
+    assert len(cleanup_errors) == 1
 
 
 @pytest.mark.parametrize("stdin", ["{", "[]", "null", "{}", "\n"])
@@ -1133,16 +1152,15 @@ def test_corrupt_apply_root_rebind_quarantines_neither_replacement_ledger(
     write_private_file(audited, b"{audited-corrupt}\n")
     displaced = tmp_path / "audited-root"
     replacement = root / "sessions" / ("b" * 64 + ".json")
-    original_build = cli.build_audit
+    original_capture = cli.capture_authorized_audit
 
-    def audit_then_rebind(*args, **kwargs):
-        snapshot = original_build(*args, **kwargs)
+    def rebind_before_capture(*args, **kwargs):
         root.rename(displaced)
         make_private_directory(root / "sessions")
         write_private_file(replacement, b"{replacement-corrupt}\n")
-        return snapshot
+        return original_capture(*args, **kwargs)
 
-    monkeypatch.setattr(cli, "build_audit", audit_then_rebind)
+    monkeypatch.setattr(cli, "capture_authorized_audit", rebind_before_capture)
     assert cli.main(["cleanup", "--apply"]) != 0
     captured = capsys.readouterr()
 
@@ -1339,3 +1357,49 @@ def test_explain_matches_recorded_child_and_preserves_unavailable_tri_state(
     assert "state=unmanaged" in unavailable.out
     assert "observed=unavailable" in unavailable.out
     assert "state=gone" not in unavailable.out
+
+
+def test_committed_hook_start_still_notifies_and_falls_back_when_recovery_fails(
+    hook_runtime, monkeypatch
+) -> None:
+    runtime, store, _clock, notifier, _procfs = hook_runtime
+    notifier.result = False
+    original_write = store._write_transition_record_locked
+    original_recover = store._recover_transition_events_locked
+    committed = False
+    fallback_calls = []
+
+    def commit_then_report_failure(record_kind, record_key, updated):
+        nonlocal committed
+        revision = original_write(record_kind, record_key, updated)
+        if record_kind == "sessions" and not committed:
+            committed = True
+            raise OSError("COMMITTED-SAVE-CANARY")
+        return revision
+
+    def recovery_fails_after_commit(*args, **kwargs):
+        if committed:
+            raise OSError("RECOVERY-CANARY")
+        return original_recover(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store,
+        "_write_transition_record_locked",
+        commit_then_report_failure,
+    )
+    monkeypatch.setattr(
+        store,
+        "_recover_transition_events_locked",
+        recovery_fails_after_commit,
+    )
+    monkeypatch.setattr(
+        hook,
+        "_opportunistic_cleanup",
+        lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
+    )
+
+    runtime.start(source="SOURCE-CANARY")
+
+    assert store.load_session("thr_123") is not None
+    assert notifier.calls == 1
+    assert len(fallback_calls) == 1

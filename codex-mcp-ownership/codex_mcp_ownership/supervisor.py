@@ -867,22 +867,23 @@ def _persist_terminal_best_effort(
     terminal = _terminal_process(process, disposition, failure_reason)
     try:
         with store.locked():
-            current = store.load_process(process.wrapper.stable_key())
-            if current is not None and (
-                current.wrapper == process.wrapper
-                and current.owner_generation == process.owner_generation
+            current = store.load_raw_process(process.wrapper.stable_key())
+            if current is None or (
+                current.wrapper != process.wrapper
+                or current.owner_generation != process.owner_generation
             ):
-                current_reasons = current.owner_reason_codes
-                if current_reasons == ("association_pending",):
-                    current_reasons = ()
-                terminal = replace(
-                    current,
-                    members=terminal.members,
-                    exit_code=terminal.exit_code,
-                    owner_reason_codes=tuple(
-                        dict.fromkeys(current_reasons + terminal.owner_reason_codes)
-                    ),
-                )
+                return process
+            current_reasons = current.owner_reason_codes
+            if current_reasons == ("association_pending",):
+                current_reasons = ()
+            terminal = replace(
+                current,
+                members=terminal.members,
+                exit_code=terminal.exit_code,
+                owner_reason_codes=tuple(
+                    dict.fromkeys(current_reasons + terminal.owner_reason_codes)
+                ),
+            )
             store.save_process(terminal)
     except BaseException:
         pass
@@ -1009,16 +1010,22 @@ def _run_spawned_child(
     )
     try:
         with store.locked():
-            current = store.load_process(process.wrapper.stable_key())
-            if current is not None and (
-                current.wrapper == process.wrapper
-                and current.owner_generation == process.owner_generation
+            current = store.load_raw_process(process.wrapper.stable_key())
+            if current is None or (
+                current.wrapper != process.wrapper
+                or current.owner_generation != process.owner_generation
             ):
-                updated = replace(
-                    current,
-                    members=updated.members,
-                    exit_code=updated.exit_code,
+                raise _PostSpawnFailure(
+                    "state_exit_conflict",
+                    process,
+                    record_may_exist=record_may_exist,
+                    result=exit_code,
                 )
+            updated = replace(
+                current,
+                members=updated.members,
+                exit_code=updated.exit_code,
+            )
             store.save_process(updated)
             store.append_event(_exit_event(updated, clock.wall_iso()))
         fail_if_forwarding_failed()

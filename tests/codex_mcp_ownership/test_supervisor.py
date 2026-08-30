@@ -14,7 +14,7 @@ import pytest
 
 from codex_mcp_ownership import classify, model, procfs, state, supervisor
 from codex_mcp_ownership.clock import SystemClock
-from helpers import FakeClock
+from helpers import FakeClock, sample_process
 
 
 FAKE_MCP = Path(__file__).with_name("fixtures") / "fake_mcp.py"
@@ -967,6 +967,30 @@ def test_state_failure_after_spawn_reaps_exact_child_and_restores_handlers(
         } == previous
     finally:
         _kill_captured_children(children)
+
+
+def test_stale_terminal_best_effort_never_replaces_a_newer_generation(
+    tmp_path,
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    base = sample_process()
+    stale = replace(base, owner_generation="1" * 64)
+    current = replace(
+        base,
+        owner_generation="2" * 64,
+        owner_reason_codes=("new_generation",),
+    )
+    store.save_process(current)
+
+    supervisor._persist_terminal_best_effort(
+        stale,
+        supervisor._ChildDisposition(23, ()),
+        "state_exit_failed",
+        store,
+        record_may_exist=True,
+    )
+
+    assert store.load_process(base.wrapper.stable_key()) == current
 
 
 def test_state_and_transient_restore_failure_dispose_owned_group_only_once(

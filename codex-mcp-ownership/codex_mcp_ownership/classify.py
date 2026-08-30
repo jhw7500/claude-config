@@ -4,6 +4,8 @@ from dataclasses import replace
 import math
 import os
 from pathlib import Path
+import time
+from typing import Callable
 
 from .clock import Clock
 from .model import (
@@ -17,7 +19,7 @@ from .model import (
     lease_generation_digest,
 )
 from .procfs import IdentityObservation, LinuxProcfs
-from .state import StateCorruption, StateStore
+from .state import OperationDeadlineExceeded, StateCorruption, StateStore
 
 
 ASSOCIATION_WINDOW_SECONDS = 30.0
@@ -32,6 +34,14 @@ _STATE_ORDER = (
     "stubborn",
     "gone",
 )
+
+
+def _deadline_check(
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> None:
+    if deadline is not None and monotonic() >= deadline:
+        raise OperationDeadlineExceeded("audit deadline exhausted")
 
 
 def _owner_host_keys(
@@ -121,10 +131,14 @@ def _recorded_identities(process: ManagedProcess) -> tuple[ProcessIdentity, ...]
 def _observe_process(
     process: ManagedProcess,
     procfs: LinuxProcfs,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[tuple[ProcessIdentity, ...], str | None]:
     live: list[ProcessIdentity] = []
     for expected in _recorded_identities(process):
+        _deadline_check(deadline, monotonic)
         observation = _observe_identity(procfs, expected.pid)
+        _deadline_check(deadline, monotonic)
         if observation.kind == "unavailable":
             return (), "process_identity_unavailable"
         if observation.kind == "missing":
@@ -157,7 +171,10 @@ def _observe_identity(procfs: LinuxProcfs, pid: int) -> IdentityObservation:
 def _host_identity_state(
     procfs: LinuxProcfs,
     owner_host_keys: frozenset[str],
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> str:
+    _deadline_check(deadline, monotonic)
     proc_root = getattr(procfs, "proc_root", None)
     if not isinstance(proc_root, Path):
         return "unavailable"
@@ -169,7 +186,9 @@ def _host_identity_state(
         return "unavailable"
     unavailable = False
     for pid in pids:
+        _deadline_check(deadline, monotonic)
         observation = _observe_identity(procfs, pid)
+        _deadline_check(deadline, monotonic)
         if observation.kind == "unavailable":
             unavailable = True
             continue
@@ -217,7 +236,11 @@ def classify_process(
     procfs: LinuxProcfs,
     now_boot: float,
     grace_seconds: float = OWNER_GRACE_SECONDS,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> Classification:
+    _deadline_check(deadline, monotonic)
     if (
         not _valid_boot_time(now_boot)
         or not math.isfinite(grace_seconds)
@@ -237,7 +260,12 @@ def classify_process(
             ("invalid_lifecycle_time",),
             (),
         )
-    live_identities, identity_error = _observe_process(process, procfs)
+    live_identities, identity_error = _observe_process(
+        process,
+        procfs,
+        deadline,
+        monotonic,
+    )
     if identity_error is not None:
         return _classification(process, "unknown", (identity_error,), ())
     if not live_identities:
@@ -333,6 +361,23 @@ def classify_process(
     first_gone = process.first_owner_gone_boot
     term_sent = process.term_sent_boot
     term_sent_keys = process.term_sent_keys
+    force_receipt_reasons = tuple(
+        reason
+        for reason in process.owner_reason_codes
+        if reason
+        in {
+            "signal_force_pending",
+            "signal_force_conflict",
+            "signal_force_delivered",
+        }
+    )
+    if force_receipt_reasons:
+        return _classification(
+            process,
+            "unknown",
+            force_receipt_reasons,
+            live_identities,
+        )
     if "signal_term_pending" in process.owner_reason_codes:
         return _classification(
             process,
@@ -401,7 +446,12 @@ def classify_process(
     if owner.state == "ended":
         owner_loss_reason = "owner_session_ended"
     else:
-        host_state = _host_identity_state(procfs, _owner_host_keys(process, owner))
+        host_state = _host_identity_state(
+            procfs,
+            _owner_host_keys(process, owner),
+            deadline,
+            monotonic,
+        )
         if host_state == "unavailable":
             return _classification(
                 process,
@@ -439,6 +489,9 @@ def classify_process(
     assert grace_deadline is not None
     if term_sent is not None:
         live_keys = frozenset(identity.stable_key() for identity in live_identities)
+        if live_keys and live_keys.issubset(term_sent_keys):
+            term_sent_keys = live_keys
+            process = replace(process, term_sent_keys=live_keys)
         if live_keys != term_sent_keys:
             process = replace(
                 process,
@@ -490,8 +543,10 @@ def _unknown_after_corruption(
     process: ManagedProcess,
     procfs: LinuxProcfs,
     reason: str,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> Classification:
-    live_identities, _ = _observe_process(process, procfs)
+    live_identities, _ = _observe_process(process, procfs, deadline, monotonic)
     return _classification(process, "unknown", (reason,), live_identities)
 
 
@@ -499,7 +554,10 @@ def _audit_boot_id(
     procfs: LinuxProcfs,
     processes: tuple[ManagedProcess, ...],
     leases: tuple[SessionLease, ...],
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> str:
+    _deadline_check(deadline, monotonic)
     read_boot_id = getattr(procfs, "_boot_id", None)
     if callable(read_boot_id):
         try:
@@ -507,6 +565,7 @@ def _audit_boot_id(
         except OSError:
             boot_id = None
         if isinstance(boot_id, str) and boot_id:
+            _deadline_check(deadline, monotonic)
             return boot_id
     if processes:
         return processes[0].wrapper.boot_id
@@ -518,10 +577,15 @@ def _audit_boot_id(
 def _audit_rss_observation(
     procfs: LinuxProcfs,
     identity: ProcessIdentity,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[bool, int]:
     try:
+        _deadline_check(deadline, monotonic)
         rss_kib = procfs.rss_kib(identity)
+        _deadline_check(deadline, monotonic)
         observation = _observe_identity(procfs, identity.pid)
+        _deadline_check(deadline, monotonic)
     except (OSError, ValueError):
         return False, 0
     if (
@@ -535,7 +599,15 @@ def _audit_rss_observation(
     return True, rss_kib
 
 
-def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSnapshot:
+def build_audit(
+    store: StateStore,
+    procfs: LinuxProcfs,
+    clock: Clock,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> AuditSnapshot:
+    _deadline_check(deadline, monotonic)
     if store._owns_lock():
         raise ValueError("audit cannot run under a mutable lock")
     audit_store = StateStore(
@@ -546,13 +618,16 @@ def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSn
     corrupt_count = 0
     sessions_corrupt = False
     try:
-        leases = audit_store.load_sessions()
+        leases = audit_store.load_sessions(deadline=deadline, monotonic=monotonic)
     except StateCorruption:
         leases = ()
         sessions_corrupt = True
         corrupt_count += 1
     try:
-        processes = audit_store.load_processes()
+        processes = audit_store.load_processes(
+            deadline=deadline,
+            monotonic=monotonic,
+        )
     except StateCorruption:
         processes = ()
         corrupt_count += 1
@@ -564,6 +639,8 @@ def build_audit(store: StateStore, procfs: LinuxProcfs, clock: Clock) -> AuditSn
         clock,
         corrupt_count=corrupt_count,
         sessions_corrupt=sessions_corrupt,
+        deadline=deadline,
+        monotonic=monotonic,
     )
 
 
@@ -575,39 +652,57 @@ def build_audit_from_records(
     *,
     corrupt_count: int = 0,
     sessions_corrupt: bool = False,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> AuditSnapshot:
-
+    _deadline_check(deadline, monotonic)
     now_boot = clock.boottime()
-    initial_entries = tuple(
-        sorted(
-            (
-                (
-                    process,
-                    _unknown_after_corruption(
-                        process,
-                        procfs,
-                        "corrupt_session_state",
-                    )
-                    if sessions_corrupt
-                    else classify_process(process, leases, procfs, now_boot),
-                )
-                for process in processes
-            ),
-            key=lambda entry: entry[0].wrapper.stable_key(),
+    _deadline_check(deadline, monotonic)
+    entries: list[tuple[ManagedProcess, Classification]] = []
+    for process in processes:
+        _deadline_check(deadline, monotonic)
+        item = (
+            _unknown_after_corruption(
+                process,
+                procfs,
+                "corrupt_session_state",
+                deadline,
+                monotonic,
+            )
+            if sessions_corrupt
+            else classify_process(
+                process,
+                leases,
+                procfs,
+                now_boot,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
         )
+        _deadline_check(deadline, monotonic)
+        entries.append((process, item))
+    initial_entries = tuple(
+        sorted(entries, key=lambda entry: entry[0].wrapper.stable_key())
     )
     observations: dict[str, tuple[bool, int]] = {}
     unique_live: dict[str, ProcessIdentity] = {}
     rss_kib = 0
     classifications_list: list[Classification] = []
     for stored_process, item in initial_entries:
+        _deadline_check(deadline, monotonic)
         verified: list[ProcessIdentity] = []
         unavailable = False
         for identity in item.live_identities:
+            _deadline_check(deadline, monotonic)
             key = identity.stable_key()
             observation = observations.get(key)
             if observation is None:
-                observation = _audit_rss_observation(procfs, identity)
+                observation = _audit_rss_observation(
+                    procfs,
+                    identity,
+                    deadline,
+                    monotonic,
+                )
                 observations[key] = observation
             exact, rss = observation
             if not exact:
@@ -630,6 +725,7 @@ def build_audit_from_records(
                 eligible_term=False,
             )
         classifications_list.append(item)
+        _deadline_check(deadline, monotonic)
     classifications = tuple(classifications_list)
 
     counts = {state: 0 for state in _STATE_ORDER}
@@ -648,9 +744,10 @@ def build_audit_from_records(
     owned_or_shared = managed - unknown
     generated = ObservedTime(
         clock.wall_iso(),
-        _audit_boot_id(procfs, processes, leases),
+        _audit_boot_id(procfs, processes, leases, deadline, monotonic),
         now_boot,
     )
+    _deadline_check(deadline, monotonic)
     return AuditSnapshot(
         schema_version=1,
         generated=generated,
