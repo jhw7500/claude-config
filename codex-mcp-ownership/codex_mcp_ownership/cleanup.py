@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import hmac
 import json
@@ -23,6 +23,7 @@ from .model import (
     ManagedProcess,
     ProcessIdentity,
     SessionLease,
+    SignalIntent,
     lease_generation_digest,
 )
 from .procfs import IdentityObservation, LinuxProcfs
@@ -70,12 +71,30 @@ class CleanupDeadlineExceeded(RuntimeError):
     """The caller's bounded cleanup deadline expired."""
 
 
+@dataclass(frozen=True)
+class CleanupAuthority:
+    root_token: tuple[int, int]
+    revision: int
+    sessions_digest: str
+    processes: tuple[ManagedProcess, ...]
+    leases: tuple[SessionLease, ...]
+
+
 def _deadline_check(
     deadline: float | None,
     monotonic: Callable[[], float],
 ) -> None:
     if deadline is not None and monotonic() >= deadline:
         raise CleanupDeadlineExceeded("cleanup deadline exhausted")
+
+
+def _remaining_timeout(
+    deadline: float | None,
+    monotonic: Callable[[], float],
+) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - monotonic())
 
 
 class PidfdSignalBackend:
@@ -220,33 +239,56 @@ def select_force_actions(
 def _state_snapshot(
     store: StateStore,
     expected_root_token: tuple[int, int] | None = None,
-) -> tuple[tuple[int, int], tuple[ManagedProcess, ...], tuple[SessionLease, ...]]:
-    with store.locked(expected_root_token=expected_root_token):
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[tuple[int, int], int, tuple[ManagedProcess, ...], tuple[SessionLease, ...]]:
+    _deadline_check(deadline, monotonic)
+    with store.locked(
+        expected_root_token=expected_root_token,
+        remaining_timeout=_remaining_timeout(deadline, monotonic),
+    ):
         token = store.root_token()
+        revision = store.ledger_revision()
         leases = store.load_sessions()
         processes = store.load_processes()
-    return token, processes, leases
+    return token, revision, processes, leases
 
 
-def _current_authority(
+def _sessions_digest(leases: tuple[SessionLease, ...]) -> str:
+    payload = [
+        lease.to_dict() for lease in sorted(leases, key=lambda item: item.session_id)
+    ]
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def capture_authorized_audit(
     store: StateStore,
-    root_token: tuple[int, int],
-    expected: ManagedProcess,
-    expected_lease: SessionLease | None,
-) -> bool:
-    try:
-        lock = store.locked(expected_root_token=root_token)
-        with lock:
-            if store.root_token() != root_token:
-                return False
-            current = store.load_process(expected.wrapper.stable_key())
-            if current != expected:
-                return False
-            if expected.owner_session_id is None:
-                return expected_lease is None
-            return store.load_session(expected.owner_session_id) == expected_lease
-    except (FileNotFoundError, UnsafeStatePath):
-        return False
+    procfs: LinuxProcfs,
+    clock: Clock,
+) -> tuple[AuditSnapshot, CleanupAuthority]:
+    with store.locked():
+        root_token = store.root_token()
+        revision = store.ledger_revision()
+        leases = store.load_sessions()
+        processes = store.load_processes()
+    authority = CleanupAuthority(
+        root_token,
+        revision,
+        _sessions_digest(leases),
+        processes,
+        leases,
+    )
+    return (
+        classify.build_audit_from_records(processes, leases, procfs, clock),
+        authority,
+    )
 
 
 def _cas_process_and_event(
@@ -256,18 +298,26 @@ def _cas_process_and_event(
     expected_lease: SessionLease | None,
     updated: ManagedProcess,
     event: dict[str, object] | None,
-) -> bool:
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    allow_expired: bool = False,
+) -> int | None:
     try:
-        lock = store.locked(expected_root_token=root_token)
+        if not allow_expired:
+            _deadline_check(deadline, monotonic)
+        lock = store.locked(
+            expected_root_token=root_token,
+            remaining_timeout=_remaining_timeout(deadline, monotonic),
+        )
         with lock:
             if store.root_token() != root_token:
-                return False
+                return None
             current = store.load_process(expected.wrapper.stable_key())
             if current != expected:
-                return False
+                return None
             if expected.owner_session_id is None:
                 if expected_lease is not None:
-                    return False
+                    return None
             else:
                 current_lease = store.load_session(expected.owner_session_id)
                 if (
@@ -276,23 +326,57 @@ def _cas_process_and_event(
                     or expected.owner_generation
                     != lease_generation_digest(current_lease)
                 ):
-                    return False
-            event_id = None if event is None else store.stage_event(event)
+                    return None
+            force_event = bool(
+                event is not None and "force" in str(event.get("event", ""))
+            )
+            intent = (
+                store.load_force_intent(expected.wrapper.stable_key())
+                if force_event
+                else store.load_signal_intent(expected.wrapper.stable_key())
+            )
+            if event is None:
+                event_id = None
+            elif intent is not None:
+                event_id = store.prepare_transition_event(
+                    "force-receipts" if force_event else "signal-intents",
+                    intent.process_key,
+                    intent,
+                    intent,
+                    event,
+                )
+            else:
+                event_id = store.prepare_transition_event(
+                    "processes",
+                    expected.wrapper.stable_key(),
+                    expected,
+                    updated,
+                    event,
+                )
             try:
                 if updated != expected:
                     store.save_process(updated, maintenance=False)
             except Exception:
                 if event_id is not None:
-                    store.discard_staged_event(event_id)
+                    try:
+                        store.recover_transition_events()
+                    except Exception:
+                        pass
+                try:
+                    if store.load_process(expected.wrapper.stable_key()) == updated:
+                        return store.ledger_revision()
+                except Exception:
+                    pass
                 raise
             if event_id is not None:
                 try:
-                    store.flush_staged_events()
+                    store.mark_transition_committed(event_id)
+                    store.recover_transition_events()
                 except Exception:
                     pass
-            return True
-    except (FileNotFoundError, UnsafeStatePath):
-        return False
+            return store.ledger_revision()
+    except (FileNotFoundError, TimeoutError, UnsafeStatePath):
+        return None
 
 
 def _owner_loss_event(
@@ -339,15 +423,72 @@ def _without_term_intent(process: ManagedProcess) -> ManagedProcess:
     )
 
 
+def _persist_intent_status(
+    store: StateStore,
+    root_token: tuple[int, int],
+    process: ManagedProcess,
+    expected_lease: SessionLease | None,
+    status: str,
+    delivered_keys: frozenset[str],
+    term_sent_boot: float | None = None,
+    action: str = "term",
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> int | None:
+    try:
+        with store.locked(
+            expected_root_token=root_token,
+            remaining_timeout=_remaining_timeout(deadline, monotonic),
+        ):
+            current = store.load_process(process.wrapper.stable_key())
+            if (
+                current is None
+                or current.wrapper != process.wrapper
+                or current.owner_session_id != process.owner_session_id
+                or current.owner_generation != process.owner_generation
+            ):
+                return None
+            if current.owner_session_id is not None:
+                lease = store.load_session(current.owner_session_id)
+                if (
+                    lease != expected_lease
+                    or lease is None
+                    or current.owner_generation != lease_generation_digest(lease)
+                ):
+                    return None
+            intent = (
+                store.load_force_intent(process.wrapper.stable_key())
+                if action == "force"
+                else store.load_signal_intent(process.wrapper.stable_key())
+            )
+            if intent is None:
+                return None
+            return store.save_signal_intent(
+                replace(
+                    intent,
+                    status=status,
+                    delivered_keys=tuple(sorted(delivered_keys)),
+                    term_sent_boot=term_sent_boot,
+                )
+            )
+    except (FileNotFoundError, TimeoutError, UnsafeStatePath):
+        return None
+
+
 def _mark_persistence_conflict(
     store: StateStore,
     root_token: tuple[int, int],
     classification: Classification,
     expected_lease: SessionLease | None,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> None:
     expected = classification.process
     try:
-        with store.locked(expected_root_token=root_token):
+        with store.locked(
+            expected_root_token=root_token,
+            remaining_timeout=_remaining_timeout(deadline, monotonic),
+        ):
             current = store.load_process(expected.wrapper.stable_key())
             if current is None:
                 return
@@ -365,9 +506,15 @@ def _mark_persistence_conflict(
                     or current.owner_generation != lease_generation_digest(lease)
                 ):
                     return
-            pending = _with_term_intent(current, classification)
-            store.save_process(pending, maintenance=False)
-            event_id = store.stage_event(
+            intent = store.load_signal_intent(current.wrapper.stable_key())
+            if intent is None or intent.owner_generation != current.owner_generation:
+                return
+            conflicted = replace(intent, status="conflict")
+            event_id = store.prepare_transition_event(
+                "signal-intents",
+                intent.process_key,
+                intent,
+                conflicted,
                 {
                     "schema_version": 1,
                     "event": "cleanup_state_persistence_conflict",
@@ -377,13 +524,15 @@ def _mark_persistence_conflict(
                     "process_key": current.wrapper.stable_key(),
                     "state": "unknown",
                     "reason_codes": ["state_persistence_conflict"],
-                }
+                },
             )
+            store.save_signal_intent(conflicted)
             try:
-                store.flush_staged_events()
+                store.mark_transition_committed(event_id)
+                store.recover_transition_events()
             except Exception:
-                del event_id
-    except (FileNotFoundError, UnsafeStatePath):
+                pass
+    except (FileNotFoundError, TimeoutError, UnsafeStatePath):
         return
 
 
@@ -413,16 +562,19 @@ def execute_cleanup(
     confirm_token: str | None = None,
     deadline: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
+    authority: CleanupAuthority | None = None,
 ) -> CleanupReport:
     _deadline_check(deadline, monotonic)
     if not apply:
         before = classify.build_audit(store, procfs, clock)
         _deadline_check(deadline, monotonic)
-        before_count, before_rss_kib = _fresh_metrics(before, procfs)
+        before_count, before_rss_kib = _fresh_metrics(
+            before, procfs, deadline, monotonic
+        )
         _deadline_check(deadline, monotonic)
         after = classify.build_audit(store, procfs, clock)
         _deadline_check(deadline, monotonic)
-        after_count, after_rss_kib = _fresh_metrics(after, procfs)
+        after_count, after_rss_kib = _fresh_metrics(after, procfs, deadline, monotonic)
         return CleanupReport(
             before_count=before_count,
             before_rss_kib=before_rss_kib,
@@ -452,10 +604,28 @@ def execute_cleanup(
         if force_payload["boot_id"] != current_boot_id:
             raise InvalidForceConfirmation("force confirmation boot ID changed")
 
-    root_token, stored_processes, leases = _state_snapshot(store)
+    expected_root = None if authority is None else authority.root_token
+    root_token, authority_revision, stored_processes, leases = _state_snapshot(
+        store,
+        expected_root_token=expected_root,
+        deadline=deadline,
+        monotonic=monotonic,
+    )
+    if authority is not None and (
+        root_token != authority.root_token
+        or authority_revision != authority.revision
+        or stored_processes != authority.processes
+        or leases != authority.leases
+        or _sessions_digest(leases) != authority.sessions_digest
+    ):
+        raise UnsafeStatePath("cleanup authority changed after audit")
     _deadline_check(deadline, monotonic)
     try:
-        with store.locked(expected_root_token=root_token):
+        with store.locked(
+            expected_root_token=root_token,
+            remaining_timeout=_remaining_timeout(deadline, monotonic),
+        ):
+            store.recover_transition_events()
             store.flush_staged_events()
     except Exception:
         pass
@@ -466,7 +636,7 @@ def execute_cleanup(
         clock,
     )
     _deadline_check(deadline, monotonic)
-    before_count, before_rss_kib = _fresh_metrics(before, procfs)
+    before_count, before_rss_kib = _fresh_metrics(before, procfs, deadline, monotonic)
     _deadline_check(deadline, monotonic)
     lease_by_id = {lease.session_id: lease for lease in leases}
     stored_by_key = {
@@ -512,14 +682,22 @@ def execute_cleanup(
                     if first_loss
                     else None
                 ),
+                deadline,
+                monotonic,
             )
             _deadline_check(deadline, monotonic)
-            if proposal_persisted:
+            if proposal_persisted is not None:
+                authority_revision = proposal_persisted
                 stored_by_key[process_key] = proposed
 
     outcomes: list[CleanupOutcome] = []
     attempted = 0
+    delivered_before_deadline = False
+    deadline_exhausted_after_delivery = False
+    partial_force = False
     for process_key, process_actions in grouped.items():
+        if deadline_exhausted_after_delivery:
+            break
         classification = current.get(process_key)
         authority_process = None if classification is None else classification.process
         survived_term = False
@@ -533,6 +711,13 @@ def execute_cleanup(
         group_outcomes: list[CleanupOutcome] = []
         seen: set[str] = set()
         for action in process_actions:
+            try:
+                _deadline_check(deadline, monotonic)
+            except CleanupDeadlineExceeded:
+                if delivered_before_deadline:
+                    deadline_exhausted_after_delivery = True
+                    break
+                raise
             identity_key = action.identity.stable_key()
             if identity_key in seen:
                 outcome = CleanupOutcome(action, "skipped", "duplicate_action")
@@ -562,6 +747,8 @@ def execute_cleanup(
                 action,
                 procfs,
                 signaler,
+                deadline,
+                monotonic,
             )
             try:
                 _deadline_check(deadline, monotonic)
@@ -579,32 +766,54 @@ def execute_cleanup(
             assert pidfd is not None
             close_failed = False
             try:
-                outcome, was_attempted, authority_process = (
-                    _send_prepared_under_authority(
-                        action,
-                        pidfd,
-                        signum,
-                        store,
-                        root_token,
-                        expected_process,
-                        expected_lease,
-                        classification,
-                        signaler,
-                        clock,
-                        force_payload,
-                        deadline,
-                        monotonic,
+                try:
+                    outcome, was_attempted, authority_process, authority_revision = (
+                        _send_prepared_under_authority(
+                            action,
+                            pidfd,
+                            signum,
+                            store,
+                            root_token,
+                            expected_process,
+                            expected_lease,
+                            classification,
+                            signaler,
+                            clock,
+                            force_payload,
+                            authority_revision,
+                            _sessions_digest(leases),
+                            deadline,
+                            monotonic,
+                        )
                     )
-                )
+                except InvalidForceConfirmation:
+                    if not action.force or not delivered_keys:
+                        raise
+                    outcome = CleanupOutcome(
+                        action, "skipped", "partial_force_authority_expired"
+                    )
+                    was_attempted = False
+                    partial_force = True
             finally:
                 try:
                     signaler.close(pidfd)
                 except OSError:
                     close_failed = True
+            post_boundary_expired = False
             if was_attempted and outcome.status != "skipped":
                 outcome = _post_signal_outcome(action, procfs, close_failed)
+                post_boundary_expired = bool(
+                    deadline is not None and monotonic() >= deadline
+                )
             attempted += int(was_attempted)
-            if outcome.status == "survived" and not action.force:
+            delivered_before_deadline |= (
+                was_attempted and outcome.reason != "signal_failed"
+            )
+            if (
+                outcome.status == "survived"
+                and not action.force
+                and not post_boundary_expired
+            ):
                 observed, time_reason = _observed_boot_time(clock, term_time_floor)
                 if time_reason is None:
                     assert observed is not None
@@ -625,6 +834,18 @@ def execute_cleanup(
                 "identity_unavailable_after_signal",
                 "identity_changed_after_signal",
             }
+            if partial_force:
+                break
+            if post_boundary_expired:
+                term_time_valid = False
+                deadline_exhausted_after_delivery = True
+                break
+            if was_attempted:
+                try:
+                    _deadline_check(deadline, monotonic)
+                except CleanupDeadlineExceeded:
+                    deadline_exhausted_after_delivery = True
+                    break
         forced = process_actions[0].force
         current_keys = (
             set()
@@ -632,7 +853,44 @@ def execute_cleanup(
             else {identity.stable_key() for identity in classification.live_identities}
         )
         complete_delivery = bool(current_keys) and delivered_keys == current_keys
-        if (
+        if partial_force and classification is not None:
+            assert authority_process is not None
+            intent_revision = _persist_intent_status(
+                store,
+                root_token,
+                authority_process,
+                expected_lease,
+                "conflict",
+                frozenset(delivered_keys),
+                action="force",
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            if intent_revision is not None:
+                authority_revision = intent_revision
+            persisted = _cas_process_and_event(
+                store,
+                root_token,
+                authority_process,
+                expected_lease,
+                authority_process,
+                {
+                    "schema_version": 1,
+                    "event": "cleanup_force_partial",
+                    "observed_wall": before.generated.wall_iso,
+                    "server": classification.process.server,
+                    "scope": classification.process.scope,
+                    "process_key": process_key,
+                    "state": "unknown",
+                    "reason_codes": ["partial_force_authority_expired"],
+                },
+                deadline,
+                monotonic,
+                allow_expired=deadline_exhausted_after_delivery,
+            )
+            if persisted is not None:
+                authority_revision = persisted
+        elif (
             survived_term
             and classification is not None
             and not forced
@@ -641,36 +899,51 @@ def execute_cleanup(
             and term_sent_boot is not None
         ):
             assert authority_process is not None
-            updated = replace(
-                _without_term_intent(authority_process),
-                term_sent_boot=term_sent_boot,
-                term_sent_keys=frozenset(survived_keys),
-            )
-            persisted = _cas_process_and_event(
+            intent_revision = _persist_intent_status(
                 store,
                 root_token,
                 authority_process,
                 expected_lease,
-                updated,
-                {
-                    "schema_version": 1,
-                    "event": "cleanup_term_sent",
-                    "observed_wall": before.generated.wall_iso,
-                    "server": updated.server,
-                    "scope": updated.scope,
-                    "process_key": process_key,
-                    "state": "exiting",
-                    "reason_codes": list(
-                        classification.reason_codes + ("sigterm_survived",)
-                    ),
-                },
+                "delivered",
+                frozenset(survived_keys),
+                term_sent_boot,
+                deadline=deadline,
+                monotonic=monotonic,
             )
-            if not persisted:
+            updated = store.load_process(process_key)
+            persisted = None
+            if intent_revision is not None and updated is not None:
+                authority_revision = intent_revision
+                persisted = _cas_process_and_event(
+                    store,
+                    root_token,
+                    updated,
+                    expected_lease,
+                    updated,
+                    {
+                        "schema_version": 1,
+                        "event": "cleanup_term_sent",
+                        "observed_wall": before.generated.wall_iso,
+                        "server": updated.server,
+                        "scope": updated.scope,
+                        "process_key": process_key,
+                        "state": "exiting",
+                        "reason_codes": list(
+                            classification.reason_codes + ("sigterm_survived",)
+                        ),
+                    },
+                    deadline,
+                    monotonic,
+                    allow_expired=deadline_exhausted_after_delivery,
+                )
+            if persisted is None:
                 _mark_persistence_conflict(
                     store,
                     root_token,
                     classification,
                     expected_lease,
+                    deadline,
+                    monotonic,
                 )
                 _replace_group_outcome_reason(
                     outcomes, group_outcomes, "state_persistence_conflict"
@@ -682,6 +955,19 @@ def execute_cleanup(
             and complete_delivery
         ):
             assert authority_process is not None
+            intent_revision = _persist_intent_status(
+                store,
+                root_token,
+                authority_process,
+                expected_lease,
+                "delivered",
+                frozenset(delivered_keys),
+                action="force",
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            if intent_revision is not None:
+                authority_revision = intent_revision
             _cas_process_and_event(
                 store,
                 root_token,
@@ -700,6 +986,9 @@ def execute_cleanup(
                         classification.reason_codes + ("sigkill_survived",)
                     ),
                 },
+                deadline,
+                monotonic,
+                allow_expired=deadline_exhausted_after_delivery,
             )
         elif (
             terminated_term
@@ -711,6 +1000,19 @@ def execute_cleanup(
             )
         ):
             assert authority_process is not None
+            intent_revision = _persist_intent_status(
+                store,
+                root_token,
+                authority_process,
+                expected_lease,
+                "delivered" if forced else "conflict",
+                frozenset(delivered_keys),
+                action="force" if forced else "term",
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            if intent_revision is not None:
+                authority_revision = intent_revision
             completed_process = (
                 authority_process
                 if forced
@@ -744,6 +1046,9 @@ def execute_cleanup(
                         )
                     ),
                 },
+                deadline,
+                monotonic,
+                allow_expired=deadline_exhausted_after_delivery,
             )
         elif (
             terminated_term
@@ -752,7 +1057,20 @@ def execute_cleanup(
             or (survived_term and not forced and not term_time_valid)
         ) and classification is not None:
             assert authority_process is not None
-            _cas_process_and_event(
+            intent_revision = _persist_intent_status(
+                store,
+                root_token,
+                authority_process,
+                expected_lease,
+                "conflict",
+                frozenset(delivered_keys),
+                action="force" if forced else "term",
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            if intent_revision is not None:
+                authority_revision = intent_revision
+            persisted = _cas_process_and_event(
                 store,
                 root_token,
                 authority_process,
@@ -782,16 +1100,28 @@ def execute_cleanup(
                         + tuple(sorted({outcome.reason for outcome in group_outcomes}))
                     ),
                 },
+                deadline,
+                monotonic,
+                allow_expired=deadline_exhausted_after_delivery,
             )
+            if persisted is None:
+                _replace_group_outcome_reason(
+                    outcomes, group_outcomes, "state_persistence_conflict"
+                )
     try:
+        if deadline_exhausted_after_delivery:
+            raise CleanupDeadlineExceeded("cleanup deadline exhausted after delivery")
         if store.root_token() != root_token:
             raise UnsafeStatePath("state root identity changed")
-        after_token, after_processes, after_leases = _state_snapshot(
-            store, expected_root_token=root_token
+        after_token, _after_revision, after_processes, after_leases = _state_snapshot(
+            store,
+            expected_root_token=root_token,
+            deadline=deadline,
+            monotonic=monotonic,
         )
         if after_token != root_token:
             raise UnsafeStatePath("state root identity changed")
-    except (FileNotFoundError, UnsafeStatePath):
+    except (CleanupDeadlineExceeded, FileNotFoundError, UnsafeStatePath):
         after_state_available = False
         after = None
         after_count = 0
@@ -804,7 +1134,7 @@ def execute_cleanup(
             procfs,
             clock,
         )
-        after_count, after_rss_kib = _fresh_metrics(after, procfs)
+        after_count, after_rss_kib = _fresh_metrics(after, procfs, deadline, monotonic)
     rendered = tuple(outcomes)
     return CleanupReport(
         before_count=before_count,
@@ -822,6 +1152,7 @@ def execute_cleanup(
         after_classifications=() if after is None else after.classifications,
         after_state_available=after_state_available,
         authority_lost=not after_state_available,
+        partial_force=partial_force,
     )
 
 
@@ -850,17 +1181,26 @@ def _canonical_json(value: object) -> bytes:
             sort_keys=True,
             allow_nan=False,
         )
-    except (TypeError, ValueError, OverflowError, RecursionError) as error:
+        return rendered.encode("utf-8")
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+        UnicodeEncodeError,
+    ) as error:
         raise InvalidForceConfirmation(
             "force confirmation is not canonical JSON"
         ) from error
-    return rendered.encode("utf-8")
 
 
 def _finite_boot_time(value: object, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise InvalidForceConfirmation(f"{field} must be a finite boot time")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except (ValueError, TypeError, OverflowError) as error:
+        raise InvalidForceConfirmation(f"{field} must be a finite boot time") from error
     if not math.isfinite(converted) or converted < 0:
         raise InvalidForceConfirmation(f"{field} must be a finite boot time")
     return converted
@@ -1042,6 +1382,8 @@ def _validate_current_force_actions(
 def _fresh_metrics(
     snapshot: AuditSnapshot,
     procfs: LinuxProcfs,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[int, int]:
     identities: dict[str, ProcessIdentity] = {}
     for classification in snapshot.classifications:
@@ -1052,24 +1394,34 @@ def _fresh_metrics(
         recorded += process.members
         for identity in recorded:
             identities[identity.stable_key()] = identity
-    return _fresh_identity_metrics(tuple(identities.values()), procfs)
+    return _fresh_identity_metrics(
+        tuple(identities.values()), procfs, deadline, monotonic
+    )
 
 
 def _fresh_identity_metrics(
     identities: tuple[ProcessIdentity, ...],
     procfs: LinuxProcfs,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[int, int]:
     count = 0
     total_rss_kib = 0
     for identity in sorted(identities, key=lambda item: item.stable_key()):
+        _deadline_check(deadline, monotonic)
         before = _observe_identity(procfs, identity.pid)
+        _deadline_check(deadline, monotonic)
         if before.kind != "live" or before.identity != identity:
             continue
         try:
+            _deadline_check(deadline, monotonic)
             rss_kib = procfs.rss_kib(identity)
+            _deadline_check(deadline, monotonic)
         except (OSError, ValueError):
             continue
+        _deadline_check(deadline, monotonic)
         after = _observe_identity(procfs, identity.pid)
+        _deadline_check(deadline, monotonic)
         if (
             isinstance(rss_kib, bool)
             or not isinstance(rss_kib, int)
@@ -1151,18 +1503,40 @@ def _prepare_exact_signal(
     action: CleanupAction,
     procfs: LinuxProcfs,
     signaler: SignalBackend,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> tuple[int | None, CleanupOutcome | None]:
+    _deadline_check(deadline, monotonic)
     before = _observe_identity(procfs, action.identity.pid)
+    _deadline_check(deadline, monotonic)
     reason = _mismatch_reason(before, stage="before_pidfd")
     if reason is not None:
         return None, CleanupOutcome(action, "skipped", reason)
     if before.identity != action.identity:
         return None, CleanupOutcome(action, "skipped", "identity_changed")
     try:
+        _deadline_check(deadline, monotonic)
         pidfd = signaler.open(action.identity)
+        _deadline_check(deadline, monotonic)
+    except CleanupDeadlineExceeded:
+        if "pidfd" in locals():
+            try:
+                signaler.close(pidfd)
+            except OSError:
+                pass
+        raise
     except (PidfdUnavailable, OSError):
         return None, CleanupOutcome(action, "skipped", "pidfd_unavailable")
+    _deadline_check(deadline, monotonic)
     after_open = _observe_identity(procfs, action.identity.pid)
+    try:
+        _deadline_check(deadline, monotonic)
+    except CleanupDeadlineExceeded:
+        try:
+            signaler.close(pidfd)
+        except OSError:
+            pass
+        raise
     reason = _mismatch_reason(after_open, stage="after_pidfd")
     if reason is not None or after_open.identity != action.identity:
         try:
@@ -1187,19 +1561,43 @@ def _send_prepared_under_authority(
     signaler: SignalBackend,
     clock: Clock,
     force_payload: dict[str, object] | None,
+    expected_revision: int,
+    expected_sessions_digest: str,
     deadline: float | None,
     monotonic: Callable[[], float],
-) -> tuple[CleanupOutcome, bool, ManagedProcess]:
+) -> tuple[CleanupOutcome, bool, ManagedProcess, int]:
     try:
-        with store.locked(expected_root_token=root_token):
+        _deadline_check(deadline, monotonic)
+        with store.locked(
+            expected_root_token=root_token,
+            remaining_timeout=_remaining_timeout(deadline, monotonic),
+        ):
             if store.root_token() != root_token:
                 raise UnsafeStatePath("state root identity changed")
+            if store.lexical_root_token() != root_token:
+                raise UnsafeStatePath("state root pathname changed")
+            if store.ledger_revision() != expected_revision:
+                return (
+                    CleanupOutcome(action, "skipped", "state_authority_changed"),
+                    False,
+                    expected_process,
+                    expected_revision,
+                )
+            current_sessions = store.load_sessions()
+            if _sessions_digest(current_sessions) != expected_sessions_digest:
+                return (
+                    CleanupOutcome(action, "skipped", "state_authority_changed"),
+                    False,
+                    expected_process,
+                    expected_revision,
+                )
             current = store.load_process(expected_process.wrapper.stable_key())
             if current != expected_process:
                 return (
                     CleanupOutcome(action, "skipped", "state_authority_changed"),
                     False,
                     expected_process,
+                    expected_revision,
                 )
             if expected_process.owner_session_id is None:
                 if expected_lease is not None:
@@ -1207,6 +1605,7 @@ def _send_prepared_under_authority(
                         CleanupOutcome(action, "skipped", "state_authority_changed"),
                         False,
                         expected_process,
+                        expected_revision,
                     )
             else:
                 current_lease = store.load_session(expected_process.owner_session_id)
@@ -1220,6 +1619,7 @@ def _send_prepared_under_authority(
                         CleanupOutcome(action, "skipped", "state_authority_changed"),
                         False,
                         expected_process,
+                        expected_revision,
                     )
             if action.force:
                 if force_payload is None:
@@ -1245,33 +1645,101 @@ def _send_prepared_under_authority(
                     )
             _deadline_check(deadline, monotonic)
             authority_process = expected_process
+            process_key = expected_process.wrapper.stable_key()
+            identity_keys = tuple(
+                sorted(
+                    identity.stable_key() for identity in classification.live_identities
+                )
+            )
+            existing_intent = (
+                store.load_force_intent(process_key)
+                if action.force
+                else store.load_signal_intent(process_key)
+            )
+            delivered_keys = (
+                () if existing_intent is None else existing_intent.delivered_keys
+            )
+            intent = SignalIntent(
+                1,
+                process_key,
+                expected_process.owner_generation or ("0" * 64),
+                identity_keys,
+                "force" if action.force else "term",
+                "pending",
+                delivered_keys,
+            )
+            expected_revision = store.save_signal_intent(intent)
             if not action.force:
-                authority_process = _with_term_intent(expected_process, classification)
-                store.save_process(authority_process, maintenance=False)
+                authority_process = store.load_process(process_key)
+                assert authority_process is not None
                 _deadline_check(deadline, monotonic)
+                if (
+                    store.lexical_root_token() != root_token
+                    or store.ledger_revision() != expected_revision
+                    or _sessions_digest(store.load_sessions())
+                    != expected_sessions_digest
+                ):
+                    return (
+                        CleanupOutcome(action, "skipped", "state_authority_changed"),
+                        False,
+                        authority_process,
+                        expected_revision,
+                    )
+            if (
+                store.lexical_root_token() != root_token
+                or store.ledger_revision() != expected_revision
+            ):
+                return (
+                    CleanupOutcome(action, "skipped", "state_authority_changed"),
+                    False,
+                    authority_process,
+                    expected_revision,
+                )
             try:
                 signaler.send(pidfd, signum)
             except OSError:
-                if not action.force:
-                    current = store.load_process(expected_process.wrapper.stable_key())
-                    if current == authority_process:
-                        store.save_process(expected_process, maintenance=False)
-                        authority_process = expected_process
+                current_intent = (
+                    store.load_force_intent(process_key)
+                    if action.force
+                    else store.load_signal_intent(process_key)
+                )
+                if current_intent == intent and not delivered_keys:
+                    expected_revision = store.remove_signal_intent(
+                        process_key,
+                        action="force" if action.force else "term",
+                    )
+                    authority_process = expected_process
+                elif current_intent is not None:
+                    expected_revision = store.save_signal_intent(
+                        replace(current_intent, status="conflict")
+                    )
                 return (
                     CleanupOutcome(action, "skipped", "signal_failed"),
                     True,
                     authority_process,
+                    expected_revision,
                 )
+            delivered = tuple(
+                sorted(set(delivered_keys) | {action.identity.stable_key()})
+            )
+            expected_revision = store.save_signal_intent(
+                replace(intent, delivered_keys=delivered)
+            )
+            if not action.force:
+                authority_process = store.load_process(process_key)
+                assert authority_process is not None
             return (
                 CleanupOutcome(action, "survived", "signal_delivered"),
                 True,
                 authority_process,
+                expected_revision,
             )
     except (FileNotFoundError, UnsafeStatePath):
         return (
             CleanupOutcome(action, "skipped", "state_authority_changed"),
             False,
             expected_process,
+            expected_revision,
         )
 
 
@@ -1291,69 +1759,3 @@ def _post_signal_outcome(
         return CleanupOutcome(action, "skipped", "identity_changed_after_signal")
     reason = "sigkill_survived" if action.force else "sigterm_survived"
     return CleanupOutcome(action, "survived", reason + close_suffix)
-
-
-def _signal_exact(
-    action: CleanupAction,
-    procfs: LinuxProcfs,
-    signaler: SignalBackend,
-    signum: int,
-) -> tuple[CleanupOutcome, bool]:
-    before = _observe_identity(procfs, action.identity.pid)
-    reason = _mismatch_reason(before, stage="before_pidfd")
-    if reason is not None:
-        return CleanupOutcome(action, "skipped", reason), False
-    if before.identity != action.identity:
-        return CleanupOutcome(action, "skipped", "identity_changed"), False
-    try:
-        pidfd = signaler.open(action.identity)
-    except (PidfdUnavailable, OSError):
-        return CleanupOutcome(action, "skipped", "pidfd_unavailable"), False
-    attempted = False
-    sent = False
-    pending: CleanupOutcome | None = None
-    close_failed = False
-    try:
-        after_open = _observe_identity(procfs, action.identity.pid)
-        reason = _mismatch_reason(after_open, stage="after_pidfd")
-        if reason is not None:
-            pending = CleanupOutcome(action, "skipped", reason)
-        elif after_open.identity != action.identity:
-            pending = CleanupOutcome(
-                action,
-                "skipped",
-                "identity_changed_after_pidfd",
-            )
-        else:
-            attempted = True
-            try:
-                signaler.send(pidfd, signum)
-                sent = True
-            except OSError:
-                pending = CleanupOutcome(action, "skipped", "signal_failed")
-    finally:
-        try:
-            signaler.close(pidfd)
-        except OSError:
-            close_failed = True
-
-    if pending is not None:
-        return pending, attempted
-    if not sent:
-        return CleanupOutcome(action, "skipped", "signal_failed"), attempted
-
-    after_signal = _observe_identity(procfs, action.identity.pid)
-    close_suffix = "_pidfd_close_failed" if close_failed else ""
-    if after_signal.kind == "missing":
-        reason = "sigkill_terminated" if action.force else "sigterm_terminated"
-        return CleanupOutcome(action, "terminated", reason + close_suffix), attempted
-    if after_signal.kind != "live" or after_signal.identity is None:
-        return CleanupOutcome(
-            action, "skipped", "identity_unavailable_after_signal"
-        ), attempted
-    if after_signal.identity != action.identity:
-        return CleanupOutcome(
-            action, "skipped", "identity_changed_after_signal"
-        ), attempted
-    reason = "sigkill_survived" if action.force else "sigterm_survived"
-    return CleanupOutcome(action, "survived", reason + close_suffix), attempted

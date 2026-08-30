@@ -541,6 +541,13 @@ def test_durable_start_notifies_and_falls_back_after_event_append_failure(
     assert runtime.only_lease().state == "active"
     assert notifier.calls == 1
     assert len(fallback) == 1
+    assert list((store.root / "event-journal").iterdir())
+
+    monkeypatch.setattr(store, "append_event", StateStore.append_event.__get__(store))
+    store.recover_transition_events()
+    events = (store.root / "events.jsonl").read_text().splitlines()
+    assert sum('"event":"session_started"' in line for line in events) == 1
+    assert list((store.root / "event-journal").iterdir()) == []
 
 
 def test_notifier_exception_is_failed_start_request_with_exactly_one_fallback(
@@ -613,6 +620,49 @@ def test_notifier_and_fallback_failures_emit_only_constant_diagnostics(
     assert '"event":"hook_notifier_failed"' in events
     assert '"event":"hook_fallback_failed"' in events
     assert "FALLBACK-CANARY" not in events
+    assert "SOURCE-CANARY" not in events
+
+
+def test_lock_exit_and_notifier_failure_still_run_one_fallback_and_diagnostics(
+    hook_runtime, monkeypatch
+):
+    runtime, store, _clock, notifier, _procfs = hook_runtime
+    notifier.result = False
+    original_locked = store.locked
+    fallback = []
+
+    class ExitFailure:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+
+        def __enter__(self):
+            entered = self.inner.__enter__()
+            self.raise_on_exit = store._lock_depth == 1
+            return entered
+
+        def __exit__(self, exc_type, exc, traceback):
+            result = self.inner.__exit__(exc_type, exc, traceback)
+            if exc_type is None and self.raise_on_exit:
+                raise OSError("LOCK-EXIT-CANARY")
+            return result
+
+    monkeypatch.setattr(
+        store,
+        "locked",
+        lambda *args, **kwargs: ExitFailure(original_locked(*args, **kwargs)),
+    )
+    monkeypatch.setattr(
+        hook, "_opportunistic_cleanup", lambda *args: fallback.append(args)
+    )
+
+    runtime.start(source="SOURCE-CANARY")
+
+    assert notifier.calls == 1
+    assert len(fallback) == 1
+    monkeypatch.setattr(store, "locked", original_locked)
+    events = (store.root / "events.jsonl").read_text()
+    assert '"event":"hook_notifier_failed"' in events
+    assert "LOCK-EXIT-CANARY" not in events
     assert "SOURCE-CANARY" not in events
 
 
@@ -1016,6 +1066,33 @@ def test_cleanup_apply_reports_pidfd_skip_reason(cli_runtime, monkeypatch, capsy
     captured = capsys.readouterr()
     assert "status=skipped" in captured.out
     assert "reason=pidfd_unavailable" in captured.out
+
+
+def test_cleanup_report_labels_preflight_only_fields(cli_runtime) -> None:
+    root, _tree, procfs, clock = cli_runtime
+    snapshot = classify.build_audit(StateStore(root), procfs, clock)
+    report = cleanup.CleanupReport(
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        (),
+        partial_force=True,
+    )
+
+    rendered = cli._report_dict(snapshot, report)
+    human = cli._human_report(snapshot, report)
+
+    assert "classifications" not in rendered
+    assert "ownership_coverage" not in rendered
+    assert "state_counts" not in rendered
+    assert "preflight_classifications" in rendered
+    assert "preflight_ownership_coverage" in rendered
+    assert "partial_force=true" in human
 
 
 def test_cleanup_force_without_apply_is_safe_usage_error(cli_runtime, capsys):

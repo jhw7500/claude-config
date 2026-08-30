@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import fcntl
 import hashlib
 import json
@@ -771,6 +772,114 @@ def test_common_prefix_oversized_records_quarantine_to_unique_bounded_destinatio
     assert len(quarantined) == 2
     assert any(path.read_bytes().endswith(b"first") for path in quarantined)
     assert any(path.read_bytes().endswith(b"second") for path in quarantined)
+
+
+def test_quarantine_rename_failure_leaves_single_diagnosable_source(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "state"
+    store = state.StateStore(root)
+    sessions = root / "sessions"
+    make_private_directory(root)
+    make_private_directory(sessions)
+    path = sessions / ("a" * 64 + ".json")
+    write_private_file(path, b"not-json\n")
+    original = state.os.rename
+    monkeypatch.setattr(
+        state.os,
+        "rename",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("rename failed")),
+    )
+
+    with pytest.raises(OSError):
+        store.load_sessions()
+
+    assert path.exists()
+    assert path.stat().st_nlink == 1
+    monkeypatch.setattr(state.os, "rename", original)
+    with pytest.raises(state.StateCorruption) as error:
+        store.load_sessions()
+    assert error.value.quarantine_path is not None
+    assert not path.exists()
+
+
+def test_prepared_event_without_state_commit_recovers_without_false_event(
+    tmp_path,
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    event_id = store.prepare_transition_event(
+        "processes",
+        expected.wrapper.stable_key(),
+        expected,
+        updated,
+        {
+            "schema_version": 1,
+            "event": "owner_loss_observed",
+            "observed_wall": expected.spawned.wall_iso,
+            "process_key": expected.wrapper.stable_key(),
+            "state": "exiting",
+            "reason_codes": ["owner_session_ended"],
+        },
+    )
+
+    store.recover_transition_events()
+
+    assert store.load_processes()[0] == expected
+    assert not (store.root / "events.jsonl").exists()
+    assert not (store.root / "event-journal" / f"{event_id}.json").exists()
+
+
+def test_prior_v1_process_without_owner_generation_loads_conservatively(
+    tmp_path,
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    process = sample_process()
+    payload = process.to_dict()
+    del payload["owner_generation"]
+    directory = store.root / "processes"
+    make_private_directory(directory)
+    write_private_file(
+        directory / f"{process.wrapper.stable_key()}.json",
+        json.dumps(payload, sort_keys=True).encode() + b"\n",
+    )
+
+    loaded = store.load_processes()
+
+    assert len(loaded) == 1
+    assert loaded[0].owner_session_id == process.owner_session_id
+    assert loaded[0].owner_generation is None
+    assert not (store.root / "corrupt").exists()
+
+
+def test_committed_event_in_rotated_log_is_not_duplicated(tmp_path) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    event = {
+        "schema_version": 1,
+        "event": "owner_loss_observed",
+        "observed_wall": expected.spawned.wall_iso,
+        "process_key": expected.wrapper.stable_key(),
+        "state": "exiting",
+        "reason_codes": ["owner_session_ended"],
+    }
+    event_id = store.prepare_transition_event(
+        "processes", expected.wrapper.stable_key(), expected, updated, event
+    )
+    store.save_process(updated)
+    store.mark_transition_committed(event_id)
+    store.append_event(dict(event, event_id=event_id), maintenance=False)
+    os.rename(store.root / "events.jsonl", store.root / "events.jsonl.1")
+
+    store.recover_transition_events()
+
+    assert not (store.root / "events.jsonl").exists()
+    backup = (store.root / "events.jsonl.1").read_text()
+    assert backup.count(event_id) == 1
 
 
 def test_deeply_nested_record_is_corruption_without_recursion_traceback(tmp_path):

@@ -160,19 +160,22 @@ def _opportunistic_cleanup(
     store: StateStore,
     procfs: LinuxProcfs,
     clock: Clock,
+    deadline: float | None = None,
 ) -> None:
     try:
-        _opportunistic_cleanup_bounded(store, procfs, clock)
+        _opportunistic_cleanup_bounded(store, procfs, clock, deadline)
     except CleanupDeadlineExceeded:
-        _fallback_deferred(store, clock, "elapsed_budget_exhausted")
+        _fallback_deferred(store, clock, "elapsed_budget_exhausted", deadline)
 
 
 def _opportunistic_cleanup_bounded(
     store: StateStore,
     procfs: LinuxProcfs,
     clock: Clock,
+    deadline: float | None = None,
 ) -> None:
-    deadline = time.monotonic() + FALLBACK_MAX_ELAPSED_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + FALLBACK_MAX_ELAPSED_SECONDS
 
     def check_deadline() -> None:
         if time.monotonic() >= deadline:
@@ -191,7 +194,7 @@ def _opportunistic_cleanup_bounded(
         except FileNotFoundError:
             continue
         if record_count > FALLBACK_MAX_RECORDS:
-            _fallback_deferred(store, clock, "record_budget_exhausted")
+            _fallback_deferred(store, clock, "record_budget_exhausted", deadline)
             return
     check_deadline()
     snapshot = build_audit(store, procfs, clock)
@@ -201,7 +204,7 @@ def _opportunistic_cleanup_bounded(
     actions = plan_cleanup(snapshot)
     check_deadline()
     if len(actions) > FALLBACK_MAX_ACTIONS:
-        _fallback_deferred(store, clock, "action_budget_exhausted")
+        _fallback_deferred(store, clock, "action_budget_exhausted", deadline)
         return
     if actions:
         check_deadline()
@@ -233,49 +236,129 @@ def _opportunistic_cleanup_bounded(
     )
 
 
-def _fallback_deferred(store: StateStore, clock: Clock, reason: str) -> None:
+def _remaining_budget(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _fallback_deferred(
+    store: StateStore,
+    clock: Clock,
+    reason: str,
+    deadline: float | None = None,
+) -> None:
     try:
+        if deadline is not None and _remaining_budget(deadline) == 0.0:
+            return
+        observed_wall = _validated_text(clock.wall_iso(), "wall clock", 128)
+        remaining = _remaining_budget(deadline)
+        if deadline is not None and remaining == 0.0:
+            return
         store.append_event(
             {
                 "schema_version": 1,
                 "event": "hook_fallback_deferred",
-                "observed_wall": _validated_text(clock.wall_iso(), "wall clock", 128),
+                "observed_wall": observed_wall,
                 "state": "unknown",
                 "reason_codes": [reason],
             },
             maintenance=False,
+            remaining_timeout=remaining,
         )
     except Exception:
         pass
 
 
-def _hook_diagnostic(store: StateStore, clock: Clock, event: str, reason: str) -> None:
+def _hook_diagnostic(
+    store: StateStore,
+    clock: Clock,
+    event: str,
+    reason: str,
+    deadline: float | None = None,
+) -> None:
     try:
+        if deadline is not None and _remaining_budget(deadline) == 0.0:
+            return
+        observed_wall = _validated_text(clock.wall_iso(), "wall clock", 128)
+        remaining = _remaining_budget(deadline)
+        if deadline is not None and remaining == 0.0:
+            return
         store.append_event(
             {
                 "schema_version": 1,
                 "event": event,
-                "observed_wall": _validated_text(clock.wall_iso(), "wall clock", 128),
+                "observed_wall": observed_wall,
                 "state": "unknown",
                 "reason_codes": [reason],
             },
             maintenance=False,
+            remaining_timeout=remaining,
         )
     except Exception:
         pass
 
 
-def _save_session_milestone(store: StateStore, lease: SessionLease) -> bool:
+def _save_session_milestone(
+    store: StateStore,
+    expected: SessionLease | None,
+    lease: SessionLease,
+    event: dict[str, object],
+) -> bool:
+    event_id = store.prepare_transition_event(
+        "sessions",
+        session_key(lease.session_id),
+        expected,
+        lease,
+        event,
+    )
     try:
         store.save_session(lease, maintenance=False)
     except Exception:
         try:
+            store.recover_transition_events()
             if store.load_session(lease.session_id) == lease:
                 return True
         except Exception:
             pass
         raise
+    try:
+        store.mark_transition_committed(event_id)
+        store.recover_transition_events()
+    except Exception:
+        pass
     return True
+
+
+def _after_durable_start(
+    durable: bool,
+    store: StateStore,
+    procfs: LinuxProcfs,
+    clock: Clock,
+    notifier: SystemdNotifier,
+) -> None:
+    if not durable:
+        return
+    deadline = time.monotonic() + FALLBACK_MAX_ELAPSED_SECONDS
+    if _request_cleanup(notifier):
+        return
+    _hook_diagnostic(
+        store,
+        clock,
+        "hook_notifier_failed",
+        "notifier_request_failed",
+        deadline,
+    )
+    try:
+        _opportunistic_cleanup(store, procfs, clock, deadline)
+    except Exception:
+        _hook_diagnostic(
+            store,
+            clock,
+            "hook_fallback_failed",
+            "fallback_execution_failed",
+            deadline,
+        )
 
 
 def handle_payload(
@@ -323,37 +406,14 @@ def handle_payload(
                         )
                         else candidate
                     )
-                    durable = _save_session_milestone(store, lease)
-                    _append_event_best_effort(
+                    durable = _save_session_milestone(
                         store,
+                        current,
+                        lease,
                         _event("session_started", lease),
-                        candidate.observed.wall_iso,
                     )
             finally:
-                notified = durable and _request_cleanup(notifier)
-            if durable and not notified:
-                _hook_diagnostic(
-                    store,
-                    clock,
-                    "hook_notifier_failed",
-                    "notifier_request_failed",
-                )
-                try:
-                    _opportunistic_cleanup(store, procfs, clock)
-                except CleanupDeadlineExceeded:
-                    _hook_diagnostic(
-                        store,
-                        clock,
-                        "hook_fallback_deferred",
-                        "elapsed_budget_exhausted",
-                    )
-                except Exception:
-                    _hook_diagnostic(
-                        store,
-                        clock,
-                        "hook_fallback_failed",
-                        "fallback_execution_failed",
-                    )
+                _after_durable_start(durable, store, procfs, clock, notifier)
             return
 
         parent_pid = os.getppid()
@@ -383,11 +443,11 @@ def handle_payload(
                     ended=ended_observed,
                 )
                 ended.to_dict()
-                durable = _save_session_milestone(store, ended)
-                _append_event_best_effort(
+                durable = _save_session_milestone(
                     store,
+                    current,
+                    ended,
                     _event("session_ended", ended),
-                    ended_observed.wall_iso,
                 )
         finally:
             notified = durable and _request_cleanup(notifier)

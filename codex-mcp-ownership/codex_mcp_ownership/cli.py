@@ -12,6 +12,7 @@ from .cleanup import (
     InvalidForceConfirmation,
     PidfdSignalBackend,
     PidfdUnavailable,
+    capture_authorized_audit,
     execute_cleanup,
     issue_force_token,
     plan_cleanup,
@@ -122,18 +123,20 @@ def _report_dict(
         outcomes = report.outcomes
         after_state_available = report.after_state_available
         authority_lost = report.authority_lost
+        partial_force = report.partial_force
     if report is None:
         after_state_available = True
         authority_lost = False
+        partial_force = False
     rendered = {
         "schema_version": 1,
-        "ownership_coverage": dict(snapshot.ownership_coverage),
         "before_count": before_count,
         "before_rss_kib": before_rss,
         "after_count": after_count,
         "after_rss_kib": after_rss,
         "after_state_available": after_state_available,
         "authority_lost": authority_lost,
+        "partial_force": partial_force,
         "attempted": attempted,
         "terminated": terminated,
         "survived": survived,
@@ -155,11 +158,12 @@ def _report_dict(
             }
             for item in outcomes
         ],
-        "classifications": [
-            _safe_classification(item) for item in snapshot.classifications
-        ],
     }
     prefix = "" if report is None else "preflight_"
+    rendered[prefix + "ownership_coverage"] = dict(snapshot.ownership_coverage)
+    rendered[prefix + "classifications"] = [
+        _safe_classification(item) for item in snapshot.classifications
+    ]
     rendered[prefix + "state_counts"] = dict(snapshot.state_counts)
     rendered[prefix + "process_count"] = snapshot.process_count
     rendered[prefix + "rss_kib"] = snapshot.rss_kib
@@ -189,7 +193,8 @@ def _human_report(snapshot: AuditSnapshot, report: CleanupReport | None = None) 
         ),
         (
             f"after_state_available={str(values['after_state_available']).lower()} "
-            f"authority_lost={str(values['authority_lost']).lower()}"
+            f"authority_lost={str(values['authority_lost']).lower()} "
+            f"partial_force={str(values['partial_force']).lower()}"
         ),
     ]
     for phase in ("before", "after"):
@@ -263,6 +268,9 @@ def _cleanup_command(apply: bool, force: bool, confirm: str | None) -> int:
                 store.load_sessions()
                 store.load_processes()
         return _diagnostic("state unavailable")
+    authority = None
+    if apply:
+        snapshot, authority = capture_authorized_audit(store, procfs, clock)
     actions = (
         select_force_actions(snapshot, confirm, clock)
         if force
@@ -307,6 +315,7 @@ def _cleanup_command(apply: bool, force: bool, confirm: str | None) -> int:
         clock,
         apply=apply,
         confirm_token=confirm,
+        authority=authority,
     )
     sys.stdout.write(_human_report(snapshot, report))
     if not apply:
@@ -316,7 +325,7 @@ def _cleanup_command(apply: bool, force: bool, confirm: str | None) -> int:
                 sys.stdout.write(
                     f"pid={item.process.wrapper.pid} force_confirmation={token}\n"
                 )
-    return 0
+    return 1 if report.partial_force else 0
 
 
 def _explain_command(pid: int) -> int:

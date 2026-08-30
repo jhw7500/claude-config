@@ -342,6 +342,9 @@ class ManagedProcess:
 
     @classmethod
     def from_dict(cls, data: object) -> ManagedProcess:
+        if isinstance(data, dict) and "owner_generation" not in data:
+            data = dict(data)
+            data["owner_generation"] = None
         parsed = _require_exact_keys(
             data,
             {
@@ -424,6 +427,92 @@ class ManagedProcess:
 
 
 @dataclass(frozen=True)
+class SignalIntent:
+    schema_version: int
+    process_key: str
+    owner_generation: str
+    identity_keys: tuple[str, ...]
+    action: Literal["term", "force"]
+    status: Literal["pending", "delivered", "conflict"]
+    delivered_keys: tuple[str, ...] = ()
+    term_sent_boot: float | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            "schema_version": self.schema_version,
+            "process_key": self.process_key,
+            "owner_generation": self.owner_generation,
+            "identity_keys": list(self.identity_keys),
+            "action": self.action,
+            "status": self.status,
+            "delivered_keys": list(self.delivered_keys),
+            "term_sent_boot": self.term_sent_boot,
+        }
+        self.from_dict(data)
+        return data
+
+    @classmethod
+    def from_dict(cls, data: object) -> SignalIntent:
+        parsed = _require_exact_keys(
+            data,
+            {
+                "schema_version",
+                "process_key",
+                "owner_generation",
+                "identity_keys",
+                "action",
+                "status",
+                "delivered_keys",
+                "term_sent_boot",
+            },
+        )
+        if parsed["schema_version"] != 1:
+            raise ValueError("unsupported signal intent schema")
+        process_key = _string(parsed["process_key"], "process_key")
+        owner_generation = _string(parsed["owner_generation"], "owner_generation")
+        if (
+            _STABLE_KEY.fullmatch(process_key) is None
+            or _STABLE_KEY.fullmatch(owner_generation) is None
+        ):
+            raise ValueError("invalid signal intent generation")
+        identity_keys = _strings(parsed["identity_keys"], "identity_keys")
+        delivered_keys = _strings(parsed["delivered_keys"], "delivered_keys")
+        if (
+            not identity_keys
+            or tuple(sorted(set(identity_keys))) != identity_keys
+            or any(_STABLE_KEY.fullmatch(key) is None for key in identity_keys)
+            or tuple(sorted(set(delivered_keys))) != delivered_keys
+            or any(key not in identity_keys for key in delivered_keys)
+        ):
+            raise ValueError("invalid signal intent identities")
+        action = _string(parsed["action"], "action")
+        status = _string(parsed["status"], "status")
+        if action not in ("term", "force") or status not in (
+            "pending",
+            "delivered",
+            "conflict",
+        ):
+            raise ValueError("invalid signal intent state")
+        term_sent = parsed["term_sent_boot"]
+        if term_sent is not None:
+            term_sent = _float(term_sent, "term_sent_boot")
+        if action == "term" and status == "delivered" and term_sent is None:
+            raise ValueError("delivered TERM intent needs time")
+        if status != "delivered" and term_sent is not None:
+            raise ValueError("undelivered intent cannot have TERM time")
+        return cls(
+            1,
+            process_key,
+            owner_generation,
+            identity_keys,
+            action,
+            status,
+            delivered_keys,
+            term_sent,
+        )
+
+
+@dataclass(frozen=True)
 class Association:
     kind: Literal["session", "shared", "unknown"]
     session_id: str | None
@@ -495,3 +584,4 @@ class CleanupReport:
     after_classifications: tuple[Classification, ...] = ()
     after_state_available: bool = True
     authority_lost: bool = False
+    partial_force: bool = False
