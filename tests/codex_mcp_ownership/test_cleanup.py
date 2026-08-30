@@ -576,6 +576,7 @@ def test_apply_reaudits_under_lock_and_persists_term_survivor(orphan_context) ->
     events = cleanup_events(store)
     assert [event["event"] for event in events] == [
         "cleanup_term_pending",
+        "cleanup_term_dispatch",
         "cleanup_term_delivery_receipt",
         "cleanup_term_sent",
     ]
@@ -2801,3 +2802,322 @@ def test_force_deadline_after_first_delivery_is_partial_and_accounts_for_all(
     assert len(report.outcomes) == len(actions)
     assert report.skipped == len(actions) - 1
     assert [call[0] for call in signaler.calls].count("send") == 1
+
+
+def _expand_stubborn_process(store, tree, clock, process):
+    write_proc_entry(
+        tree.proc_root,
+        654,
+        "654 (second) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 6540 0 0\n",
+        tree.proc_root / "node",
+        "VmRSS:\t48 kB\n",
+    )
+    second = tree.identity(654)
+    assert second is not None
+    expanded = replace(
+        process,
+        members=(process.wrapper, second),
+        term_sent_keys=frozenset({process.wrapper.stable_key(), second.stable_key()}),
+    )
+    store.save_process(expanded)
+    snapshot = classify.build_audit(store, tree, clock)
+    assert snapshot.classifications[0].state == "stubborn"
+    return snapshot, second
+
+
+def test_final_lexical_binding_check_prevents_signal_at_effect_seam(
+    orphan_context, tmp_path, monkeypatch
+) -> None:
+    store, tree, clock, snapshot, _process, _lease = orphan_context
+    displaced = tmp_path / "final-effect-root"
+    original_transition = store.transition
+    rebound = False
+
+    def rebind_after_all_effect_preconditions(*args, **kwargs):
+        nonlocal rebound
+        if kwargs.get("effect") is not None:
+            original_before = kwargs["before_effect"]
+
+            def before_then_rebind():
+                nonlocal rebound
+                original_before()
+                if not rebound:
+                    store.root.rename(displaced)
+                    store.root.mkdir(mode=0o700)
+                    rebound = True
+
+            kwargs["before_effect"] = before_then_rebind
+        return original_transition(*args, **kwargs)
+
+    monkeypatch.setattr(store, "transition", rebind_after_all_effect_preconditions)
+    signaler = FakeSignalBackend()
+
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+    )
+
+    assert rebound is True
+    assert [call for call in signaler.calls if call[0] == "send"] == []
+    assert report.authority_lost is True
+    assert report.after_state_available is False
+    assert list(store.root.iterdir()) == []
+
+
+def test_successful_singleton_dispatch_is_not_collapsed_to_signal_failure(
+    orphan_context, monkeypatch
+) -> None:
+    store, tree, clock, snapshot, process, _lease = orphan_context
+    original_write = store._write_transition_record_locked
+    failed = False
+
+    def fail_delivered_receipt(kind, key, updated, **kwargs):
+        nonlocal failed
+        if (
+            not failed
+            and isinstance(updated, model.SignalIntent)
+            and updated.delivered_keys
+        ):
+            failed = True
+            raise OSError("POST-EFFECT-RECEIPT-FAILURE")
+        return original_write(kind, key, updated, **kwargs)
+
+    monkeypatch.setattr(
+        store, "_write_transition_record_locked", fail_delivered_receipt
+    )
+    signaler = FakeSignalBackend()
+
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+    )
+
+    assert [call[0] for call in signaler.calls].count("send") == 1
+    assert report.attempted == 1
+    assert report.outcomes[0].status == "survived"
+    assert report.outcomes[0].reason == "signal_delivery_indeterminate"
+    assert report.authority_lost is True
+    assert report.after_state_available is False
+    intent = store.load_signal_intent(process.wrapper.stable_key())
+    assert intent is not None
+    no_replay_keys = set(intent.delivered_keys) | set(
+        getattr(intent, "dispatch_keys", ())
+    )
+    assert process.wrapper.stable_key() in no_replay_keys
+
+
+def test_post_effect_deadline_returns_indeterminate_singleton_report(
+    orphan_context, monkeypatch
+) -> None:
+    store, tree, clock, snapshot, process, _lease = orphan_context
+    signaler = FakeSignalBackend()
+    original_mark = store._mark_transition_committed_locked
+    now = [0.0]
+    expired = False
+
+    def expire_before_post_effect_commit(event_id, **kwargs):
+        nonlocal expired
+        if not expired and any(call[0] == "send" for call in signaler.calls):
+            now[0] = 1.0
+            expired = True
+        return original_mark(event_id, **kwargs)
+
+    monkeypatch.setattr(
+        store,
+        "_mark_transition_committed_locked",
+        expire_before_post_effect_commit,
+    )
+
+    report = cleanup.execute_cleanup(
+        cleanup.plan_cleanup(snapshot),
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+        deadline=0.5,
+        monotonic=lambda: now[0],
+    )
+
+    assert expired is True
+    assert [call[0] for call in signaler.calls].count("send") == 1
+    assert report.attempted == 1
+    assert report.outcomes[0].status == "survived"
+    assert report.outcomes[0].reason == "signal_delivery_indeterminate"
+    assert report.partial_force is False
+    assert report.authority_lost is True
+    assert report.after_state_available is False
+    intent = store.load_signal_intent(process.wrapper.stable_key())
+    assert intent is not None
+    assert process.wrapper.stable_key() in (
+        set(intent.delivered_keys) | set(intent.dispatch_keys)
+    )
+
+
+def test_successful_multi_dispatch_failure_accounts_partial_force_truth(
+    stubborn_context, monkeypatch
+) -> None:
+    store, tree, clock, _snapshot, process, _lease, _classification = stubborn_context
+    snapshot, _second = _expand_stubborn_process(store, tree, clock, process)
+    classification = snapshot.classifications[0]
+    token = cleanup.issue_force_token(classification, clock)
+    actions = cleanup.plan_cleanup(snapshot, force=True)
+    original_write = store._write_transition_record_locked
+    failed = False
+
+    def fail_first_delivered_receipt(kind, key, updated, **kwargs):
+        nonlocal failed
+        if (
+            not failed
+            and isinstance(updated, model.SignalIntent)
+            and updated.action == "force"
+            and updated.delivered_keys
+        ):
+            failed = True
+            raise OSError("POST-EFFECT-FORCE-RECEIPT-FAILURE")
+        return original_write(kind, key, updated, **kwargs)
+
+    monkeypatch.setattr(
+        store,
+        "_write_transition_record_locked",
+        fail_first_delivered_receipt,
+    )
+    signaler = FakeSignalBackend()
+
+    report = cleanup.execute_cleanup(
+        actions,
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+        confirm_token=token,
+    )
+
+    assert [call[0] for call in signaler.calls].count("send") == 1
+    assert report.attempted == 1
+    assert len(report.outcomes) == len(actions)
+    assert report.outcomes[0].status == "survived"
+    assert report.outcomes[0].reason == "signal_delivery_indeterminate"
+    assert report.outcomes[1].status == "skipped"
+    assert report.partial_force is True
+    assert report.authority_lost is True
+    assert report.after_state_available is False
+
+
+def test_deadline_during_second_delivery_journal_returns_accounted_report(
+    stubborn_context, monkeypatch
+) -> None:
+    store, tree, clock, _snapshot, process, _lease, _classification = stubborn_context
+    snapshot, _second = _expand_stubborn_process(store, tree, clock, process)
+    classification = snapshot.classifications[0]
+    token = cleanup.issue_force_token(classification, clock)
+    actions = cleanup.plan_cleanup(snapshot, force=True)
+    now = [0.0]
+    signaler = FakeSignalBackend()
+    original_build = store._build_transition_journal
+    expired = False
+
+    def expire_after_second_delivery_construction(*args, **kwargs):
+        nonlocal expired
+        result = original_build(*args, **kwargs)
+        updated = args[3]
+        dispatch_keys = getattr(updated, "dispatch_keys", updated.delivered_keys)
+        if (
+            not expired
+            and isinstance(updated, model.SignalIntent)
+            and updated.action == "force"
+            and len(dispatch_keys) == 2
+            and [call[0] for call in signaler.calls].count("send") == 1
+        ):
+            now[0] = 1.0
+            expired = True
+        return result
+
+    monkeypatch.setattr(
+        store,
+        "_build_transition_journal",
+        expire_after_second_delivery_construction,
+    )
+
+    report = cleanup.execute_cleanup(
+        actions,
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+        confirm_token=token,
+        deadline=0.5,
+        monotonic=lambda: now[0],
+    )
+
+    assert expired is True
+    assert [call[0] for call in signaler.calls].count("send") == 1
+    assert report.attempted == 1
+    assert len(report.outcomes) == len(actions)
+    assert report.partial_force is True
+    assert report.after_state_available is False
+
+
+def test_unrelated_corrupt_receipt_blocks_signal_before_backend_use(
+    orphan_context,
+) -> None:
+    store, tree, clock, snapshot, _process, _lease = orphan_context
+    receipts = store.root / "event-receipts"
+    receipts.mkdir(mode=0o700)
+    corrupt = receipts / (("a" * 64) + ".json")
+    corrupt.write_bytes(b'{"schema_version":1}\n')
+    corrupt.chmod(0o600)
+    signaler = FakeSignalBackend()
+
+    with pytest.raises(state.StateCorruption):
+        cleanup.execute_cleanup(
+            cleanup.plan_cleanup(snapshot),
+            store,
+            tree,
+            signaler,
+            clock,
+            apply=True,
+        )
+
+    assert signaler.calls == []
+
+
+@pytest.mark.parametrize("identity_count", [1, 2])
+def test_force_delivery_event_is_partial_only_for_strict_subsets(
+    stubborn_context, identity_count
+) -> None:
+    store, tree, clock, snapshot, process, _lease, _classification = stubborn_context
+    if identity_count == 2:
+        snapshot, _second = _expand_stubborn_process(store, tree, clock, process)
+    classification = snapshot.classifications[0]
+    token = cleanup.issue_force_token(classification, clock)
+    actions = cleanup.plan_cleanup(snapshot, force=True)
+
+    report = cleanup.execute_cleanup(
+        actions,
+        store,
+        tree,
+        FakeSignalBackend(),
+        clock,
+        apply=True,
+        confirm_token=token,
+    )
+
+    assert report.partial_force is False
+    events = [
+        json.loads(line)
+        for line in (store.root / "events.jsonl").read_text().splitlines()
+    ]
+    names = [event["event"] for event in events]
+    assert names.count("cleanup_force_partial") == identity_count - 1
+    assert names.count("cleanup_force_delivery_receipt") == 1

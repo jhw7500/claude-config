@@ -273,10 +273,11 @@ def test_atomic_json_write_failure_removes_private_temporary_file(
     tmp_path, monkeypatch
 ):
     store = state.StateStore(tmp_path / "state")
+    monkeypatch.setattr(store, "_bump_ledger_revision_locked", lambda **_kwargs: 1)
     monkeypatch.setattr(
         state,
         "_write_all",
-        lambda *args: (_ for _ in ()).throw(OSError("short write")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("short write")),
     )
     with pytest.raises(OSError, match="short write"):
         store.save_session(sample_lease())
@@ -302,8 +303,9 @@ def test_atomic_json_cleanup_preserves_temp_after_inode_gains_second_link(
     temporary = store.root / "sessions" / ".tmp-owned"
     second_link = store.root / "sessions" / ".tmp-second-link"
     monkeypatch.setattr(state.secrets, "token_hex", lambda size: "owned")
+    monkeypatch.setattr(store, "_bump_ledger_revision_locked", lambda **_kwargs: 2)
 
-    def link_then_fail(fd, data):
+    def link_then_fail(fd, data, **_kwargs):
         os.link(temporary, second_link)
         raise OSError("injected write failure")
 
@@ -804,32 +806,39 @@ def test_quarantine_rename_failure_leaves_single_diagnosable_source(
 
 
 def test_prepared_event_without_state_commit_recovers_without_false_event(
-    tmp_path,
+    tmp_path, monkeypatch
 ) -> None:
     store = state.StateStore(tmp_path / "state")
     expected = sample_process()
     updated = replace(expected, first_owner_gone_boot=200.0)
     store.save_process(expected)
-    event_id = store.prepare_transition_event(
-        "processes",
-        expected.wrapper.stable_key(),
-        expected,
-        updated,
-        {
-            "schema_version": 1,
-            "event": "owner_loss_observed",
-            "observed_wall": expected.spawned.wall_iso,
-            "process_key": expected.wrapper.stable_key(),
-            "state": "exiting",
-            "reason_codes": ["owner_session_ended"],
-        },
+    monkeypatch.setattr(
+        store,
+        "_write_transition_record_locked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("NO-COMMIT")),
     )
+
+    with pytest.raises(OSError, match="NO-COMMIT"):
+        store.transition(
+            "processes",
+            expected.wrapper.stable_key(),
+            expected,
+            updated,
+            {
+                "schema_version": 1,
+                "event": "owner_loss_observed",
+                "observed_wall": expected.spawned.wall_iso,
+                "process_key": expected.wrapper.stable_key(),
+                "state": "exiting",
+                "reason_codes": ["owner_session_ended"],
+            },
+        )
 
     store.recover_transition_events()
 
     assert store.load_processes()[0] == expected
     assert not (store.root / "events.jsonl").exists()
-    assert not (store.root / "event-journal" / f"{event_id}.json").exists()
+    assert list((store.root / "event-journal").iterdir()) == []
 
 
 def test_prior_v1_process_without_owner_generation_loads_conservatively(
@@ -852,34 +861,6 @@ def test_prior_v1_process_without_owner_generation_loads_conservatively(
     assert loaded[0].owner_session_id == process.owner_session_id
     assert loaded[0].owner_generation is None
     assert not (store.root / "corrupt").exists()
-
-
-def test_committed_event_in_rotated_log_is_not_duplicated(tmp_path) -> None:
-    store = state.StateStore(tmp_path / "state")
-    expected = sample_process()
-    updated = replace(expected, first_owner_gone_boot=200.0)
-    store.save_process(expected)
-    event = {
-        "schema_version": 1,
-        "event": "owner_loss_observed",
-        "observed_wall": expected.spawned.wall_iso,
-        "process_key": expected.wrapper.stable_key(),
-        "state": "exiting",
-        "reason_codes": ["owner_session_ended"],
-    }
-    event_id = store.prepare_transition_event(
-        "processes", expected.wrapper.stable_key(), expected, updated, event
-    )
-    store.save_process(updated)
-    store.mark_transition_committed(event_id)
-    store.append_event(dict(event, event_id=event_id), maintenance=False)
-    os.rename(store.root / "events.jsonl", store.root / "events.jsonl.1")
-
-    store.recover_transition_events()
-
-    assert not (store.root / "events.jsonl").exists()
-    backup = (store.root / "events.jsonl.1").read_text()
-    assert backup.count(event_id) == 1
 
 
 def test_deeply_nested_record_is_corruption_without_recursion_traceback(tmp_path):
@@ -917,7 +898,7 @@ def test_transition_rejects_a_same_digest_wrong_target_journal(tmp_path) -> None
     store.save_signal_intent(intent)
 
     with pytest.raises(ValueError, match="transition must change raw state"):
-        store.prepare_transition_event(
+        store.transition(
             "signal-intents",
             intent.process_key,
             intent,
@@ -1096,3 +1077,180 @@ def test_quarantine_race_cannot_overwrite_a_new_destination(
     assert any(path.read_bytes() == sentinel for path in quarantined_files)
     assert any(path.read_bytes() == raw for path in quarantined_files)
     assert all(path.stat().st_nlink == 1 for path in quarantined_files)
+
+
+def _owner_loss_event(process, reason: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "event": "owner_loss_observed",
+        "observed_wall": process.spawned.wall_iso,
+        "process_key": process.wrapper.stable_key(),
+        "state": "exiting",
+        "reason_codes": [reason],
+    }
+
+
+def _retain_next_transition_journal(store, monkeypatch):
+    original_unlink = state.os.unlink
+    retained = False
+
+    def retain_journal(name, *args, **kwargs):
+        nonlocal retained
+        rendered = os.fspath(name)
+        if (
+            not retained
+            and rendered.endswith(".json")
+            and len(rendered) == 69
+            and all(character in "0123456789abcdef" for character in rendered[:-5])
+        ):
+            retained = True
+            raise OSError("RETAIN-JOURNAL")
+        return original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(state.os, "unlink", retain_journal)
+    return original_unlink
+
+
+def test_expiry_after_journal_construction_starts_no_write_boundary(
+    tmp_path, monkeypatch
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    now = [0.0]
+    original_build = store._build_transition_journal
+
+    def build_then_expire(*args, **kwargs):
+        result = original_build(*args, **kwargs)
+        now[0] = 1.0
+        return result
+
+    monkeypatch.setattr(store, "_build_transition_journal", build_then_expire)
+
+    with pytest.raises(state.OperationDeadlineExceeded):
+        store.transition(
+            "processes",
+            expected.wrapper.stable_key(),
+            expected,
+            updated,
+            _owner_loss_event(expected, "deadline_after_construction"),
+            deadline=0.5,
+            monotonic=lambda: now[0],
+        )
+
+    journal = store.root / "event-journal"
+    assert not journal.exists() or list(journal.iterdir()) == []
+    assert store.load_raw_process(expected.wrapper.stable_key()) == expected
+
+
+def test_receipt_prevents_reemission_after_retained_journal_and_log_rotation(
+    tmp_path, monkeypatch
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    original_unlink = _retain_next_transition_journal(store, monkeypatch)
+
+    store.transition(
+        "processes",
+        expected.wrapper.stable_key(),
+        expected,
+        updated,
+        _owner_loss_event(expected, "rotation_independent_receipt"),
+    )
+
+    monkeypatch.setattr(state.os, "unlink", original_unlink)
+    event_id = next((store.root / "event-receipts").iterdir()).stem
+    monkeypatch.setattr(state, "EVENT_LOG_MAX_BYTES", 256)
+    filler = {
+        "schema_version": 1,
+        "event": "filler",
+        "reason_codes": ["x" * 180],
+    }
+    for _index in range(state.EVENT_LOG_BACKUPS + 2):
+        store.append_event(filler, maintenance=False)
+    assert not any(
+        event_id in path.read_text(encoding="utf-8")
+        for path in store.root.glob("events.jsonl*")
+    )
+
+    original_append = store.append_event
+
+    def forbid_receipt_backed_reemission(event, **kwargs):
+        if event.get("event_id") == event_id:
+            raise AssertionError("immutable receipt must prevent event re-emission")
+        return original_append(event, **kwargs)
+
+    monkeypatch.setattr(store, "append_event", forbid_receipt_backed_reemission)
+    store.recover_transition_events()
+
+    assert list((store.root / "event-journal").iterdir()) == []
+
+
+def test_active_transitions_enforce_event_receipt_retention(
+    tmp_path, monkeypatch
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    monkeypatch.setattr(state, "EVENT_RECEIPT_RETENTION", 2)
+    current = sample_process()
+    store.save_process(current)
+
+    for exit_code in (1, 2, 3):
+        updated = replace(current, exit_code=exit_code)
+        store.transition(
+            "processes",
+            current.wrapper.stable_key(),
+            current,
+            updated,
+            _owner_loss_event(current, f"transition_{exit_code}"),
+        )
+        current = updated
+
+    assert len(list((store.root / "event-receipts").iterdir())) <= 2
+    assert list((store.root / "event-journal").iterdir()) == []
+
+
+def test_direct_event_append_reconciles_retained_transition_before_rotation(
+    tmp_path, monkeypatch
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    original_unlink = _retain_next_transition_journal(store, monkeypatch)
+    store.transition(
+        "processes",
+        expected.wrapper.stable_key(),
+        expected,
+        updated,
+        _owner_loss_event(expected, "direct_append_reconciliation"),
+    )
+    monkeypatch.setattr(state.os, "unlink", original_unlink)
+    assert list((store.root / "event-journal").iterdir())
+
+    store.append_event({"schema_version": 1, "event": "direct-cache-append"})
+
+    assert list((store.root / "event-journal").iterdir()) == []
+    events = [
+        json.loads(line)
+        for path in store.root.glob("events.jsonl*")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    event_ids = [event["event_id"] for event in events if "event_id" in event]
+    assert len(event_ids) == len(set(event_ids))
+
+
+@pytest.mark.parametrize(
+    "removed_api",
+    [
+        "prepare_transition_event",
+        "mark_transition_committed",
+        "stage_event",
+        "discard_staged_event",
+        "flush_staged_events",
+    ],
+)
+def test_parallel_transition_writer_apis_are_not_public(removed_api) -> None:
+    assert not hasattr(state.StateStore, removed_api)

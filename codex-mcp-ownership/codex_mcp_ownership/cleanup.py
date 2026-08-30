@@ -29,6 +29,7 @@ from .model import (
 from .procfs import IdentityObservation, LinuxProcfs
 from .state import (
     OperationDeadlineExceeded,
+    PostEffectStateError,
     RootBinding,
     StateStore,
     UnsafeStatePath,
@@ -467,15 +468,25 @@ def _validate_process_authority_locked(
     store: StateStore,
     process: ManagedProcess,
     lease: SessionLease | None,
+    deadline: float | None,
+    monotonic: Callable[[], float],
 ) -> None:
-    current = store.load_raw_process(process.wrapper.stable_key())
+    current = store.load_raw_process(
+        process.wrapper.stable_key(),
+        deadline=deadline,
+        monotonic=monotonic,
+    )
     if current != process:
         raise UnsafeStatePath("authorized process generation changed")
     if process.owner_session_id is None:
         if lease is not None:
             raise UnsafeStatePath("authorized lease changed")
         return
-    current_lease = store.load_session(process.owner_session_id)
+    current_lease = store.load_session(
+        process.owner_session_id,
+        deadline=deadline,
+        monotonic=monotonic,
+    )
     if (
         current_lease != lease
         or current_lease is None
@@ -520,7 +531,13 @@ def _transition_intent(
     effect: Callable[[], None] | None = None,
 ) -> int:
     def final_precondition() -> None:
-        _validate_process_authority_locked(store, process, lease)
+        _validate_process_authority_locked(
+            store,
+            process,
+            lease,
+            deadline,
+            monotonic,
+        )
         if before_effect is not None:
             before_effect()
 
@@ -779,6 +796,7 @@ def _execute_cleanup_protocol(
     attempted = 0
     partial_force = False
     deadline_expired = False
+    post_effect_failure = False
     stop_all = False
     initial_term_intents = {
         intent.process_key: intent for intent in authority.term_intents
@@ -934,9 +952,34 @@ def _execute_cleanup_protocol(
                     )
                     created_intent = True
                 assert intent is not None
-                delivered = tuple(
-                    sorted(set(intent.delivered_keys) | {action.identity.stable_key()})
+                identity_key = action.identity.stable_key()
+                dispatch = tuple(sorted(set(intent.dispatch_keys) | {identity_key}))
+                dispatched_intent = replace(intent, dispatch_keys=dispatch)
+                revision = _transition_intent(
+                    store,
+                    authority,
+                    revision,
+                    intent,
+                    dispatched_intent,
+                    _cleanup_event(
+                        classification,
+                        before.generated.wall_iso,
+                        (
+                            "cleanup_force_dispatch"
+                            if forced
+                            else "cleanup_term_dispatch"
+                        ),
+                        "unknown",
+                        classification.reason_codes
+                        + ("signal_dispatch_indeterminate",),
+                    ),
+                    process=raw,
+                    lease=lease,
+                    deadline=deadline,
+                    monotonic=monotonic,
                 )
+                intent = dispatched_intent
+                delivered = tuple(sorted(set(intent.delivered_keys) | {identity_key}))
                 delivered_intent = replace(intent, delivered_keys=delivered)
 
                 def before_send() -> None:
@@ -959,7 +1002,7 @@ def _execute_cleanup_protocol(
                             before.generated.wall_iso,
                             (
                                 "cleanup_force_partial"
-                                if forced and not intent.delivered_keys
+                                if forced and set(delivered) < set(intent.identity_keys)
                                 else "cleanup_force_delivery_receipt"
                                 if forced
                                 else "cleanup_term_delivery_receipt"
@@ -997,6 +1040,50 @@ def _execute_cleanup_protocol(
                             group_outcomes.append(skipped)
                         break
                     raise
+                except CleanupDeadlineExceeded:
+                    if forced and delivered_keys:
+                        partial_force = True
+                        deadline_expired = True
+                        for remaining in process_actions[index:]:
+                            skipped = CleanupOutcome(
+                                remaining,
+                                "skipped",
+                                "partial_force_deadline_exhausted",
+                            )
+                            outcomes.append(skipped)
+                            group_outcomes.append(skipped)
+                        break
+                    raise
+                except PostEffectStateError as error:
+                    attempted += 1
+                    delivered_keys.add(identity_key)
+                    if error.record_persisted:
+                        intent = delivered_intent
+                    outcome = CleanupOutcome(
+                        action,
+                        "survived",
+                        "signal_delivery_indeterminate",
+                    )
+                    outcomes.append(outcome)
+                    group_outcomes.append(outcome)
+                    authority_lost = True
+                    post_effect_failure = True
+                    if forced:
+                        partial_force = delivered_keys < set(intent.identity_keys)
+                    for remaining in process_actions[index + 1 :]:
+                        skipped = CleanupOutcome(
+                            remaining,
+                            "skipped",
+                            (
+                                "partial_force_state_unavailable"
+                                if forced and partial_force
+                                else "state_authority_changed"
+                            ),
+                        )
+                        outcomes.append(skipped)
+                        group_outcomes.append(skipped)
+                    stop_all = True
+                    break
                 except OSError:
                     attempted += 1
                     outcome = CleanupOutcome(action, "skipped", "signal_failed")
@@ -1045,7 +1132,7 @@ def _execute_cleanup_protocol(
                     break
                 attempted += 1
                 intent = delivered_intent
-                delivered_keys.add(action.identity.stable_key())
+                delivered_keys.add(identity_key)
                 if deadline is not None and monotonic() >= deadline:
                     outcome = CleanupOutcome(
                         action,
@@ -1121,6 +1208,20 @@ def _execute_cleanup_protocol(
                         outcomes.append(skipped)
                         group_outcomes.append(skipped)
                     break
+            except CleanupDeadlineExceeded:
+                if forced and delivered_keys:
+                    partial_force = True
+                    deadline_expired = True
+                    for remaining in process_actions[index:]:
+                        skipped = CleanupOutcome(
+                            remaining,
+                            "skipped",
+                            "partial_force_deadline_exhausted",
+                        )
+                        outcomes.append(skipped)
+                        group_outcomes.append(skipped)
+                    break
+                raise
             except (FileNotFoundError, TimeoutError, UnsafeStatePath, OSError):
                 authority_lost = True
                 outcome = CleanupOutcome(
@@ -1253,7 +1354,7 @@ def _execute_cleanup_protocol(
         else:
             revision = next_revision
 
-    if deadline_expired:
+    if deadline_expired or post_effect_failure:
         return _unavailable_report(
             before,
             before_count,

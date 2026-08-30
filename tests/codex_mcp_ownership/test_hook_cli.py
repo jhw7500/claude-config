@@ -536,9 +536,10 @@ def test_durable_start_notifies_and_falls_back_after_event_append_failure(
     runtime, store, _clock, notifier, _procfs = hook_runtime
     notifier.result = False
     fallback = []
+    original_append = store._append_event_locked
     monkeypatch.setattr(
         store,
-        "append_event",
+        "_append_event_locked",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("event failed")),
     )
     monkeypatch.setattr(
@@ -548,12 +549,14 @@ def test_durable_start_notifies_and_falls_back_after_event_append_failure(
     assert runtime.only_lease().state == "active"
     assert notifier.calls == 1
     assert len(fallback) == 1
-    assert list((store.root / "event-journal").iterdir())
 
-    monkeypatch.setattr(store, "append_event", StateStore.append_event.__get__(store))
+    monkeypatch.setattr(store, "_append_event_locked", original_append)
     store.recover_transition_events()
-    events = (store.root / "events.jsonl").read_text().splitlines()
-    assert sum('"event":"session_started"' in line for line in events) == 1
+    receipts = [
+        json.loads(path.read_text(encoding="utf-8"))["event"]
+        for path in (store.root / "event-receipts").iterdir()
+    ]
+    assert sum(event["event"] == "session_started" for event in receipts) == 1
     assert list((store.root / "event-journal").iterdir()) == []
 
 
@@ -677,17 +680,17 @@ def test_concurrent_start_end_events_follow_locked_state_order(
     hook_runtime, monkeypatch
 ):
     runtime, store, clock, _notifier, _procfs = hook_runtime
-    original_append = store.append_event
+    original_append = store._append_event_locked
     start_event_entered = threading.Event()
     release_start_event = threading.Event()
 
-    def delayed_append(event, **kwargs):
-        if event.get("event") == "session_started":
+    def delayed_append(root_fd, record, **kwargs):
+        if b'"event":"session_started"' in record:
             start_event_entered.set()
             assert release_start_event.wait(2.0)
-        return original_append(event, **kwargs)
+        return original_append(root_fd, record, **kwargs)
 
-    monkeypatch.setattr(store, "append_event", delayed_append)
+    monkeypatch.setattr(store, "_append_event_locked", delayed_append)
     start_thread = threading.Thread(target=runtime.start)
     start_thread.start()
     assert start_event_entered.wait(2.0)
@@ -721,7 +724,7 @@ def test_durable_end_notifies_after_event_append_failure(hook_runtime, monkeypat
     runtime.start()
     monkeypatch.setattr(
         store,
-        "append_event",
+        "_append_event_locked",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("event failed")),
     )
     clock.advance(1.0)
@@ -1369,9 +1372,9 @@ def test_committed_hook_start_still_notifies_and_falls_back_when_recovery_fails(
     committed = False
     fallback_calls = []
 
-    def commit_then_report_failure(record_kind, record_key, updated):
+    def commit_then_report_failure(record_kind, record_key, updated, **kwargs):
         nonlocal committed
-        revision = original_write(record_kind, record_key, updated)
+        revision = original_write(record_kind, record_key, updated, **kwargs)
         if record_kind == "sessions" and not committed:
             committed = True
             raise OSError("COMMITTED-SAVE-CANARY")
@@ -1403,3 +1406,16 @@ def test_committed_hook_start_still_notifies_and_falls_back_when_recovery_fails(
     assert store.load_session("thr_123") is not None
     assert notifier.calls == 1
     assert len(fallback_calls) == 1
+
+
+def test_opportunistic_fallback_enumeration_does_not_use_unbounded_iterdir(
+    hook_runtime, monkeypatch
+) -> None:
+    _runtime, store, clock, _notifier, procfs = hook_runtime
+
+    def forbid_iterdir(_path):
+        raise AssertionError("fallback enumeration must use capped scandir")
+
+    monkeypatch.setattr(Path, "iterdir", forbid_iterdir)
+
+    hook._opportunistic_cleanup_bounded(store, procfs, clock)

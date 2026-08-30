@@ -175,11 +175,16 @@ def _opportunistic_cleanup_bounded(
         check_deadline()
         directory = store.root / kind
         try:
-            for _item in directory.iterdir():
-                check_deadline()
-                record_count += 1
-                if record_count > FALLBACK_MAX_RECORDS:
-                    break
+            with os.scandir(directory) as entries:
+                iterator = iter(entries)
+                while record_count <= FALLBACK_MAX_RECORDS:
+                    check_deadline()
+                    try:
+                        next(iterator)
+                    except StopIteration:
+                        break
+                    check_deadline()
+                    record_count += 1
         except FileNotFoundError:
             continue
         if record_count > FALLBACK_MAX_RECORDS:
@@ -263,6 +268,7 @@ def _fallback_deferred(
             },
             maintenance=False,
             remaining_timeout=remaining,
+            deadline=deadline,
         )
     except Exception:
         pass
@@ -292,6 +298,7 @@ def _hook_diagnostic(
             },
             maintenance=False,
             remaining_timeout=remaining,
+            deadline=deadline,
         )
     except Exception:
         pass

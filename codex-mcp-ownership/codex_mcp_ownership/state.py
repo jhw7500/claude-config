@@ -74,6 +74,14 @@ class OperationDeadlineExceeded(RuntimeError):
     """The absolute deadline expired before the next bounded operation."""
 
 
+class PostEffectStateError(RuntimeError):
+    """The irreversible effect returned before durable completion failed."""
+
+    def __init__(self, message: str, *, record_persisted: bool) -> None:
+        super().__init__(message)
+        self.record_persisted = record_persisted
+
+
 class ReadOnlyStateError(PermissionError):
     """A mutation was attempted through an audit-only store."""
 
@@ -269,10 +277,18 @@ def _parse_state_record(
     return parser(decoded)
 
 
-def _write_all(fd: int, data: bytes) -> None:
+def _write_all(
+    fd: int,
+    data: bytes,
+    *,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
     position = 0
     while position < len(data):
+        _deadline_check(deadline, monotonic)
         written = os.write(fd, data[position:])
+        _deadline_check(deadline, monotonic)
         if written <= 0:
             raise OSError(errno.EIO, "short state write")
         position += written
@@ -325,6 +341,7 @@ class StateStore:
         self._lock_fd: int | None = None
         self._pinned_root_fd: int | None = None
         self._lock_depth = 0
+        self._effect_transition_ids: set[str] = set()
 
     def _require_mutable(self) -> None:
         if self.read_only:
@@ -711,18 +728,30 @@ class StateStore:
                                 self._lock_condition.notify_all()
 
     def _atomic_json(
-        self, directory_fd: int, directory: Path, name: str, value: object
+        self,
+        directory_fd: int,
+        directory: Path,
+        name: str,
+        value: object,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not self._owns_lock():
             raise RuntimeError("atomic state writes require the state lock")
+        _deadline_check(deadline, monotonic)
         data = _canonical_json(value)
+        _deadline_check(deadline, monotonic)
         target = directory / name
         try:
+            _deadline_check(deadline, monotonic)
             existing = self._open_private_file(directory_fd, name, target)
+            _deadline_check(deadline, monotonic)
         except FileNotFoundError:
             existing = None
         if existing is not None:
             os.close(existing)
+            _deadline_check(deadline, monotonic)
         temporary = f".tmp-{secrets.token_hex(16)}"
         flags = (
             os.O_WRONLY
@@ -733,21 +762,34 @@ class StateStore:
         )
         created: os.stat_result | None = None
         try:
+            _deadline_check(deadline, monotonic)
             fd = os.open(temporary, flags, _FILE_MODE, dir_fd=directory_fd)
+            _deadline_check(deadline, monotonic)
             created = os.fstat(fd)
+            _deadline_check(deadline, monotonic)
             try:
                 os.fchmod(fd, _FILE_MODE)
-                _write_all(fd, data)
+                _deadline_check(deadline, monotonic)
+                _write_all(
+                    fd,
+                    data,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
                 os.fsync(fd)
+                _deadline_check(deadline, monotonic)
             finally:
                 os.close(fd)
+            _deadline_check(deadline, monotonic)
             os.replace(
                 temporary,
                 name,
                 src_dir_fd=directory_fd,
                 dst_dir_fd=directory_fd,
             )
+            _deadline_check(deadline, monotonic)
             os.fsync(directory_fd)
+            _deadline_check(deadline, monotonic)
         except Exception:
             if created is not None:
                 try:
@@ -772,19 +814,54 @@ class StateStore:
                     os.unlink(temporary, dir_fd=directory_fd)
             raise
 
-    def _maintenance_locked(self) -> None:
+    def _maintenance_locked(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        _deadline_check(deadline, monotonic)
+        if deadline is not None:
+            # Time-bounded writers enforce the authoritative receipt invariant;
+            # unrelated archival and transaction housekeeping remains deferrable.
+            self._prune_event_receipts_locked(
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            return
         self._prune_event_backups_locked()
         self._prune_event_receipts_locked()
         self._prune_transactions_locked()
 
-    def ledger_revision(self) -> int:
+    def ledger_revision(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> int:
+        _deadline_check(deadline, monotonic)
         if self._owns_lock() or self.read_only:
-            return self._ledger_revision_locked()
-        with self.locked():
-            return self._ledger_revision_locked()
+            return self._ledger_revision_locked(
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+        with self.locked(
+            remaining_timeout=_remaining_timeout(deadline, monotonic),
+        ):
+            return self._ledger_revision_locked(
+                deadline=deadline,
+                monotonic=monotonic,
+            )
 
-    def _ledger_revision_locked(self) -> int:
+    def _ledger_revision_locked(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> int:
+        _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
+        _deadline_check(deadline, monotonic)
         try:
             try:
                 fd = self._open_private_file(
@@ -795,7 +872,11 @@ class StateStore:
             except FileNotFoundError:
                 return 0
             try:
-                raw = _read_state_record(fd)
+                raw = _read_state_record(
+                    fd,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
             finally:
                 os.close(fd)
         finally:
@@ -825,35 +906,57 @@ class StateStore:
                 hashlib.sha256(raw).hexdigest(),
             ) from error
 
-    def _bump_ledger_revision_locked(self) -> int:
+    def _bump_ledger_revision_locked(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> int:
         if not self._owns_lock():
             raise RuntimeError("ledger revision update requires the state lock")
-        revision = self._ledger_revision_locked() + 1
+        _deadline_check(deadline, monotonic)
+        revision = (
+            self._ledger_revision_locked(
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            + 1
+        )
+        _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
+        _deadline_check(deadline, monotonic)
         temporary = f".ledger-revision-{secrets.token_hex(16)}"
         fd: int | None = None
         try:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK
             flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            _deadline_check(deadline, monotonic)
             fd = os.open(temporary, flags, _FILE_MODE, dir_fd=root_fd)
+            _deadline_check(deadline, monotonic)
             os.fchmod(fd, _FILE_MODE)
+            _deadline_check(deadline, monotonic)
             payload = _canonical_json({"schema_version": 1, "revision": revision})
-            position = 0
-            while position < len(payload):
-                written = os.write(fd, payload[position:])
-                if written <= 0:
-                    raise OSError(errno.EIO, "short ledger revision write")
-                position += written
+            _deadline_check(deadline, monotonic)
+            _write_all(
+                fd,
+                payload,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
             os.fsync(fd)
+            _deadline_check(deadline, monotonic)
             os.close(fd)
             fd = None
+            _deadline_check(deadline, monotonic)
             os.replace(
                 temporary,
                 LEDGER_REVISION_FILENAME,
                 src_dir_fd=root_fd,
                 dst_dir_fd=root_fd,
             )
+            _deadline_check(deadline, monotonic)
             os.fsync(root_fd)
+            _deadline_check(deadline, monotonic)
         except Exception:
             if fd is not None:
                 os.close(fd)
@@ -873,22 +976,33 @@ class StateStore:
         payload: dict[str, object],
         *,
         maintenance: bool,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> int:
         if not self._owns_lock():
             raise RuntimeError("state record write requires the state lock")
         if maintenance:
-            self._maintenance_locked()
+            self._maintenance_locked(deadline=deadline, monotonic=monotonic)
+        _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
+        _deadline_check(deadline, monotonic)
         try:
+            _deadline_check(deadline, monotonic)
             directory_fd = self._open_directory(root_fd, kind, create=True)
+            _deadline_check(deadline, monotonic)
             assert directory_fd is not None
             try:
-                revision = self._bump_ledger_revision_locked()
+                revision = self._bump_ledger_revision_locked(
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
                 self._atomic_json(
                     directory_fd,
                     self.root / kind,
                     key + ".json",
                     payload,
+                    deadline=deadline,
+                    monotonic=monotonic,
                 )
                 return revision
             finally:
@@ -1004,7 +1118,13 @@ class StateStore:
         ).encode("utf-8")
         return hashlib.sha256(rendered).hexdigest()
 
-    def load_session(self, session_id: str) -> SessionLease | None:
+    def load_session(
+        self,
+        session_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> SessionLease | None:
         """Load only the SHA-256-addressed lease for ``session_id``."""
         key = session_key(session_id)
         value = self._load_exact_record(
@@ -1012,6 +1132,8 @@ class StateStore:
             key,
             SessionLease.from_dict,
             lambda item: session_key(item.session_id),
+            deadline=deadline,
+            monotonic=monotonic,
         )
         if value is not None and value.session_id != session_id:
             raise StateCorruption(self.root / "sessions" / f"{key}.json", key)
@@ -1023,7 +1145,13 @@ class StateStore:
             return None
         return self._overlay_signal_intent(process)
 
-    def load_raw_process(self, process_key: str) -> ManagedProcess | None:
+    def load_raw_process(
+        self,
+        process_key: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> ManagedProcess | None:
         if not isinstance(process_key, str) or len(process_key) != _HEX_DIGEST_LENGTH:
             raise ValueError("invalid process key")
         try:
@@ -1035,13 +1163,21 @@ class StateStore:
             process_key,
             ManagedProcess.from_dict,
             lambda item: item.wrapper.stable_key(),
+            deadline=deadline,
+            monotonic=monotonic,
         )
         if process is None:
             return None
         assert isinstance(process, ManagedProcess)
         return process
 
-    def load_signal_intent(self, process_key: str) -> SignalIntent | None:
+    def load_signal_intent(
+        self,
+        process_key: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> SignalIntent | None:
         if not _is_hex_digest(process_key):
             raise ValueError("invalid process key")
         value = self._load_exact_record(
@@ -1049,11 +1185,19 @@ class StateStore:
             process_key,
             SignalIntent.from_dict,
             lambda item: item.process_key,
+            deadline=deadline,
+            monotonic=monotonic,
         )
         assert value is None or isinstance(value, SignalIntent)
         return value
 
-    def load_force_intent(self, process_key: str) -> SignalIntent | None:
+    def load_force_intent(
+        self,
+        process_key: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> SignalIntent | None:
         if not _is_hex_digest(process_key):
             raise ValueError("invalid process key")
         value = self._load_exact_record(
@@ -1061,6 +1205,8 @@ class StateStore:
             process_key,
             SignalIntent.from_dict,
             lambda item: item.process_key,
+            deadline=deadline,
+            monotonic=monotonic,
         )
         assert value is None or isinstance(value, SignalIntent)
         return value
@@ -1134,6 +1280,13 @@ class StateStore:
         delivered = tuple(
             sorted(set(existing.delivered_keys) | set(proposed.delivered_keys))
         )
+        dispatch = tuple(
+            sorted(
+                set(existing.dispatch_keys)
+                | set(proposed.dispatch_keys)
+                | set(delivered)
+            )
+        )
         if existing.status in {"delivered", "conflict"}:
             status = existing.status
         else:
@@ -1150,6 +1303,7 @@ class StateStore:
             status=status,
             delivered_keys=delivered,
             term_sent_boot=term_sent_boot,
+            dispatch_keys=dispatch,
         )
 
     def remove_signal_intent(self, process_key: str, *, action: str = "term") -> int:
@@ -1248,16 +1402,32 @@ class StateStore:
         key: str,
         parser: Callable[[object], _Record],
         key_for: Callable[[_Record], str],
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> _Record | None:
+        _deadline_check(deadline, monotonic)
         if not self._root_exists():
             return None
         if self.read_only:
             return self._load_exact_record_locked_or_read_only(
-                kind, key, parser, key_for
+                kind,
+                key,
+                parser,
+                key_for,
+                deadline=deadline,
+                monotonic=monotonic,
             )
-        with self.locked():
+        with self.locked(
+            remaining_timeout=_remaining_timeout(deadline, monotonic),
+        ):
             return self._load_exact_record_locked_or_read_only(
-                kind, key, parser, key_for
+                kind,
+                key,
+                parser,
+                key_for,
+                deadline=deadline,
+                monotonic=monotonic,
             )
 
     def _load_exact_record_locked_or_read_only(
@@ -1266,8 +1436,13 @@ class StateStore:
         key: str,
         parser: Callable[[object], _Record],
         key_for: Callable[[_Record], str],
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> _Record | None:
+        _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
+        _deadline_check(deadline, monotonic)
         try:
             directory_fd = self._open_directory(root_fd, kind, create=False)
             if directory_fd is None:
@@ -1280,10 +1455,17 @@ class StateStore:
                 except FileNotFoundError:
                     return None
                 try:
-                    raw = _read_state_record(fd)
+                    raw = _read_state_record(
+                        fd,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    )
                 except (ValueError, OverflowError, RecursionError):
+                    _deadline_check(deadline, monotonic)
                     os.lseek(fd, 0, os.SEEK_SET)
+                    _deadline_check(deadline, monotonic)
                     raw = os.read(fd, STATE_RECORD_MAX_BYTES + 1)
+                    _deadline_check(deadline, monotonic)
                 finally:
                     os.close(fd)
                 digest = hashlib.sha256(raw).hexdigest()
@@ -1499,6 +1681,8 @@ class StateStore:
         *,
         maintenance: bool = True,
         remaining_timeout: float | None = None,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(event, dict):
             raise ValueError("event must be a record")
@@ -1512,97 +1696,57 @@ class StateStore:
         record = _canonical_json(event)
         if len(record) > EVENT_LOG_MAX_BYTES:
             raise ValueError("event record exceeds maximum log size")
+        _deadline_check(deadline, monotonic)
         self._require_mutable()
         lock = (
             self.locked()
-            if remaining_timeout is None
-            else self.locked(remaining_timeout=remaining_timeout)
+            if remaining_timeout is None and deadline is None
+            else self.locked(
+                remaining_timeout=(
+                    remaining_timeout
+                    if deadline is None
+                    else min(
+                        remaining_timeout
+                        if remaining_timeout is not None
+                        else self.lock_timeout,
+                        _remaining_timeout(deadline, monotonic) or 0.0,
+                    )
+                )
+            )
         )
         with lock:
+            self._recover_before_write_locked(deadline, monotonic)
             if maintenance:
-                self._maintenance_locked()
+                self._maintenance_locked(
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+            _deadline_check(deadline, monotonic)
             root_fd = self._open_root()
             try:
-                self._append_event_locked(root_fd, record)
-            finally:
-                os.close(root_fd)
-
-    def stage_event(self, event: dict[str, object]) -> str:
-        if not isinstance(event, dict):
-            raise ValueError("event must be a record")
-        payload = dict(event)
-        payload.pop("event_id", None)
-        event_id = hashlib.sha256(_canonical_json(payload)).hexdigest()
-        payload["event_id"] = event_id
-        self._require_mutable()
-        with self.locked():
-            root_fd = self._open_root()
-            try:
-                directory_fd = self._open_directory(root_fd, "outbox", create=True)
-                assert directory_fd is not None
-                try:
-                    self._atomic_json(
-                        directory_fd,
-                        self.root / "outbox",
-                        event_id + ".json",
-                        payload,
+                event_id = event.get("event_id")
+                if isinstance(event_id, str):
+                    created = self._write_event_receipt_locked(
+                        root_fd,
+                        event_id,
+                        event,
+                        self.ledger_revision(
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        ),
+                        deadline=deadline,
+                        monotonic=monotonic,
                     )
-                finally:
-                    os.close(directory_fd)
+                    if not created:
+                        return
+                self._append_event_locked(
+                    root_fd,
+                    record,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
             finally:
                 os.close(root_fd)
-        return event_id
-
-    def prepare_transition_event(
-        self,
-        record_kind: str,
-        record_key: str,
-        expected: SessionLease | ManagedProcess | SignalIntent | None,
-        updated: SessionLease | ManagedProcess | SignalIntent,
-        event: dict[str, object],
-    ) -> str:
-        if record_kind not in {
-            "sessions",
-            "processes",
-            "signal-intents",
-            "force-receipts",
-        }:
-            raise ValueError("invalid transition record kind")
-        event_payload = dict(event)
-        event_payload.pop("event_id", None)
-        expected_payload = None if expected is None else expected.to_dict()
-        updated_payload = updated.to_dict()
-        expected_digest = hashlib.sha256(_canonical_json(expected_payload)).hexdigest()
-        updated_digest = hashlib.sha256(_canonical_json(updated_payload)).hexdigest()
-        if expected_digest == updated_digest:
-            raise ValueError("transition must change raw state")
-        event_id = hashlib.sha256(
-            _canonical_json(
-                {
-                    "record_kind": record_kind,
-                    "record_key": record_key,
-                    "expected_digest": expected_digest,
-                    "updated_digest": updated_digest,
-                    "event": event_payload,
-                }
-            )
-        ).hexdigest()
-        event_payload["event_id"] = event_id
-        journal = {
-            "schema_version": 1,
-            "phase": "prepared",
-            "record_kind": record_kind,
-            "record_key": record_key,
-            "expected_digest": expected_digest,
-            "updated_digest": updated_digest,
-            "event_id": event_id,
-            "event": event_payload,
-        }
-        self._require_mutable()
-        with self.locked():
-            self._recover_before_write_locked()
-            self._write_transition_journal_locked(event_id, journal)
-        return event_id
 
     def transition(
         self,
@@ -1654,8 +1798,16 @@ class StateStore:
                 expected,
                 updated,
                 event,
+                deadline=deadline,
+                monotonic=monotonic,
             )
-            self._write_transition_journal_locked(event_id, journal)
+            _deadline_check(deadline, monotonic)
+            self._write_transition_journal_locked(
+                event_id,
+                journal,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
             _deadline_check(deadline, monotonic)
             self._validate_transition_authority_locked(
                 record_kind,
@@ -1667,24 +1819,43 @@ class StateStore:
                 deadline,
                 monotonic,
             )
+            effect_completed = False
             try:
                 if before_effect is not None:
                     before_effect()
                     _deadline_check(deadline, monotonic)
                 if effect is not None:
-                    effect()
-            except Exception:
+                    self._effect_transition_ids.add(event_id)
+                    try:
+                        if expected_root_binding is not None:
+                            self.validate_root_binding(expected_root_binding)
+                        effect()
+                        effect_completed = True
+                    finally:
+                        self._effect_transition_ids.discard(event_id)
+            except Exception as error:
+                if isinstance(error, OperationDeadlineExceeded):
+                    raise
                 self._recover_known_transition_locked(
                     event_id,
                     journal,
-                    materialize_existing=False,
                 )
                 raise
+            if effect_completed:
+                try:
+                    _deadline_check(deadline, monotonic)
+                except OperationDeadlineExceeded as error:
+                    raise PostEffectStateError(
+                        "effect completed after operation deadline",
+                        record_persisted=False,
+                    ) from error
             try:
                 revision = self._write_transition_record_locked(
                     record_kind,
                     record_key,
                     updated,
+                    deadline=deadline,
+                    monotonic=monotonic,
                 )
             except Exception:
                 recovery_failed = False
@@ -1692,7 +1863,6 @@ class StateStore:
                     self._recover_known_transition_locked(
                         event_id,
                         journal,
-                        materialize_existing=False,
                     )
                 except Exception:
                     recovery_failed = True
@@ -1701,30 +1871,67 @@ class StateStore:
                     and self._transition_record_locked(record_kind, record_key)
                     == updated
                 ):
+                    if effect_completed:
+                        raise PostEffectStateError(
+                            "effect completed before state write reported failure",
+                            record_persisted=True,
+                        )
                     return self.ledger_revision()
+                if effect_completed:
+                    raise PostEffectStateError(
+                        "effect completed before state persistence failed",
+                        record_persisted=False,
+                    )
                 raise
             try:
-                self._mark_transition_committed_locked(event_id)
-            except OSError:
+                self._mark_transition_committed_locked(
+                    event_id,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+            except Exception as error:
+                if (
+                    isinstance(error, OperationDeadlineExceeded)
+                    and not effect_completed
+                ):
+                    raise
+                recovery_failed = False
                 try:
                     self._recover_known_transition_locked(
                         event_id,
                         journal,
-                        materialize_existing=False,
                     )
-                except OSError:
-                    pass
-                if self._transition_record_locked(record_kind, record_key) == updated:
+                except Exception:
+                    recovery_failed = True
+                record_persisted = False
+                try:
+                    record_persisted = (
+                        self._transition_record_locked(record_kind, record_key)
+                        == updated
+                    )
+                except Exception:
+                    recovery_failed = True
+                if effect_completed:
+                    raise PostEffectStateError(
+                        "effect completed before journal commit failed",
+                        record_persisted=record_persisted,
+                    ) from error
+                if not recovery_failed and record_persisted:
                     return self.ledger_revision()
                 raise
             try:
                 self._recover_known_transition_locked(
                     event_id,
                     journal,
-                    materialize_existing=False,
                 )
-            except OSError:
-                pass
+            except Exception as error:
+                if effect_completed:
+                    raise PostEffectStateError(
+                        "effect completed before event receipt materialization failed",
+                        record_persisted=True,
+                    ) from error
+                if not isinstance(error, OSError):
+                    raise
             return revision
 
     def _validate_transition_authority_locked(
@@ -1742,7 +1949,11 @@ class StateStore:
             self.validate_root_binding(expected_root_binding)
         if (
             expected_revision is not None
-            and self.ledger_revision() != expected_revision
+            and self.ledger_revision(
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            != expected_revision
         ):
             raise UnsafeStatePath("authorized ledger revision changed")
         if expected_sessions_digest is not None and (
@@ -1750,7 +1961,12 @@ class StateStore:
             != expected_sessions_digest
         ):
             raise UnsafeStatePath("authorized session set changed")
-        current = self._transition_record_locked(record_kind, record_key)
+        current = self._transition_record_locked(
+            record_kind,
+            record_key,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
         if current != expected:
             raise UnsafeStatePath("transition raw state changed")
 
@@ -1761,7 +1977,11 @@ class StateStore:
         expected: SessionLease | ManagedProcess | SignalIntent | None,
         updated: SessionLease | ManagedProcess | SignalIntent,
         event: dict[str, object],
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> tuple[str, dict[str, object]]:
+        _deadline_check(deadline, monotonic)
         if record_kind not in {
             "sessions",
             "processes",
@@ -1773,8 +1993,11 @@ class StateStore:
         event_payload.pop("event_id", None)
         expected_payload = None if expected is None else expected.to_dict()
         updated_payload = updated.to_dict()
+        _deadline_check(deadline, monotonic)
         expected_digest = hashlib.sha256(_canonical_json(expected_payload)).hexdigest()
+        _deadline_check(deadline, monotonic)
         updated_digest = hashlib.sha256(_canonical_json(updated_payload)).hexdigest()
+        _deadline_check(deadline, monotonic)
         if expected_digest == updated_digest:
             raise ValueError("transition must change raw state")
         event_id = hashlib.sha256(
@@ -1788,6 +2011,7 @@ class StateStore:
                 }
             )
         ).hexdigest()
+        _deadline_check(deadline, monotonic)
         event_payload["event_id"] = event_id
         return event_id, {
             "schema_version": 1,
@@ -1805,6 +2029,9 @@ class StateStore:
         record_kind: str,
         record_key: str,
         updated: SessionLease | ManagedProcess | SignalIntent,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> int:
         if record_kind == "sessions" and isinstance(updated, SessionLease):
             if session_key(updated.session_id) != record_key:
@@ -1825,43 +2052,68 @@ class StateStore:
             record_key,
             updated.to_dict(),
             maintenance=False,
+            deadline=deadline,
+            monotonic=monotonic,
         )
 
     def _transition_record_locked(
         self,
         kind: str,
         key: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> SessionLease | ManagedProcess | SignalIntent | None:
         if kind == "sessions":
-            records = self.load_sessions()
+            records = self.load_sessions(deadline=deadline, monotonic=monotonic)
             return next(
                 (item for item in records if session_key(item.session_id) == key),
                 None,
             )
         if kind == "processes":
-            return self.load_raw_process(key)
+            return self.load_raw_process(
+                key,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
         if kind == "signal-intents":
-            return self.load_signal_intent(key)
+            return self.load_signal_intent(
+                key,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
         if kind == "force-receipts":
-            return self.load_force_intent(key)
+            return self.load_force_intent(
+                key,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
         raise UnsafeStatePath("invalid journal record kind")
 
     def _write_transition_journal_locked(
         self,
         event_id: str,
         journal: dict[str, object],
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not self._owns_lock():
             raise RuntimeError("transition journal write requires the state lock")
+        _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
+        _deadline_check(deadline, monotonic)
         try:
             directory_fd = self._open_directory(root_fd, "event-journal", create=True)
+            _deadline_check(deadline, monotonic)
             assert directory_fd is not None
             try:
                 names = _bounded_directory_names(
                     directory_fd,
                     self.root / "event-journal",
                     TRANSITION_JOURNAL_LIMIT,
+                    deadline=deadline,
+                    monotonic=monotonic,
                 )
                 if (
                     len(names) >= TRANSITION_JOURNAL_LIMIT
@@ -1871,26 +2123,32 @@ class StateStore:
                         self.root / "event-journal",
                         hashlib.sha256(b"journal_capacity").hexdigest(),
                     )
+                _deadline_check(deadline, monotonic)
                 self._atomic_json(
                     directory_fd,
                     self.root / "event-journal",
                     event_id + ".json",
                     journal,
+                    deadline=deadline,
+                    monotonic=monotonic,
                 )
             finally:
                 os.close(directory_fd)
         finally:
             os.close(root_fd)
 
-    def mark_transition_committed(self, event_id: str) -> None:
-        if not _is_hex_digest(event_id):
-            raise ValueError("invalid event ID")
-        self._require_mutable()
-        with self.locked():
-            self._mark_transition_committed_locked(event_id)
-
-    def _mark_transition_committed_locked(self, event_id: str) -> None:
-        journal = self._load_journal_locked(event_id)
+    def _mark_transition_committed_locked(
+        self,
+        event_id: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        journal = self._load_journal_locked(
+            event_id,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
         if journal is None:
             return
         journal["phase"] = "committed"
@@ -1904,6 +2162,8 @@ class StateStore:
                     self.root / "event-journal",
                     event_id + ".json",
                     journal,
+                    deadline=deadline,
+                    monotonic=monotonic,
                 )
             finally:
                 os.close(directory_fd)
@@ -1940,8 +2200,16 @@ class StateStore:
             deadline=deadline,
             monotonic=monotonic,
         )
-        self._flush_staged_events_locked(
+        self._prune_event_receipts_locked(
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        self._recover_legacy_outbox_locked(
             LEGACY_OUTBOX_DRAIN_LIMIT,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        self._prune_event_receipts_locked(
             deadline=deadline,
             monotonic=monotonic,
         )
@@ -1955,8 +2223,11 @@ class StateStore:
     ) -> None:
         _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
+        _deadline_check(deadline, monotonic)
         try:
+            _deadline_check(deadline, monotonic)
             directory_fd = self._open_directory(root_fd, "event-journal", create=False)
+            _deadline_check(deadline, monotonic)
             if directory_fd is None:
                 return
             try:
@@ -1972,6 +2243,8 @@ class StateStore:
                     if not name.endswith(".json") or not _is_hex_digest(name[:-5]):
                         raise UnsafeStatePath("invalid event journal entry")
                     event_id = name[:-5]
+                    if event_id in self._effect_transition_ids:
+                        continue
                     journal = self._load_journal_locked(
                         event_id,
                         deadline=deadline,
@@ -1986,7 +2259,6 @@ class StateStore:
                         journal,
                         deadline=deadline,
                         monotonic=monotonic,
-                        materialize_existing=True,
                     )
                     _deadline_check(deadline, monotonic)
             finally:
@@ -2003,12 +2275,14 @@ class StateStore:
         *,
         deadline: float | None,
         monotonic: Callable[[], float],
-        materialize_existing: bool,
     ) -> bool:
         """Recover one known journal without enumerating unrelated state."""
         _deadline_check(deadline, monotonic)
         current_digest = self._transition_record_digest_locked(
-            journal["record_kind"], journal["record_key"]
+            journal["record_kind"],
+            journal["record_key"],
+            deadline=deadline,
+            monotonic=monotonic,
         )
         _deadline_check(deadline, monotonic)
         has_receipt = self._event_receipt_exists_locked(
@@ -2028,24 +2302,32 @@ class StateStore:
                 root_fd,
                 event_id,
                 journal["event"],
-                self.ledger_revision(),
+                self.ledger_revision(
+                    deadline=deadline,
+                    monotonic=monotonic,
+                ),
+                deadline=deadline,
+                monotonic=monotonic,
             )
-            if created or (
-                materialize_existing
-                and not self._event_logged_locked(
+            if created:
+                self._append_event_locked(
                     root_fd,
-                    event_id,
+                    _canonical_json(journal["event"]),
                     deadline=deadline,
                     monotonic=monotonic,
                 )
-            ):
-                self.append_event(journal["event"], maintenance=False)
+            self._prune_event_receipts_locked(
+                deadline=deadline,
+                monotonic=monotonic,
+            )
         elif current_digest != journal["expected_digest"]:
             raise StateCorruption(
                 self.root / "event-journal" / (event_id + ".json"),
                 hashlib.sha256(_canonical_json(journal)).hexdigest(),
             )
+        _deadline_check(deadline, monotonic)
         os.unlink(event_id + ".json", dir_fd=directory_fd)
+        _deadline_check(deadline, monotonic)
         os.fsync(directory_fd)
         _deadline_check(deadline, monotonic)
         return committed
@@ -2054,8 +2336,6 @@ class StateStore:
         self,
         event_id: str,
         journal: dict[str, object],
-        *,
-        materialize_existing: bool,
     ) -> bool:
         """Finish the active transition without a post-deadline journal scan."""
         root_fd = self._open_root()
@@ -2074,7 +2354,6 @@ class StateStore:
                     journal,
                     deadline=None,
                     monotonic=time.monotonic,
-                    materialize_existing=materialize_existing,
                 )
             finally:
                 os.close(directory_fd)
@@ -2090,8 +2369,11 @@ class StateStore:
     ) -> dict[str, object] | None:
         _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
+        _deadline_check(deadline, monotonic)
         try:
+            _deadline_check(deadline, monotonic)
             directory_fd = self._open_directory(root_fd, "event-journal", create=False)
+            _deadline_check(deadline, monotonic)
             if directory_fd is None:
                 return None
             try:
@@ -2101,6 +2383,7 @@ class StateStore:
                         event_id + ".json",
                         self.root / "event-journal" / (event_id + ".json"),
                     )
+                    _deadline_check(deadline, monotonic)
                 except FileNotFoundError:
                     return None
                 try:
@@ -2160,22 +2443,43 @@ class StateStore:
             )
         return payload
 
-    def _transition_record_digest_locked(self, kind: str, key: str) -> str:
+    def _transition_record_digest_locked(
+        self,
+        kind: str,
+        key: str,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> str:
+        _deadline_check(deadline, monotonic)
         if kind == "sessions":
-            records = self.load_sessions()
+            records = self.load_sessions(deadline=deadline, monotonic=monotonic)
             current = next(
                 (item for item in records if session_key(item.session_id) == key),
                 None,
             )
         elif kind == "processes":
-            current = self.load_raw_process(key)
+            current = self.load_raw_process(
+                key,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
         elif kind == "signal-intents":
-            current = self.load_signal_intent(key)
+            current = self.load_signal_intent(
+                key,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
         elif kind == "force-receipts":
-            current = self.load_force_intent(key)
+            current = self.load_force_intent(
+                key,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
         else:
             raise UnsafeStatePath("invalid journal record kind")
         payload = None if current is None else current.to_dict()
+        _deadline_check(deadline, monotonic)
         return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
     def _load_event_receipt_locked(
@@ -2190,6 +2494,7 @@ class StateStore:
         if not _is_hex_digest(event_id):
             raise UnsafeStatePath("invalid event receipt ID")
         directory_fd = self._open_directory(root_fd, "event-receipts", create=False)
+        _deadline_check(deadline, monotonic)
         if directory_fd is None:
             return None
         try:
@@ -2199,6 +2504,7 @@ class StateStore:
                     event_id + ".json",
                     self.root / "event-receipts" / (event_id + ".json"),
                 )
+                _deadline_check(deadline, monotonic)
             except FileNotFoundError:
                 return None
             try:
@@ -2280,7 +2586,11 @@ class StateStore:
         event_id: str,
         event: object,
         committed_revision: int,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> bool:
+        _deadline_check(deadline, monotonic)
         if not _is_hex_digest(event_id) or not isinstance(event, dict):
             raise StateCorruption(
                 self.root / "event-receipts",
@@ -2291,7 +2601,12 @@ class StateStore:
                 self.root / "event-receipts" / (event_id + ".json"),
                 hashlib.sha256(_canonical_json(event)).hexdigest(),
             )
-        current = self._load_event_receipt_locked(root_fd, event_id)
+        current = self._load_event_receipt_locked(
+            root_fd,
+            event_id,
+            deadline=deadline,
+            monotonic=monotonic,
+        )
         if current is not None:
             if current["event"] != event:
                 raise StateCorruption(
@@ -2299,7 +2614,14 @@ class StateStore:
                     hashlib.sha256(_canonical_json(current)).hexdigest(),
                 )
             return False
+        self._prune_event_receipts_locked(
+            deadline=deadline,
+            monotonic=monotonic,
+            reserve=1,
+        )
+        _deadline_check(deadline, monotonic)
         directory_fd = self._open_directory(root_fd, "event-receipts", create=True)
+        _deadline_check(deadline, monotonic)
         assert directory_fd is not None
         try:
             receipt = {
@@ -2314,53 +2636,15 @@ class StateStore:
                 self.root / "event-receipts",
                 event_id + ".json",
                 receipt,
+                deadline=deadline,
+                monotonic=monotonic,
             )
+            _deadline_check(deadline, monotonic)
             return True
         finally:
             os.close(directory_fd)
 
-    def discard_staged_event(self, event_id: str) -> None:
-        if not _is_hex_digest(event_id):
-            raise ValueError("invalid event ID")
-        self._require_mutable()
-        with self.locked():
-            root_fd = self._open_root()
-            try:
-                directory_fd = self._open_directory(root_fd, "outbox", create=False)
-                if directory_fd is None:
-                    return
-                try:
-                    try:
-                        os.unlink(event_id + ".json", dir_fd=directory_fd)
-                    except FileNotFoundError:
-                        return
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            finally:
-                os.close(root_fd)
-
-    def flush_staged_events(
-        self,
-        limit: int = LEGACY_OUTBOX_DRAIN_LIMIT,
-        *,
-        deadline: float | None = None,
-        monotonic: Callable[[], float] = time.monotonic,
-    ) -> None:
-        if type(limit) is not int or limit < 0 or limit > LEGACY_OUTBOX_DRAIN_LIMIT:
-            raise ValueError("invalid outbox limit")
-        _deadline_check(deadline, monotonic)
-        self._require_mutable()
-        with self.locked(
-            remaining_timeout=_remaining_timeout(deadline, monotonic),
-        ):
-            self._flush_staged_events_locked(
-                limit,
-                deadline=deadline,
-                monotonic=monotonic,
-            )
-
-    def _flush_staged_events_locked(
+    def _recover_legacy_outbox_locked(
         self,
         limit: int,
         *,
@@ -2369,8 +2653,11 @@ class StateStore:
     ) -> None:
         _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
+        _deadline_check(deadline, monotonic)
         try:
+            _deadline_check(deadline, monotonic)
             directory_fd = self._open_directory(root_fd, "outbox", create=False)
+            _deadline_check(deadline, monotonic)
             if directory_fd is None:
                 return
             try:
@@ -2393,6 +2680,7 @@ class StateStore:
                         name,
                         self.root / "outbox" / name,
                     )
+                    _deadline_check(deadline, monotonic)
                     try:
                         raw = _read_state_record(
                             fd,
@@ -2424,20 +2712,27 @@ class StateStore:
                             self.root / "outbox" / name,
                             hashlib.sha256(raw).hexdigest(),
                         )
-                    self._write_event_receipt_locked(
+                    created = self._write_event_receipt_locked(
                         root_fd,
                         event_id,
                         payload,
-                        self.ledger_revision(),
-                    )
-                    if not self._event_logged_locked(
-                        root_fd,
-                        event_id,
+                        self.ledger_revision(
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        ),
                         deadline=deadline,
                         monotonic=monotonic,
-                    ):
-                        self.append_event(payload, maintenance=False)
+                    )
+                    if created:
+                        self._append_event_locked(
+                            root_fd,
+                            _canonical_json(payload),
+                            deadline=deadline,
+                            monotonic=monotonic,
+                        )
+                    _deadline_check(deadline, monotonic)
                     os.unlink(name, dir_fd=directory_fd)
+                    _deadline_check(deadline, monotonic)
                     os.fsync(directory_fd)
                     _deadline_check(deadline, monotonic)
             finally:
@@ -2445,96 +2740,147 @@ class StateStore:
         finally:
             os.close(root_fd)
 
-    def _event_logged_locked(
+    def _append_event_locked(
         self,
         root_fd: int,
-        event_id: str,
+        record: bytes,
         *,
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
-    ) -> bool:
-        needle = f'"event_id":"{event_id}"'.encode("ascii")
-        for name in ("events.jsonl",) + EVENT_LOG_BACKUP_FILENAMES:
-            _deadline_check(deadline, monotonic)
-            try:
-                fd = self._open_private_file(root_fd, name, self.root / name)
-            except FileNotFoundError:
-                continue
-            try:
-                raw = _read_all(
-                    fd,
-                    deadline=deadline,
-                    monotonic=monotonic,
-                    max_bytes=EVENT_LOG_MAX_BYTES + STATE_RECORD_MAX_BYTES,
-                )
-            except ValueError as error:
-                raise StateCorruption(
-                    self.root / name,
-                    hashlib.sha256(b"event_log_scan_limit").hexdigest(),
-                ) from error
-            finally:
-                os.close(fd)
-            if needle in raw:
-                return True
-            _deadline_check(deadline, monotonic)
-        return False
-
-    def _append_event_locked(self, root_fd: int, record: bytes) -> None:
+    ) -> None:
+        _deadline_check(deadline, monotonic)
         name = "events.jsonl"
         path = self.root / name
         size = 0
         try:
             current_fd = self._open_private_file(root_fd, name, path)
+            _deadline_check(deadline, monotonic)
         except FileNotFoundError:
             current_fd = None
         if current_fd is not None:
             try:
+                _deadline_check(deadline, monotonic)
                 size = os.fstat(current_fd).st_size
+                _deadline_check(deadline, monotonic)
             finally:
                 os.close(current_fd)
+        _deadline_check(deadline, monotonic)
         if size and size + len(record) > EVENT_LOG_MAX_BYTES:
-            self._rotate_events_locked(root_fd)
+            self._rotate_events_locked(
+                root_fd,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            _deadline_check(deadline, monotonic)
         try:
+            _deadline_check(deadline, monotonic)
             fd = self._open_private_file(root_fd, name, path, os.O_WRONLY | os.O_APPEND)
+            _deadline_check(deadline, monotonic)
         except FileNotFoundError:
             flags = os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK
             flags |= os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
+            _deadline_check(deadline, monotonic)
             fd = os.open(name, flags, _FILE_MODE, dir_fd=root_fd)
+            _deadline_check(deadline, monotonic)
             os.fchmod(fd, _FILE_MODE)
+            _deadline_check(deadline, monotonic)
         try:
-            _validate_file(os.fstat(fd), path)
-            _write_all(fd, record)
+            _deadline_check(deadline, monotonic)
+            value = os.fstat(fd)
+            _deadline_check(deadline, monotonic)
+            _validate_file(value, path)
+            _write_all(
+                fd,
+                record,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            _deadline_check(deadline, monotonic)
             os.fsync(fd)
+            _deadline_check(deadline, monotonic)
         finally:
             os.close(fd)
+        _deadline_check(deadline, monotonic)
         os.fsync(root_fd)
+        _deadline_check(deadline, monotonic)
 
-    def _validate_named_file_if_present(self, directory_fd: int, name: str) -> bool:
+    def _validate_named_file_if_present(
+        self,
+        directory_fd: int,
+        name: str,
+        *,
+        deadline: float | None,
+        monotonic: Callable[[], float],
+    ) -> bool:
+        _deadline_check(deadline, monotonic)
         try:
             fd = self._open_private_file(directory_fd, name, self.root / name)
+            _deadline_check(deadline, monotonic)
         except FileNotFoundError:
             return False
         os.close(fd)
+        _deadline_check(deadline, monotonic)
         return True
 
-    def _rotate_events_locked(self, root_fd: int) -> None:
+    def _rotate_events_locked(
+        self,
+        root_fd: int,
+        *,
+        deadline: float | None,
+        monotonic: Callable[[], float],
+    ) -> None:
+        _deadline_check(deadline, monotonic)
         oldest = f"events.jsonl.{EVENT_LOG_BACKUPS}"
-        if self._validate_named_file_if_present(root_fd, oldest):
+        if self._validate_named_file_if_present(
+            root_fd,
+            oldest,
+            deadline=deadline,
+            monotonic=monotonic,
+        ):
+            _deadline_check(deadline, monotonic)
             os.unlink(oldest, dir_fd=root_fd)
+            _deadline_check(deadline, monotonic)
         for number in range(EVENT_LOG_BACKUPS - 1, 0, -1):
+            _deadline_check(deadline, monotonic)
             source = f"events.jsonl.{number}"
             destination = f"events.jsonl.{number + 1}"
-            if not self._validate_named_file_if_present(root_fd, source):
+            if not self._validate_named_file_if_present(
+                root_fd,
+                source,
+                deadline=deadline,
+                monotonic=monotonic,
+            ):
                 continue
-            self._validate_named_file_if_present(root_fd, destination)
+            self._validate_named_file_if_present(
+                root_fd,
+                destination,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            _deadline_check(deadline, monotonic)
             os.replace(source, destination, src_dir_fd=root_fd, dst_dir_fd=root_fd)
-        if self._validate_named_file_if_present(root_fd, "events.jsonl"):
-            self._validate_named_file_if_present(root_fd, "events.jsonl.1")
+            _deadline_check(deadline, monotonic)
+        if self._validate_named_file_if_present(
+            root_fd,
+            "events.jsonl",
+            deadline=deadline,
+            monotonic=monotonic,
+        ):
+            self._validate_named_file_if_present(
+                root_fd,
+                "events.jsonl.1",
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            _deadline_check(deadline, monotonic)
             os.replace(
                 "events.jsonl", "events.jsonl.1", src_dir_fd=root_fd, dst_dir_fd=root_fd
             )
+            _deadline_check(deadline, monotonic)
+        _deadline_check(deadline, monotonic)
         os.fsync(root_fd)
+        _deadline_check(deadline, monotonic)
 
     def _prune_event_backups_locked(self) -> None:
         if not self._root_exists():
@@ -2566,46 +2912,97 @@ class StateStore:
         finally:
             os.close(root_fd)
 
-    def _prune_event_receipts_locked(self) -> None:
-        if not self._root_exists():
+    def _prune_event_receipts_locked(
+        self,
+        *,
+        deadline: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        reserve: int = 0,
+    ) -> None:
+        if reserve not in {0, 1}:
+            raise ValueError("invalid event receipt reservation")
+        _deadline_check(deadline, monotonic)
+        exists = self._root_exists()
+        _deadline_check(deadline, monotonic)
+        if not exists:
             return
+        _deadline_check(deadline, monotonic)
         root_fd = self._open_root()
+        _deadline_check(deadline, monotonic)
         try:
+            _deadline_check(deadline, monotonic)
             receipt_fd = self._open_directory(root_fd, "event-receipts", create=False)
+            _deadline_check(deadline, monotonic)
             if receipt_fd is None:
                 return
+            _deadline_check(deadline, monotonic)
             journal_fd = self._open_directory(root_fd, "event-journal", create=False)
+            _deadline_check(deadline, monotonic)
             try:
-                protected = (
-                    set()
-                    if journal_fd is None
-                    else {
-                        name[:-5]
-                        for name in os.listdir(journal_fd)
-                        if name.endswith(".json") and _is_hex_digest(name[:-5])
-                    }
+                protected: set[str] = set()
+                if journal_fd is not None:
+                    journal_names = _bounded_directory_names(
+                        journal_fd,
+                        self.root / "event-journal",
+                        TRANSITION_JOURNAL_LIMIT,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    )
+                    for name in journal_names:
+                        if not name.endswith(".json") or not _is_hex_digest(name[:-5]):
+                            raise UnsafeStatePath("invalid event journal entry")
+                        protected.add(name[:-5])
+                receipt_names = _bounded_directory_names(
+                    receipt_fd,
+                    self.root / "event-receipts",
+                    STATE_DIRECTORY_MAX_ENTRIES,
+                    deadline=deadline,
+                    monotonic=monotonic,
                 )
                 candidates: list[tuple[int, str]] = []
-                for name in os.listdir(receipt_fd):
+                for name in receipt_names:
+                    _deadline_check(deadline, monotonic)
                     if not name.endswith(".json") or not _is_hex_digest(name[:-5]):
                         raise UnsafeStatePath("invalid event receipt entry")
+                    receipt = self._load_event_receipt_locked(
+                        root_fd,
+                        name[:-5],
+                        deadline=deadline,
+                        monotonic=monotonic,
+                    )
+                    if receipt is None:
+                        raise StateCorruption(
+                            self.root / "event-receipts" / name,
+                            hashlib.sha256(b"missing_event_receipt").hexdigest(),
+                        )
+                    _deadline_check(deadline, monotonic)
                     fd = self._open_private_file(
                         receipt_fd,
                         name,
                         self.root / "event-receipts" / name,
                     )
+                    _deadline_check(deadline, monotonic)
                     try:
-                        candidates.append((os.fstat(fd).st_mtime_ns, name))
+                        _deadline_check(deadline, monotonic)
+                        value = os.fstat(fd)
+                        _deadline_check(deadline, monotonic)
+                        candidates.append((value.st_mtime_ns, name))
                     finally:
                         os.close(fd)
-                excess = max(0, len(candidates) - EVENT_RECEIPT_RETENTION)
+                    _deadline_check(deadline, monotonic)
+                excess = max(
+                    0,
+                    len(candidates) + reserve - EVENT_RECEIPT_RETENTION,
+                )
                 changed = False
                 for _mtime, name in sorted(candidates):
+                    _deadline_check(deadline, monotonic)
                     if excess == 0:
                         break
                     if name[:-5] in protected:
                         continue
                     os.unlink(name, dir_fd=receipt_fd)
+                    _deadline_check(deadline, monotonic)
                     excess -= 1
                     changed = True
                 if excess:
@@ -2614,7 +3011,9 @@ class StateStore:
                         hashlib.sha256(b"receipt_capacity").hexdigest(),
                     )
                 if changed:
+                    _deadline_check(deadline, monotonic)
                     os.fsync(receipt_fd)
+                    _deadline_check(deadline, monotonic)
             finally:
                 if journal_fd is not None:
                     os.close(journal_fd)

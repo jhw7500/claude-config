@@ -436,6 +436,7 @@ class SignalIntent:
     status: Literal["pending", "delivered", "conflict"]
     delivered_keys: tuple[str, ...] = ()
     term_sent_boot: float | None = None
+    dispatch_keys: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         data: dict[str, object] = {
@@ -447,12 +448,16 @@ class SignalIntent:
             "status": self.status,
             "delivered_keys": list(self.delivered_keys),
             "term_sent_boot": self.term_sent_boot,
+            "dispatch_keys": sorted(set(self.dispatch_keys) | set(self.delivered_keys)),
         }
         self.from_dict(data)
         return data
 
     @classmethod
     def from_dict(cls, data: object) -> SignalIntent:
+        if isinstance(data, dict) and "dispatch_keys" not in data:
+            data = dict(data)
+            data["dispatch_keys"] = list(data.get("delivered_keys", ()))
         parsed = _require_exact_keys(
             data,
             {
@@ -464,6 +469,7 @@ class SignalIntent:
                 "status",
                 "delivered_keys",
                 "term_sent_boot",
+                "dispatch_keys",
             },
         )
         if parsed["schema_version"] != 1:
@@ -477,12 +483,16 @@ class SignalIntent:
             raise ValueError("invalid signal intent generation")
         identity_keys = _strings(parsed["identity_keys"], "identity_keys")
         delivered_keys = _strings(parsed["delivered_keys"], "delivered_keys")
+        dispatch_keys = _strings(parsed["dispatch_keys"], "dispatch_keys")
         if (
             not identity_keys
             or tuple(sorted(set(identity_keys))) != identity_keys
             or any(_STABLE_KEY.fullmatch(key) is None for key in identity_keys)
             or tuple(sorted(set(delivered_keys))) != delivered_keys
             or any(key not in identity_keys for key in delivered_keys)
+            or tuple(sorted(set(dispatch_keys))) != dispatch_keys
+            or any(key not in identity_keys for key in dispatch_keys)
+            or any(key not in dispatch_keys for key in delivered_keys)
         ):
             raise ValueError("invalid signal intent identities")
         action = _string(parsed["action"], "action")
@@ -509,6 +519,7 @@ class SignalIntent:
             status,
             delivered_keys,
             term_sent,
+            dispatch_keys,
         )
 
 
