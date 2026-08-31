@@ -2825,6 +2825,130 @@ def _expand_stubborn_process(store, tree, clock, process):
     return snapshot, second
 
 
+@pytest.mark.parametrize("expiry_point", ["before_second_open", "after_second_open"])
+def test_force_second_pidfd_deadline_returns_complete_partial_report(
+    stubborn_context, expiry_point
+) -> None:
+    store, tree, clock, _snapshot, process, _lease, _classification = stubborn_context
+    snapshot, _second = _expand_stubborn_process(store, tree, clock, process)
+    classification = snapshot.classifications[0]
+    token = cleanup.issue_force_token(classification, clock)
+    actions = cleanup.plan_cleanup(snapshot, force=True)
+    now = [0.0]
+    first_sent = [False]
+
+    class ExpiringProcfs:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+        def observe_identity(self, pid):
+            result = self.delegate.observe_identity(pid)
+            if (
+                expiry_point == "before_second_open"
+                and first_sent[0]
+                and pid == actions[1].identity.pid
+            ):
+                now[0] = 1.0
+            return result
+
+    class ExpiringBackend(FakeSignalBackend):
+        def __init__(self):
+            super().__init__()
+            self.opens = 0
+
+        def open(self, identity):
+            self.opens += 1
+            pidfd = super().open(identity)
+            if self.opens == 2 and expiry_point == "after_second_open":
+                now[0] = 1.0
+            return pidfd
+
+        def send(self, pidfd, signum):
+            super().send(pidfd, signum)
+            first_sent[0] = True
+
+    signaler = ExpiringBackend()
+    report = cleanup.execute_cleanup(
+        actions,
+        store,
+        ExpiringProcfs(tree),
+        signaler,
+        clock,
+        apply=True,
+        confirm_token=token,
+        deadline=0.5,
+        monotonic=lambda: now[0],
+    )
+
+    assert report.partial_force is True
+    assert report.after_state_available is False
+    assert report.attempted == 1
+    assert len(report.outcomes) == len(actions)
+    assert report.skipped == len(actions) - 1
+    assert report.outcomes[-1].reason == "partial_force_deadline_exhausted"
+    assert [call[0] for call in signaler.calls].count("send") == 1
+    if expiry_point == "after_second_open":
+        assert [call[0] for call in signaler.calls].count("close") == 2
+    else:
+        assert [call[0] for call in signaler.calls].count("close") == 1
+
+
+def test_term_second_pidfd_deadline_returns_unavailable_nonpartial_report(
+    orphan_context,
+) -> None:
+    store, tree, clock, _snapshot, process, _lease = orphan_context
+    write_proc_entry(
+        tree.proc_root,
+        654,
+        "654 (second) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 6540 0 0\n",
+        tree.proc_root / "node",
+        "VmRSS:\t48 kB\n",
+    )
+    second = tree.identity(654)
+    assert second is not None
+    expanded = replace(process, members=(process.wrapper, second))
+    store.save_process(expanded)
+    snapshot = classify.build_audit(store, tree, clock)
+    actions = cleanup.plan_cleanup(snapshot)
+    assert len(actions) == 2
+    now = [0.0]
+
+    class ExpiringBackend(FakeSignalBackend):
+        def __init__(self):
+            super().__init__()
+            self.opens = 0
+
+        def open(self, identity):
+            self.opens += 1
+            pidfd = super().open(identity)
+            if self.opens == 2:
+                now[0] = 1.0
+            return pidfd
+
+    signaler = ExpiringBackend()
+    report = cleanup.execute_cleanup(
+        actions,
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+        deadline=0.5,
+        monotonic=lambda: now[0],
+    )
+
+    assert report.partial_force is False
+    assert report.after_state_available is False
+    assert report.attempted == 1
+    assert len(report.outcomes) == len(actions)
+    assert report.outcomes[-1].reason == "cleanup_deadline_exhausted"
+    assert [call[0] for call in signaler.calls].count("send") == 1
+    assert [call[0] for call in signaler.calls].count("close") == 2
+
+
 def test_final_lexical_binding_check_prevents_signal_at_effect_seam(
     orphan_context, tmp_path, monkeypatch
 ) -> None:

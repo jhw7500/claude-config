@@ -830,45 +830,48 @@ def _execute_cleanup_protocol(
                         group_outcomes.append(outcome)
                     break
                 raise
-            matches = (
-                _matches_force_action(action, classification)
-                if forced
-                else _matches_automatic_action(action, classification)
-            )
-            if not matches:
-                outcome = CleanupOutcome(action, "skipped", "classification_changed")
-                outcomes.append(outcome)
-                group_outcomes.append(outcome)
-                continue
-            pidfd, prepared_outcome = _prepare_exact_signal(
-                action,
-                procfs,
-                signaler,
-                deadline,
-                monotonic,
-            )
-            if prepared_outcome is not None:
-                outcomes.append(prepared_outcome)
-                group_outcomes.append(prepared_outcome)
-                if forced:
-                    partial_force = bool(delivered_keys)
-                    for remaining in process_actions[index + 1 :]:
-                        skipped = CleanupOutcome(
-                            remaining,
-                            "skipped",
-                            (
-                                "partial_force_identity_failure"
-                                if delivered_keys
-                                else "force_confirmation_invalidated"
-                            ),
-                        )
-                        outcomes.append(skipped)
-                        group_outcomes.append(skipped)
-                    break
-                continue
-            assert pidfd is not None
+            pidfd: int | None = None
             close_failed = False
             try:
+                matches = (
+                    _matches_force_action(action, classification)
+                    if forced
+                    else _matches_automatic_action(action, classification)
+                )
+                if not matches:
+                    outcome = CleanupOutcome(
+                        action, "skipped", "classification_changed"
+                    )
+                    outcomes.append(outcome)
+                    group_outcomes.append(outcome)
+                    continue
+                pidfd, prepared_outcome = _prepare_exact_signal(
+                    action,
+                    procfs,
+                    signaler,
+                    deadline,
+                    monotonic,
+                )
+                if prepared_outcome is not None:
+                    outcomes.append(prepared_outcome)
+                    group_outcomes.append(prepared_outcome)
+                    if forced:
+                        partial_force = bool(delivered_keys)
+                        for remaining in process_actions[index + 1 :]:
+                            skipped = CleanupOutcome(
+                                remaining,
+                                "skipped",
+                                (
+                                    "partial_force_identity_failure"
+                                    if delivered_keys
+                                    else "force_confirmation_invalidated"
+                                ),
+                            )
+                            outcomes.append(skipped)
+                            group_outcomes.append(skipped)
+                        break
+                    continue
+                assert pidfd is not None
                 if not created_intent:
                     proposed_intent = _intent_for_actions(
                         raw,
@@ -1172,14 +1175,19 @@ def _execute_cleanup_protocol(
                         group_outcomes.append(skipped)
                     break
             except CleanupDeadlineExceeded:
-                if forced and delivered_keys:
-                    partial_force = True
-                    deadline_expired = True
+                deadline_expired = True
+                if delivered_keys:
+                    if forced:
+                        partial_force = True
                     for remaining in process_actions[index:]:
                         skipped = CleanupOutcome(
                             remaining,
                             "skipped",
-                            "partial_force_deadline_exhausted",
+                            (
+                                "partial_force_deadline_exhausted"
+                                if forced
+                                else "cleanup_deadline_exhausted"
+                            ),
                         )
                         outcomes.append(skipped)
                         group_outcomes.append(skipped)
@@ -1211,19 +1219,20 @@ def _execute_cleanup_protocol(
                 stop_all = True
                 break
             finally:
-                try:
-                    signaler.close(pidfd)
-                except OSError:
-                    close_failed = True
-                    if group_outcomes:
-                        prior = group_outcomes[-1]
-                        if prior.status in {"survived", "terminated"}:
-                            amended = replace(
-                                prior,
-                                reason=prior.reason + "_pidfd_close_failed",
-                            )
-                            group_outcomes[-1] = amended
-                            outcomes[-1] = amended
+                if pidfd is not None:
+                    try:
+                        signaler.close(pidfd)
+                    except OSError:
+                        close_failed = True
+                        if group_outcomes:
+                            prior = group_outcomes[-1]
+                            if prior.status in {"survived", "terminated"}:
+                                amended = replace(
+                                    prior,
+                                    reason=prior.reason + "_pidfd_close_failed",
+                                )
+                                group_outcomes[-1] = amended
+                                outcomes[-1] = amended
 
         if deadline_expired or stop_all or intent is None or not created_intent:
             continue
