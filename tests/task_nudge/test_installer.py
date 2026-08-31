@@ -421,7 +421,7 @@ def test_mode_difference_is_a_real_change_with_private_backup(installer, tmp_pat
         [installer.PlannedWrite(target, b"same\n", 0o600, True)],
         stamp="20260831010101",
     )
-    backup = tmp_path / "settings.json.bak.20260831010101"
+    backup = tmp_path / "settings.json.bak.task-nudge.20260831010101"
     assert target.read_bytes() == backup.read_bytes() == b"same\n"
     assert stat.S_IMODE(target.stat().st_mode) == stat.S_IMODE(backup.stat().st_mode) == 0o600
 
@@ -456,7 +456,7 @@ def test_backup_collision_fails_before_any_replacement(installer, tmp_path):
     for target in (first, second):
         target.write_bytes(b"old")
         target.chmod(0o600)
-    collision = tmp_path / "b.bak.20260831010101"
+    collision = tmp_path / "b.bak.task-nudge.20260831010101"
     collision.write_bytes(b"do-not-touch")
     calls = []
 
@@ -534,7 +534,7 @@ def test_legacy_shim_symlink_migrates_once_to_regular_file(installer, tmp_path, 
     installer.apply_transaction(installer.build_plan(source, home), stamp="20260831010101")
     assert shim.is_file() and not shim.is_symlink()
     assert stat.S_IMODE(shim.stat().st_mode) == 0o700
-    backup = shim.parent / "task-nudge.sh.bak.20260831010101"
+    backup = shim.parent / "task-nudge.sh.bak.task-nudge.20260831010101"
     assert backup.read_bytes() == b"legacy\n" and stat.S_IMODE(backup.stat().st_mode) == 0o600
     before = sorted(shim.parent.glob("task-nudge.sh.bak.*"))
     installer.apply_transaction(installer.build_plan(source, home), stamp="20260831020202")
@@ -596,7 +596,7 @@ def test_raced_backup_collision_is_not_unlinked_or_replaced(installer, tmp_path)
     target = tmp_path / "settings.json"
     target.write_bytes(b"original")
     target.chmod(0o600)
-    raced_backup = tmp_path / "settings.json.bak.20260831010101"
+    raced_backup = tmp_path / "settings.json.bak.task-nudge.20260831010101"
     replace_calls = []
 
     def race(phase, path):
@@ -681,7 +681,7 @@ def test_existing_target_swap_before_backup_is_preserved(installer, tmp_path):
         )
     assert target.is_symlink() and target.resolve() == outside
     assert outside.read_bytes() == b"outside"
-    assert not (tmp_path / "settings.json.bak.20260831010101").exists()
+    assert not (tmp_path / "settings.json.bak.task-nudge.20260831010101").exists()
 
 
 def test_existing_regular_swap_before_replace_is_preserved(installer, tmp_path):
@@ -702,7 +702,7 @@ def test_existing_regular_swap_before_replace_is_preserved(installer, tmp_path):
             phase_hook=swap,
         )
     assert target.read_bytes() == b"substituted"
-    assert not (tmp_path / "settings.json.bak.20260831010101").exists()
+    assert not (tmp_path / "settings.json.bak.task-nudge.20260831010101").exists()
 
 
 @pytest.mark.parametrize("replacement_type", ["symlink", "directory"])

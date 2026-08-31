@@ -857,7 +857,7 @@ def apply_transaction(
         return []
 
     backup_names = {
-        plan.path: plan.path.name + ".bak." + stamp
+        plan.path: plan.path.name + ".bak.task-nudge." + stamp
         for plan in changed
         if plan.backup and snapshots[plan.path].exists
     }

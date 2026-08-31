@@ -11,6 +11,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 CORE_PATH = REPO / "hooks" / "task_nudge.py"
 INSTALLER_PATH = REPO / "scripts" / "install-task-nudge.py"
+INSTALL = REPO / "install.sh"
 
 
 @pytest.fixture(scope="session")
@@ -40,6 +41,20 @@ def home(tmp_path):
     (path / "scratch").mkdir(mode=0o700)
     (path / "runtime").mkdir(mode=0o700)
     return path
+
+
+@pytest.fixture
+def run_install():
+    def invoke(home):
+        env = dict(os.environ, HOME=str(home))
+        return subprocess.run(
+            ["/bin/bash", "-c", f'umask 022; exec /bin/bash "{INSTALL}"'],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    return invoke
 
 
 @pytest.fixture
