@@ -12,6 +12,20 @@ CLAUDE_COMMAND = "$HOME/.claude/hooks/task-nudge.sh"
 CODEX_COMMAND = "/usr/bin/python3 $HOME/.local/share/claude-config/hooks/task-nudge-codex.py"
 
 
+def _tree_snapshot(root):
+    snapshot = {}
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        if stat.S_ISREG(metadata.st_mode):
+            payload = path.read_bytes()
+        elif stat.S_ISLNK(metadata.st_mode):
+            payload = os.readlink(path)
+        else:
+            payload = None
+        snapshot[path.relative_to(root)] = (metadata.st_mode, payload)
+    return snapshot
+
+
 def test_merge_hook_config_preserves_unrelated_entries(installer):
     original = {
         "hooks": {
@@ -368,6 +382,62 @@ def test_build_plan_independently_preflights_every_config_target(installer, tmp_
     with pytest.raises(installer.InstallError):
         installer.build_plan(source, home)
     assert {path: path.read_bytes() for path in home.rglob("*") if path.is_file()} == before
+
+
+def test_apply_rejects_existing_target_content_change_since_build_without_artifacts(
+    installer, tmp_path, home
+):
+    source, _ = _source_repo(tmp_path)
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text('{"theme":"before"}\n', encoding="utf-8")
+    settings.chmod(0o600)
+    plans = installer.build_plan(source, home)
+
+    settings.write_text('{"theme":"concurrent"}\n', encoding="utf-8")
+    before_apply = _tree_snapshot(home)
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(plans, stamp="20260831010101")
+
+    assert _tree_snapshot(home) == before_apply
+
+
+def test_apply_rejects_target_that_appeared_since_build_without_artifacts(
+    installer, tmp_path, home
+):
+    source, _ = _source_repo(tmp_path)
+    plans = installer.build_plan(source, home)
+    hooks = home / ".codex" / "hooks.json"
+    hooks.parent.mkdir()
+    hooks.write_text('{"concurrent":true}\n', encoding="utf-8")
+    hooks.chmod(0o600)
+
+    before_apply = _tree_snapshot(home)
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(plans, stamp="20260831010101")
+
+    assert _tree_snapshot(home) == before_apply
+
+
+def test_apply_rejects_target_identity_change_since_build_without_artifacts(
+    installer, tmp_path, home
+):
+    source, _ = _source_repo(tmp_path)
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir()
+    settings.write_text('{"theme":"before"}\n', encoding="utf-8")
+    settings.chmod(0o600)
+    plans = installer.build_plan(source, home)
+
+    original = settings.read_bytes()
+    settings.rename(tmp_path / "held-original-settings")
+    settings.write_bytes(original)
+    settings.chmod(0o600)
+    before_apply = _tree_snapshot(home)
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(plans, stamp="20260831010101")
+
+    assert _tree_snapshot(home) == before_apply
 
 
 def test_transaction_rolls_back_updated_and_created_targets(installer, tmp_path):

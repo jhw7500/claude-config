@@ -672,9 +672,13 @@ def _state_directory(env: Mapping[str, str]) -> Path | None:
     return _private_child(tmpdir, f"task-nudge-{os.getuid()}", allow_shared_parent=True)
 
 
-def _existing_marker_claim(marker: Path) -> MarkerClaim | None:
+def _marker_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return (metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode))
+
+
+def _existing_marker_claim(directory_descriptor: int, name: str) -> MarkerClaim | None:
     try:
-        existing = os.lstat(marker)
+        existing = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
     except FileNotFoundError:
         return None
     except OSError:
@@ -688,6 +692,38 @@ def _existing_marker_claim(marker: Path) -> MarkerClaim | None:
     return MarkerClaim.ALREADY_DONE
 
 
+def _close_after_error(descriptor: int) -> None:
+    try:
+        os.fstat(descriptor)
+    except OSError:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _remove_created_marker(
+    directory_descriptor: int,
+    name: str,
+    created_identity: tuple[int, int, int],
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    except OSError:
+        return
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_uid != os.getuid()
+        or _marker_identity(current) != created_identity
+    ):
+        return
+    try:
+        os.unlink(name, dir_fd=directory_descriptor)
+    except OSError:
+        return
+
+
 def claim_session_marker(
     runtime: Runtime, session_id: str, env: Mapping[str, str] | None = None
 ) -> MarkerClaim:
@@ -696,30 +732,56 @@ def claim_session_marker(
     state_dir = _state_directory(os.environ if env is None else env)
     if state_dir is None:
         return MarkerClaim.UNAVAILABLE
-    marker = state_dir / marker_name(runtime, session_id)
-    existing_claim = _existing_marker_claim(marker)
-    if existing_claim is not None:
-        return existing_claim
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    name = marker_name(runtime, session_id)
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        descriptor = os.open(marker, flags, 0o600)
-    except FileExistsError:
-        return _existing_marker_claim(marker) or MarkerClaim.UNAVAILABLE
+        directory_descriptor = os.open(state_dir, directory_flags)
     except OSError:
         return MarkerClaim.UNAVAILABLE
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
-        os.fchmod(descriptor, 0o600)
-    except OSError:
+        directory_metadata = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_uid != os.getuid()
+            or (directory_metadata.st_mode & 0o077) != 0
+        ):
+            return MarkerClaim.UNAVAILABLE
+        existing_claim = _existing_marker_claim(directory_descriptor, name)
+        if existing_claim is not None:
+            return existing_claim
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=directory_descriptor)
+        except FileExistsError:
+            return _existing_marker_claim(directory_descriptor, name) or MarkerClaim.UNAVAILABLE
+        except OSError:
+            return MarkerClaim.UNAVAILABLE
+        created_identity = _marker_identity(os.fstat(descriptor))
+        try:
+            os.fchmod(descriptor, 0o600)
+        except OSError:
+            _close_after_error(descriptor)
+            _remove_created_marker(directory_descriptor, name, created_identity)
+            return MarkerClaim.UNAVAILABLE
         try:
             os.close(descriptor)
         except OSError:
-            pass
-        return MarkerClaim.UNAVAILABLE
-    try:
-        os.close(descriptor)
+            _close_after_error(descriptor)
+            _remove_created_marker(directory_descriptor, name, created_identity)
+            return MarkerClaim.UNAVAILABLE
+        return MarkerClaim.CLAIMED
     except OSError:
         return MarkerClaim.UNAVAILABLE
-    return MarkerClaim.CLAIMED
+    finally:
+        try:
+            os.close(directory_descriptor)
+        except OSError:
+            pass
 
 
 def evaluate_event(

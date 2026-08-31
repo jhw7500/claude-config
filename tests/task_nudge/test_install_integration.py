@@ -49,6 +49,20 @@ def _task_target_snapshot(home):
     return snapshot
 
 
+def _task_artifact_snapshot(home):
+    artifacts = {}
+    for target in _task_targets(home):
+        if not target.parent.exists():
+            continue
+        candidates = list(target.parent.glob(f"{target.name}.bak.*"))
+        candidates.extend(target.parent.glob(".task-nudge-*"))
+        for path in candidates:
+            metadata = path.lstat()
+            payload = path.read_bytes() if stat.S_ISREG(metadata.st_mode) else None
+            artifacts[path] = (metadata.st_mode, payload)
+    return artifacts
+
+
 def test_fresh_install_adds_neutral_hooks_codex_config_and_agents(home, run_install):
     result = run_install(home)
     assert result.returncode == 0, result.stderr
@@ -152,6 +166,31 @@ def test_corrupt_codex_config_leaves_all_task_nudge_targets_unchanged(home, run_
     result = run_install(home)
     assert result.returncode != 0
     assert _task_target_snapshot(home) == before
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"hooks":{},"hooks":{"PreToolUse":[]}}',
+        '{"hooks":{"PreToolUse":[],"PreToolUse":[{"matcher":"Bash","hooks":[]}]}}',
+    ],
+    ids=["duplicate-top-level-key", "duplicate-nested-key"],
+)
+def test_duplicate_key_claude_settings_leave_task_nudge_targets_and_artifacts_unchanged(
+    home, run_install, payload
+):
+    first = run_install(home)
+    assert first.returncode == 0, first.stderr
+    settings = home / ".claude" / "settings.json"
+    settings.write_text(payload, encoding="utf-8")
+    before_targets = _task_target_snapshot(home)
+    before_artifacts = _task_artifact_snapshot(home)
+
+    result = run_install(home)
+
+    assert result.returncode != 0
+    assert _task_target_snapshot(home) == before_targets
+    assert _task_artifact_snapshot(home) == before_artifacts
 
 
 def test_malformed_agents_marker_leaves_task_nudge_targets_unchanged(home, run_install):

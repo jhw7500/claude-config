@@ -211,11 +211,26 @@ f = sys.argv[1]
 notion = (len(sys.argv) > 2 and sys.argv[2] == "있음")
 sys.path.insert(0, sys.argv[3])
 from private_config import write_private
+
+class DuplicateKeyError(ValueError):
+    pass
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateKeyError
+        value[key] = item
+    return value
+
 try:
     with open(f) as fh:
-        d = json.load(fh)
+        d = json.load(fh, object_pairs_hook=unique_object)
 except FileNotFoundError:
     d = {}
+except DuplicateKeyError:
+    print("[install] settings.json 오류: duplicate JSON key", file=sys.stderr)
+    raise SystemExit(1)
 hooks = d.setdefault("hooks", {})
 
 import os

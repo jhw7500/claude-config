@@ -50,6 +50,7 @@ class PlannedWrite:
     mode: int
     backup: bool
     allow_legacy_symlink: bool = False
+    precondition: _TargetSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -466,10 +467,10 @@ def build_plan(
 
     claude_config = home / ".claude" / "settings.json"
     codex_config = home / ".codex" / "hooks.json"
-    for config_path in (claude_config, codex_config):
-        _inspect_target(PlannedWrite(config_path, b"", 0o600, True))
-    claude_raw = _read_optional_regular_path(claude_config)
-    codex_raw = _read_optional_regular_path(codex_config)
+    claude_snapshot = _inspect_target(PlannedWrite(claude_config, b"", 0o600, True))
+    codex_snapshot = _inspect_target(PlannedWrite(codex_config, b"", 0o600, True))
+    claude_raw = claude_snapshot.data if claude_snapshot.exists else None
+    codex_raw = codex_snapshot.data if codex_snapshot.exists else None
     claude_value = merge_hook_config(
         {} if claude_raw is None else _parse_json_config(claude_raw),
         matcher=CLAUDE_MATCHER,
@@ -486,14 +487,19 @@ def build_plan(
     )
 
     override = home / ".codex" / "AGENTS.override.md"
-    override_raw = _read_optional_regular_path(override)
+    override_snapshot = _inspect_target(PlannedWrite(override, b"", 0o600, True))
+    override_raw = override_snapshot.data if override_snapshot.exists else None
     try:
         override_nonempty = override_raw is not None and bool(override_raw.decode("utf-8").strip())
     except UnicodeDecodeError as error:
         raise InstallError("AGENTS override is not UTF-8") from error
     agents_path = override if override_nonempty else home / ".codex" / "AGENTS.md"
-    _inspect_target(PlannedWrite(agents_path, b"", 0o600, True))
-    agents_raw = override_raw if override_nonempty else _read_optional_regular_path(agents_path)
+    agents_snapshot = (
+        override_snapshot
+        if override_nonempty
+        else _inspect_target(PlannedWrite(agents_path, b"", 0o600, True))
+    )
+    agents_raw = agents_snapshot.data if agents_snapshot.exists else None
     try:
         agents_original = "" if agents_raw is None else agents_raw.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -516,13 +522,34 @@ def build_plan(
         PlannedWrite(codex_config, render_json_config(codex_value), 0o600, True),
         PlannedWrite(agents_path, agents_data, 0o600, True),
     ]
+    build_snapshots = {
+        claude_config: claude_snapshot,
+        codex_config: codex_snapshot,
+        agents_path: agents_snapshot,
+    }
     seen: set[Path] = set()
+    validated_plans: list[PlannedWrite] = []
     for plan in plans:
         if plan.path in seen:
             raise InstallError("duplicate planned target")
         seen.add(plan.path)
-        _inspect_target(plan)
-    return plans
+        snapshot = build_snapshots.get(plan.path)
+        current = _inspect_target(plan)
+        if snapshot is not None and not _snapshot_matches(current, snapshot):
+            raise InstallError("planned target changed while building plan")
+        if snapshot is None:
+            snapshot = current
+        validated_plans.append(
+            PlannedWrite(
+                plan.path,
+                plan.data,
+                plan.mode,
+                plan.backup,
+                allow_legacy_symlink=plan.allow_legacy_symlink,
+                precondition=snapshot,
+            )
+        )
+    return validated_plans
 
 
 def _open_parent(
@@ -837,12 +864,17 @@ def apply_transaction(
     for plan in ordered:
         handle = _open_parent(plan.path, create=False, created_directories=[])
         if handle is None:
-            snapshots[plan.path] = _TargetSnapshot(False)
-            continue
-        try:
-            snapshots[plan.path] = _snapshot_at(handle, plan)
-        finally:
-            os.close(handle.descriptor)
+            current = _TargetSnapshot(False)
+        else:
+            try:
+                current = _snapshot_at(handle, plan)
+            finally:
+                os.close(handle.descriptor)
+        if plan.precondition is not None and not _snapshot_matches(
+            current, plan.precondition
+        ):
+            raise InstallError("planned target changed since plan was built")
+        snapshots[plan.path] = current
     changed = [
         plan
         for plan in ordered

@@ -152,6 +152,71 @@ def test_marker_is_private_and_namespaces_runtimes(core, tmp_path):
     assert all(os.stat(path).st_mode & 0o777 == 0o600 for path in state_dirs[0].iterdir())
 
 
+def test_fchmod_failure_does_not_consume_once_state(core, tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    runtime.chmod(0o700)
+    env = {"XDG_RUNTIME_DIR": str(runtime)}
+    real_fchmod = core.os.fchmod
+
+    def fail_fchmod(_descriptor, _mode):
+        raise OSError("injected fchmod failure")
+
+    monkeypatch.setattr(core.os, "fchmod", fail_fchmod)
+    assert core.claim_session_marker(core.Runtime.CODEX, "fchmod", env=env) is core.MarkerClaim.UNAVAILABLE
+
+    monkeypatch.setattr(core.os, "fchmod", real_fchmod)
+    assert core.claim_session_marker(core.Runtime.CODEX, "fchmod", env=env) is core.MarkerClaim.CLAIMED
+
+
+def test_close_failure_does_not_consume_once_state(core, tmp_path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    runtime.chmod(0o700)
+    env = {"XDG_RUNTIME_DIR": str(runtime)}
+    real_close = core.os.close
+    injected = False
+    failed_descriptor = None
+
+    def fail_before_close_once(descriptor):
+        nonlocal failed_descriptor, injected
+        if not injected:
+            injected = True
+            failed_descriptor = descriptor
+            raise OSError("injected close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(core.os, "close", fail_before_close_once)
+    assert core.claim_session_marker(core.Runtime.CODEX, "close", env=env) is core.MarkerClaim.UNAVAILABLE
+
+    monkeypatch.setattr(core.os, "close", real_close)
+    assert injected
+    with pytest.raises(OSError):
+        os.fstat(failed_descriptor)
+    assert core.claim_session_marker(core.Runtime.CODEX, "close", env=env) is core.MarkerClaim.CLAIMED
+
+
+def test_failed_marker_cleanup_never_unlinks_substituted_file(
+    core, tmp_path, monkeypatch
+):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    runtime.chmod(0o700)
+    env = {"XDG_RUNTIME_DIR": str(runtime)}
+    marker = runtime / "task-nudge" / core.marker_name(core.Runtime.CODEX, "substitution")
+    attacker_bytes = b"attacker-owned-content"
+
+    def substitute_before_fchmod_fails(_descriptor, _mode):
+        marker.unlink()
+        marker.write_bytes(attacker_bytes)
+        marker.chmod(0o600)
+        raise OSError("injected fchmod failure after substitution")
+
+    monkeypatch.setattr(core.os, "fchmod", substitute_before_fchmod_fails)
+    assert core.claim_session_marker(core.Runtime.CODEX, "substitution", env=env) is core.MarkerClaim.UNAVAILABLE
+    assert marker.read_bytes() == attacker_bytes
+
+
 def test_unsafe_state_roots_fail_closed(core, tmp_path):
     runtime = tmp_path / "runtime"
     runtime.mkdir(mode=0o777)

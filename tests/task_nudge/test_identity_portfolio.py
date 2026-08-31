@@ -1,5 +1,7 @@
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -208,3 +210,68 @@ def test_bounded_launcher_reaps_child_that_closes_pipes_before_timeout(core, mon
     assert time.monotonic() - started < 1
     assert len(processes) == 1
     assert processes[0].poll() is not None
+
+
+def _process_exists(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_for_process_exit(pid, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_exists(pid):
+            return True
+        time.sleep(0.01)
+    return not _process_exists(pid)
+
+
+def test_task_nudge_timeout_cancels_real_host_nested_child(
+    core, tmp_path, monkeypatch
+):
+    host = Path(__file__).resolve().parents[2] / "scripts" / "jhw-control-host.py"
+    child_pid_file = tmp_path / "control-child.pid"
+    driver = tmp_path / "launcher-driver.py"
+    driver.write_text(
+        "\n".join(
+            [
+                "import importlib.util",
+                "from pathlib import Path",
+                "import sys",
+                "spec = importlib.util.spec_from_file_location('real_jhw_control_host', sys.argv[1])",
+                "host = importlib.util.module_from_spec(spec)",
+                "sys.modules[spec.name] = host",
+                "spec.loader.exec_module(host)",
+                "child = (\"from pathlib import Path; import os, sys, time; \"",
+                "         \"Path(sys.argv[1]).write_text(str(os.getpid()), encoding='ascii'); \"",
+                "         \"time.sleep(30)\")",
+                "host.run_bounded(",
+                "    [sys.executable, '-I', '-c', child, sys.argv[2]],",
+                "    env={'PATH': host.TRUSTED_PATH},",
+                "    timeout_seconds=30,",
+                "    max_output_bytes=128,",
+                ")",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(core, "LAUNCHER_TIMEOUT_SECONDS", 1.0)
+    child_pid = None
+    try:
+        result = core._bounded_launcher_run(
+            [sys.executable, str(driver), str(host), str(child_pid_file)]
+        )
+        assert result is None
+        assert child_pid_file.is_file()
+        child_pid = int(child_pid_file.read_text(encoding="ascii"))
+        assert _wait_for_process_exit(child_pid), (
+            f"nested control child PID {child_pid} survived launcher timeout"
+        )
+    finally:
+        if child_pid is not None and _process_exists(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+            _wait_for_process_exit(child_pid)
