@@ -36,7 +36,8 @@ def test_nudge_message_is_canonical_safe_korean_policy(core):
         core.RegistrationResult(core.RegistrationStatus.UNKNOWN, None, "PORTFOLIO_UNAVAILABLE")
     )
     assert message.startswith("[TASK-NUDGE]")
-    assert "PORTFOLIO_UNAVAILABLE" in message
+    assert "즉시 작업의 unknown이면" in message
+    assert "backlog(unknown 포함)" in message
     assert "GitHub Issue 생성" in message
     assert "Project/Repository 등록" in message
     assert "Task 시작" in message
@@ -45,6 +46,15 @@ def test_nudge_message_is_canonical_safe_korean_policy(core):
     assert "여러 구현 단계와 검증" in message
     assert "subagent" in message and "이미 결정" in message
     assert "/home/" not in message and "session-secret" not in message
+    order = [
+        "(1) 이미 결정됨·제외 작업",
+        "(2) backlog(unknown 포함)",
+        "(3) 즉시 작업의 unknown",
+        "(4) 등록 저장소의 즉시 작업",
+        "(5) 미등록 저장소의 즉시 작업",
+    ]
+    assert [message.index(item) for item in order] == sorted(message.index(item) for item in order)
+    assert message.index("backlog(unknown 포함)") < message.index("즉시 작업의 unknown이면")
 
 
 def _payload(repo, *, runtime):
@@ -99,6 +109,24 @@ def test_adapters_reject_oversized_stdin_with_bounded_output(name, home, run_ada
     assert "padding" not in output and "x" * 32 not in output
 
 
+@pytest.mark.parametrize("name", ["task-nudge-claude.py", "task-nudge-codex.py"])
+@pytest.mark.parametrize(
+    "raw_input",
+    [
+        "{malformed-json",
+        "[]",
+        "{\"nested\":" * 1100 + "null" + "}" * 1100,
+    ],
+    ids=["malformed", "non-object", "deeply-nested"],
+)
+def test_adapters_classify_invalid_json_without_creating_a_marker(name, raw_input, home, run_adapter):
+    result = run_adapter(name, raw_input, home)
+    output = json.loads(result.stdout)["systemMessage"] if name.endswith("codex.py") else result.stdout
+    assert result.returncode == 0 and result.stderr == ""
+    assert "HOOK_INPUT_INVALID" in output
+    assert not list((home / "runtime").rglob("*"))
+
+
 def test_adapters_suppress_skip_subagent_and_already_decided(repo, registered_home, run_adapter):
     skipped = _payload(repo, runtime="claude")
     skipped["tool_input"] = {"file_path": str(registered_home / ".claude" / "settings.json")}
@@ -133,3 +161,66 @@ def test_manual_check_is_stateless_bounded_json(repo, registered_home, run_manua
     assert json.loads(first.stdout) == expected
     assert json.loads(second.stdout) == expected
     assert first.stderr == second.stderr == ""
+
+
+def _adapter_message(name, result):
+    assert result.returncode == 0
+    if name.endswith("codex.py"):
+        assert set(json.loads(result.stdout)) == {"systemMessage"}
+        return json.loads(result.stdout)["systemMessage"]
+    return result.stdout
+
+
+@pytest.mark.parametrize("name", ["task-nudge-claude.py", "task-nudge-codex.py"])
+def test_runtime_outputs_never_leak_success_or_unknown_canaries(name, repo, registered_home, run_adapter):
+    payload = _payload(repo, runtime="codex" if name.endswith("codex.py") else "claude")
+    payload.update({
+        "credential": "CREDENTIAL_CANARY", "project_id": "PROJECT_ID_CANARY",
+        "repository_id": "REPOSITORY_ID_CANARY", "task_id": "TASK_ID_CANARY",
+        "claim_id": "CLAIM_ID_CANARY",
+    })
+    success = run_adapter(name, payload, registered_home)
+    _adapter_message(name, success)
+    unknown_home = repo.parent / f"unknown-{name}"
+    unknown_home.mkdir(mode=0o700)
+    (unknown_home / "runtime").mkdir(mode=0o700)
+    (unknown_home / "scratch").mkdir(mode=0o700)
+    unknown = run_adapter(name, payload, unknown_home)
+    _adapter_message(name, unknown)
+    canaries = [
+        str(repo), "private-secret.py", payload["session_id"], "CREDENTIAL_CANARY",
+        "PROJECT_ID_CANARY", "REPOSITORY_ID_CANARY", "TASK_ID_CANARY", "CLAIM_ID_CANARY",
+    ]
+    for text in (success.stdout + success.stderr, unknown.stdout + unknown.stderr):
+        assert all(canary not in text for canary in canaries)
+
+
+@pytest.mark.parametrize("name", ["task-nudge-claude.py", "task-nudge-codex.py"])
+def test_runtime_outputs_never_leak_launcher_or_invalid_input_canaries(name, repo, home, run_adapter, install_launcher):
+    payload = _payload(repo, runtime="codex" if name.endswith("codex.py") else "claude")
+    payload["exception_detail"] = "EXCEPTION_TEXT_CANARY"
+    install_launcher(
+        home,
+        {
+            "command": "portfolio status",
+            "result": {
+                "project_id": "PROJECT_ID_CANARY", "repo_id": "REPOSITORY_ID_CANARY",
+                "task_id": "TASK_ID_CANARY", "claim_id": "CLAIM_ID_CANARY",
+                "credential": "CREDENTIAL_CANARY",
+            },
+        },
+        exit_code=1,
+        stdout_prefix="RAW_CHILD_OUTPUT_CANARY",
+        stderr="RAW_CHILD_STDERR_CANARY EXCEPTION_TEXT_CANARY",
+    )
+    launcher = run_adapter(name, payload, home)
+    invalid = run_adapter(name, "{EXCEPTION_TEXT_CANARY", home)
+    _adapter_message(name, launcher)
+    _adapter_message(name, invalid)
+    canaries = [
+        str(repo), "private-secret.py", payload["session_id"], "EXCEPTION_TEXT_CANARY",
+        "RAW_CHILD_OUTPUT_CANARY", "RAW_CHILD_STDERR_CANARY", "PROJECT_ID_CANARY",
+        "REPOSITORY_ID_CANARY", "TASK_ID_CANARY", "CLAIM_ID_CANARY", "CREDENTIAL_CANARY",
+    ]
+    for text in (launcher.stdout + launcher.stderr, invalid.stdout + invalid.stderr):
+        assert all(canary not in text for canary in canaries)

@@ -20,7 +20,7 @@ def _read_payload() -> object:
         raise core.NudgeError("HOOK_INPUT_INVALID")
     try:
         payload = json.loads(raw.decode("utf-8"), object_pairs_hook=core._unique_object)
-    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError) as error:
         raise core.NudgeError("HOOK_INPUT_INVALID") from error
     if not isinstance(payload, dict):
         raise core.NudgeError("HOOK_INPUT_INVALID")

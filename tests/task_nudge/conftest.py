@@ -43,19 +43,26 @@ def repo(tmp_path):
     return path
 
 
-def install_fake_launcher(home, payload, exit_code=0):
+def install_fake_launcher(home, payload, exit_code=0, *, stdout_prefix="", stderr=""):
     launcher = home / ".local" / "bin" / "jhw-control-host"
     launcher.parent.mkdir(parents=True)
     launcher.write_text(
         "#!/usr/bin/python3\n"
         "import json, sys\n"
         f"payload = {payload!r}\n"
+        f"sys.stdout.write({stdout_prefix!r})\n"
         "sys.stdout.write(json.dumps(payload))\n"
+        f"sys.stderr.write({stderr!r})\n"
         f"raise SystemExit({exit_code})\n",
         encoding="utf-8",
     )
     launcher.chmod(0o500)
     return launcher
+
+
+@pytest.fixture
+def install_launcher():
+    return install_fake_launcher
 
 
 @pytest.fixture
@@ -92,7 +99,7 @@ def run_adapter():
         env = dict(os.environ, HOME=str(home), XDG_RUNTIME_DIR=str(home / "runtime"), TMPDIR=str(home / "scratch"))
         return subprocess.run(
             [sys.executable, str(REPO / "hooks" / name)],
-            input=json.dumps(payload), text=True, capture_output=True, check=False, env=env,
+            input=payload if isinstance(payload, str) else json.dumps(payload), text=True, capture_output=True, check=False, env=env,
         )
     return invoke
 
