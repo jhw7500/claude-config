@@ -1090,6 +1090,98 @@ def _owner_loss_event(process, reason: str) -> dict[str, object]:
     }
 
 
+def _write_journal(store, event_id, journal):
+    directory = store.root / "event-journal"
+    make_private_directory(directory)
+    write_private_file(
+        directory / f"{event_id}.json",
+        json.dumps(journal, sort_keys=True, separators=(",", ":")).encode() + b"\n",
+    )
+
+
+def test_committed_journal_with_expected_raw_state_is_corruption_without_event(
+    tmp_path,
+):
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    event_id, journal = store._build_transition_journal(
+        "processes",
+        expected.wrapper.stable_key(),
+        expected,
+        updated,
+        _owner_loss_event(expected, "semantic_contradiction"),
+    )
+    journal["phase"] = "committed"
+    _write_journal(store, event_id, journal)
+
+    with pytest.raises(state.StateCorruption):
+        store.recover_transition_events()
+
+    assert store.load_raw_process(expected.wrapper.stable_key()) == expected
+    assert list((store.root / "event-receipts").glob("*.json")) == []
+    assert not (store.root / "events.jsonl").exists()
+    assert (store.root / "event-journal" / f"{event_id}.json").exists()
+
+
+def test_receipt_with_expected_raw_state_is_corruption_and_preserves_evidence(
+    tmp_path,
+):
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    event_id, journal = store._build_transition_journal(
+        "processes",
+        expected.wrapper.stable_key(),
+        expected,
+        updated,
+        _owner_loss_event(expected, "receipt_contradiction"),
+    )
+    _write_journal(store, event_id, journal)
+    receipt_dir = store.root / "event-receipts"
+    make_private_directory(receipt_dir)
+    receipt = {
+        "schema_version": 1,
+        "transition_id": event_id,
+        "event_id": event_id,
+        "committed_revision": store.ledger_revision(),
+        "event": journal["event"],
+    }
+    write_private_file(
+        receipt_dir / f"{event_id}.json",
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode() + b"\n",
+    )
+
+    with pytest.raises(state.StateCorruption):
+        store.recover_transition_events()
+
+    assert (receipt_dir / f"{event_id}.json").exists()
+    assert (store.root / "event-journal" / f"{event_id}.json").exists()
+
+
+def test_journal_event_id_must_match_derived_transition_id(tmp_path):
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    event_id, journal = store._build_transition_journal(
+        "processes",
+        expected.wrapper.stable_key(),
+        expected,
+        updated,
+        _owner_loss_event(expected, "derived_id"),
+    )
+    journal["event"]["reason_codes"] = ["mutated_after_id_derivation"]
+    _write_journal(store, event_id, journal)
+
+    with pytest.raises(state.StateCorruption):
+        store.recover_transition_events()
+
+    assert (store.root / "event-journal" / f"{event_id}.json").exists()
+
+
 def _retain_next_transition_journal(store, monkeypatch):
     original_unlink = state.os.unlink
     retained = False

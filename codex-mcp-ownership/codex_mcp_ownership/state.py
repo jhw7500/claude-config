@@ -18,6 +18,13 @@ from typing import Callable, Iterator, TypeVar
 
 from . import model
 from .model import ManagedProcess, SessionLease, SignalIntent
+from .transition_truth import (
+    RecoveryContradiction,
+    RecoveryDecision,
+    RecoveryEvidence,
+    decide_recovery,
+    derive_transition_id,
+)
 
 
 EVENT_LOG_MAX_BYTES = 1_048_576
@@ -2000,17 +2007,13 @@ class StateStore:
         _deadline_check(deadline, monotonic)
         if expected_digest == updated_digest:
             raise ValueError("transition must change raw state")
-        event_id = hashlib.sha256(
-            _canonical_json(
-                {
-                    "record_kind": record_kind,
-                    "record_key": record_key,
-                    "expected_digest": expected_digest,
-                    "updated_digest": updated_digest,
-                    "event": event_payload,
-                }
-            )
-        ).hexdigest()
+        event_id = derive_transition_id(
+            record_kind,
+            record_key,
+            expected_digest,
+            updated_digest,
+            event_payload,
+        )
         _deadline_check(deadline, monotonic)
         event_payload["event_id"] = event_id
         return event_id, {
@@ -2292,12 +2295,22 @@ class StateStore:
             deadline=deadline,
             monotonic=monotonic,
         )
-        committed = bool(
-            journal["phase"] == "committed"
-            or current_digest == journal["updated_digest"]
-            or has_receipt
-        )
-        if committed:
+        try:
+            decision = decide_recovery(
+                RecoveryEvidence(
+                    phase=journal["phase"],
+                    current_digest=current_digest,
+                    expected_digest=journal["expected_digest"],
+                    updated_digest=journal["updated_digest"],
+                    has_matching_receipt=has_receipt,
+                )
+            )
+        except RecoveryContradiction as error:
+            raise StateCorruption(
+                self.root / "event-journal" / (event_id + ".json"),
+                hashlib.sha256(_canonical_json(journal)).hexdigest(),
+            ) from error
+        if decision is RecoveryDecision.FINALIZE_UPDATED:
             created = self._write_event_receipt_locked(
                 root_fd,
                 event_id,
@@ -2320,17 +2333,16 @@ class StateStore:
                 deadline=deadline,
                 monotonic=monotonic,
             )
-        elif current_digest != journal["expected_digest"]:
-            raise StateCorruption(
-                self.root / "event-journal" / (event_id + ".json"),
-                hashlib.sha256(_canonical_json(journal)).hexdigest(),
-            )
+        elif decision is RecoveryDecision.ALREADY_RECEIPTED:
+            created = False
+        elif decision is RecoveryDecision.DISCARD_PREPARED:
+            created = False
         _deadline_check(deadline, monotonic)
         os.unlink(event_id + ".json", dir_fd=directory_fd)
         _deadline_check(deadline, monotonic)
         os.fsync(directory_fd)
         _deadline_check(deadline, monotonic)
-        return committed
+        return decision is not RecoveryDecision.DISCARD_PREPARED
 
     def _recover_known_transition_locked(
         self,
@@ -2437,6 +2449,20 @@ class StateStore:
             or not isinstance(payload["event"], dict)
             or payload["event"].get("event_id") != event_id
         ):
+            raise StateCorruption(
+                self.root / "event-journal" / (event_id + ".json"),
+                hashlib.sha256(raw).hexdigest(),
+            )
+        event_without_id = dict(payload["event"])
+        event_without_id.pop("event_id", None)
+        derived = derive_transition_id(
+            payload["record_kind"],
+            payload["record_key"],
+            payload["expected_digest"],
+            payload["updated_digest"],
+            event_without_id,
+        )
+        if derived != event_id:
             raise StateCorruption(
                 self.root / "event-journal" / (event_id + ".json"),
                 hashlib.sha256(raw).hexdigest(),
