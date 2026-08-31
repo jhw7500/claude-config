@@ -25,6 +25,21 @@ class RegistrationStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+class WorkKind(str, Enum):
+    EXCLUDED = "excluded"
+    BACKLOG = "backlog"
+    IMMEDIATE = "immediate"
+
+
+class SuggestedAction(str, Enum):
+    NO_TASK = "no_task"
+    GITHUB_ISSUE_ONLY = "github_issue_only"
+    FORMAL_ISSUE_TASK = "formal_issue_task"
+    TEMPORARY_TASK = "temporary_task"
+    REGISTER_REPOSITORY = "register_repository"
+    STOP_FOR_CLASSIFICATION = "stop_for_classification"
+
+
 class Runtime(str, Enum):
     CLAUDE = "claude"
     CODEX = "codex"
@@ -50,6 +65,33 @@ class RegistrationResult:
 
 
 @dataclass(frozen=True)
+class PolicyContext:
+    status: RegistrationStatus
+    work: WorkKind
+    recurring: bool = False
+    existing_issue: bool = False
+    bounded: bool = False
+
+    @classmethod
+    def from_strings(
+        cls,
+        *,
+        status: str,
+        work: str,
+        recurring: bool = False,
+        existing_issue: bool = False,
+        bounded: bool = False,
+    ) -> "PolicyContext":
+        return cls(
+            RegistrationStatus(status),
+            WorkKind(work),
+            recurring,
+            existing_issue,
+            bounded,
+        )
+
+
+@dataclass(frozen=True)
 class HookEvent:
     runtime: Runtime
     session_id: str
@@ -64,6 +106,78 @@ class NudgeError(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+def suggest_action(context: PolicyContext) -> SuggestedAction:
+    """Apply the policy table without attempting to infer conversation context."""
+    if context.work is WorkKind.EXCLUDED:
+        return SuggestedAction.NO_TASK
+    if context.work is WorkKind.BACKLOG:
+        return SuggestedAction.GITHUB_ISSUE_ONLY
+    if context.status is RegistrationStatus.UNKNOWN:
+        return SuggestedAction.STOP_FOR_CLASSIFICATION
+    if context.status is RegistrationStatus.REGISTERED:
+        if context.existing_issue or context.recurring:
+            return SuggestedAction.FORMAL_ISSUE_TASK
+        if context.bounded:
+            return SuggestedAction.TEMPORARY_TASK
+        return SuggestedAction.NO_TASK
+    if context.recurring:
+        return SuggestedAction.REGISTER_REPOSITORY
+    return SuggestedAction.NO_TASK
+
+
+def has_recurring_evidence(
+    *,
+    explicit_long_running: bool = False,
+    existing_issue_plan_or_handoff: bool = False,
+    architectural_multistage: bool = False,
+    file_count: int | None = None,
+    repository_present: bool = False,
+) -> bool:
+    """Accept only the three approved positive recurring-work evidence classes."""
+    del file_count, repository_present
+    return explicit_long_running or existing_issue_plan_or_handoff or architectural_multistage
+
+
+_BOUNDED_REASONS = frozenset(
+    {
+        "HOOK_INPUT_INVALID",
+        "REPOSITORY_IDENTITY_UNKNOWN",
+        "PORTFOLIO_UNAVAILABLE",
+        "PORTFOLIO_RESULT_INCOMPLETE",
+        "NUDGE_STATE_UNAVAILABLE",
+    }
+)
+
+
+def _safe_message_identity(result: RegistrationResult) -> str:
+    if result.status in {RegistrationStatus.REGISTERED, RegistrationStatus.UNREGISTERED}:
+        slug = result.repository_slug
+        if isinstance(slug, str) and parse_github_slug(f"https://github.com/{slug}") == slug.lower():
+            return f"저장소: {slug.lower()} / 상태: {result.status.value}"
+        return f"상태: {result.status.value}"
+    reason = result.reason if result.reason in _BOUNDED_REASONS else "PORTFOLIO_UNAVAILABLE"
+    return f"상태: unknown / 사유: {reason}"
+
+
+def render_nudge_message(result: RegistrationResult) -> str:
+    """Return the shared, scrubbed runtime guidance for a registration result."""
+    identity = _safe_message_identity(result)
+    return (
+        "[TASK-NUDGE] " + identity + "\n"
+        "정책 우선순서: (1) 이미 결정됨·제외 작업(조회/Q&A·단순 문서/설정·subagent)은 Task 없이 진행; "
+        "(2) 향후 backlog는 등록 상태와 무관하게 GitHub Issue만 제안; "
+        "(3) 등록 저장소의 즉시 작업은 기존 Issue 또는 반복 증거면 Formal Issue Task, "
+        "현재 세션에서 끝낼 제한 작업이면 Temporary Task, 조정 비용보다 작으면 Task 없음; "
+        "(4) 미등록 저장소의 즉시 작업은 반복 증거가 있을 때만 Project/Repository 등록만 먼저 제안, 아니면 Task 없음; "
+        "(5) unknown이면 등록 여부를 가정하지 말고 현재 변경을 중단하고 복구가 필요하다고 알린다.\n"
+        "반복·다중 세션 증거는 다음 셋뿐이다: 사용자의 장기·반복·여러 세션 명시, "
+        "기존 GitHub Issue·승인된 계획·Handoff, 여러 구현 단계와 검증이 필요한 아키텍처 작업. "
+        "파일 수나 저장소 안에 있다는 사실은 증거가 아니다.\n"
+        "GitHub Issue 생성, Project/Repository 등록, Formal 또는 Temporary Task 시작은 각각 별도의 명시적 사용자 승인 후에만 한다. "
+        "앞 단계 승인은 다음 단계를 승인하지 않는다. 이미 결정했거나 subagent이면 이 안내를 적용하지 않는다."
+    )
 
 
 HTTPS_REMOTE = re.compile(
