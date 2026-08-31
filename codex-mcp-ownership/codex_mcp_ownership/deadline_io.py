@@ -1,12 +1,45 @@
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
+import errno
 import fcntl
 import os
 from typing import Callable, TypeVar
 
 
 _T = TypeVar("_T")
+
+
+def _rename_noreplace(
+    source_fd: int,
+    source: str,
+    destination_fd: int,
+    destination: str,
+) -> None:
+    """Use Linux renameat2(RENAME_NOREPLACE) without a replace-capable gap."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_fd,
+        os.fsencode(source),
+        destination_fd,
+        os.fsencode(destination),
+        1,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), destination)
 
 
 class OperationDeadlineExceeded(RuntimeError):
@@ -177,6 +210,22 @@ class DeadlineIO:
             destination,
             src_dir_fd=source_dir_fd,
             dst_dir_fd=destination_dir_fd,
+        )
+
+    def rename_noreplace(
+        self,
+        source: str,
+        destination: str,
+        *,
+        source_dir_fd: int,
+        destination_dir_fd: int,
+    ) -> None:
+        self._call(
+            _rename_noreplace,
+            source_dir_fd,
+            source,
+            destination_dir_fd,
+            destination,
         )
 
     def unlink(self, name: str, *, dir_fd: int) -> None:

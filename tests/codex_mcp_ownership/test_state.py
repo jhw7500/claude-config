@@ -98,6 +98,50 @@ def test_created_state_paths_have_deterministic_private_modes(tmp_path, umask):
     assert (root / "state.lock").stat().st_mode & 0o777 == 0o600
 
 
+def test_root_creation_closes_anchor_when_normal_open_hits_deadline(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    now = [0.0]
+    anchors = []
+    anchor_closes = []
+    original_mkdir_private = deadline_io.DeadlineIO.mkdir_private
+    original_close = deadline_io.DeadlineIO.close_fd
+
+    def mkdir_then_expire(io, *args, **kwargs):
+        anchor_fd = original_mkdir_private(io, *args, **kwargs)
+        anchors.append(anchor_fd)
+        now[0] = 1.0
+        return anchor_fd
+
+    def capture_close(io, fd):
+        if fd in anchors:
+            anchor_closes.append(fd)
+        return original_close(io, fd)
+
+    monkeypatch.setattr(deadline_io.DeadlineIO, "mkdir_private", mkdir_then_expire)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "close_fd", capture_close)
+
+    try:
+        with pytest.raises(state.OperationDeadlineExceeded):
+            store.append_event(
+                {"schema_version": 1, "event": "anchor_deadline"},
+                deadline=0.5,
+                monotonic=lambda: now[0],
+            )
+
+        assert len(anchors) == 1
+        assert anchor_closes == anchors
+        with pytest.raises(OSError):
+            os.fstat(anchors[0])
+    finally:
+        for fd in anchors:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 @pytest.mark.parametrize("session_id", ["bad/session", "bad\x01session", "", "x" * 129])
 def test_invalid_session_id_is_rejected_before_any_path_is_created(
     tmp_path, session_id
@@ -159,6 +203,75 @@ def test_event_log_accepts_only_redacted_allowlisted_fields(tmp_path):
     store.append_event(event)
     assert json.loads((store.root / "events.jsonl").read_text()) == event
     assert (store.root / "events.jsonl").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("failure_kind", ["oserror", "deadline"])
+def test_event_log_create_closes_fd_and_preserves_fchmod_failure(
+    tmp_path, monkeypatch, failure_kind
+):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    now = [0.0]
+    event_fds = []
+    close_calls = []
+    original_open = deadline_io.DeadlineIO.open_fd
+    original_close = deadline_io.DeadlineIO.close_fd
+    original_fchmod = deadline_io.os.fchmod
+    injected = OSError("event fchmod failed")
+
+    def capture_event_fd(io, name, *args, **kwargs):
+        fd = original_open(io, name, *args, **kwargs)
+        if name == "events.jsonl":
+            event_fds.append(fd)
+        return fd
+
+    def close_then_report(io, fd):
+        result = original_close(io, fd)
+        if fd in event_fds:
+            close_calls.append(fd)
+            raise OSError("event close failed")
+        return result
+
+    monkeypatch.setattr(deadline_io.DeadlineIO, "open_fd", capture_event_fd)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "close_fd", close_then_report)
+    if failure_kind == "oserror":
+        monkeypatch.setattr(
+            deadline_io.DeadlineIO,
+            "fchmod",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(injected),
+        )
+        expected_error = OSError
+        kwargs = {}
+    else:
+
+        def fchmod_then_expire(*args, **kwargs):
+            result = original_fchmod(*args, **kwargs)
+            now[0] = 1.0
+            return result
+
+        monkeypatch.setattr(deadline_io.os, "fchmod", fchmod_then_expire)
+        expected_error = state.OperationDeadlineExceeded
+        kwargs = {"deadline": 0.5, "monotonic": lambda: now[0]}
+
+    try:
+        with pytest.raises(expected_error) as error:
+            store.append_event(
+                {"schema_version": 1, "event": "fchmod_failure"},
+                **kwargs,
+            )
+
+        if failure_kind == "oserror":
+            assert error.value is injected
+        assert len(event_fds) == 1
+        assert close_calls == event_fds
+        with pytest.raises(OSError):
+            os.fstat(event_fds[0])
+    finally:
+        for fd in event_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _build_unsafe_store(
@@ -240,6 +353,32 @@ def test_writable_load_quarantines_corruption_by_digest_under_lock(tmp_path):
     assert quarantined[0].read_bytes() == raw
     assert quarantined[0].stat().st_mode & 0o777 == 0o600
     assert error.value.quarantine_path == quarantined[0]
+
+
+def test_quarantine_uses_typed_no_replace_rename_gateway(tmp_path, monkeypatch):
+    store = state.StateStore(tmp_path / "state")
+    sessions = store.root / "sessions"
+    make_private_directory(sessions)
+    corrupt = sessions / ("a" * 64 + ".json")
+    write_private_file(corrupt, b"{not-json}\n")
+
+    class RenameBoundaryReached(RuntimeError):
+        pass
+
+    def stop_at_typed_boundary(*_args, **_kwargs):
+        raise RenameBoundaryReached("typed rename boundary")
+
+    monkeypatch.setattr(
+        deadline_io.DeadlineIO,
+        "rename_noreplace",
+        stop_at_typed_boundary,
+        raising=False,
+    )
+
+    with pytest.raises(RenameBoundaryReached, match="typed rename boundary"):
+        store.load_sessions()
+
+    assert corrupt.read_bytes() == b"{not-json}\n"
 
 
 def test_atomic_json_failure_preserves_previous_record(tmp_path, monkeypatch):
@@ -357,6 +496,40 @@ def test_lock_path_replacement_during_acquisition_is_rejected(tmp_path, monkeypa
     with pytest.raises(state.UnsafeStatePath):
         with store.locked():
             pass
+
+
+def test_nested_public_writer_reuses_outer_bounded_gateway(tmp_path, monkeypatch):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    now = [0.0]
+    later_boundaries = []
+    original_dup = deadline_io.os.dup
+
+    def record_dup(fd):
+        if now[0] >= 0.5:
+            later_boundaries.append("dup")
+        return original_dup(fd)
+
+    monkeypatch.setattr(deadline_io.os, "dup", record_dup)
+    outer_io = deadline_io.DeadlineIO(deadline_io.DeadlineBudget(0.5, lambda: now[0]))
+
+    with store._locked_with_io(io=outer_io):
+        now[0] = 1.0
+        with pytest.raises(state.OperationDeadlineExceeded):
+            store.save_session(sample_lease("session:nested"))
+
+    assert later_boundaries == []
+
+
+def test_direct_locked_registers_fallback_gateway_for_reentrant_scope(tmp_path):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    different_io = deadline_io.DeadlineIO(deadline_io.DeadlineBudget(None, lambda: 0.0))
+
+    with store.locked():
+        with pytest.raises(RuntimeError, match="I/O gateway"):
+            with store._locked_with_io(io=different_io):
+                pass
 
 
 def test_shared_store_serializes_different_threads(tmp_path):
@@ -789,9 +962,9 @@ def test_quarantine_rename_failure_leaves_single_diagnosable_source(
     make_private_directory(sessions)
     path = sessions / ("a" * 64 + ".json")
     write_private_file(path, b"not-json\n")
-    original = state._rename_noreplace
+    original = deadline_io._rename_noreplace
     monkeypatch.setattr(
-        state,
+        deadline_io,
         "_rename_noreplace",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("rename failed")),
     )
@@ -801,7 +974,7 @@ def test_quarantine_rename_failure_leaves_single_diagnosable_source(
 
     assert path.exists()
     assert path.stat().st_nlink == 1
-    monkeypatch.setattr(state, "_rename_noreplace", original)
+    monkeypatch.setattr(deadline_io, "_rename_noreplace", original)
     with pytest.raises(state.StateCorruption) as error:
         store.load_sessions()
     assert error.value.quarantine_path is not None
@@ -1046,7 +1219,7 @@ def test_quarantine_race_cannot_overwrite_a_new_destination(
     target = sessions / (("a" * 64) + ".json")
     raw = b"{corrupt}\n"
     write_private_file(target, raw)
-    original_rename = state._rename_noreplace
+    original_rename = deadline_io._rename_noreplace
     sentinel = b"existing-quarantine-evidence\n"
     injected = False
 
@@ -1068,7 +1241,7 @@ def test_quarantine_race_cannot_overwrite_a_new_destination(
             raise FileExistsError(destination)
         return original_rename(source_fd, source, destination_fd, destination)
 
-    monkeypatch.setattr(state, "_rename_noreplace", inject_collision)
+    monkeypatch.setattr(deadline_io, "_rename_noreplace", inject_collision)
 
     with pytest.raises(state.StateCorruption):
         state.StateStore(root).load_sessions()

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import ctypes
 from dataclasses import dataclass, replace
 import errno
 import fcntl as fcntl
@@ -265,35 +264,11 @@ def _write_all_with_io(io: DeadlineIO, fd: int, data: bytes) -> None:
         position += written
 
 
-def _rename_noreplace(
-    source_fd: int,
-    source: str,
-    destination_fd: int,
-    destination: str,
-) -> None:
-    """Use Linux renameat2(RENAME_NOREPLACE) without a replace-capable gap."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
-    renameat2.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    ]
-    renameat2.restype = ctypes.c_int
-    result = renameat2(
-        source_fd,
-        os.fsencode(source),
-        destination_fd,
-        os.fsencode(destination),
-        1,
-    )
-    if result != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number), destination)
+def _close_fd_after_failure(io: DeadlineIO, fd: int) -> None:
+    try:
+        io.close_fd(fd)
+    except OSError:
+        pass
 
 
 class StateStore:
@@ -311,6 +286,7 @@ class StateStore:
         self._lock_releasing = False
         self._lock_fd: int | None = None
         self._pinned_root_fd: int | None = None
+        self._lock_io: DeadlineIO | None = None
         self._lock_depth = 0
         self._effect_transition_ids: set[str] = set()
         self._operation_io = threading.local()
@@ -326,7 +302,21 @@ class StateStore:
                 and not self._lock_releasing
                 and self._lock_depth > 0
                 and self._pinned_root_fd is not None
+                and self._lock_io is not None
             )
+
+    def _operation_gateway(
+        self,
+        deadline: float | None,
+        monotonic: Callable[[], float],
+    ) -> DeadlineIO:
+        owner = threading.get_ident()
+        with self._lock_condition:
+            if self._lock_owner == owner and not self._lock_releasing:
+                if self._lock_io is None or self._lock_depth < 1:
+                    raise RuntimeError("invalid state-lock I/O gateway ownership")
+                return self._lock_io
+        return DeadlineIO(DeadlineBudget(deadline, monotonic))
 
     def _root_exists(self, *, io: DeadlineIO) -> bool:
         try:
@@ -338,7 +328,7 @@ class StateStore:
 
     def root_token(self) -> tuple[int, int]:
         """Return the device/inode identity of the current pinned state root."""
-        io = DeadlineIO(DeadlineBudget(None, time.monotonic))
+        io = self._operation_gateway(None, time.monotonic)
         fd = self._open_root(io=io)
         try:
             value = io.fstat(fd)
@@ -406,7 +396,7 @@ class StateStore:
 
     def root_binding(self) -> RootBinding:
         """Capture the exact root and its immediate lexical parent/name binding."""
-        io = DeadlineIO(DeadlineBudget(None, time.monotonic))
+        io = self._operation_gateway(None, time.monotonic)
         return self._root_binding_with_io(io=io)
 
     def validate_root_binding(self, expected: RootBinding) -> None:
@@ -481,7 +471,7 @@ class StateStore:
 
     def lexical_root_token(self) -> tuple[int, int]:
         """Return the inode currently bound to the configured root pathname."""
-        io = DeadlineIO(DeadlineBudget(None, time.monotonic))
+        io = self._operation_gateway(None, time.monotonic)
         value = io.stat(os.fspath(self.root))
         _validate_directory(value, self.root)
         return value.st_dev, value.st_ino
@@ -522,27 +512,43 @@ class StateStore:
                         next_fd = io.open_fd(component, flags, dir_fd=current_fd)
                     except OSError as error:
                         if anchor_fd is not None:
-                            io.close_fd(anchor_fd)
+                            closing_fd = anchor_fd
+                            anchor_fd = None
+                            _close_fd_after_failure(io, closing_fd)
                         raise UnsafeStatePath(
                             f"cannot safely open state path component: {walked}"
                         ) from error
+                    except Exception:
+                        if anchor_fd is not None:
+                            closing_fd = anchor_fd
+                            anchor_fd = None
+                            _close_fd_after_failure(io, closing_fd)
+                        raise
                     try:
-                        try:
-                            opened = io.fstat(next_fd)
-                            _validate_directory(opened, walked)
-                            if anchor_fd is not None:
-                                anchored = io.fstat(anchor_fd)
-                                _validate_directory(anchored, walked)
-                                if (opened.st_dev, opened.st_ino) != (
-                                    anchored.st_dev,
-                                    anchored.st_ino,
-                                ):
-                                    raise UnsafeStatePath(
-                                        f"state directory changed during open: {walked}"
-                                    )
-                        finally:
-                            if anchor_fd is not None:
-                                io.close_fd(anchor_fd)
+                        opened = io.fstat(next_fd)
+                        _validate_directory(opened, walked)
+                        if anchor_fd is not None:
+                            anchored = io.fstat(anchor_fd)
+                            _validate_directory(anchored, walked)
+                            if (opened.st_dev, opened.st_ino) != (
+                                anchored.st_dev,
+                                anchored.st_ino,
+                            ):
+                                raise UnsafeStatePath(
+                                    f"state directory changed during open: {walked}"
+                                )
+                    except Exception:
+                        if anchor_fd is not None:
+                            closing_fd = anchor_fd
+                            anchor_fd = None
+                            _close_fd_after_failure(io, closing_fd)
+                        raise
+                    else:
+                        if anchor_fd is not None:
+                            closing_fd = anchor_fd
+                            anchor_fd = None
+                            io.close_fd(closing_fd)
+                    try:
                         io.fsync(current_fd)
                     except Exception:
                         io.close_fd(next_fd)
@@ -741,6 +747,8 @@ class StateStore:
         if stack is None:
             stack = []
             self._operation_io.stack = stack
+        if stack and stack[-1] is not io:
+            raise RuntimeError("reentrant state-lock I/O gateway changed")
         stack.append(io)
         try:
             if expected_root_token is None and remaining_timeout is None:
@@ -771,8 +779,33 @@ class StateStore:
         stack = getattr(self._operation_io, "stack", None)
         if stack:
             io = stack[-1]
+            registered = False
         else:
             io = DeadlineIO(DeadlineBudget(None, time.monotonic))
+            if stack is None:
+                stack = []
+                self._operation_io.stack = stack
+            stack.append(io)
+            registered = True
+        try:
+            with self._locked_core(
+                io=io,
+                expected_root_token=expected_root_token,
+                remaining_timeout=remaining_timeout,
+            ):
+                yield self
+        finally:
+            if registered and (not stack or stack.pop() is not io):
+                raise RuntimeError("invalid operation I/O gateway ownership")
+
+    @contextmanager
+    def _locked_core(
+        self,
+        *,
+        io: DeadlineIO,
+        expected_root_token: tuple[int, int] | None = None,
+        remaining_timeout: float | None = None,
+    ) -> Iterator[StateStore]:
         owner = threading.get_ident()
         timeout = self.lock_timeout
         if remaining_timeout is not None:
@@ -788,6 +821,8 @@ class StateStore:
                     raise RuntimeError("state lock is releasing")
                 if self._pinned_root_fd is None or self._lock_depth < 1:
                     raise RuntimeError("invalid reentrant state-lock ownership")
+                if self._lock_io is not io:
+                    raise RuntimeError("reentrant state-lock I/O gateway changed")
                 if expected_root_token is not None:
                     pinned = io.fstat(self._pinned_root_fd)
                     if (pinned.st_dev, pinned.st_ino) != expected_root_token:
@@ -808,12 +843,17 @@ class StateStore:
                     self._lock_condition.wait(wait_for)
                 self._lock_owner = owner
                 self._lock_depth = 1
+                self._lock_io = io
         if nested:
             try:
                 yield self
             finally:
                 with self._lock_condition:
-                    if self._lock_owner != owner or self._lock_depth <= 1:
+                    if (
+                        self._lock_owner != owner
+                        or self._lock_depth <= 1
+                        or self._lock_io is not io
+                    ):
                         raise RuntimeError("invalid nested state-lock release")
                     self._lock_depth -= 1
             return
@@ -850,7 +890,11 @@ class StateStore:
                     )
                     time.sleep(sleep_for)
             with self._lock_condition:
-                if self._lock_owner != owner or self._lock_depth != 1:
+                if (
+                    self._lock_owner != owner
+                    or self._lock_depth != 1
+                    or self._lock_io is not io
+                ):
                     raise RuntimeError(
                         "state-lock ownership changed during acquisition"
                     )
@@ -860,7 +904,11 @@ class StateStore:
                 yield self
             finally:
                 with self._lock_condition:
-                    if self._lock_owner != owner or self._lock_depth != 1:
+                    if (
+                        self._lock_owner != owner
+                        or self._lock_depth != 1
+                        or self._lock_io is not io
+                    ):
                         raise RuntimeError(
                             "outer state lock exited with nested ownership"
                         )
@@ -883,6 +931,7 @@ class StateStore:
                                 self._lock_depth = 0
                                 self._lock_fd = None
                                 self._pinned_root_fd = None
+                                self._lock_io = None
                                 self._lock_releasing = False
                                 self._lock_owner = None
                                 self._lock_condition.notify_all()
@@ -992,7 +1041,7 @@ class StateStore:
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> int:
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         io.budget.check()
         if self._owns_lock() or self.read_only:
             return self._ledger_revision_locked(io=io)
@@ -1101,7 +1150,7 @@ class StateStore:
         key = session_key(lease.session_id)
         payload = lease.to_dict()
         self._require_mutable()
-        io = DeadlineIO(DeadlineBudget(None, time.monotonic))
+        io = self._operation_gateway(None, time.monotonic)
         with self._locked_with_io(io=io):
             self._recover_before_write_locked(io=io)
             self._save_record_locked(
@@ -1120,7 +1169,7 @@ class StateStore:
         key = process.wrapper.stable_key()
         payload = process.to_dict()
         self._require_mutable()
-        io = DeadlineIO(DeadlineBudget(None, time.monotonic))
+        io = self._operation_gateway(None, time.monotonic)
         with self._locked_with_io(io=io):
             self._recover_before_write_locked(io=io)
             self._save_record_locked(
@@ -1144,7 +1193,7 @@ class StateStore:
         except ValueError as error:
             raise ValueError("invalid process key") from error
         self._require_mutable()
-        io = DeadlineIO(DeadlineBudget(None, time.monotonic))
+        io = self._operation_gateway(None, time.monotonic)
         if not self._root_exists(io=io):
             return
         with self._locked_with_io(io=io):
@@ -1183,7 +1232,7 @@ class StateStore:
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> tuple[SessionLease, ...]:
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         return self._load_sessions_with_io(io=io)
 
     def _load_sessions_with_io(self, *, io: DeadlineIO) -> tuple[SessionLease, ...]:
@@ -1200,7 +1249,7 @@ class StateStore:
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> str:
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         return self._sessions_digest_with_io(io=io)
 
     def _sessions_digest_with_io(self, *, io: DeadlineIO) -> str:
@@ -1228,7 +1277,7 @@ class StateStore:
         monotonic: Callable[[], float] = time.monotonic,
     ) -> SessionLease | None:
         """Load only the SHA-256-addressed lease for ``session_id``."""
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         key = session_key(session_id)
         value = self._load_exact_record_with_io(
             "sessions",
@@ -1242,7 +1291,7 @@ class StateStore:
         return value
 
     def load_process(self, process_key: str) -> ManagedProcess | None:
-        io = DeadlineIO(DeadlineBudget(None, time.monotonic))
+        io = self._operation_gateway(None, time.monotonic)
         process = self._load_raw_process_with_io(process_key, io=io)
         if process is None:
             return None
@@ -1255,7 +1304,7 @@ class StateStore:
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> ManagedProcess | None:
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         return self._load_raw_process_with_io(process_key, io=io)
 
     def _load_raw_process_with_io(
@@ -1286,7 +1335,7 @@ class StateStore:
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> SignalIntent | None:
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         return self._load_signal_intent_with_io(process_key, action="term", io=io)
 
     def _load_signal_intent_with_io(
@@ -1316,7 +1365,7 @@ class StateStore:
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> SignalIntent | None:
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         return self._load_signal_intent_with_io(process_key, action="force", io=io)
 
     def load_signal_intents(
@@ -1326,7 +1375,7 @@ class StateStore:
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> tuple[SignalIntent, ...]:
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         return self._load_signal_intents_with_io(action, io=io)
 
     def _load_signal_intents_with_io(
@@ -1356,7 +1405,7 @@ class StateStore:
             "force-receipts" if intent.action == "force" else "signal-intents"
         )
         self._require_mutable()
-        io = DeadlineIO(DeadlineBudget(None, time.monotonic))
+        io = self._operation_gateway(None, time.monotonic)
         with self._locked_with_io(io=io):
             self._recover_before_write_locked(io=io)
             existing = self._load_signal_intent_with_io(
@@ -1428,7 +1477,7 @@ class StateStore:
             raise ValueError("invalid signal intent action")
         directory_name = "force-receipts" if action == "force" else "signal-intents"
         self._require_mutable()
-        io = DeadlineIO(DeadlineBudget(None, time.monotonic))
+        io = self._operation_gateway(None, time.monotonic)
         with self._locked_with_io(io=io):
             self._recover_before_write_locked(io=io)
             root_fd = self._open_root(io=io)
@@ -1618,7 +1667,7 @@ class StateStore:
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> tuple[ManagedProcess, ...]:
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         return tuple(
             self._overlay_signal_intent(process, io=io)
             for process in self._load_records_with_io(
@@ -1635,7 +1684,7 @@ class StateStore:
         deadline: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> tuple[ManagedProcess, ...]:
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         return self._load_raw_processes_with_io(io=io)
 
     def _load_raw_processes_with_io(
@@ -1766,9 +1815,12 @@ class StateStore:
             for _attempt in range(16):
                 candidate = f"{kind}-{digest}-{secrets.token_hex(8)}.json"
                 try:
-                    io.budget.check()
-                    _rename_noreplace(source_fd, name, quarantine_fd, candidate)
-                    io.budget.check()
+                    io.rename_noreplace(
+                        name,
+                        candidate,
+                        source_dir_fd=source_fd,
+                        destination_dir_fd=quarantine_fd,
+                    )
                 except FileExistsError:
                     continue
                 destination = candidate
@@ -1803,7 +1855,7 @@ class StateStore:
         record = _canonical_json(event)
         if len(record) > EVENT_LOG_MAX_BYTES:
             raise ValueError("event record exceeds maximum log size")
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         io.budget.check()
         self._require_mutable()
         with self._locked_with_io(io=io, remaining_timeout=remaining_timeout):
@@ -1849,8 +1901,8 @@ class StateStore:
         effect: Callable[[], None] | None = None,
     ) -> int:
         """Commit one exact raw-state mutation and its logical event receipt."""
-        budget = DeadlineBudget(deadline, monotonic)
-        io = DeadlineIO(budget)
+        io = self._operation_gateway(deadline, monotonic)
+        budget = io.budget
         budget.check()
         self._require_mutable()
         root_token = (
@@ -2264,7 +2316,7 @@ class StateStore:
     ) -> None:
         if type(limit) is not int or limit < 0 or limit > TRANSITION_JOURNAL_LIMIT:
             raise ValueError("invalid transition recovery limit")
-        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        io = self._operation_gateway(deadline, monotonic)
         io.budget.check()
         self._require_mutable()
         with self._locked_with_io(io=io):
@@ -2873,18 +2925,24 @@ class StateStore:
                 os.O_WRONLY | os.O_APPEND,
                 io=io,
             )
+            created = False
         except FileNotFoundError:
             flags = os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK
             flags |= os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
             fd = io.open_fd(name, flags, _FILE_MODE, dir_fd=root_fd)
-            io.fchmod(fd, _FILE_MODE)
+            created = True
         try:
+            if created:
+                io.fchmod(fd, _FILE_MODE)
             value = io.fstat(fd)
             _validate_file(value, path)
             _write_all_with_io(io, fd, record)
             io.fsync(fd)
-        finally:
+        except Exception:
+            _close_fd_after_failure(io, fd)
+            raise
+        else:
             io.close_fd(fd)
         io.fsync(root_fd)
 

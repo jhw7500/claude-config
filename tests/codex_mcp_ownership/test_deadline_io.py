@@ -123,6 +123,33 @@ def test_mkdir_private_closes_anchor_when_mode_finalization_fails(
         os.fstat(anchors[0])
 
 
+def test_rename_noreplace_reports_expiry_after_typed_boundary(monkeypatch):
+    now = [0.0]
+    calls = []
+
+    def rename_then_expire(source_fd, source, destination_fd, destination):
+        calls.append((source_fd, source, destination_fd, destination))
+        now[0] = 1.0
+
+    monkeypatch.setattr(
+        deadline_io,
+        "_rename_noreplace",
+        rename_then_expire,
+        raising=False,
+    )
+    io = deadline_io.DeadlineIO(deadline_io.DeadlineBudget(0.5, lambda: now[0]))
+
+    with pytest.raises(deadline_io.OperationDeadlineExceeded):
+        io.rename_noreplace(
+            "source",
+            "destination",
+            source_dir_fd=11,
+            destination_dir_fd=22,
+        )
+
+    assert calls == [(11, "source", 22, "destination")]
+
+
 def test_open_fd_closes_handle_when_deadline_crosses_after_open(tmp_path, monkeypatch):
     target = tmp_path / "state.json"
     target.write_bytes(b"{}\n")
