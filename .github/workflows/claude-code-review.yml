@@ -2,7 +2,7 @@ name: Claude Code Review
 
 on:
   pull_request:
-    types: [opened, synchronize]
+    types: [opened, synchronize, ready_for_review]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -20,7 +20,8 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.fork == false &&
-      github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false) ||
       (github.event_name == 'workflow_dispatch' && inputs.force_review)
     permissions:
       actions: read
@@ -28,9 +29,18 @@ jobs:
       id-token: write
       issues: read
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/claude-code-review.yml@ffdf5c1ff6237502ac67296ffabb9146d623c7a6
+    uses: jhw7500/automation/.github/workflows/claude-code-review.yml@ccd1b6f3e1833c82d73826c1332cc6e3e4841d30
     with:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
       force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}
+      review_mode: >-
+        ${{
+          github.event_name == 'workflow_dispatch' && inputs.force_review && 'request' ||
+          contains(github.event.pull_request.labels.*.name, 'review:request') &&
+          contains(github.event.pull_request.labels.*.name, 'review:skip') && 'conflict' ||
+          contains(github.event.pull_request.labels.*.name, 'review:request') && 'request' ||
+          contains(github.event.pull_request.labels.*.name, 'review:skip') && 'skip' ||
+          'auto'
+        }}
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
