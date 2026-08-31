@@ -614,6 +614,27 @@ def _unavailable_report(
     )
 
 
+def _complete_deadline_outcomes(
+    actions: tuple[CleanupAction, ...],
+    outcomes: list[CleanupOutcome],
+    *,
+    forced: bool,
+) -> None:
+    pending = list(outcomes)
+    completed: list[CleanupOutcome] = []
+    reason = (
+        "partial_force_deadline_exhausted" if forced else "cleanup_deadline_exhausted"
+    )
+    for action in actions:
+        for index, outcome in enumerate(pending):
+            if outcome.action == action:
+                completed.append(pending.pop(index))
+                break
+        else:
+            completed.append(CleanupOutcome(action, "skipped", reason))
+    outcomes[:] = completed
+
+
 def _verify_authorized_audit(
     store: StateStore,
     authority: AuthorizedAudit,
@@ -655,7 +676,8 @@ def _execute_cleanup_protocol(
 ) -> CleanupReport:
     _deadline_check(deadline, monotonic)
     if authority is None:
-        initial_binding = store.root_binding()
+        io = DeadlineIO(DeadlineBudget(deadline, monotonic))
+        initial_binding = store._root_binding_with_io(io=io)
         _deadline_check(deadline, monotonic)
         authority = capture_authorized_audit(
             store,
@@ -761,6 +783,7 @@ def _execute_cleanup_protocol(
     deadline_expired = False
     post_effect_failure = False
     stop_all = False
+    irreversible_effect_delivered = False
     initial_term_intents = {
         intent.process_key: intent for intent in authority.term_intents
     }
@@ -798,6 +821,15 @@ def _execute_cleanup_protocol(
         term_time_valid = True
 
         for index, action in enumerate(process_actions):
+            try:
+                _deadline_check(deadline, monotonic)
+            except CleanupDeadlineExceeded:
+                if irreversible_effect_delivered:
+                    deadline_expired = True
+                    if forced:
+                        partial_force = True
+                    break
+                raise
             if force_payload is not None:
                 try:
                     _validate_force_delivery(force_payload, classification, clock)
@@ -814,27 +846,6 @@ def _execute_cleanup_protocol(
                             group_outcomes.append(outcome)
                         break
                     raise
-            try:
-                _deadline_check(deadline, monotonic)
-            except CleanupDeadlineExceeded:
-                if delivered_keys:
-                    deadline_expired = True
-                    if forced:
-                        partial_force = True
-                    for remaining in process_actions[index:]:
-                        outcome = CleanupOutcome(
-                            remaining,
-                            "skipped",
-                            (
-                                "partial_force_deadline_exhausted"
-                                if forced
-                                else "cleanup_deadline_exhausted"
-                            ),
-                        )
-                        outcomes.append(outcome)
-                        group_outcomes.append(outcome)
-                    break
-                raise
             pidfd: int | None = None
             close_failed = False
             try:
@@ -1012,21 +1023,15 @@ def _execute_cleanup_protocol(
                         break
                     raise
                 except CleanupDeadlineExceeded:
-                    if forced and delivered_keys:
-                        partial_force = True
+                    if irreversible_effect_delivered:
                         deadline_expired = True
-                        for remaining in process_actions[index:]:
-                            skipped = CleanupOutcome(
-                                remaining,
-                                "skipped",
-                                "partial_force_deadline_exhausted",
-                            )
-                            outcomes.append(skipped)
-                            group_outcomes.append(skipped)
+                        if forced:
+                            partial_force = True
                         break
                     raise
                 except PostEffectStateError as error:
                     attempted += 1
+                    irreversible_effect_delivered = True
                     delivered_keys.add(identity_key)
                     if error.record_persisted:
                         intent = delivered_intent
@@ -1102,6 +1107,7 @@ def _execute_cleanup_protocol(
                     stop_all = True
                     break
                 attempted += 1
+                irreversible_effect_delivered = True
                 intent = delivered_intent
                 delivered_keys.add(identity_key)
                 if deadline is not None and monotonic() >= deadline:
@@ -1115,15 +1121,6 @@ def _execute_cleanup_protocol(
                     deadline_expired = True
                     if forced:
                         partial_force = True
-                    if forced and index + 1 < len(process_actions):
-                        for remaining in process_actions[index + 1 :]:
-                            skipped = CleanupOutcome(
-                                remaining,
-                                "skipped",
-                                "partial_force_deadline_exhausted",
-                            )
-                            outcomes.append(skipped)
-                            group_outcomes.append(skipped)
                     break
                 try:
                     outcome = _post_signal_outcome(
@@ -1144,18 +1141,6 @@ def _execute_cleanup_protocol(
                     deadline_expired = True
                     if forced:
                         partial_force = True
-                    for remaining in process_actions[index + 1 :]:
-                        skipped = CleanupOutcome(
-                            remaining,
-                            "skipped",
-                            (
-                                "partial_force_deadline_exhausted"
-                                if forced
-                                else "cleanup_deadline_exhausted"
-                            ),
-                        )
-                        outcomes.append(skipped)
-                        group_outcomes.append(skipped)
                     break
                 if outcome.status == "survived" and not forced:
                     observed, time_reason = _observed_boot_time(clock, term_time_floor)
@@ -1180,22 +1165,10 @@ def _execute_cleanup_protocol(
                         group_outcomes.append(skipped)
                     break
             except CleanupDeadlineExceeded:
-                deadline_expired = True
-                if delivered_keys:
+                if irreversible_effect_delivered:
+                    deadline_expired = True
                     if forced:
                         partial_force = True
-                    for remaining in process_actions[index:]:
-                        skipped = CleanupOutcome(
-                            remaining,
-                            "skipped",
-                            (
-                                "partial_force_deadline_exhausted"
-                                if forced
-                                else "cleanup_deadline_exhausted"
-                            ),
-                        )
-                        outcomes.append(skipped)
-                        group_outcomes.append(skipped)
                     break
                 raise
             except (FileNotFoundError, TimeoutError, UnsafeStatePath, OSError):
@@ -1239,7 +1212,18 @@ def _execute_cleanup_protocol(
                                 group_outcomes[-1] = amended
                                 outcomes[-1] = amended
 
-        if deadline_expired or stop_all or intent is None or not created_intent:
+        if deadline_expired:
+            _complete_deadline_outcomes(actions, outcomes, forced=has_force)
+            return _unavailable_report(
+                before,
+                before_count,
+                before_rss_kib,
+                outcomes,
+                attempted,
+                authority_lost=authority_lost,
+                partial_force=partial_force,
+            )
+        if stop_all or intent is None or not created_intent:
             continue
         authorized_keys = set(intent.identity_keys)
         complete = delivered_keys == authorized_keys

@@ -39,6 +39,8 @@ def test_recovery_truth_table_accepts_only_consistent_states(
         ("e", "committed", True),
         ("e", "prepared", True),
         ("third", "prepared", False),
+        ("third", "prepared", True),
+        ("third", "committed", False),
         ("third", "committed", True),
     ],
 )

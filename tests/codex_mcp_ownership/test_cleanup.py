@@ -4,6 +4,7 @@ import base64
 from dataclasses import replace
 import hashlib
 import json
+import os
 import signal
 import shutil
 
@@ -2757,8 +2758,42 @@ def test_deadline_stops_classification_before_the_next_observation(
     assert expiring.observations == 1
 
 
+def test_initial_root_binding_deadline_stops_parent_traversal_before_next_boundary(
+    orphan_context, monkeypatch
+) -> None:
+    store, tree, clock, _snapshot, _process, _lease = orphan_context
+    now = [0.0]
+    opens = 0
+    original_open = os.open
+
+    def expire_during_first_parent_open(*args, **kwargs):
+        nonlocal opens
+        if now[0] >= 0.5:
+            raise AssertionError("filesystem boundary started after deadline")
+        fd = original_open(*args, **kwargs)
+        opens += 1
+        now[0] = 1.0
+        return fd
+
+    monkeypatch.setattr(os, "open", expire_during_first_parent_open)
+
+    with pytest.raises(cleanup.CleanupDeadlineExceeded):
+        cleanup.execute_cleanup(
+            (),
+            store,
+            tree,
+            FakeSignalBackend(),
+            clock,
+            apply=True,
+            deadline=0.5,
+            monotonic=lambda: now[0],
+        )
+
+    assert opens == 1
+
+
 def test_force_deadline_after_first_delivery_is_partial_and_accounts_for_all(
-    stubborn_context,
+    stubborn_context, monkeypatch
 ) -> None:
     store, tree, clock, _snapshot, process, _lease, _classification = stubborn_context
     write_proc_entry(
@@ -2781,9 +2816,84 @@ def test_force_deadline_after_first_delivery_is_partial_and_accounts_for_all(
     token = cleanup.issue_force_token(classification, clock)
     actions = cleanup.plan_cleanup(snapshot, force=True)
     now = [0.0]
-    signaler = FakeSignalBackend(
-        on_send=lambda _identity, _signum: now.__setitem__(0, 1.0)
+    post_send_checks = 0
+    original_transition = cleanup._transition_intent
+
+    def expire_after_delivery_transition(*args, **kwargs):
+        result = original_transition(*args, **kwargs)
+        if kwargs.get("effect") is not None:
+            now[0] = 1.0
+        return result
+
+    monkeypatch.setattr(cleanup, "_transition_intent", expire_after_delivery_transition)
+
+    def monotonic():
+        nonlocal post_send_checks
+        if now[0] < 0.5:
+            return now[0]
+        post_send_checks += 1
+        if post_send_checks > 1:
+            raise AssertionError("clock boundary started after handled deadline")
+        return now[0]
+
+    signaler = FakeSignalBackend()
+
+    report = cleanup.execute_cleanup(
+        actions,
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+        confirm_token=token,
+        deadline=0.5,
+        monotonic=monotonic,
     )
+
+    assert report.outcomes == (
+        model.CleanupOutcome(
+            actions[0],
+            "survived",
+            "signal_delivered_unobserved_deadline",
+        ),
+        model.CleanupOutcome(
+            actions[1],
+            "skipped",
+            "partial_force_deadline_exhausted",
+        ),
+    )
+    assert report.partial_force is True
+    assert report.after_state_available is False
+    assert report.attempted == 1
+    assert [call[0] for call in signaler.calls] == ["open", "send", "close"]
+    assert post_send_checks == 1
+
+
+def test_force_deadline_between_iterations_precedes_token_revalidation(
+    stubborn_context, monkeypatch
+) -> None:
+    store, tree, clock, _snapshot, process, _lease, _classification = stubborn_context
+    snapshot, _second = _expand_stubborn_process(store, tree, clock, process)
+    classification = snapshot.classifications[0]
+    token = cleanup.issue_force_token(classification, clock)
+    actions = cleanup.plan_cleanup(snapshot, force=True)
+    now = [0.0]
+    original_outcome = cleanup._post_signal_outcome
+    original_boottime = clock.boottime
+
+    def expire_after_first_outcome(*args, **kwargs):
+        outcome = original_outcome(*args, **kwargs)
+        now[0] = 1.0
+        return outcome
+
+    def forbid_force_validation_after_expiry():
+        if now[0] >= 0.5:
+            raise AssertionError("force validation started after cleanup deadline")
+        return original_boottime()
+
+    monkeypatch.setattr(cleanup, "_post_signal_outcome", expire_after_first_outcome)
+    monkeypatch.setattr(clock, "boottime", forbid_force_validation_after_expiry)
+    signaler = FakeSignalBackend()
 
     report = cleanup.execute_cleanup(
         actions,
@@ -2797,11 +2907,18 @@ def test_force_deadline_after_first_delivery_is_partial_and_accounts_for_all(
         monotonic=lambda: now[0],
     )
 
-    assert report.partial_force is True
+    assert report.outcomes == (
+        model.CleanupOutcome(actions[0], "survived", "sigkill_survived"),
+        model.CleanupOutcome(
+            actions[1],
+            "skipped",
+            "partial_force_deadline_exhausted",
+        ),
+    )
     assert report.attempted == 1
-    assert len(report.outcomes) == len(actions)
-    assert report.skipped == len(actions) - 1
-    assert [call[0] for call in signaler.calls].count("send") == 1
+    assert report.partial_force is True
+    assert report.after_state_available is False
+    assert [call[0] for call in signaler.calls] == ["open", "send", "close"]
 
 
 def _expand_stubborn_process(store, tree, clock, process):
@@ -2823,6 +2940,164 @@ def _expand_stubborn_process(store, tree, clock, process):
     snapshot = classify.build_audit(store, tree, clock)
     assert snapshot.classifications[0].state == "stubborn"
     return snapshot, second
+
+
+def _add_second_orphan_process(store, tree, clock, process, lease):
+    write_proc_entry(
+        tree.proc_root,
+        654,
+        "654 (second) S 1 654 654 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 6540 0 0\n",
+        tree.proc_root / "node",
+        "VmRSS:\t48 kB\n",
+    )
+    second = tree.identity(654)
+    assert second is not None
+    second_lease = replace(
+        lease,
+        session_id="session:second-process",
+        host_keys=(second.stable_key(),),
+    )
+    second_process = replace(
+        process,
+        record_id=second.stable_key(),
+        wrapper=second,
+        members=(second,),
+        pgid=second.pgid,
+        host_keys=frozenset({second.stable_key()}),
+        owner_session_id=second_lease.session_id,
+        owner_generation=model.lease_generation_digest(second_lease),
+        term_sent_keys=frozenset(),
+    )
+    store.save_session(second_lease)
+    store.save_process(second_process)
+    snapshot = classify.build_audit(store, tree, clock)
+    assert [item.state for item in snapshot.classifications] == ["orphan", "orphan"]
+    return snapshot
+
+
+def test_term_post_delivery_deadline_accounts_later_process_without_boundary(
+    orphan_context, monkeypatch
+) -> None:
+    store, tree, clock, _snapshot, process, lease = orphan_context
+    snapshot = _add_second_orphan_process(
+        store,
+        tree,
+        clock,
+        process,
+        lease,
+    )
+    actions = cleanup.plan_cleanup(snapshot)
+    assert len(actions) == 2
+    expired = [False]
+    post_send_checks = 0
+    original_transition = cleanup._transition_intent
+
+    def expire_after_delivery_transition(*args, **kwargs):
+        result = original_transition(*args, **kwargs)
+        if kwargs.get("effect") is not None:
+            expired[0] = True
+        return result
+
+    monkeypatch.setattr(cleanup, "_transition_intent", expire_after_delivery_transition)
+
+    def monotonic():
+        nonlocal post_send_checks
+        if not expired[0]:
+            return 0.0
+        post_send_checks += 1
+        if post_send_checks > 1:
+            raise AssertionError("clock boundary started after handled deadline")
+        return 1.0
+
+    signaler = FakeSignalBackend()
+    report = cleanup.execute_cleanup(
+        actions,
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+        deadline=0.5,
+        monotonic=monotonic,
+    )
+
+    assert report.outcomes == (
+        model.CleanupOutcome(
+            actions[0],
+            "survived",
+            "signal_delivered_unobserved_deadline",
+        ),
+        model.CleanupOutcome(actions[1], "skipped", "cleanup_deadline_exhausted"),
+    )
+    assert report.attempted == 1
+    assert report.partial_force is False
+    assert report.after_state_available is False
+    assert [call[0] for call in signaler.calls] == ["open", "send", "close"]
+    assert post_send_checks == 1
+
+
+def test_term_immediate_post_transition_deadline_accounts_same_process_remainder(
+    orphan_context, monkeypatch
+) -> None:
+    store, tree, clock, _snapshot, process, _lease = orphan_context
+    write_proc_entry(
+        tree.proc_root,
+        654,
+        "654 (second) S 1 321 321 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 6540 0 0\n",
+        tree.proc_root / "node",
+        "VmRSS:\t48 kB\n",
+    )
+    second = tree.identity(654)
+    assert second is not None
+    store.save_process(replace(process, members=(process.wrapper, second)))
+    actions = cleanup.plan_cleanup(classify.build_audit(store, tree, clock))
+    assert len(actions) == 2
+    expired = [False]
+    post_send_checks = 0
+    original_transition = cleanup._transition_intent
+
+    def expire_after_delivery_transition(*args, **kwargs):
+        result = original_transition(*args, **kwargs)
+        if kwargs.get("effect") is not None:
+            expired[0] = True
+        return result
+
+    monkeypatch.setattr(cleanup, "_transition_intent", expire_after_delivery_transition)
+
+    def monotonic():
+        nonlocal post_send_checks
+        if not expired[0]:
+            return 0.0
+        post_send_checks += 1
+        if post_send_checks > 1:
+            raise AssertionError("clock boundary started after handled deadline")
+        return 1.0
+
+    signaler = FakeSignalBackend()
+    report = cleanup.execute_cleanup(
+        actions,
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+        deadline=0.5,
+        monotonic=monotonic,
+    )
+
+    assert report.outcomes == (
+        model.CleanupOutcome(
+            actions[0],
+            "survived",
+            "signal_delivered_unobserved_deadline",
+        ),
+        model.CleanupOutcome(actions[1], "skipped", "cleanup_deadline_exhausted"),
+    )
+    assert report.attempted == 1
+    assert report.partial_force is False
+    assert report.after_state_available is False
+    assert [call[0] for call in signaler.calls] == ["open", "send", "close"]
+    assert post_send_checks == 1
 
 
 @pytest.mark.parametrize("expiry_point", ["before_second_open", "after_second_open"])

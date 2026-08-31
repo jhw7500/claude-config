@@ -142,6 +142,127 @@ def test_root_creation_closes_anchor_when_normal_open_hits_deadline(
                 pass
 
 
+def test_root_creation_fstat_expiry_closes_anchor_and_normal_fd_once(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    now = [0.0]
+    anchors = []
+    normal_fds = []
+    close_calls = []
+    original_mkdir_private = deadline_io.DeadlineIO.mkdir_private
+    original_open = deadline_io.DeadlineIO.open_fd
+    original_fstat = deadline_io.os.fstat
+    original_close = deadline_io.DeadlineIO.close_fd
+
+    def capture_anchor(io, *args, **kwargs):
+        anchor_fd = original_mkdir_private(io, *args, **kwargs)
+        anchors.append(anchor_fd)
+        return anchor_fd
+
+    def capture_normal_fd(io, name, flags, *args, **kwargs):
+        fd = original_open(io, name, flags, *args, **kwargs)
+        if name == store.root.name and not flags & getattr(os, "O_PATH", 0):
+            normal_fds.append(fd)
+        return fd
+
+    def expire_during_normal_fstat(fd):
+        value = original_fstat(fd)
+        if fd in normal_fds:
+            now[0] = 1.0
+        return value
+
+    def capture_close(io, fd):
+        if fd in anchors or fd in normal_fds:
+            close_calls.append(fd)
+        return original_close(io, fd)
+
+    monkeypatch.setattr(deadline_io.DeadlineIO, "mkdir_private", capture_anchor)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "open_fd", capture_normal_fd)
+    monkeypatch.setattr(deadline_io.os, "fstat", expire_during_normal_fstat)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "close_fd", capture_close)
+
+    try:
+        with pytest.raises(state.OperationDeadlineExceeded):
+            store.append_event(
+                {"schema_version": 1, "event": "validation_deadline"},
+                deadline=0.5,
+                monotonic=lambda: now[0],
+            )
+
+        assert len(anchors) == 1
+        assert len(normal_fds) == 1
+        assert close_calls.count(anchors[0]) == 1
+        assert close_calls.count(normal_fds[0]) == 1
+        with pytest.raises(OSError):
+            os.fstat(anchors[0])
+        with pytest.raises(OSError):
+            os.fstat(normal_fds[0])
+    finally:
+        for fd in anchors + normal_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def test_root_creation_anchor_close_error_closes_normal_fd_and_preserves_error(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    anchors = []
+    normal_fds = []
+    close_calls = []
+    original_mkdir_private = deadline_io.DeadlineIO.mkdir_private
+    original_open = deadline_io.DeadlineIO.open_fd
+    original_close = deadline_io.DeadlineIO.close_fd
+    anchor_error = OSError("anchor close failed")
+
+    def capture_anchor(io, *args, **kwargs):
+        anchor_fd = original_mkdir_private(io, *args, **kwargs)
+        anchors.append(anchor_fd)
+        return anchor_fd
+
+    def capture_normal_fd(io, name, flags, *args, **kwargs):
+        fd = original_open(io, name, flags, *args, **kwargs)
+        if name == store.root.name and not flags & getattr(os, "O_PATH", 0):
+            normal_fds.append(fd)
+        return fd
+
+    def fail_tracked_closes(io, fd):
+        if fd in anchors or fd in normal_fds:
+            close_calls.append(fd)
+            original_close(io, fd)
+            if fd in anchors:
+                raise anchor_error
+            raise OSError("normal cleanup close failed")
+        return original_close(io, fd)
+
+    monkeypatch.setattr(deadline_io.DeadlineIO, "mkdir_private", capture_anchor)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "open_fd", capture_normal_fd)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "close_fd", fail_tracked_closes)
+
+    try:
+        with pytest.raises(OSError) as error:
+            store.append_event({"schema_version": 1, "event": "anchor_close"})
+
+        assert error.value is anchor_error
+        assert len(anchors) == 1
+        assert len(normal_fds) == 1
+        assert close_calls.count(anchors[0]) == 1
+        assert close_calls.count(normal_fds[0]) == 1
+        with pytest.raises(OSError):
+            os.fstat(anchors[0])
+        with pytest.raises(OSError):
+            os.fstat(normal_fds[0])
+    finally:
+        for fd in anchors + normal_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 @pytest.mark.parametrize("session_id", ["bad/session", "bad\x01session", "", "x" * 129])
 def test_invalid_session_id_is_rejected_before_any_path_is_created(
     tmp_path, session_id
@@ -458,6 +579,62 @@ def test_atomic_json_cleanup_preserves_temp_after_inode_gains_second_link(
     assert second_link.exists()
 
 
+def test_atomic_json_close_failure_starts_no_stat_or_unlink_recovery(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    token = "e" * 32
+    temporary = store.root / "sessions" / f".tmp-{token}"
+    temp_fds = []
+    close_calls = []
+    recovery_boundaries = []
+    original_open = deadline_io.DeadlineIO.open_fd
+    original_close = deadline_io.DeadlineIO.close_fd
+    original_stat = deadline_io.os.stat
+    original_unlink = deadline_io.os.unlink
+    close_error = OSError("atomic temp close failed")
+
+    def capture_temp_fd(io, name, *args, **kwargs):
+        fd = original_open(io, name, *args, **kwargs)
+        if name == f".tmp-{token}":
+            temp_fds.append(fd)
+        return fd
+
+    def fail_temp_close(io, fd):
+        if fd in temp_fds:
+            close_calls.append(fd)
+            original_close(io, fd)
+            raise close_error
+        return original_close(io, fd)
+
+    def record_temp_stat(name, *args, **kwargs):
+        if os.fspath(name) == f".tmp-{token}":
+            recovery_boundaries.append("stat")
+        return original_stat(name, *args, **kwargs)
+
+    def record_temp_unlink(name, *args, **kwargs):
+        if os.fspath(name) == f".tmp-{token}":
+            recovery_boundaries.append("unlink")
+        return original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(state.secrets, "token_hex", lambda size: token)
+    monkeypatch.setattr(store, "_bump_ledger_revision_locked", lambda **_kwargs: 2)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "open_fd", capture_temp_fd)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "close_fd", fail_temp_close)
+    monkeypatch.setattr(deadline_io.os, "stat", record_temp_stat)
+    monkeypatch.setattr(deadline_io.os, "unlink", record_temp_unlink)
+
+    with pytest.raises(OSError) as error:
+        store.save_session(sample_lease("session:second"))
+
+    assert error.value is close_error
+    assert len(temp_fds) == 1
+    assert close_calls == temp_fds
+    assert recovery_boundaries == []
+    assert temporary.exists()
+
+
 def test_lock_contention_times_out_without_replacing_lock_inode(tmp_path):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
@@ -519,6 +696,73 @@ def test_nested_public_writer_reuses_outer_bounded_gateway(tmp_path, monkeypatch
             store.save_session(sample_lease("session:nested"))
 
     assert later_boundaries == []
+
+
+def test_direct_locked_rejects_preexpired_nested_deadline_before_io(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    lease = sample_lease()
+    store.save_session(lease)
+    boundaries = []
+    original_dup = deadline_io.os.dup
+
+    def record_dup(fd):
+        boundaries.append(fd)
+        return original_dup(fd)
+
+    monkeypatch.setattr(deadline_io.os, "dup", record_dup)
+
+    with store.locked():
+        with pytest.raises(state.OperationDeadlineExceeded):
+            store.load_sessions(deadline=0.5, monotonic=lambda: 1.0)
+
+    assert boundaries == []
+
+
+def test_nested_narrower_deadline_fails_closed_before_boundary_crossing(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    lease = sample_lease()
+    store.save_session(lease)
+    now = [0.0]
+    boundaries = []
+    original_dup = deadline_io.os.dup
+
+    def cross_nested_deadline(fd):
+        duplicate = original_dup(fd)
+        boundaries.append(fd)
+        now[0] = 1.0
+        return duplicate
+
+    monkeypatch.setattr(deadline_io.os, "dup", cross_nested_deadline)
+
+    def monotonic():
+        return now[0]
+
+    outer_io = deadline_io.DeadlineIO(deadline_io.DeadlineBudget(2.0, monotonic))
+
+    with store._locked_with_io(io=outer_io):
+        with pytest.raises(state.OperationDeadlineExceeded):
+            store.load_sessions(deadline=0.5, monotonic=monotonic)
+
+    assert boundaries == []
+
+
+def test_nested_matching_deadline_reuses_exact_outer_gateway(tmp_path):
+    store = state.StateStore(tmp_path / "state")
+    lease = sample_lease()
+    store.save_session(lease)
+
+    def monotonic():
+        return 0.0
+
+    outer_io = deadline_io.DeadlineIO(deadline_io.DeadlineBudget(0.5, monotonic))
+
+    with store._locked_with_io(io=outer_io):
+        assert store.load_sessions(deadline=0.5, monotonic=monotonic) == (lease,)
+        assert store._operation_gateway(0.5, monotonic) is outer_io
 
 
 def test_direct_locked_registers_fallback_gateway_for_reentrant_scope(tmp_path):

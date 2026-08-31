@@ -315,6 +315,15 @@ class StateStore:
             if self._lock_owner == owner and not self._lock_releasing:
                 if self._lock_io is None or self._lock_depth < 1:
                     raise RuntimeError("invalid state-lock I/O gateway ownership")
+                active_budget = self._lock_io.budget
+                if deadline is not None and (
+                    active_budget.deadline is None
+                    or active_budget.monotonic is not monotonic
+                    or deadline < active_budget.deadline
+                ):
+                    raise OperationDeadlineExceeded(
+                        "nested operation deadline cannot narrow active I/O gateway"
+                    )
                 return self._lock_io
         return DeadlineIO(DeadlineBudget(deadline, monotonic))
 
@@ -508,6 +517,7 @@ class StateStore:
                         )
                     except FileExistsError:
                         pass
+                    next_fd: int | None = None
                     try:
                         next_fd = io.open_fd(component, flags, dir_fd=current_fd)
                     except OSError as error:
@@ -542,21 +552,35 @@ class StateStore:
                             closing_fd = anchor_fd
                             anchor_fd = None
                             _close_fd_after_failure(io, closing_fd)
+                        if next_fd is not None:
+                            closing_fd = next_fd
+                            next_fd = None
+                            _close_fd_after_failure(io, closing_fd)
                         raise
-                    else:
-                        if anchor_fd is not None:
-                            closing_fd = anchor_fd
-                            anchor_fd = None
+                    if anchor_fd is not None:
+                        closing_fd = anchor_fd
+                        anchor_fd = None
+                        try:
                             io.close_fd(closing_fd)
+                        except Exception:
+                            if next_fd is not None:
+                                closing_fd = next_fd
+                                next_fd = None
+                                _close_fd_after_failure(io, closing_fd)
+                            raise
                     try:
                         io.fsync(current_fd)
                     except Exception:
-                        io.close_fd(next_fd)
+                        if next_fd is not None:
+                            closing_fd = next_fd
+                            next_fd = None
+                            _close_fd_after_failure(io, closing_fd)
                         raise
                 except OSError as error:
                     raise UnsafeStatePath(
                         f"cannot safely open state path component: {walked}"
                     ) from error
+                assert next_fd is not None
                 io.close_fd(current_fd)
                 current_fd = next_fd
             _validate_directory(io.fstat(current_fd), self.root)
@@ -960,6 +984,7 @@ class StateStore:
         )
         fd: int | None = None
         created: os.stat_result | None = None
+        close_finalizer_failed = False
         try:
             fd = io.open_fd(temporary, flags, _FILE_MODE, dir_fd=directory_fd)
             created = io.fstat(fd)
@@ -968,7 +993,11 @@ class StateStore:
             io.fsync(fd)
             closing_fd = fd
             fd = None
-            io.close_fd(closing_fd)
+            try:
+                io.close_fd(closing_fd)
+            except Exception:
+                close_finalizer_failed = True
+                raise
             try:
                 target_fd = self._open_private_file(
                     directory_fd,
@@ -1004,7 +1033,11 @@ class StateStore:
                     io.close_fd(closing_fd)
                 except OSError:
                     pass
-            if not io.budget.expired() and created is not None:
+            if (
+                not close_finalizer_failed
+                and not io.budget.expired()
+                and created is not None
+            ):
                 try:
                     current = io.stat(temporary, dir_fd=directory_fd)
                 except FileNotFoundError:
