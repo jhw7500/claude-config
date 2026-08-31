@@ -835,3 +835,179 @@ def test_directory_fsync_failure_is_bounded_and_rolls_back(installer, tmp_path, 
         )
     assert not target.exists()
     assert "directory fsync injection" not in str(caught.value)
+
+
+@pytest.mark.parametrize("substitution_type", ["regular", "symlink", "directory"])
+def test_post_claim_substitution_is_preserved_without_losing_original(
+    installer, tmp_path, substitution_type
+):
+    target = tmp_path / "settings.json"
+    target.write_bytes(b"original-target")
+    target.chmod(0o600)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside-target")
+
+    def inject(phase, path):
+        if phase != "after_target_claim":
+            return
+        if substitution_type == "regular":
+            path.write_bytes(b"unowned-substitution")
+            path.chmod(0o600)
+        elif substitution_type == "symlink":
+            path.symlink_to(outside)
+        else:
+            path.mkdir()
+
+    with pytest.raises(installer.InstallError) as caught:
+        installer.apply_transaction(
+            [installer.PlannedWrite(target, b"installed", 0o600, True)],
+            stamp="20260831010101",
+            phase_hook=inject,
+        )
+    if substitution_type == "regular":
+        assert target.read_bytes() == b"unowned-substitution"
+    elif substitution_type == "symlink":
+        assert target.is_symlink() and os.readlink(target) == str(outside)
+        assert outside.read_bytes() == b"outside-target"
+    else:
+        assert target.is_dir()
+    quarantines = list(tmp_path.glob(".task-nudge-quarantine.*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].is_file() and quarantines[0].read_bytes() == b"original-target"
+    assert "unowned-substitution" not in str(caught.value)
+
+
+def test_post_claim_substitution_preserves_legacy_symlink_quarantine(installer, tmp_path, home):
+    shim = home / ".claude" / "hooks" / "task-nudge.sh"
+    shim.parent.mkdir(parents=True)
+    legacy = tmp_path / "legacy-shim"
+    legacy.write_bytes(b"legacy")
+    shim.symlink_to(legacy)
+
+    def inject(phase, path):
+        if phase == "after_target_claim":
+            path.write_bytes(b"unowned")
+            path.chmod(0o600)
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            [
+                installer.PlannedWrite(
+                    shim,
+                    b"installed",
+                    0o700,
+                    True,
+                    allow_legacy_symlink=True,
+                )
+            ],
+            stamp="20260831010101",
+            phase_hook=inject,
+        )
+    assert shim.read_bytes() == b"unowned"
+    quarantines = list(shim.parent.glob(".task-nudge-quarantine.*"))
+    assert len(quarantines) == 1 and quarantines[0].is_symlink()
+    assert os.readlink(quarantines[0]) == str(legacy)
+    assert quarantines[0].read_bytes() == b"legacy"
+
+
+def test_post_claim_substitution_of_missing_target_is_not_overwritten(installer, tmp_path):
+    target = tmp_path / "hooks.json"
+
+    def inject(phase, path):
+        if phase == "after_target_claim":
+            path.write_bytes(b"unowned-new-entry")
+            path.chmod(0o600)
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            [installer.PlannedWrite(target, b"installed", 0o600, True)],
+            stamp="20260831010101",
+            phase_hook=inject,
+        )
+    assert target.read_bytes() == b"unowned-new-entry"
+    assert not list(tmp_path.glob(".task-nudge-quarantine.*"))
+
+
+def test_substitution_atomically_captured_by_claim_is_restored_and_rejected(installer, tmp_path):
+    target = tmp_path / "settings.json"
+    target.write_bytes(b"original-target")
+    target.chmod(0o600)
+    displaced_original = tmp_path / "externally-displaced-original"
+
+    def inject(phase, path):
+        if phase == "before_target_claim":
+            path.rename(displaced_original)
+            path.write_bytes(b"captured-substitution")
+            path.chmod(0o600)
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            [installer.PlannedWrite(target, b"installed", 0o600, True)],
+            stamp="20260831010101",
+            phase_hook=inject,
+        )
+    assert target.read_bytes() == b"captured-substitution"
+    assert displaced_original.read_bytes() == b"original-target"
+    assert not list(tmp_path.glob(".task-nudge-quarantine.*"))
+
+
+def test_existing_fifo_source_is_rejected_promptly_without_writes(installer, tmp_path, home):
+    source, _ = _source_repo(tmp_path)
+    fifo = source / "hooks" / "task_nudge.py"
+    fifo.unlink()
+    os.mkfifo(fifo)
+    env = dict(os.environ, HOME=str(home), TMPDIR=str(home / "scratch"))
+    result = subprocess.run(
+        [sys.executable, str(installer.REPO / "scripts" / "install-task-nudge.py"), "--repo", str(source)],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+        timeout=1.0,
+    )
+    assert result.returncode != 0
+    assert str(fifo) not in result.stderr
+    assert not (home / ".local" / "share" / "claude-config").exists()
+
+
+def test_regular_source_raced_to_fifo_is_rejected_promptly(installer, tmp_path, home):
+    source, _ = _source_repo(tmp_path)
+    program = """
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fifo_race_installer", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+victim = Path(sys.argv[2]) / "hooks" / "task_nudge.py"
+def swap(path):
+    if path == victim:
+        path.unlink()
+        os.mkfifo(path)
+try:
+    module.build_plan(Path(sys.argv[2]), Path(sys.argv[3]), before_source_open=swap)
+except module.InstallError as error:
+    print(str(error))
+    raise SystemExit(7)
+raise SystemExit(0)
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            program,
+            str(installer.REPO / "scripts" / "install-task-nudge.py"),
+            str(source),
+            str(home),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=1.0,
+    )
+    assert result.returncode == 7
+    assert str(source) not in result.stdout + result.stderr
+    assert not (home / ".local" / "share" / "claude-config").exists()

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 import argparse
+import ctypes
 import errno
 import json
 import os
@@ -26,8 +27,20 @@ CLAUDE_COMMAND = "$HOME/.claude/hooks/task-nudge.sh"
 CODEX_MATCHER = "apply_patch|Edit|Write"
 CODEX_COMMAND = "/usr/bin/python3 $HOME/.local/share/claude-config/hooks/task-nudge-codex.py"
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-_READ_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+_READ_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
 _SYSTEM_REPLACE = os.replace
+_RENAME_NOREPLACE = 1
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
+if _RENAMEAT2 is not None:
+    _RENAMEAT2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    _RENAMEAT2.restype = ctypes.c_int
 
 
 @dataclass(frozen=True)
@@ -262,6 +275,26 @@ def _identity(metadata: os.stat_result) -> tuple[int, int, int]:
     return (metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode))
 
 
+def _rename_noreplace(
+    source_descriptor: int,
+    source_name: str,
+    target_descriptor: int,
+    target_name: str,
+) -> None:
+    if _RENAMEAT2 is None:
+        raise InstallError("atomic no-replace rename is unavailable")
+    result = _RENAMEAT2(
+        source_descriptor,
+        os.fsencode(source_name),
+        target_descriptor,
+        os.fsencode(target_name),
+        _RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
 def _path_components(path: Path) -> tuple[str, ...]:
     if not path.is_absolute() or ".." in path.parts:
         raise InstallError("filesystem path must be absolute and normalized")
@@ -320,6 +353,8 @@ def _read_regular_at(
         raise InstallError("required file is missing")
     except OSError as error:
         raise InstallError("cannot inspect file safely") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise InstallError("file is not a regular file")
     if before_open is not None:
         before_open()
     try:
@@ -535,9 +570,15 @@ def _read_regular_absolute(path: Path) -> tuple[bytes, os.stat_result]:
         os.close(parent_descriptor)
 
 
-def _snapshot_at(handle: _ParentHandle, plan: PlannedWrite) -> _TargetSnapshot:
+def _snapshot_at(
+    handle: _ParentHandle,
+    plan: PlannedWrite,
+    *,
+    entry_name: str | None = None,
+) -> _TargetSnapshot:
+    name = plan.path.name if entry_name is None else entry_name
     try:
-        metadata = os.stat(plan.path.name, dir_fd=handle.descriptor, follow_symlinks=False)
+        metadata = os.stat(name, dir_fd=handle.descriptor, follow_symlinks=False)
     except FileNotFoundError:
         return _TargetSnapshot(False)
     except OSError as error:
@@ -552,7 +593,7 @@ def _snapshot_at(handle: _ParentHandle, plan: PlannedWrite) -> _TargetSnapshot:
         if not is_legacy_shim:
             raise InstallError("planned target is an unsafe symlink")
         try:
-            link_target = os.readlink(plan.path.name, dir_fd=handle.descriptor)
+            link_target = os.readlink(name, dir_fd=handle.descriptor)
             candidate = Path(link_target)
             if not candidate.is_absolute():
                 candidate = Path(os.path.normpath(os.fspath(handle.path / candidate)))
@@ -569,7 +610,7 @@ def _snapshot_at(handle: _ParentHandle, plan: PlannedWrite) -> _TargetSnapshot:
             _identity(metadata),
             _identity(target_metadata),
         )
-    result = _read_regular_at(handle.descriptor, plan.path.name)
+    result = _read_regular_at(handle.descriptor, name)
     if result is None:
         raise InstallError("planned target changed during validation")
     data, opened_metadata = result
@@ -709,6 +750,43 @@ def _write_backup_at(handle: _ParentHandle, name: str, data: bytes) -> _OwnedEnt
         raise InstallError("cannot create transaction backup") from error
 
 
+def _claim_target_at(handle: _ParentHandle, target_name: str) -> _OwnedEntry:
+    for _ in range(128):
+        quarantine_name = ".task-nudge-quarantine." + secrets.token_hex(12)
+        try:
+            _rename_noreplace(
+                handle.descriptor,
+                target_name,
+                handle.descriptor,
+                quarantine_name,
+            )
+        except OSError as error:
+            if error.errno == errno.EEXIST:
+                continue
+            raise InstallError("cannot atomically claim target") from error
+        identity = _entry_identity(handle, quarantine_name)
+        if identity is None:
+            raise InstallError("claimed target disappeared")
+        return _OwnedEntry(quarantine_name, identity)
+    raise InstallError("cannot allocate target quarantine")
+
+
+def _restore_claim_at(
+    handle: _ParentHandle,
+    quarantine: _OwnedEntry,
+    target_name: str,
+) -> None:
+    if _entry_identity(handle, quarantine.name) != quarantine.identity:
+        raise InstallError("target quarantine ownership changed")
+    _rename_noreplace(
+        handle.descriptor,
+        quarantine.name,
+        handle.descriptor,
+        target_name,
+    )
+    os.fsync(handle.descriptor)
+
+
 def _remove_created_directories(
     created: list[_CreatedDirectory],
     *,
@@ -800,6 +878,7 @@ def apply_transaction(
     staged: dict[Path, _OwnedEntry] = {}
     restores: dict[Path, _OwnedEntry] = {}
     created_backups: dict[Path, _OwnedEntry] = {}
+    quarantines: dict[Path, _OwnedEntry] = {}
     replaced: list[PlannedWrite] = []
     rollback_failed = False
     try:
@@ -846,13 +925,24 @@ def apply_transaction(
             if not _snapshot_matches(_snapshot_at(handle, plan), snapshots[plan.path]):
                 raise InstallError("planned target changed before replacement")
             stage = staged[plan.path]
+            if snapshots[plan.path].exists:
+                if phase_hook is not None:
+                    phase_hook("before_target_claim", plan.path)
+                quarantine = _claim_target_at(handle, plan.path.name)
+                quarantines[plan.path] = quarantine
+                os.fsync(handle.descriptor)
+                captured = _snapshot_at(handle, plan, entry_name=quarantine.name)
+                if not _snapshot_matches(captured, snapshots[plan.path]):
+                    raise InstallError("atomically claimed target did not match snapshot")
+            if phase_hook is not None:
+                phase_hook("after_target_claim", plan.path)
             try:
                 if replace is _SYSTEM_REPLACE:
-                    _SYSTEM_REPLACE(
+                    _rename_noreplace(
+                        handle.descriptor,
                         stage.name,
+                        handle.descriptor,
                         plan.path.name,
-                        src_dir_fd=handle.descriptor,
-                        dst_dir_fd=handle.descriptor,
                     )
                 else:
                     replace(handle.path / stage.name, plan.path)
@@ -862,6 +952,9 @@ def apply_transaction(
                 raise
             replaced.append(plan)
             os.fsync(handle.descriptor)
+        for plan, quarantine in list(quarantines.items()):
+            _unlink_owned(handles[plan], quarantine)
+            del quarantines[plan]
         for plan, restore in list(restores.items()):
             _unlink_owned(handles[plan], restore)
             del restores[plan]
@@ -874,28 +967,47 @@ def apply_transaction(
                 current_identity = _entry_identity(handle, plan.path.name)
                 if current_identity != staged[plan.path].identity:
                     raise InstallError("replacement ownership changed before rollback")
+                _unlink_owned(
+                    handle,
+                    _OwnedEntry(plan.path.name, staged[plan.path].identity),
+                )
                 if snapshot.exists:
-                    restore = restores.get(plan.path)
-                    if restore is None or _entry_identity(handle, restore.name) != restore.identity:
-                        restore = _stage_restore_at(handle, snapshot)
-                    _SYSTEM_REPLACE(
-                        restore.name,
-                        plan.path.name,
-                        src_dir_fd=handle.descriptor,
-                        dst_dir_fd=handle.descriptor,
-                    )
-                    os.fsync(handle.descriptor)
-                    restores.pop(plan.path, None)
-                else:
-                    os.unlink(plan.path.name, dir_fd=handle.descriptor)
-                    os.fsync(handle.descriptor)
+                    quarantine = quarantines.get(plan.path)
+                    if (
+                        quarantine is not None
+                        and _entry_identity(handle, quarantine.name) == quarantine.identity
+                    ):
+                        _restore_claim_at(handle, quarantine, plan.path.name)
+                        quarantines.pop(plan.path, None)
+                    else:
+                        restore = restores.get(plan.path)
+                        if restore is None or _entry_identity(handle, restore.name) != restore.identity:
+                            restore = _stage_restore_at(handle, snapshot)
+                        _rename_noreplace(
+                            handle.descriptor,
+                            restore.name,
+                            handle.descriptor,
+                            plan.path.name,
+                        )
+                        os.fsync(handle.descriptor)
+                        restores.pop(plan.path, None)
             except BaseException:
                 rollback_failed = True
-        for plan, backup in reversed(list(created_backups.items())):
+        for plan, quarantine in list(quarantines.items()):
             try:
-                _unlink_owned(handles[plan], backup)
+                if _entry_identity(handles[plan], plan.name) is not None:
+                    rollback_failed = True
+                    continue
+                _restore_claim_at(handles[plan], quarantine, plan.name)
+                quarantines.pop(plan, None)
             except BaseException:
                 rollback_failed = True
+        if not rollback_failed:
+            for plan, backup in reversed(list(created_backups.items())):
+                try:
+                    _unlink_owned(handles[plan], backup)
+                except BaseException:
+                    rollback_failed = True
         for mapping in (staged, restores):
             for plan, entry in list(mapping.items()):
                 try:
