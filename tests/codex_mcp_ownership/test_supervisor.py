@@ -201,7 +201,10 @@ def _open_exact_pidfd(identity: model.ProcessIdentity) -> int | None:
     live_procfs = procfs.LinuxProcfs()
     if live_procfs.identity(identity.pid) != identity:
         return None
-    pidfd = live_procfs.open_pidfd(identity)
+    try:
+        pidfd = live_procfs.open_pidfd(identity)
+    except OSError:
+        return None
     if live_procfs.identity(identity.pid) != identity:
         os.close(pidfd)
         return None
@@ -312,7 +315,7 @@ def test_supervisor_preserves_stdio_and_exit_code(
     assert stdout == b'{"jsonrpc":"2.0"}\n'
 
 
-def test_child_exit_code_and_lifecycle_state_are_persisted_without_args(
+def test_normal_exit_removes_process_record_and_retains_redacted_event(
     supervisor_command: list[str],
     tmp_path: Path,
 ) -> None:
@@ -328,19 +331,7 @@ def test_child_exit_code_and_lifecycle_state_are_persisted_without_args(
         path.read_bytes() for path in store.root.rglob("*") if path.is_file()
     )
     assert returncode == 17
-    assert len(records) == 1
-    record = records[0]
-    parent_identity = procfs.LinuxProcfs().identity(os.getpid())
-    assert parent_identity is not None
-    assert record.exit_code == 17
-    assert record.scope == "user"
-    assert record.server == "fake"
-    assert record.cwd == str(tmp_path)
-    assert record.child is not None
-    assert record.pgid == record.child.pgid == record.child.pid
-    assert record.child in record.members
-    assert parent_identity.stable_key() in record.host_keys
-    assert record.spawned.boot_id == record.wrapper.boot_id == record.child.boot_id
+    assert records == ()
     assert stdout == stderr == b""
     assert canary.encode() not in persisted + stdout + stderr
     events = [
@@ -349,7 +340,209 @@ def test_child_exit_code_and_lifecycle_state_are_persisted_without_args(
         .read_text(encoding="utf-8")
         .splitlines()
     ]
+    assert events[-1]["event"] == "supervisor_child_exited"
+    assert events[-1]["exit_code"] == 17
     assert events[-1]["state"] == "exiting"
+    assert events[-1]["reason_codes"] == ["child_exit_observed"]
+
+
+def test_live_descendant_keeps_terminal_process_record(
+    supervisor_command: list[str],
+    tmp_path: Path,
+) -> None:
+    _require_pidfd_signaling()
+    descendant_pid = tmp_path / "live-descendant-pid"
+    descendant_code = (
+        "import os,pathlib,sys,time;"
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));"
+        "time.sleep(30)"
+    )
+    leader_code = (
+        "import pathlib,subprocess,sys,time;"
+        "pid=pathlib.Path(sys.argv[1]);"
+        "subprocess.Popen([sys.executable,'-c',sys.argv[2],sys.argv[1]],"
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+        "stderr=subprocess.DEVNULL,close_fds=True);"
+        "deadline=time.monotonic()+2;"
+        "exec('while not pid.exists():\\n"
+        " if time.monotonic() >= deadline: raise SystemExit(91)\\n"
+        " time.sleep(.01)')"
+    )
+    store = state.StateStore(tmp_path / "state")
+    wrapper = subprocess.Popen(
+        supervisor_command
+        + [sys.executable, "-c", leader_code, str(descendant_pid), descendant_code],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=tmp_path,
+        close_fds=True,
+    )
+    descendant_handle: tuple[model.ProcessIdentity, int] | None = None
+    try:
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            if descendant_pid.exists():
+                identity = procfs.LinuxProcfs().identity(
+                    int(descendant_pid.read_text(encoding="utf-8"))
+                )
+                if identity is not None:
+                    pidfd = _open_exact_pidfd(identity)
+                    if pidfd is not None:
+                        descendant_handle = (identity, pidfd)
+                        break
+            time.sleep(0.01)
+        assert descendant_handle is not None
+
+        stdout, stderr = wrapper.communicate(timeout=5.0)
+        records = store.load_processes()
+        assert wrapper.returncode == 0
+        assert stdout == stderr == b""
+        assert len(records) == 1
+        assert records[0].exit_code == 0
+        assert descendant_handle[0].stable_key() in {
+            member.stable_key() for member in records[0].members
+        }
+    finally:
+        try:
+            _stop_exact_process(wrapper, store)
+        finally:
+            if descendant_handle is not None:
+                try:
+                    _signal_exact_pidfds([descendant_handle], signal.SIGKILL)
+                    _wait_exact_identity_gone(descendant_handle[0])
+                finally:
+                    os.close(descendant_handle[1])
+
+
+def test_new_descendant_is_persisted_before_wrapper_crash(
+    supervisor_command: list[str],
+    tmp_path: Path,
+) -> None:
+    _require_pidfd_signaling()
+    release = tmp_path / "release-descendant"
+    descendant_pid = tmp_path / "descendant-pid"
+    descendant_ready = tmp_path / "descendant-ready"
+    descendant_code = (
+        "import os,pathlib,sys,time;"
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));"
+        "pathlib.Path(sys.argv[2]).write_text('ready');"
+        "time.sleep(30)"
+    )
+    leader_code = (
+        "import pathlib,subprocess,sys,time\n"
+        "release=pathlib.Path(sys.argv[1])\n"
+        "while not release.exists(): time.sleep(.01)\n"
+        "subprocess.Popen([sys.executable,'-c',sys.argv[2],*sys.argv[3:5]],"
+        "close_fds=True)\n"
+        "time.sleep(30)\n"
+    )
+    store = state.StateStore(tmp_path / "state")
+    wrapper = subprocess.Popen(
+        supervisor_command
+        + [
+            sys.executable,
+            "-c",
+            leader_code,
+            str(release),
+            descendant_code,
+            str(descendant_pid),
+            str(descendant_ready),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=tmp_path,
+        close_fds=True,
+    )
+    leader_handle: tuple[model.ProcessIdentity, int] | None = None
+    descendant_handle: tuple[model.ProcessIdentity, int] | None = None
+    try:
+        deadline = time.monotonic() + 4.0
+        initial: model.ManagedProcess | None = None
+        while time.monotonic() < deadline:
+            records = _exact_processes(store)
+            if records and records[0].child is not None:
+                initial = records[0]
+                break
+            time.sleep(0.01)
+        assert initial is not None
+        assert initial.child is not None
+        while time.monotonic() < deadline:
+            pidfd = _open_exact_pidfd(initial.child)
+            if pidfd is not None:
+                leader_handle = (initial.child, pidfd)
+                break
+            time.sleep(0.01)
+        assert leader_handle is not None
+
+        release.write_text("release", encoding="utf-8")
+        while time.monotonic() < deadline:
+            if descendant_ready.exists() and descendant_pid.exists():
+                identity = procfs.LinuxProcfs().identity(
+                    int(descendant_pid.read_text(encoding="utf-8"))
+                )
+                if identity is not None:
+                    pidfd = _open_exact_pidfd(identity)
+                    if pidfd is not None:
+                        descendant_handle = (identity, pidfd)
+                        break
+            time.sleep(0.01)
+        assert descendant_handle is not None
+
+        descendant_identity = descendant_handle[0]
+        while time.monotonic() < deadline:
+            records = _exact_processes(store)
+            if records and descendant_identity.stable_key() in {
+                member.stable_key() for member in records[0].members
+            }:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("late descendant was not persisted while supervised")
+
+        wrapper.kill()
+        wrapper.wait(timeout=2.0)
+        persisted = store.load_processes()
+        assert len(persisted) == 1
+        assert descendant_identity.stable_key() in {
+            member.stable_key() for member in persisted[0].members
+        }
+    finally:
+        try:
+            _stop_exact_process(wrapper, store)
+        finally:
+            cleanup_deadline = time.monotonic() + 2.0
+            while leader_handle is None and time.monotonic() < cleanup_deadline:
+                if initial is not None and initial.child is not None:
+                    pidfd = _open_exact_pidfd(initial.child)
+                    if pidfd is not None:
+                        leader_handle = (initial.child, pidfd)
+                        break
+                time.sleep(0.01)
+            while descendant_handle is None and time.monotonic() < cleanup_deadline:
+                if descendant_pid.exists():
+                    identity = procfs.LinuxProcfs().identity(
+                        int(descendant_pid.read_text(encoding="utf-8"))
+                    )
+                    if identity is not None:
+                        pidfd = _open_exact_pidfd(identity)
+                        if pidfd is not None:
+                            descendant_handle = (identity, pidfd)
+                            break
+                time.sleep(0.01)
+            fixture_handles = [
+                handle
+                for handle in (leader_handle, descendant_handle)
+                if handle is not None
+            ]
+            try:
+                _signal_exact_pidfds(fixture_handles, signal.SIGKILL)
+                for identity, _ in fixture_handles:
+                    _wait_exact_identity_gone(identity)
+            finally:
+                for _, pidfd in reversed(fixture_handles):
+                    os.close(pidfd)
 
 
 def _active_lease(
@@ -389,11 +582,18 @@ def test_unique_session_lease_is_persisted_as_owner(
         store,
         tmp_path,
     )
-    record = store.load_processes()[0]
+    events = [
+        json.loads(line)
+        for line in (store.root / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    reconciled = next(event for event in events if event["event"] == "owner_reconciled")
     assert returncode == 0
-    assert record.owner_session_id == lease.session_id
-    assert record.owner_generation == model.lease_generation_digest(lease)
-    assert record.owner_reason_codes == ("unique_matching_session",)
+    assert reconciled["state"] == "session"
+    assert reconciled["session_id"] == lease.session_id
+    assert reconciled["reason_codes"] == ["unique_matching_session"]
+    assert store.load_processes() == ()
 
 
 def test_two_matching_leases_persist_ambiguous_unknown(
@@ -413,11 +613,18 @@ def test_two_matching_leases_persist_ambiguous_unknown(
         store,
         tmp_path,
     )
-    record = store.load_processes()[0]
+    events = [
+        json.loads(line)
+        for line in (store.root / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    reconciled = next(event for event in events if event["event"] == "owner_reconciled")
     assert returncode == 0
-    assert record.owner_session_id is None
-    assert record.shared_owner is None
-    assert record.owner_reason_codes == ("multiple_matching_sessions",)
+    assert reconciled["state"] == "unknown"
+    assert "session_id" not in reconciled
+    assert reconciled["reason_codes"] == ["multiple_matching_sessions"]
+    assert store.load_processes() == ()
 
 
 def test_reconciliation_reloads_leases_and_uses_bounded_retry_delays(
@@ -773,7 +980,7 @@ def test_wrapper_sigterm_reaches_only_its_child_group(
         _stop_exact_process(process, store)
 
 
-def test_persisted_wrapper_converges_to_gone_after_exit(
+def test_exited_wrapper_converges_to_zero_managed_processes(
     supervisor_command: list[str],
     tmp_path: Path,
 ) -> None:
@@ -783,15 +990,15 @@ def test_persisted_wrapper_converges_to_gone_after_exit(
         store,
         tmp_path,
     )
-    record = store.load_processes()[0]
-    result = classify.classify_process(
-        record,
-        store.load_sessions(),
+    audit = classify.build_audit(
+        store,
         procfs.LinuxProcfs(),
-        SystemClock().boottime(),
+        SystemClock(),
     )
     assert returncode == 0
-    assert result.state == "gone"
+    assert store.load_processes() == ()
+    assert audit.process_count == 0
+    assert audit.rss_kib == 0
 
 
 def test_spawn_failure_redacts_command_and_uses_stable_reason(
@@ -1665,28 +1872,93 @@ def test_popen_failure_restores_handlers_and_redacts_exception(
     } == previous
 
 
-def test_exit_state_failure_keeps_child_exit_code_and_exact_record(
+def test_exit_event_append_failure_recovers_after_atomic_process_delete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     children = _capture_real_popen(monkeypatch)
     store = state.StateStore(tmp_path / "state")
-    original_append = store.append_event
+    original_append = store._append_event_locked
     original_forward = supervisor.forward_signal
     group_terms: list[tuple[int, int]] = []
+    failed = False
 
-    def fail_exit_event(event: dict[str, object]) -> None:
-        if event.get("event") == "supervisor_child_exited":
+    def fail_exit_event(root_fd: int, record: bytes, **kwargs) -> None:
+        nonlocal failed
+        event = json.loads(record)
+        if event.get("event") == "supervisor_child_exited" and not failed:
+            failed = True
             raise OSError("exit-state-secret")
-        original_append(event)
+        original_append(root_fd, record, **kwargs)
 
     def record_group_term(pgid: int, signum: int) -> None:
         group_terms.append((pgid, signum))
         original_forward(pgid, signum)
 
-    monkeypatch.setattr(store, "append_event", fail_exit_event)
+    monkeypatch.setattr(store, "_append_event_locked", fail_exit_event)
     monkeypatch.setattr(supervisor, "forward_signal", record_group_term)
+    try:
+        result = supervisor.run_supervisor(
+            supervisor.SupervisorRequest(
+                "user",
+                "fake",
+                sys.executable,
+                ("-c", "raise SystemExit(17)", "argv-secret"),
+                str(tmp_path),
+            ),
+            store,
+            procfs.LinuxProcfs(),
+            FakeClock(boot=100.0),
+            sleeper=lambda _delay: None,
+        )
+        captured = capsys.readouterr()
+        monkeypatch.setattr(store, "_append_event_locked", original_append)
+        store.recover_transition_events()
+        records = store.load_processes()
+        assert result == 17
+        assert records == ()
+        assert captured.err == ""
+        assert "secret" not in captured.err
+        assert group_terms == []
+        receipts = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in (store.root / "event-receipts").iterdir()
+        ]
+        exit_receipts = [
+            receipt
+            for receipt in receipts
+            if receipt["event"]["event"] == "supervisor_child_exited"
+        ]
+        assert len(exit_receipts) == 1
+        assert exit_receipts[0]["event"]["exit_code"] == 17
+        assert list((store.root / "event-journal").iterdir()) == []
+    finally:
+        _kill_captured_children(children)
+
+
+def test_exit_delete_failure_keeps_child_exit_code_and_exact_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    children = _capture_real_popen(monkeypatch)
+    store = state.StateStore(tmp_path / "state")
+    original_transition = store.transition
+
+    def fail_delete(record_kind, record_key, expected, updated, event, **kwargs):
+        if updated is None:
+            raise OSError("delete-state-secret")
+        return original_transition(
+            record_kind,
+            record_key,
+            expected,
+            updated,
+            event,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(store, "transition", fail_delete)
     try:
         result = supervisor.run_supervisor(
             supervisor.SupervisorRequest(
@@ -1710,7 +1982,6 @@ def test_exit_state_failure_keeps_child_exit_code_and_exact_record(
             "codex-mcp-supervisor: server=fake reason=state_exit_failed\n"
         )
         assert "secret" not in captured.err
-        assert group_terms == []
     finally:
         _kill_captured_children(children)
 
@@ -1726,7 +1997,8 @@ def test_reaped_leader_numeric_pgid_substitution_is_never_signaled_or_persisted(
     original_popen = subprocess.Popen
     group_terms: list[tuple[int, int]] = []
     store = state.StateStore(tmp_path / "state")
-    original_append = store.append_event
+    original_save = store.save_process
+    saved_processes: list[model.ManagedProcess] = []
     boot_id = procfs.LinuxProcfs().boot_id()
     assert boot_id is not None
 
@@ -1761,16 +2033,15 @@ def test_reaped_leader_numeric_pgid_substitution_is_never_signaled_or_persisted(
         children.append(child)
         return child
 
-    def fail_exit_event(event: dict[str, object]) -> None:
-        if event.get("event") == "supervisor_child_exited":
-            raise OSError("exit-state-secret")
-        original_append(event)
+    def capture_save(process: model.ManagedProcess, **kwargs) -> None:
+        saved_processes.append(process)
+        original_save(process, **kwargs)
 
     def record_group_term(pgid: int, signum: int) -> None:
         group_terms.append((pgid, signum))
 
     monkeypatch.setattr(supervisor.subprocess, "Popen", capture_reap)
-    monkeypatch.setattr(store, "append_event", fail_exit_event)
+    monkeypatch.setattr(store, "save_process", capture_save)
     monkeypatch.setattr(supervisor, "forward_signal", record_group_term)
     try:
         result = supervisor.run_supervisor(
@@ -1790,11 +2061,12 @@ def test_reaped_leader_numeric_pgid_substitution_is_never_signaled_or_persisted(
         records = store.load_processes()
         assert result == 17
         assert group_terms == []
-        assert len(records) == 1
-        assert replace(replacement, pgid=children[0].pid) not in records[0].members
-        assert captured.err == (
-            "codex-mcp-supervisor: server=fake reason=state_exit_failed\n"
+        assert records == ()
+        assert all(
+            replace(replacement, pgid=children[0].pid) not in process.members
+            for process in saved_processes
         )
+        assert captured.err == ""
     finally:
         _kill_captured_children(children)
 
@@ -2176,6 +2448,29 @@ def test_complete_final_capture_anchors_unreaped_zombie_leader_by_pidfd(
     assert lifecycle.capture_final_group()
     assert opened == [(identity.pid, 0)]
     assert lifecycle.pidfds == {identity.stable_key(): 101}
+    assert lifecycle.close()
+
+
+def test_unavailable_captured_identity_is_not_considered_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = procfs.LinuxProcfs().identity(os.getpid())
+    assert identity is not None
+
+    class Child:
+        pid = identity.pid
+        returncode = None
+
+    lifecycle = supervisor._OwnedGroupLifecycle(
+        Child(),  # type: ignore[arg-type]
+        procfs.LinuxProcfs(),
+        Child.pid,
+    )
+    lifecycle.identities[identity.stable_key()] = identity
+    monkeypatch.setattr(lifecycle, "_pidfd_exited", lambda _key: False)
+    monkeypatch.setattr(lifecycle, "_observation", lambda _identity: "unavailable")
+
+    assert not lifecycle.captured_identities_are_gone()
     assert lifecycle.close()
 
 

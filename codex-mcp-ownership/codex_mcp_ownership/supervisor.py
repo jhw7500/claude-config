@@ -395,34 +395,53 @@ class _OwnedGroupLifecycle:
             return False
         return result is not None
 
-    def _wait_once(self, timeout: float | None) -> int:
+    def _wait_once(
+        self,
+        timeout: float | None,
+        persist_captured: Callable[[tuple[ProcessIdentity, ...]], None] | None = None,
+    ) -> int:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             previous_mask = self.mask_state.block_forwarded()
             try:
                 if not self.leader_exit_observed:
                     self.leader_exit_observed = self._exit_observed()
-                if self.leader_exit_observed and self.capture_final_group():
-                    self.group_access_closed = True
-                    result = self.child.wait()
-                    self.leader_reaped = True
-                    return result
+                if self.leader_exit_observed:
+                    complete = self.capture_final_group()
+                    if persist_captured is not None:
+                        persist_captured(self.disposition().members)
+                    if complete:
+                        self.group_access_closed = True
+                        result = self.child.wait()
+                        self.leader_reaped = True
+                        return result
             finally:
                 self.mask_state.restore(previous_mask)
             if deadline is not None and time.monotonic() >= deadline:
                 raise subprocess.TimeoutExpired(self.child.args, timeout)
             time.sleep(0.01)
 
-    def wait_for_exit(self, check_forwarding: Callable[[], None]) -> int:
+    def wait_for_exit(
+        self,
+        check_forwarding: Callable[[], None],
+        persist_captured: Callable[[tuple[ProcessIdentity, ...]], None] | None = None,
+    ) -> int:
         while True:
             self.capture_group()
+            if persist_captured is not None:
+                persist_captured(self.disposition().members)
             try:
-                result = self._wait_once(0.05)
+                result = self._wait_once(0.05, persist_captured)
             except subprocess.TimeoutExpired:
                 check_forwarding()
                 continue
             check_forwarding()
             return result
+
+    def captured_identities_are_gone(self) -> bool:
+        return all(
+            not self._identity_live(identity) for identity in self.identities.values()
+        )
 
     def _reap_after_term(self) -> None:
         while not self.leader_reaped:
@@ -826,6 +845,8 @@ def _exit_event(process: ManagedProcess, observed_wall: str) -> dict[str, object
         "state": "exiting",
         "reason_codes": ["child_exit_observed"],
     }
+    if process.exit_code is not None:
+        event["exit_code"] = process.exit_code
     if process.owner_session_id is not None:
         event["session_id"] = process.owner_session_id
     return event
@@ -991,9 +1012,49 @@ def _run_spawned_child(
             record_may_exist=record_may_exist,
         ) from None
 
+    def persist_captured_members(
+        captured: tuple[ProcessIdentity, ...],
+    ) -> None:
+        nonlocal process
+        known_keys = {member.stable_key() for member in process.members}
+        if all(member.stable_key() in known_keys for member in captured):
+            return
+        try:
+            with store.locked():
+                current = store.load_raw_process(process.wrapper.stable_key())
+                if current is None or (
+                    current.wrapper != process.wrapper
+                    or current.owner_generation != process.owner_generation
+                ):
+                    raise _PostSpawnFailure(
+                        "state_capture_conflict",
+                        process,
+                        record_may_exist=record_may_exist,
+                    )
+                merged = {member.stable_key(): member for member in current.members}
+                for member in captured:
+                    merged.setdefault(member.stable_key(), member)
+                process = replace(
+                    current,
+                    members=tuple(merged[key] for key in sorted(merged)),
+                )
+                store.save_process(process)
+        except _PostSpawnFailure:
+            raise
+        except BaseException:
+            raise _PostSpawnFailure(
+                "state_capture_failed",
+                process,
+                record_may_exist=record_may_exist,
+            ) from None
+
     try:
         lifecycle.capture_group()
-        exit_code = lifecycle.wait_for_exit(fail_if_forwarding_failed)
+        persist_captured_members(lifecycle.disposition().members)
+        exit_code = lifecycle.wait_for_exit(
+            fail_if_forwarding_failed,
+            persist_captured_members,
+        )
     except _PostSpawnFailure:
         raise
     except BaseException:
@@ -1009,6 +1070,7 @@ def _run_spawned_child(
         exit_code=exit_code,
     )
     try:
+        captured_identities_are_gone = lifecycle.captured_identities_are_gone()
         with store.locked():
             current = store.load_raw_process(process.wrapper.stable_key())
             if current is None or (
@@ -1026,8 +1088,19 @@ def _run_spawned_child(
                 members=updated.members,
                 exit_code=updated.exit_code,
             )
-            store.save_process(updated)
-            store.append_event(_exit_event(updated, clock.wall_iso()))
+            event = _exit_event(updated, clock.wall_iso())
+            if captured_identities_are_gone:
+                store.transition(
+                    "processes",
+                    current.wrapper.stable_key(),
+                    current,
+                    None,
+                    event,
+                )
+                record_may_exist = False
+            else:
+                store.save_process(updated)
+                store.append_event(event)
         fail_if_forwarding_failed()
     except _PostSpawnFailure:
         raise

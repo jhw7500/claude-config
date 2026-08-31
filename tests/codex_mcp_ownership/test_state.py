@@ -1492,6 +1492,221 @@ def test_transition_service_persists_rotation_independent_event_receipt(
     assert receipt["event"]["event_id"] == receipts[0].stem
 
 
+def test_process_delete_transition_removes_record_and_retains_event_receipt(
+    tmp_path,
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    store.save_process(expected)
+    event = {
+        "schema_version": 1,
+        "event": "supervisor_child_exited",
+        "observed_wall": expected.spawned.wall_iso,
+        "server": expected.server,
+        "scope": expected.scope,
+        "process_key": expected.wrapper.stable_key(),
+        "state": "exiting",
+        "reason_codes": ["child_exit_observed"],
+    }
+
+    store.transition(
+        "processes",
+        expected.wrapper.stable_key(),
+        expected,
+        None,
+        event,
+    )
+
+    assert store.load_raw_process(expected.wrapper.stable_key()) is None
+    events = [
+        json.loads(line)
+        for line in (store.root / "events.jsonl").read_text().splitlines()
+    ]
+    assert [item["event"] for item in events] == ["supervisor_child_exited"]
+    assert list((store.root / "event-journal").iterdir()) == []
+    receipts = list((store.root / "event-receipts").iterdir())
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["event"]["event"] == "supervisor_child_exited"
+
+
+def test_process_delete_transition_recovers_event_after_crash(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    store.save_process(expected)
+    event = {
+        "schema_version": 1,
+        "event": "supervisor_child_exited",
+        "observed_wall": expected.spawned.wall_iso,
+        "server": expected.server,
+        "scope": expected.scope,
+        "process_key": expected.wrapper.stable_key(),
+        "state": "exiting",
+        "reason_codes": ["child_exit_observed"],
+    }
+    original_commit = store._mark_transition_committed_locked
+
+    def crash_after_delete(*_args, **_kwargs):
+        raise KeyboardInterrupt("simulated-wrapper-crash")
+
+    monkeypatch.setattr(store, "_mark_transition_committed_locked", crash_after_delete)
+    with pytest.raises(KeyboardInterrupt, match="simulated-wrapper-crash"):
+        store.transition(
+            "processes",
+            expected.wrapper.stable_key(),
+            expected,
+            None,
+            event,
+        )
+
+    assert store.load_raw_process(expected.wrapper.stable_key()) is None
+    assert not (store.root / "events.jsonl").exists()
+    assert len(list((store.root / "event-journal").iterdir())) == 1
+
+    monkeypatch.setattr(store, "_mark_transition_committed_locked", original_commit)
+    store.recover_transition_events()
+
+    events = [
+        json.loads(line)
+        for line in (store.root / "events.jsonl").read_text().splitlines()
+    ]
+    assert [item["event"] for item in events] == ["supervisor_child_exited"]
+    assert list((store.root / "event-journal").iterdir()) == []
+    receipts = list((store.root / "event-receipts").iterdir())
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["event"]["event"] == "supervisor_child_exited"
+
+
+def test_process_delete_transition_rejects_stale_expected_record(tmp_path) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    current = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(current)
+
+    with pytest.raises(state.UnsafeStatePath, match="raw state changed"):
+        store.transition(
+            "processes",
+            expected.wrapper.stable_key(),
+            expected,
+            None,
+            {
+                "schema_version": 1,
+                "event": "supervisor_child_exited",
+                "observed_wall": expected.spawned.wall_iso,
+                "process_key": expected.wrapper.stable_key(),
+                "state": "exiting",
+                "reason_codes": ["child_exit_observed"],
+            },
+        )
+
+    assert store.load_raw_process(expected.wrapper.stable_key()) == current
+    assert not (store.root / "events.jsonl").exists()
+    journal = store.root / "event-journal"
+    assert not journal.exists() or list(journal.iterdir()) == []
+
+
+def test_process_delete_transition_failure_retains_record_without_false_event(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    store.save_process(expected)
+    original_write = store._write_transition_record_locked
+
+    def fail_delete(record_kind, record_key, updated, **kwargs):
+        if updated is None:
+            raise OSError("DELETE-FAILED")
+        return original_write(record_kind, record_key, updated, **kwargs)
+
+    monkeypatch.setattr(store, "_write_transition_record_locked", fail_delete)
+    with pytest.raises(OSError, match="DELETE-FAILED"):
+        store.transition(
+            "processes",
+            expected.wrapper.stable_key(),
+            expected,
+            None,
+            {
+                "schema_version": 1,
+                "event": "supervisor_child_exited",
+                "observed_wall": expected.spawned.wall_iso,
+                "process_key": expected.wrapper.stable_key(),
+                "state": "exiting",
+                "reason_codes": ["child_exit_observed"],
+            },
+        )
+
+    monkeypatch.setattr(store, "_write_transition_record_locked", original_write)
+    store.recover_transition_events()
+    assert store.load_raw_process(expected.wrapper.stable_key()) == expected
+    assert not (store.root / "events.jsonl").exists()
+    assert list((store.root / "event-journal").iterdir()) == []
+
+
+def test_process_delete_transition_retains_journal_until_directory_fsync(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    store.save_process(expected)
+    processes_stat = (store.root / "processes").stat()
+    original_fsync = deadline_io.DeadlineIO.fsync
+
+    def fail_processes_directory_fsync(self, fd):
+        value = os.fstat(fd)
+        if (value.st_dev, value.st_ino) == (
+            processes_stat.st_dev,
+            processes_stat.st_ino,
+        ):
+            raise OSError("PROCESS-DIRECTORY-FSYNC-FAILED")
+        return original_fsync(self, fd)
+
+    monkeypatch.setattr(
+        deadline_io.DeadlineIO,
+        "fsync",
+        fail_processes_directory_fsync,
+    )
+    with pytest.raises(
+        state.StatePersistenceError,
+        match="process deletion durability unavailable",
+    ):
+        store.transition(
+            "processes",
+            expected.wrapper.stable_key(),
+            expected,
+            None,
+            {
+                "schema_version": 1,
+                "event": "supervisor_child_exited",
+                "observed_wall": expected.spawned.wall_iso,
+                "process_key": expected.wrapper.stable_key(),
+                "state": "exiting",
+                "reason_codes": ["child_exit_observed"],
+            },
+        )
+
+    assert store.load_raw_process(expected.wrapper.stable_key()) is None
+    assert len(list((store.root / "event-journal").iterdir())) == 1
+    assert not (store.root / "events.jsonl").exists()
+    receipts = store.root / "event-receipts"
+    assert not receipts.exists() or list(receipts.iterdir()) == []
+
+    monkeypatch.setattr(deadline_io.DeadlineIO, "fsync", original_fsync)
+    store.recover_transition_events()
+    assert store.load_raw_process(expected.wrapper.stable_key()) is None
+    assert list((store.root / "event-journal").iterdir()) == []
+    events = [
+        json.loads(line)
+        for line in (store.root / "events.jsonl").read_text().splitlines()
+    ]
+    assert [item["event"] for item in events] == ["supervisor_child_exited"]
+
+
 def test_later_writer_recovers_committed_transition_before_advancing_state(
     tmp_path, monkeypatch
 ) -> None:

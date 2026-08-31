@@ -67,6 +67,7 @@ EVENT_FIELDS = {
     "state",
     "reason_codes",
     "rss_kib",
+    "exit_code",
     "event_id",
 }
 
@@ -100,6 +101,10 @@ class PostEffectStateError(RuntimeError):
     def __init__(self, message: str, *, record_persisted: bool) -> None:
         super().__init__(message)
         self.record_persisted = record_persisted
+
+
+class StatePersistenceError(RuntimeError):
+    """A raw-state mutation could not be proven durable."""
 
 
 class ReadOnlyStateError(PermissionError):
@@ -171,6 +176,9 @@ def _canonical_json(value: object) -> bytes:
     except (TypeError, ValueError) as error:
         raise ValueError("state value is not canonical JSON") from error
     return rendered.encode("utf-8") + b"\n"
+
+
+_ABSENT_RECORD_DIGEST = hashlib.sha256(_canonical_json(None)).hexdigest()
 
 
 def _mode(value: os.stat_result) -> int:
@@ -1926,7 +1934,7 @@ class StateStore:
         record_kind: str,
         record_key: str,
         expected: SessionLease | ManagedProcess | SignalIntent | None,
-        updated: SessionLease | ManagedProcess | SignalIntent,
+        updated: SessionLease | ManagedProcess | SignalIntent | None,
         event: dict[str, object],
         *,
         expected_revision: int | None = None,
@@ -1938,6 +1946,10 @@ class StateStore:
         effect: Callable[[], None] | None = None,
     ) -> int:
         """Commit one exact raw-state mutation and its logical event receipt."""
+        if updated is None and (
+            record_kind != "processes" or not isinstance(expected, ManagedProcess)
+        ):
+            raise ValueError("only an existing process transition may delete state")
         io = self._operation_gateway(deadline, monotonic)
         budget = io.budget
         budget.check()
@@ -2153,7 +2165,7 @@ class StateStore:
         record_kind: str,
         record_key: str,
         expected: SessionLease | ManagedProcess | SignalIntent | None,
-        updated: SessionLease | ManagedProcess | SignalIntent,
+        updated: SessionLease | ManagedProcess | SignalIntent | None,
         event: dict[str, object],
         *,
         io: DeadlineIO,
@@ -2169,7 +2181,7 @@ class StateStore:
         event_payload = dict(event)
         event_payload.pop("event_id", None)
         expected_payload = None if expected is None else expected.to_dict()
-        updated_payload = updated.to_dict()
+        updated_payload = None if updated is None else updated.to_dict()
         io.budget.check()
         expected_digest = hashlib.sha256(_canonical_json(expected_payload)).hexdigest()
         io.budget.check()
@@ -2201,10 +2213,44 @@ class StateStore:
         self,
         record_kind: str,
         record_key: str,
-        updated: SessionLease | ManagedProcess | SignalIntent,
+        updated: SessionLease | ManagedProcess | SignalIntent | None,
         *,
         io: DeadlineIO,
     ) -> int:
+        if updated is None:
+            if record_kind != "processes":
+                raise ValueError("only process transitions may delete state")
+            root_fd = self._open_root(io=io)
+            try:
+                directory_fd = self._open_directory(
+                    root_fd,
+                    "processes",
+                    create=False,
+                    io=io,
+                )
+                if directory_fd is None:
+                    raise UnsafeStatePath("transition process directory disappeared")
+                try:
+                    name = record_key + ".json"
+                    try:
+                        fd = self._open_private_file(
+                            directory_fd,
+                            name,
+                            self.root / "processes" / name,
+                            io=io,
+                        )
+                    except FileNotFoundError:
+                        raise UnsafeStatePath(
+                            "transition process record disappeared"
+                        ) from None
+                    io.close_fd(fd)
+                    revision = self._bump_ledger_revision_locked(io=io)
+                    io.unlink(name, dir_fd=directory_fd)
+                    return revision
+                finally:
+                    io.close_fd(directory_fd)
+            finally:
+                io.close_fd(root_fd)
         if record_kind == "sessions" and isinstance(updated, SessionLease):
             if session_key(updated.session_id) != record_key:
                 raise ValueError("session transition key mismatch")
@@ -2543,6 +2589,12 @@ class StateStore:
                 self.root / "event-journal" / (event_id + ".json"),
                 hashlib.sha256(_canonical_json(journal)).hexdigest(),
             ) from error
+        if decision is not RecoveryDecision.DISCARD_PREPARED:
+            self._ensure_process_deletion_durable_locked(
+                root_fd,
+                journal,
+                io=io,
+            )
         if decision is RecoveryDecision.FINALIZE_UPDATED:
             created = self._write_event_receipt_locked(
                 root_fd,
@@ -2565,6 +2617,37 @@ class StateStore:
         io.unlink(event_id + ".json", dir_fd=directory_fd)
         io.fsync(directory_fd)
         return decision is not RecoveryDecision.DISCARD_PREPARED
+
+    def _ensure_process_deletion_durable_locked(
+        self,
+        root_fd: int,
+        journal: dict[str, object],
+        *,
+        io: DeadlineIO,
+    ) -> None:
+        if (
+            journal["record_kind"] != "processes"
+            or journal["updated_digest"] != _ABSENT_RECORD_DIGEST
+        ):
+            return
+        io.budget.check()
+        try:
+            directory_fd = self._open_directory(
+                root_fd,
+                "processes",
+                create=False,
+                io=io,
+            )
+            if directory_fd is None:
+                raise UnsafeStatePath("transition process directory disappeared")
+            try:
+                io.fsync(directory_fd)
+            finally:
+                io.close_fd(directory_fd)
+        except OSError as error:
+            raise StatePersistenceError(
+                "process deletion durability unavailable"
+            ) from error
 
     def _recover_known_transition_locked(
         self,
