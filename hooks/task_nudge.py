@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
+import hashlib
 import json
 import os
 import re
 import selectors
+import stat
 import subprocess
 import time
 
@@ -23,6 +25,17 @@ class RegistrationStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+class Runtime(str, Enum):
+    CLAUDE = "claude"
+    CODEX = "codex"
+
+
+class MarkerClaim(str, Enum):
+    CLAIMED = "claimed"
+    ALREADY_DONE = "already_done"
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass(frozen=True)
 class RepositoryIdentity:
     root: Path
@@ -34,6 +47,15 @@ class RegistrationResult:
     status: RegistrationStatus
     repository_slug: str | None
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class HookEvent:
+    runtime: Runtime
+    session_id: str
+    cwd: Path
+    tool_name: str
+    target_paths: tuple[Path, ...]
 
 
 class NudgeError(Exception):
@@ -54,6 +76,95 @@ SSH_REMOTE = re.compile(
     r"(?P<owner>[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?)/"
     r"(?P<repo>[a-z0-9_.-]{1,100})/?\Z"
 )
+PATCH_PATH = re.compile(
+    r"^\*\*\* (?:(?:Add|Update|Delete) File:|Move to:) "
+    r"(?P<path>[^\x00-\x1f\x7f]+)$"
+)
+
+
+def _has_control_characters(value: object, *, allow_newlines: bool = False) -> bool:
+    if not isinstance(value, str):
+        return True
+    return any(
+        ord(character) == 127
+        or (ord(character) < 32 and (not allow_newlines or character not in "\n\r"))
+        for character in value
+    )
+
+
+def _lexical_absolute(path: str, cwd: Path | None = None) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        if cwd is None:
+            raise NudgeError("HOOK_INPUT_INVALID")
+        candidate = cwd / candidate
+    return Path(os.path.normpath(os.fspath(candidate)))
+
+
+def _event_fields(payload: object, runtime: Runtime, permitted_tools: set[str]) -> tuple[str, Path, str, dict[str, object]]:
+    if not isinstance(payload, dict):
+        raise NudgeError("HOOK_INPUT_INVALID")
+    session_id = payload.get("session_id")
+    cwd = payload.get("cwd")
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or _has_control_characters(session_id)
+        or not isinstance(cwd, str)
+        or not cwd
+        or _has_control_characters(cwd)
+        or not isinstance(tool_name, str)
+        or _has_control_characters(tool_name)
+        or tool_name not in permitted_tools
+        or not isinstance(tool_input, dict)
+    ):
+        raise NudgeError("HOOK_INPUT_INVALID")
+    normalized_cwd = _lexical_absolute(cwd)
+    if not normalized_cwd.is_absolute():
+        raise NudgeError("HOOK_INPUT_INVALID")
+    return session_id, normalized_cwd, tool_name, tool_input
+
+
+def _input_path(tool_input: dict[str, object], field: str, cwd: Path) -> Path:
+    value = tool_input.get(field)
+    if not isinstance(value, str) or not value or _has_control_characters(value):
+        raise NudgeError("HOOK_INPUT_INVALID")
+    return _lexical_absolute(value, cwd)
+
+
+def extract_apply_patch_paths(command: str, cwd: Path) -> tuple[Path, ...]:
+    if not isinstance(command, str) or _has_control_characters(command, allow_newlines=True):
+        raise NudgeError("HOOK_INPUT_INVALID")
+    paths: list[Path] = []
+    for line in command.splitlines():
+        match = PATCH_PATH.fullmatch(line)
+        if match is not None:
+            paths.append(_lexical_absolute(match.group("path"), cwd))
+    return tuple(paths)
+
+
+def parse_claude_event(payload: object) -> HookEvent:
+    session_id, cwd, tool_name, tool_input = _event_fields(
+        payload, Runtime.CLAUDE, {"Edit", "Write", "NotebookEdit"}
+    )
+    path_field = "notebook_path" if tool_name == "NotebookEdit" else "file_path"
+    return HookEvent(Runtime.CLAUDE, session_id, cwd, tool_name, (_input_path(tool_input, path_field, cwd),))
+
+
+def parse_codex_event(payload: object) -> HookEvent:
+    session_id, cwd, tool_name, tool_input = _event_fields(
+        payload, Runtime.CODEX, {"apply_patch", "Edit", "Write"}
+    )
+    if tool_name == "apply_patch":
+        command = tool_input.get("command")
+        if not isinstance(command, str):
+            raise NudgeError("HOOK_INPUT_INVALID")
+        paths = extract_apply_patch_paths(command, cwd)
+    else:
+        paths = (_input_path(tool_input, "file_path", cwd),)
+    return HookEvent(Runtime.CODEX, session_id, cwd, tool_name, paths)
 
 
 def parse_github_slug(remote: str) -> str | None:
@@ -349,3 +460,153 @@ def query_registration(
     if returncode != 0 or stderr or not stdout:
         return _unknown(identity.slug, "PORTFOLIO_UNAVAILABLE")
     return parse_portfolio_output(stdout, identity.slug)
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        return os.path.commonpath((os.fspath(path), os.fspath(root))) == os.fspath(root)
+    except ValueError:
+        return False
+
+
+def should_skip_event(event: HookEvent, home: Path | str, env: Mapping[str, str]) -> bool:
+    if not event.target_paths:
+        return False
+    normalized_home = _lexical_absolute(os.fspath(home))
+    scratch_value = env.get("TMPDIR", "/tmp")
+    if not isinstance(scratch_value, str) or not scratch_value or _has_control_characters(scratch_value):
+        return False
+    scratch_root = _lexical_absolute(scratch_value)
+    claude_root = normalized_home / ".claude"
+    codex_root = normalized_home / ".codex"
+    for target in event.target_paths:
+        target_path = _lexical_absolute(os.fspath(target), event.cwd)
+        if _is_within(target_path, scratch_root):
+            continue
+        if _is_within(target_path, claude_root) or _is_within(target_path, codex_root):
+            continue
+        if ".omc" in target_path.parts:
+            continue
+        if target_path.parent.name == "memory" and target_path.suffix == ".md":
+            continue
+        if target_path.name.startswith("HANDOFF") and target_path.suffix == ".md":
+            continue
+        return False
+    return True
+
+
+def marker_name(runtime: Runtime, session_id: str) -> str:
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return f"{runtime.value}-{digest}"
+
+
+def _safe_directory(path: Path) -> bool:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.getuid()
+        and (info.st_mode & 0o077) == 0
+    )
+
+
+def _private_child(parent: Path, name: str) -> Path | None:
+    if not _safe_directory(parent):
+        return None
+    child = parent / name
+    try:
+        os.mkdir(child, 0o700)
+        os.chmod(child, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return None
+    return child if _safe_directory(child) else None
+
+
+def _state_directory(env: Mapping[str, str]) -> Path | None:
+    xdg_runtime = env.get("XDG_RUNTIME_DIR")
+    if isinstance(xdg_runtime, str) and xdg_runtime and not _has_control_characters(xdg_runtime):
+        xdg_root = _lexical_absolute(xdg_runtime)
+        state_dir = _private_child(xdg_root, "task-nudge")
+        if state_dir is not None:
+            return state_dir
+    tmpdir = env.get("TMPDIR", "/tmp")
+    if not isinstance(tmpdir, str) or not tmpdir or _has_control_characters(tmpdir):
+        return None
+    return _private_child(_lexical_absolute(tmpdir), f"task-nudge-{os.getuid()}")
+
+
+def _existing_marker_claim(marker: Path) -> MarkerClaim | None:
+    try:
+        existing = os.lstat(marker)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return MarkerClaim.UNAVAILABLE
+    if (
+        not stat.S_ISREG(existing.st_mode)
+        or existing.st_uid != os.getuid()
+        or (existing.st_mode & 0o077) != 0
+    ):
+        return MarkerClaim.UNAVAILABLE
+    return MarkerClaim.ALREADY_DONE
+
+
+def claim_session_marker(
+    runtime: Runtime, session_id: str, env: Mapping[str, str] | None = None
+) -> MarkerClaim:
+    if not isinstance(runtime, Runtime) or not isinstance(session_id, str) or not session_id or _has_control_characters(session_id):
+        return MarkerClaim.UNAVAILABLE
+    state_dir = _state_directory(os.environ if env is None else env)
+    if state_dir is None:
+        return MarkerClaim.UNAVAILABLE
+    marker = state_dir / marker_name(runtime, session_id)
+    existing_claim = _existing_marker_claim(marker)
+    if existing_claim is not None:
+        return existing_claim
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(marker, flags, 0o600)
+    except FileExistsError:
+        return _existing_marker_claim(marker) or MarkerClaim.UNAVAILABLE
+    except OSError:
+        return MarkerClaim.UNAVAILABLE
+    try:
+        os.fchmod(descriptor, 0o600)
+    except OSError:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        return MarkerClaim.UNAVAILABLE
+    try:
+        os.close(descriptor)
+    except OSError:
+        return MarkerClaim.UNAVAILABLE
+    return MarkerClaim.CLAIMED
+
+
+def evaluate_event(
+    event: HookEvent,
+    home: Path | str,
+    env: Mapping[str, str],
+    runner: Callable[..., object] = subprocess.run,
+) -> RegistrationResult | None:
+    if should_skip_event(event, home, env):
+        return None
+    try:
+        identity = resolve_repository(event.cwd, runner=runner)
+    except NudgeError as error:
+        return _unknown(None, error.reason)
+    result = query_registration(identity, home, runner=runner)
+    if result.status is RegistrationStatus.UNKNOWN:
+        return result
+    marker = claim_session_marker(event.runtime, event.session_id, env=env)
+    if marker is MarkerClaim.CLAIMED:
+        return result
+    if marker is MarkerClaim.ALREADY_DONE:
+        return None
+    return _unknown(result.repository_slug, "NUDGE_STATE_UNAVAILABLE")
