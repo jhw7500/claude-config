@@ -590,3 +590,248 @@ def test_cli_source_validation_failure_is_no_write(installer, tmp_path, home):
     )
     assert result.returncode != 0
     assert sorted(home.rglob("*")) == before
+
+
+def test_raced_backup_collision_is_not_unlinked_or_replaced(installer, tmp_path):
+    target = tmp_path / "settings.json"
+    target.write_bytes(b"original")
+    target.chmod(0o600)
+    raced_backup = tmp_path / "settings.json.bak.20260831010101"
+    replace_calls = []
+
+    def race(phase, path):
+        if phase == "before_backup_create":
+            path.write_bytes(b"raced-owner-data")
+
+    def replace(source, destination):
+        replace_calls.append((source, destination))
+        os.replace(source, destination)
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            [installer.PlannedWrite(target, b"updated", 0o600, True)],
+            replace=replace,
+            stamp="20260831010101",
+            phase_hook=race,
+        )
+    assert target.read_bytes() == b"original"
+    assert raced_backup.read_bytes() == b"raced-owner-data"
+    assert replace_calls == []
+
+
+def test_source_swap_between_validation_and_open_fails_closed(installer, tmp_path, home):
+    source, _ = _source_repo(tmp_path)
+    victim = source / "hooks" / "task_nudge.py"
+    outside = tmp_path / "outside-source"
+    outside.write_bytes(b"outside-source-data")
+
+    def swap(path):
+        if path == victim:
+            path.unlink()
+            path.symlink_to(outside)
+
+    with pytest.raises(installer.InstallError):
+        installer.build_plan(source, home, before_source_open=swap)
+    assert victim.is_symlink()
+    assert outside.read_bytes() == b"outside-source-data"
+    assert not (home / ".local" / "share" / "claude-config").exists()
+
+
+def test_source_parent_swap_cannot_redirect_descriptor_read(installer, tmp_path, home):
+    source, files = _source_repo(tmp_path, canary="validated-source")
+    hooks = source / "hooks"
+    moved_hooks = source / "validated-hooks"
+    outside_hooks = tmp_path / "outside-hooks"
+    outside_hooks.mkdir()
+    for name in files:
+        (outside_hooks / name).write_text("outside-substitution\n", encoding="utf-8")
+    swapped = False
+
+    def swap(path):
+        nonlocal swapped
+        if not swapped:
+            hooks.rename(moved_hooks)
+            hooks.symlink_to(outside_hooks, target_is_directory=True)
+            swapped = True
+
+    plans = installer.build_plan(source, home, before_source_open=swap)
+    installed_core = home / ".local" / "share" / "claude-config" / "hooks" / "task_nudge.py"
+    by_path = {plan.path: plan.data for plan in plans}
+    assert by_path[installed_core] == b"# core validated-source\n"
+    assert (outside_hooks / "task_nudge.py").read_bytes() == b"outside-substitution\n"
+
+
+def test_existing_target_swap_before_backup_is_preserved(installer, tmp_path):
+    target = tmp_path / "settings.json"
+    target.write_bytes(b"original")
+    target.chmod(0o600)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+
+    def swap(phase, path):
+        if phase == "before_backup_revalidate":
+            path.unlink()
+            path.symlink_to(outside)
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            [installer.PlannedWrite(target, b"updated", 0o600, True)],
+            stamp="20260831010101",
+            phase_hook=swap,
+        )
+    assert target.is_symlink() and target.resolve() == outside
+    assert outside.read_bytes() == b"outside"
+    assert not (tmp_path / "settings.json.bak.20260831010101").exists()
+
+
+def test_existing_regular_swap_before_replace_is_preserved(installer, tmp_path):
+    target = tmp_path / "settings.json"
+    target.write_bytes(b"original")
+    target.chmod(0o600)
+
+    def swap(phase, path):
+        if phase == "before_replace_revalidate":
+            path.unlink()
+            path.write_bytes(b"substituted")
+            path.chmod(0o600)
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            [installer.PlannedWrite(target, b"updated", 0o600, True)],
+            stamp="20260831010101",
+            phase_hook=swap,
+        )
+    assert target.read_bytes() == b"substituted"
+    assert not (tmp_path / "settings.json.bak.20260831010101").exists()
+
+
+@pytest.mark.parametrize("replacement_type", ["symlink", "directory"])
+def test_missing_target_type_swap_before_replace_is_preserved(installer, tmp_path, replacement_type):
+    target = tmp_path / "hooks.json"
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+
+    def swap(phase, path):
+        if phase != "before_replace_revalidate":
+            return
+        if replacement_type == "symlink":
+            path.symlink_to(outside)
+        else:
+            path.mkdir()
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            [installer.PlannedWrite(target, b"created", 0o600, True)],
+            stamp="20260831010101",
+            phase_hook=swap,
+        )
+    if replacement_type == "symlink":
+        assert target.is_symlink() and target.resolve() == outside
+    else:
+        assert target.is_dir()
+    assert outside.read_bytes() == b"outside"
+
+
+def test_destination_parent_swap_cannot_redirect_production_replace(installer, tmp_path):
+    parent = tmp_path / "target-parent"
+    parent.mkdir()
+    target = parent / "settings.json"
+    target.write_bytes(b"original")
+    target.chmod(0o600)
+    moved_parent = tmp_path / "validated-parent"
+    outside_parent = tmp_path / "outside-parent"
+    outside_parent.mkdir()
+    outside_target = outside_parent / "settings.json"
+    outside_target.write_bytes(b"substituted")
+
+    def swap(phase, path):
+        if phase == "before_replace_revalidate":
+            parent.rename(moved_parent)
+            parent.symlink_to(outside_parent, target_is_directory=True)
+
+    installer.apply_transaction(
+        [installer.PlannedWrite(target, b"updated", 0o600, True)],
+        stamp="20260831010101",
+        phase_hook=swap,
+    )
+    assert (moved_parent / "settings.json").read_bytes() == b"updated"
+    assert outside_target.read_bytes() == b"substituted"
+
+
+def test_success_fsyncs_regular_files_and_parent_directories(installer, tmp_path, monkeypatch):
+    observed = []
+    real_fsync = installer.os.fsync
+
+    def observe(descriptor):
+        observed.append(stat.S_IFMT(os.fstat(descriptor).st_mode))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(installer.os, "fsync", observe)
+    target = tmp_path / "nested" / "hooks.json"
+    installer.apply_transaction(
+        [installer.PlannedWrite(target, b"created", 0o600, True)],
+        stamp="20260831010101",
+    )
+    assert stat.S_IFREG in observed
+    assert stat.S_IFDIR in observed
+
+
+def test_rollback_fsyncs_parent_directories(installer, tmp_path, monkeypatch):
+    existing = tmp_path / "a-settings.json"
+    created = tmp_path / "b-hooks.json"
+    trigger = tmp_path / "c-trigger"
+    existing.write_bytes(b"original")
+    existing.chmod(0o640)
+    observed = []
+    real_fsync = installer.os.fsync
+    real_replace = installer.os.replace
+    replacements = 0
+
+    def observe(descriptor):
+        observed.append(stat.S_IFMT(os.fstat(descriptor).st_mode))
+        real_fsync(descriptor)
+
+    def fail_third(source, destination):
+        nonlocal replacements
+        replacements += 1
+        if replacements == 3:
+            raise OSError("injected")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(installer.os, "fsync", observe)
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            [
+                installer.PlannedWrite(existing, b"updated", 0o600, True),
+                installer.PlannedWrite(created, b"created", 0o600, True),
+                installer.PlannedWrite(trigger, b"trigger", 0o600, True),
+            ],
+            replace=fail_third,
+            stamp="20260831010101",
+        )
+    assert existing.read_bytes() == b"original"
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o640
+    assert not created.exists() and not trigger.exists()
+    assert stat.S_IFDIR in observed
+
+
+def test_directory_fsync_failure_is_bounded_and_rolls_back(installer, tmp_path, monkeypatch):
+    target = tmp_path / "hooks.json"
+    calls = 0
+    real_fsync = installer.os.fsync
+
+    def fail_first_directory(descriptor):
+        nonlocal calls
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode) and calls == 0:
+            calls += 1
+            raise OSError("directory fsync injection")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(installer.os, "fsync", fail_first_directory)
+    with pytest.raises(installer.InstallError) as caught:
+        installer.apply_transaction(
+            [installer.PlannedWrite(target, b"created", 0o600, True)],
+            stamp="20260831010101",
+        )
+    assert not target.exists()
+    assert "directory fsync injection" not in str(caught.value)
