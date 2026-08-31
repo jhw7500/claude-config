@@ -101,6 +101,15 @@ def _lexical_absolute(path: str, cwd: Path | None = None) -> Path:
     return Path(os.path.normpath(os.fspath(candidate)))
 
 
+def _absolute_environment_path(value: object) -> Path | None:
+    if not isinstance(value, str) or not value or _has_control_characters(value):
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return None
+    return Path(os.path.normpath(os.fspath(candidate)))
+
+
 def _event_fields(payload: object, runtime: Runtime, permitted_tools: set[str]) -> tuple[str, Path, str, dict[str, object]]:
     if not isinstance(payload, dict):
         raise NudgeError("HOOK_INPUT_INVALID")
@@ -473,10 +482,9 @@ def should_skip_event(event: HookEvent, home: Path | str, env: Mapping[str, str]
     if not event.target_paths:
         return False
     normalized_home = _lexical_absolute(os.fspath(home))
-    scratch_value = env.get("TMPDIR", "/tmp")
-    if not isinstance(scratch_value, str) or not scratch_value or _has_control_characters(scratch_value):
+    scratch_root = _absolute_environment_path(env.get("TMPDIR", "/tmp"))
+    if scratch_root is None:
         return False
-    scratch_root = _lexical_absolute(scratch_value)
     claude_root = normalized_home / ".claude"
     codex_root = normalized_home / ".codex"
     for target in event.target_paths:
@@ -512,8 +520,20 @@ def _safe_directory(path: Path) -> bool:
     )
 
 
-def _private_child(parent: Path, name: str) -> Path | None:
-    if not _safe_directory(parent):
+def _safe_shared_tmp_directory(path: Path) -> bool:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid in {0, os.getuid()}
+        and bool(info.st_mode & stat.S_ISVTX)
+    )
+
+
+def _private_child(parent: Path, name: str, *, allow_shared_parent: bool = False) -> Path | None:
+    if not _safe_directory(parent) and not (allow_shared_parent and _safe_shared_tmp_directory(parent)):
         return None
     child = parent / name
     try:
@@ -527,16 +547,15 @@ def _private_child(parent: Path, name: str) -> Path | None:
 
 
 def _state_directory(env: Mapping[str, str]) -> Path | None:
-    xdg_runtime = env.get("XDG_RUNTIME_DIR")
-    if isinstance(xdg_runtime, str) and xdg_runtime and not _has_control_characters(xdg_runtime):
-        xdg_root = _lexical_absolute(xdg_runtime)
+    xdg_root = _absolute_environment_path(env.get("XDG_RUNTIME_DIR"))
+    if xdg_root is not None:
         state_dir = _private_child(xdg_root, "task-nudge")
         if state_dir is not None:
             return state_dir
-    tmpdir = env.get("TMPDIR", "/tmp")
-    if not isinstance(tmpdir, str) or not tmpdir or _has_control_characters(tmpdir):
+    tmpdir = _absolute_environment_path(env["TMPDIR"]) if "TMPDIR" in env else Path("/tmp")
+    if tmpdir is None:
         return None
-    return _private_child(_lexical_absolute(tmpdir), f"task-nudge-{os.getuid()}")
+    return _private_child(tmpdir, f"task-nudge-{os.getuid()}", allow_shared_parent=True)
 
 
 def _existing_marker_claim(marker: Path) -> MarkerClaim | None:

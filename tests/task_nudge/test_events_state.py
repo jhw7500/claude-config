@@ -165,13 +165,51 @@ def test_unsafe_state_roots_fail_closed(core, tmp_path):
     assert result is core.MarkerClaim.UNAVAILABLE
 
 
+def test_sticky_shared_tmp_root_creates_uid_private_fallback(core, tmp_path):
+    shared_tmp = tmp_path / "shared-tmp"
+    shared_tmp.mkdir(mode=0o777)
+    shared_tmp.chmod(0o1777)
+
+    assert core.claim_session_marker(core.Runtime.CODEX, "fallback", env={"TMPDIR": str(shared_tmp)}) is core.MarkerClaim.CLAIMED
+    assert core.claim_session_marker(core.Runtime.CODEX, "fallback", env={"TMPDIR": str(shared_tmp)}) is core.MarkerClaim.ALREADY_DONE
+    state_dir = shared_tmp / f"task-nudge-{os.getuid()}"
+    assert state_dir.is_dir()
+    assert os.stat(state_dir).st_mode & 0o777 == 0o700
+
+
+def test_relative_xdg_runtime_uses_safe_tmpdir_fallback(core, tmp_path):
+    fallback = tmp_path / "fallback"
+    fallback.mkdir(mode=0o700)
+    fallback.chmod(0o700)
+
+    assert core.claim_session_marker(core.Runtime.CODEX, "fallback", env={"XDG_RUNTIME_DIR": "relative", "TMPDIR": str(fallback)}) is core.MarkerClaim.CLAIMED
+    assert (fallback / f"task-nudge-{os.getuid()}").is_dir()
+
+
+def test_relative_tmpdir_is_not_scratch_or_default_fallback(core, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    event = core.HookEvent(core.Runtime.CODEX, "relative-tmp", tmp_path / "repo", "Write", (tmp_path / "repo/app.py",))
+    identity = core.RepositoryIdentity(tmp_path / "repo", "owner/repo")
+    monkeypatch.setattr(core, "resolve_repository", lambda cwd, runner: identity)
+    monkeypatch.setattr(core, "query_registration", lambda identity, home, runner: core.RegistrationResult(core.RegistrationStatus.UNREGISTERED, "owner/repo"))
+
+    assert not core.should_skip_event(event, home, {"TMPDIR": "relative"})
+    assert core.claim_session_marker(core.Runtime.CODEX, "relative-tmp", env={"TMPDIR": "relative"}) is core.MarkerClaim.UNAVAILABLE
+    assert core.evaluate_event(event, home, {"TMPDIR": "relative"}, runner=object()) == core.RegistrationResult(core.RegistrationStatus.UNKNOWN, "owner/repo", "NUDGE_STATE_UNAVAILABLE")
+    assert not list(tmp_path.rglob("task-nudge*"))
+
+
 def test_symlinked_state_root_and_wrong_owner_fail_closed(core, tmp_path, monkeypatch):
     target = tmp_path / "target"
     target.mkdir(mode=0o700)
     target.chmod(0o700)
     linked = tmp_path / "linked"
     linked.symlink_to(target, target_is_directory=True)
-    assert core.claim_session_marker(core.Runtime.CODEX, "session-a", env={"XDG_RUNTIME_DIR": str(linked)}) is core.MarkerClaim.UNAVAILABLE
+    unsafe_fallback = tmp_path / "unsafe-fallback"
+    unsafe_fallback.mkdir(mode=0o777)
+    unsafe_fallback.chmod(0o777)
+    assert core.claim_session_marker(core.Runtime.CODEX, "session-a", env={"XDG_RUNTIME_DIR": str(linked), "TMPDIR": str(unsafe_fallback)}) is core.MarkerClaim.UNAVAILABLE
 
     assert core.claim_session_marker(core.Runtime.CODEX, "marker-link", env={"XDG_RUNTIME_DIR": str(target)}) is core.MarkerClaim.CLAIMED
     marker = target / "task-nudge" / core.marker_name(core.Runtime.CODEX, "marker-link")
