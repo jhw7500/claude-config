@@ -99,13 +99,14 @@ State mutation과 event를 하나의 WAL에서 재생하는 방식이다. 장기
 
 - 한 작업은 하나의 absolute monotonic deadline만 사용한다.
 - Deadline은 helper가 새로 계산하거나 연장하지 않는다.
-- `open`, `read`, `write`, `fstat/stat`, `mkdir`, `chmod`, `fsync`, `rename/replace`,
-  `unlink`, directory iteration, procfs observation, pidfd open은 각각 하나의
-  의미 있는 boundary다.
+- `open/dup`, `read`, `write`, `lseek`, `fstat/stat`, `mkdir`, `chmod`, `fsync`,
+  `rename/replace`, `unlink`, directory iteration, `flock` 획득, procfs observation,
+  pidfd open은 각각 하나의 의미 있는 boundary다.
 - 각 boundary는 시작 직전과 반환 직후 같은 budget을 검사한다.
 - 반환 직후 만료를 발견하면 다음 boundary를 시작하지 않는다.
-- 이미 열린 descriptor의 `close`만 비관측 resource finalization으로 허용한다.
-  Close 오류는 상태 recovery나 추가 filesystem 작업을 유발하지 않는다.
+- 이미 열린 descriptor의 `close`와 이미 획득한 `flock` 해제만 비관측 resource
+  finalization으로 허용한다. Finalization 오류는 상태 recovery나 추가 filesystem
+  작업을 유발하지 않는다.
 - 만료된 경로는 temporary file이나 prepared journal을 즉시 정리하지 않는다.
   다음 invocation이 새 budget 아래 bounded reconciliation을 수행한다.
 - pidfd send는 final lexical-root authority와 분리할 수 없으므로 특수한 하나의
@@ -190,6 +191,9 @@ class DeadlineBudget:
     def check(self) -> None:
         ...
 
+    def remaining(self) -> float | None:
+        ...
+
 
 class DeadlineIO:
     def __init__(self, budget: DeadlineBudget):
@@ -205,10 +209,19 @@ class DeadlineIO:
     ) -> int:
         ...
 
+    def dup_fd(self, fd: int) -> int:
+        ...
+
     def read(self, fd: int, size: int) -> bytes:
         ...
 
     def write(self, fd: int, data: bytes) -> int:
+        ...
+
+    def lseek(self, fd: int, offset: int, whence: int) -> int:
+        ...
+
+    def flock_exclusive_nonblocking(self, fd: int) -> None:
         ...
 
     def fstat(self, fd: int) -> os.stat_result:
@@ -218,7 +231,7 @@ class DeadlineIO:
         self,
         name: str,
         *,
-        dir_fd: int,
+        dir_fd: int | None = None,
         follow_symlinks: bool = False,
     ) -> os.stat_result:
         ...
@@ -250,13 +263,20 @@ class DeadlineIO:
 
     def close_fd(self, fd: int) -> None:
         ...
+
+    def unlock_fd(self, fd: int) -> None:
+        ...
 ```
 
 각 resource-free method는 operation 전후에 `budget.check()`를 실행하며 실제
 boundary 하나만 감싼다. `open_fd()`는 open 반환 뒤 만료된 경우 자신이 얻은 fd를
 `close_fd()`로 닫고 원래 deadline 예외를 다시 발생시킨다. Directory iterator도
-같은 방식으로 iterator ownership과 close를 내부에서 처리한다. 따라서 post-check
-예외가 resource handle을 호출자에게 전달하지 못해 leak시키는 경로가 없다.
+같은 방식으로 iterator ownership과 close를 내부에서 처리한다. `dup_fd()`도 반환
+직후 만료되면 duplicate를 닫으며, `flock_exclusive_nonblocking()`은 반환 직후
+만료되면 획득한 lock을 해제한다. `close_fd()`와 `unlock_fd()`는 이미 획득한
+resource를 정리하기 위한 finalizer이므로 deadline 이후에도 호출할 수 있다.
+따라서 post-check 예외가 resource handle이나 lock을 호출자에게 넘기지 못해
+leak시키는 경로가 없다.
 복합 helper는 반드시 여러 typed method의 명시적 순서로 구성한다. 시간 제한
 mutation/recovery 경로에서 raw `os.*` boundary를 직접 호출하지 않는다.
 
@@ -280,11 +300,17 @@ Atomic JSON write는 다음 순서를 갖는다.
 5. budgeted replace
 6. budgeted directory fsync
 
+Ledger revision도 별도 temporary writer를 유지하지 않고 root directory에 같은
+Atomic JSON primitive를 사용한다. 따라서 모든 bounded JSON replace는 동일한
+temporary naming, descriptor ownership, post-expiry 규칙을 따른다.
+
 어느 boundary 반환 직후 만료되더라도 다음 단계나 stat/unlink cleanup을 시작하지
 않는다. Replace 전 남은 `.tmp-<digest>` 파일은 authoritative record가 아니며,
-다음 fresh-budget maintenance가 private owner/mode/link/name을 검증한 뒤 bounded
-수로 정리한다. Replace 후 만료되면 journal truth table이 실제 target digest로
-완료 여부를 판정한다.
+다음 fresh-budget maintenance가 state root와 알려진 Atomic JSON directory만
+bounded scan하고 private owner/mode/link/name을 검증한 뒤 최대 64개씩 정리한다.
+Malformed 또는 symlink temp-like evidence는 삭제하지 않고 corruption으로 남긴다.
+Replace 후 만료되면 journal truth table이 실제 target digest로 완료 여부를
+판정한다.
 
 ### 6.3 `StateStore` integration
 
@@ -299,6 +325,12 @@ Atomic JSON write는 다음 순서를 갖는다.
 6. updated raw record 기록
 7. journal phase 기록
 8. truth table로 recovery/materialization 결정
+
+`StateStore.locked()`도 같은 `DeadlineIO`를 내부 인자로 받아 root/lock open,
+descriptor duplicate, `flock` 획득, binding 검증을 같은 budget으로 수행한다.
+Condition wait와 nonblocking-flock retry는 `DeadlineBudget.remaining()`으로 operation
+deadline과 기존 lock timeout 중 더 짧은 시간을 사용한다. 정상/예외 teardown에서는
+이미 획득한 lock 해제와 descriptor close만 허용한다.
 
 `_recover_known_transition_locked()`는 더 이상 `deadline=None`을 만들지 않는다.
 Fresh budget이 남아 있을 때만 같은 budget으로 실행한다. Effect 이후 deadline이
