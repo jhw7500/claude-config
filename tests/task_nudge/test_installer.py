@@ -440,6 +440,127 @@ def test_apply_rejects_target_identity_change_since_build_without_artifacts(
     assert _tree_snapshot(home) == before_apply
 
 
+@pytest.mark.parametrize("initial_override", ["absent", "empty"])
+def test_apply_rejects_inactive_override_becoming_nonempty_since_build_without_artifacts(
+    installer, tmp_path, home, initial_override
+):
+    source, _ = _source_repo(tmp_path)
+    codex = home / ".codex"
+    codex.mkdir()
+    agents = codex / "AGENTS.md"
+    override = codex / "AGENTS.override.md"
+    agents.write_bytes(b"base agents\n")
+    agents.chmod(0o600)
+    if initial_override == "empty":
+        override.write_bytes(b"")
+        override.chmod(0o600)
+    plans = installer.build_plan(source, home)
+
+    override.write_bytes(b"concurrent active override\n")
+    override.chmod(0o600)
+    agents_before = agents.read_bytes()
+    override_before = override.read_bytes()
+    before_apply = _tree_snapshot(home)
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(plans, stamp="20260831010101")
+
+    assert agents.read_bytes() == agents_before
+    assert override.read_bytes() == override_before
+    assert _tree_snapshot(home) == before_apply
+
+
+@pytest.mark.parametrize(
+    ("initial_override", "transition"),
+    [
+        ("absent", "appear-empty"),
+        ("empty", "disappear"),
+        ("empty", "change-bytes"),
+        ("empty", "change-mode"),
+        ("empty", "replace-identity"),
+        ("empty", "replace-type"),
+        ("nonempty", "become-empty"),
+    ],
+)
+def test_apply_rejects_agents_selector_state_drift_without_artifacts(
+    installer, tmp_path, home, initial_override, transition
+):
+    source, _ = _source_repo(tmp_path)
+    codex = home / ".codex"
+    codex.mkdir()
+    agents = codex / "AGENTS.md"
+    override = codex / "AGENTS.override.md"
+    agents.write_bytes(b"base agents\n")
+    agents.chmod(0o600)
+    if initial_override == "empty":
+        override.write_bytes(b"")
+        override.chmod(0o600)
+    elif initial_override == "nonempty":
+        override.write_bytes(b"active override\n")
+        override.chmod(0o600)
+    plans = installer.build_plan(source, home)
+
+    if transition == "appear-empty":
+        override.write_bytes(b"")
+        override.chmod(0o600)
+    elif transition == "disappear":
+        override.unlink()
+    elif transition == "change-bytes":
+        override.write_bytes(b" \n")
+    elif transition == "change-mode":
+        override.chmod(0o640)
+    elif transition == "replace-identity":
+        override.rename(tmp_path / "held-original-override")
+        override.write_bytes(b"")
+        override.chmod(0o600)
+    elif transition == "replace-type":
+        override.rename(tmp_path / "held-regular-override")
+        override.symlink_to(tmp_path / "held-regular-override")
+    elif transition == "become-empty":
+        override.write_bytes(b"")
+    else:
+        raise AssertionError("unhandled selector transition")
+
+    before_apply = _tree_snapshot(home)
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(plans, stamp="20260831010101")
+
+    assert _tree_snapshot(home) == before_apply
+
+
+@pytest.mark.parametrize("selector_state", ["absent", "empty", "nonempty"])
+def test_apply_accepts_stable_agents_selector_and_is_idempotent(
+    installer, tmp_path, home, selector_state
+):
+    source, _ = _source_repo(tmp_path)
+    codex = home / ".codex"
+    codex.mkdir()
+    agents = codex / "AGENTS.md"
+    override = codex / "AGENTS.override.md"
+    agents.write_bytes(b"base agents\n")
+    agents.chmod(0o600)
+    if selector_state == "empty":
+        override.write_bytes(b"")
+        override.chmod(0o600)
+    elif selector_state == "nonempty":
+        override.write_bytes(b"active override\n")
+        override.chmod(0o600)
+
+    plans = installer.build_plan(source, home)
+    active = override if selector_state == "nonempty" else agents
+    changed = installer.apply_transaction(plans, stamp="20260831010101")
+    assert active in changed
+    assert installer.AGENTS_START.encode() in active.read_bytes()
+    if selector_state == "nonempty":
+        assert installer.AGENTS_START.encode() not in agents.read_bytes()
+    elif selector_state == "empty":
+        assert override.read_bytes() == b""
+    else:
+        assert not override.exists()
+
+    second = installer.build_plan(source, home)
+    assert installer.apply_transaction(second, stamp="20260831010102") == []
+
+
 def test_transaction_rolls_back_updated_and_created_targets(installer, tmp_path):
     existing = tmp_path / "a-settings.json"
     created = tmp_path / "b-hooks.json"

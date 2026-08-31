@@ -51,6 +51,7 @@ class PlannedWrite:
     backup: bool
     allow_legacy_symlink: bool = False
     precondition: _TargetSnapshot | None = None
+    selector_preconditions: tuple[_SelectorPrecondition, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,12 @@ class _TargetSnapshot:
     link_target: str | None = None
     identity: tuple[int, int, int] | None = None
     link_identity: tuple[int, int, int] | None = None
+
+
+@dataclass(frozen=True)
+class _SelectorPrecondition:
+    path: Path
+    snapshot: _TargetSnapshot
 
 
 @dataclass(frozen=True)
@@ -547,6 +554,11 @@ def build_plan(
                 plan.backup,
                 allow_legacy_symlink=plan.allow_legacy_symlink,
                 precondition=snapshot,
+                selector_preconditions=(
+                    (_SelectorPrecondition(override, override_snapshot),)
+                    if plan.path == agents_path
+                    else ()
+                ),
             )
         )
     return validated_plans
@@ -856,9 +868,19 @@ def apply_transaction(
     ordered = sorted(writes, key=lambda plan: os.fspath(plan.path))
     if len({plan.path for plan in ordered}) != len(ordered):
         raise InstallError("duplicate planned target")
+    selector_preconditions: dict[Path, _TargetSnapshot] = {}
     for plan in ordered:
         if not plan.path.is_absolute() or plan.mode not in {0o600, 0o700}:
             raise InstallError("invalid planned target")
+        for selector in plan.selector_preconditions:
+            if not selector.path.is_absolute():
+                raise InstallError("invalid selector precondition")
+            if (
+                selector.path in selector_preconditions
+                and selector_preconditions[selector.path] != selector.snapshot
+            ):
+                raise InstallError("conflicting selector preconditions")
+            selector_preconditions[selector.path] = selector.snapshot
 
     snapshots: dict[Path, _TargetSnapshot] = {}
     for plan in ordered:
@@ -875,6 +897,12 @@ def apply_transaction(
         ):
             raise InstallError("planned target changed since plan was built")
         snapshots[plan.path] = current
+    for path, expected in selector_preconditions.items():
+        current = snapshots.get(path)
+        if current is None:
+            current = _inspect_target(PlannedWrite(path, b"", 0o600, False))
+        if not _snapshot_matches(current, expected):
+            raise InstallError("AGENTS selector changed since plan was built")
     changed = [
         plan
         for plan in ordered
