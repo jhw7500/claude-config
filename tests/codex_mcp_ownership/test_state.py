@@ -12,7 +12,7 @@ import threading
 
 import pytest
 
-from codex_mcp_ownership import model, state
+from codex_mcp_ownership import deadline_io, model, state
 from helpers import (
     make_private_directory,
     sample_lease,
@@ -276,7 +276,7 @@ def test_atomic_json_write_failure_removes_private_temporary_file(
     monkeypatch.setattr(store, "_bump_ledger_revision_locked", lambda **_kwargs: 1)
     monkeypatch.setattr(
         state,
-        "_write_all",
+        "_write_all_with_io",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("short write")),
     )
     with pytest.raises(OSError, match="short write"):
@@ -287,9 +287,11 @@ def test_atomic_json_write_failure_removes_private_temporary_file(
 def test_atomic_json_temp_collision_preserves_existing_sentinel(tmp_path, monkeypatch):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
-    sentinel = store.root / "sessions" / ".tmp-collision"
+    token = "c" * 32
+    sentinel = store.root / "sessions" / f".tmp-{token}"
     write_private_file(sentinel, b"sentinel")
-    monkeypatch.setattr(state.secrets, "token_hex", lambda size: "collision")
+    monkeypatch.setattr(state.secrets, "token_hex", lambda size: token)
+    monkeypatch.setattr(store, "_reconcile_atomic_temps_locked", lambda **_kwargs: None)
     with pytest.raises(FileExistsError):
         store.save_session(sample_lease("session:second"))
     assert sentinel.read_bytes() == b"sentinel"
@@ -300,16 +302,17 @@ def test_atomic_json_cleanup_preserves_temp_after_inode_gains_second_link(
 ):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
-    temporary = store.root / "sessions" / ".tmp-owned"
-    second_link = store.root / "sessions" / ".tmp-second-link"
-    monkeypatch.setattr(state.secrets, "token_hex", lambda size: "owned")
+    token = "d" * 32
+    temporary = store.root / "sessions" / f".tmp-{token}"
+    second_link = store.root / "sessions" / ".linked-evidence"
+    monkeypatch.setattr(state.secrets, "token_hex", lambda size: token)
     monkeypatch.setattr(store, "_bump_ledger_revision_locked", lambda **_kwargs: 2)
 
-    def link_then_fail(fd, data, **_kwargs):
+    def link_then_fail(io, fd, data):
         os.link(temporary, second_link)
         raise OSError("injected write failure")
 
-    monkeypatch.setattr(state, "_write_all", link_then_fail)
+    monkeypatch.setattr(state, "_write_all_with_io", link_then_fail)
     with pytest.raises(OSError, match="injected write failure"):
         store.save_session(sample_lease("session:second"))
     assert temporary.exists()
@@ -1112,6 +1115,7 @@ def test_committed_journal_with_expected_raw_state_is_corruption_without_event(
         expected,
         updated,
         _owner_loss_event(expected, "semantic_contradiction"),
+        io=deadline_io.DeadlineIO(deadline_io.DeadlineBudget(None, lambda: 0.0)),
     )
     journal["phase"] = "committed"
     _write_journal(store, event_id, journal)
@@ -1138,6 +1142,7 @@ def test_receipt_with_expected_raw_state_is_corruption_and_preserves_evidence(
         expected,
         updated,
         _owner_loss_event(expected, "receipt_contradiction"),
+        io=deadline_io.DeadlineIO(deadline_io.DeadlineBudget(None, lambda: 0.0)),
     )
     _write_journal(store, event_id, journal)
     receipt_dir = store.root / "event-receipts"
@@ -1172,6 +1177,7 @@ def test_journal_event_id_must_match_derived_transition_id(tmp_path):
         expected,
         updated,
         _owner_loss_event(expected, "derived_id"),
+        io=deadline_io.DeadlineIO(deadline_io.DeadlineBudget(None, lambda: 0.0)),
     )
     journal["event"]["reason_codes"] = ["mutated_after_id_derivation"]
     _write_journal(store, event_id, journal)
@@ -1234,6 +1240,286 @@ def test_expiry_after_journal_construction_starts_no_write_boundary(
     journal = store.root / "event-journal"
     assert not journal.exists() or list(journal.iterdir()) == []
     assert store.load_raw_process(expected.wrapper.stable_key()) == expected
+
+
+def test_expiry_after_journal_directory_mkdir_starts_no_open_or_fsync(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    now = [0.0]
+    later = []
+    original_mkdir = deadline_io.os.mkdir
+    original_open = deadline_io.os.open
+    original_fsync = deadline_io.os.fsync
+
+    def expire_after_mkdir(*args, **kwargs):
+        result = original_mkdir(*args, **kwargs)
+        now[0] = 1.0
+        return result
+
+    def record_open(*args, **kwargs):
+        flags = args[1]
+        if now[0] >= 0.5 and not flags & getattr(os, "O_PATH", 0):
+            later.append("open")
+        return original_open(*args, **kwargs)
+
+    def record_fsync(*args, **kwargs):
+        if now[0] >= 0.5:
+            later.append("fsync")
+        return original_fsync(*args, **kwargs)
+
+    monkeypatch.setattr(deadline_io.os, "mkdir", expire_after_mkdir)
+    monkeypatch.setattr(deadline_io.os, "open", record_open)
+    monkeypatch.setattr(deadline_io.os, "fsync", record_fsync)
+
+    with pytest.raises(state.OperationDeadlineExceeded):
+        store.transition(
+            "processes",
+            expected.wrapper.stable_key(),
+            expected,
+            updated,
+            _owner_loss_event(expected, "mkdir_deadline"),
+            deadline=0.5,
+            monotonic=lambda: now[0],
+        )
+    assert later == []
+
+
+def test_expiry_after_atomic_write_starts_no_fsync_stat_or_unlink(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    now = [0.0]
+    later = []
+    original_write = deadline_io.DeadlineIO.write
+    original_fsync = deadline_io.os.fsync
+    original_stat = deadline_io.os.stat
+    original_unlink = deadline_io.os.unlink
+
+    def expire_after_write(io, fd, data):
+        result = original_write(io, fd, data)
+        now[0] = 1.0
+        return result
+
+    def record_fsync(*args, **kwargs):
+        if now[0] >= 0.5:
+            later.append("fsync")
+        return original_fsync(*args, **kwargs)
+
+    def record_stat(*args, **kwargs):
+        if now[0] >= 0.5:
+            later.append("stat")
+        return original_stat(*args, **kwargs)
+
+    def record_unlink(*args, **kwargs):
+        if now[0] >= 0.5:
+            later.append("unlink")
+        return original_unlink(*args, **kwargs)
+
+    monkeypatch.setattr(deadline_io.DeadlineIO, "write", expire_after_write)
+    monkeypatch.setattr(deadline_io.os, "fsync", record_fsync)
+    monkeypatch.setattr(deadline_io.os, "stat", record_stat)
+    monkeypatch.setattr(deadline_io.os, "unlink", record_unlink)
+
+    with pytest.raises(state.OperationDeadlineExceeded):
+        store.transition(
+            "processes",
+            expected.wrapper.stable_key(),
+            expected,
+            updated,
+            _owner_loss_event(expected, "write_deadline"),
+            deadline=0.5,
+            monotonic=lambda: now[0],
+        )
+    assert later == []
+
+
+def test_post_effect_deadline_does_not_start_known_transition_recovery(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    now = [0.0]
+    effects = []
+
+    def effect():
+        effects.append("sent")
+        now[0] = 1.0
+
+    monkeypatch.setattr(
+        store,
+        "_recover_known_transition_locked",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("expired effect must not start recovery")
+        ),
+    )
+    with pytest.raises(state.PostEffectStateError):
+        store.transition(
+            "processes",
+            expected.wrapper.stable_key(),
+            expected,
+            updated,
+            _owner_loss_event(expected, "post_effect_deadline"),
+            deadline=0.5,
+            monotonic=lambda: now[0],
+            effect=effect,
+        )
+    assert effects == ["sent"]
+    assert store.load_raw_process(expected.wrapper.stable_key()) == expected
+    assert len(list((store.root / "event-journal").glob("*.json"))) == 1
+
+
+def test_post_effect_record_write_expiry_starts_no_known_transition_recovery(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    store.save_process(expected)
+    now = [0.0]
+    effects = []
+    recoveries = []
+    original_write_record = store._write_transition_record_locked
+
+    def effect():
+        effects.append("sent")
+
+    def write_record_then_expire(*args, **kwargs):
+        revision = original_write_record(*args, **kwargs)
+        now[0] = 1.0
+        return revision
+
+    def record_recovery(*args, **kwargs):
+        recoveries.append("recover")
+        return False
+
+    monkeypatch.setattr(
+        store, "_write_transition_record_locked", write_record_then_expire
+    )
+    monkeypatch.setattr(store, "_recover_known_transition_locked", record_recovery)
+
+    with pytest.raises(state.PostEffectStateError) as error:
+        store.transition(
+            "processes",
+            expected.wrapper.stable_key(),
+            expected,
+            updated,
+            _owner_loss_event(expected, "post_effect_write_deadline"),
+            deadline=0.5,
+            monotonic=lambda: now[0],
+            effect=effect,
+        )
+
+    assert error.value.record_persisted is True
+    assert effects == ["sent"]
+    assert recoveries == []
+
+
+def test_fresh_writer_reconciles_expired_atomic_journal_temp_before_recovery(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    expected = sample_process()
+    updated = replace(expected, first_owner_gone_boot=200.0)
+    later = replace(expected, exit_code=7)
+    store.save_process(expected)
+    now = [0.0]
+    later_boundaries = []
+
+    with monkeypatch.context() as deadline_patch:
+        original_write = deadline_io.DeadlineIO.write
+        original_stat = deadline_io.os.stat
+        original_unlink = deadline_io.os.unlink
+
+        def expire_after_write(io, fd, data):
+            result = original_write(io, fd, data)
+            now[0] = 1.0
+            return result
+
+        def record_stat(*args, **kwargs):
+            if now[0] >= 0.5:
+                later_boundaries.append("stat")
+            return original_stat(*args, **kwargs)
+
+        def record_unlink(*args, **kwargs):
+            if now[0] >= 0.5:
+                later_boundaries.append("unlink")
+            return original_unlink(*args, **kwargs)
+
+        deadline_patch.setattr(deadline_io.DeadlineIO, "write", expire_after_write)
+        deadline_patch.setattr(deadline_io.os, "stat", record_stat)
+        deadline_patch.setattr(deadline_io.os, "unlink", record_unlink)
+
+        with pytest.raises(state.OperationDeadlineExceeded):
+            store.transition(
+                "processes",
+                expected.wrapper.stable_key(),
+                expected,
+                updated,
+                _owner_loss_event(expected, "reconcile_expired_temp"),
+                deadline=0.5,
+                monotonic=lambda: now[0],
+            )
+
+    journal_directory = store.root / "event-journal"
+    temporary = list(journal_directory.glob(".tmp-*"))
+    assert len(temporary) == 1
+    assert later_boundaries == []
+
+    store.save_process(later)
+
+    assert list(journal_directory.glob(".tmp-*")) == []
+    assert store.load_raw_process(expected.wrapper.stable_key()) == later
+
+
+@pytest.mark.parametrize("unsafe_kind", ["malformed", "symlink"])
+def test_atomic_temp_evidence_is_preserved_with_redacted_corruption(
+    tmp_path, unsafe_kind
+):
+    store = state.StateStore(tmp_path / "state")
+    store.save_process(sample_process())
+    directory = store.root / "sessions"
+    make_private_directory(directory)
+    name = (
+        ".tmp-not-a-private-token"
+        if unsafe_kind == "malformed"
+        else ".tmp-" + ("a" * 32)
+    )
+    evidence = directory / name
+    if unsafe_kind == "malformed":
+        write_private_file(evidence, b"evidence\n")
+    else:
+        target = tmp_path / "sentinel"
+        write_private_file(target, b"sentinel\n")
+        evidence.symlink_to(target)
+
+    with pytest.raises(state.StateCorruption) as error:
+        store.save_session(sample_lease())
+
+    assert error.value.path == directory
+    assert evidence.is_symlink() if unsafe_kind == "symlink" else evidence.exists()
+    assert name not in str(error.value)
+
+
+def test_atomic_temp_reconciliation_removes_at_most_64_candidates(tmp_path):
+    store = state.StateStore(tmp_path / "state")
+    store.save_process(sample_process())
+    directory = store.root / "sessions"
+    make_private_directory(directory)
+    for number in range(65):
+        write_private_file(directory / f".tmp-{number:032x}", b"temporary\n")
+
+    store.save_session(sample_lease())
+
+    assert len(list(directory.glob(".tmp-*"))) == 1
 
 
 def test_receipt_prevents_reemission_after_retained_journal_and_log_rotation(

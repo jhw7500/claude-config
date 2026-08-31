@@ -128,6 +128,35 @@ class DeadlineIO:
     ) -> None:
         self._call(os.mkdir, name, mode, dir_fd=dir_fd)
 
+    def mkdir_private(
+        self,
+        name: str,
+        mode: int,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        """Create and mode-normalize one Linux directory as a single boundary."""
+        path_flag = getattr(os, "O_PATH", None)
+        if path_flag is None:
+            raise OSError("O_PATH is unavailable")
+        self.budget.check()
+        anchor_fd: int | None = None
+        try:
+            os.mkdir(name, mode, dir_fd=dir_fd)
+            flags = path_flag | getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            anchor_fd = os.open(name, flags, dir_fd=dir_fd)
+            os.chmod(f"/proc/self/fd/{anchor_fd}", mode)
+            self.budget.check()
+        except Exception:
+            if anchor_fd is not None:
+                try:
+                    os.close(anchor_fd)
+                except OSError:
+                    pass
+            raise
+        return anchor_fd
+
     def fchmod(self, fd: int, mode: int) -> None:
         self._call(os.fchmod, fd, mode)
 

@@ -29,6 +29,100 @@ def test_expired_budget_starts_no_boundary(tmp_path, monkeypatch):
     assert calls == []
 
 
+def test_mkdir_private_normalizes_mode_under_restrictive_umask(tmp_path):
+    target = tmp_path / "private"
+    io = deadline_io.DeadlineIO(deadline_io.DeadlineBudget(None, lambda: 0.0))
+    previous_umask = os.umask(0o777)
+    anchor_fd = None
+    try:
+        anchor_fd = io.mkdir_private(os.fspath(target), 0o700)
+    finally:
+        os.umask(previous_umask)
+    try:
+        value = os.stat(target, follow_symlinks=False)
+        anchored = os.fstat(anchor_fd)
+        assert value.st_mode & 0o777 == 0o700
+        assert (anchored.st_dev, anchored.st_ino) == (value.st_dev, value.st_ino)
+    finally:
+        os.close(anchor_fd)
+
+
+def test_mkdir_private_finishes_anchored_mode_before_reporting_expiry(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "private"
+    now = [0.0]
+    boundaries = []
+    anchors = []
+    original_mkdir = deadline_io.os.mkdir
+    original_open = deadline_io.os.open
+    original_chmod = deadline_io.os.chmod
+    original_close = deadline_io.os.close
+
+    def mkdir_then_expire(*args, **kwargs):
+        result = original_mkdir(*args, **kwargs)
+        boundaries.append("mkdir")
+        now[0] = 1.0
+        return result
+
+    def capture_anchor(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        boundaries.append("anchor")
+        anchors.append(fd)
+        return fd
+
+    def capture_chmod(*args, **kwargs):
+        boundaries.append("chmod")
+        return original_chmod(*args, **kwargs)
+
+    def capture_close(fd):
+        boundaries.append("close")
+        return original_close(fd)
+
+    monkeypatch.setattr(deadline_io.os, "mkdir", mkdir_then_expire)
+    monkeypatch.setattr(deadline_io.os, "open", capture_anchor)
+    monkeypatch.setattr(deadline_io.os, "chmod", capture_chmod)
+    monkeypatch.setattr(deadline_io.os, "close", capture_close)
+    io = deadline_io.DeadlineIO(deadline_io.DeadlineBudget(0.5, lambda: now[0]))
+
+    with pytest.raises(deadline_io.OperationDeadlineExceeded):
+        io.mkdir_private(os.fspath(target), 0o700)
+
+    assert target.stat().st_mode & 0o777 == 0o700
+    assert boundaries == ["mkdir", "anchor", "chmod", "close"]
+    assert len(anchors) == 1
+    with pytest.raises(OSError):
+        os.fstat(anchors[0])
+
+
+def test_mkdir_private_closes_anchor_when_mode_finalization_fails(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "private"
+    anchors = []
+    original_open = deadline_io.os.open
+
+    def capture_anchor(*args, **kwargs):
+        fd = original_open(*args, **kwargs)
+        anchors.append(fd)
+        return fd
+
+    monkeypatch.setattr(deadline_io.os, "open", capture_anchor)
+    monkeypatch.setattr(
+        deadline_io.os,
+        "chmod",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("chmod failed")),
+    )
+    io = deadline_io.DeadlineIO(deadline_io.DeadlineBudget(None, lambda: 0.0))
+
+    with pytest.raises(OSError, match="chmod failed"):
+        io.mkdir_private(os.fspath(target), 0o700)
+
+    assert len(anchors) == 1
+    with pytest.raises(OSError):
+        os.fstat(anchors[0])
+
+
 def test_open_fd_closes_handle_when_deadline_crosses_after_open(tmp_path, monkeypatch):
     target = tmp_path / "state.json"
     target.write_bytes(b"{}\n")

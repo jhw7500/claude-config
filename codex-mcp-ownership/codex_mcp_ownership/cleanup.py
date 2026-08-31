@@ -14,6 +14,7 @@ from typing import Callable, Protocol
 
 from . import classify
 from .clock import Clock
+from .deadline_io import DeadlineBudget, DeadlineIO
 from .model import (
     AuditSnapshot,
     Classification,
@@ -98,15 +99,6 @@ def _deadline_check(
 ) -> None:
     if deadline is not None and monotonic() >= deadline:
         raise CleanupDeadlineExceeded("cleanup deadline exhausted")
-
-
-def _remaining_timeout(
-    deadline: float | None,
-    monotonic: Callable[[], float],
-) -> float | None:
-    if deadline is None:
-        return None
-    return max(0.0, deadline - monotonic())
 
 
 class PidfdSignalBackend:
@@ -273,30 +265,22 @@ def capture_authorized_audit(
 ) -> AuthorizedAudit:
     if not isinstance(expected_root_binding, RootBinding):
         raise TypeError("initial expected root binding is required")
+    io = DeadlineIO(DeadlineBudget(deadline, monotonic))
     _deadline_check(deadline, monotonic)
-    with store.locked(
+    with store._locked_with_io(
+        io=io,
         expected_root_token=expected_root_binding.root_token,
-        remaining_timeout=_remaining_timeout(deadline, monotonic),
     ):
-        store.validate_root_binding(expected_root_binding)
-        store._recover_before_write_locked(deadline, monotonic)
-        revision = store.ledger_revision()
-        leases = store.load_sessions(deadline=deadline, monotonic=monotonic)
-        processes = store.load_raw_processes(
-            deadline=deadline,
-            monotonic=monotonic,
+        store._validate_root_binding_with_io(expected_root_binding, io=io)
+        store._recover_before_write_locked(io=io)
+        revision = store._ledger_revision_locked(io=io)
+        leases = store._load_sessions_with_io(io=io)
+        processes = store._load_raw_processes_with_io(io=io)
+        term_intents = store._load_signal_intents_with_io("term", io=io)
+        force_intents = store._load_signal_intents_with_io("force", io=io)
+        overlaid = tuple(
+            store._overlay_signal_intent(item, io=io) for item in processes
         )
-        term_intents = store.load_signal_intents(
-            "term",
-            deadline=deadline,
-            monotonic=monotonic,
-        )
-        force_intents = store.load_signal_intents(
-            "force",
-            deadline=deadline,
-            monotonic=monotonic,
-        )
-        overlaid = tuple(store._overlay_signal_intent(item) for item in processes)
     _deadline_check(deadline, monotonic)
     snapshot = classify.build_audit_from_records(
         overlaid,
@@ -307,31 +291,17 @@ def capture_authorized_audit(
         monotonic=monotonic,
     )
     _deadline_check(deadline, monotonic)
-    with store.locked(
+    with store._locked_with_io(
+        io=io,
         expected_root_token=expected_root_binding.root_token,
-        remaining_timeout=_remaining_timeout(deadline, monotonic),
     ):
-        store.validate_root_binding(expected_root_binding)
+        store._validate_root_binding_with_io(expected_root_binding, io=io)
         if (
-            store.ledger_revision() != revision
-            or store.load_sessions(deadline=deadline, monotonic=monotonic) != leases
-            or store.load_raw_processes(
-                deadline=deadline,
-                monotonic=monotonic,
-            )
-            != processes
-            or store.load_signal_intents(
-                "term",
-                deadline=deadline,
-                monotonic=monotonic,
-            )
-            != term_intents
-            or store.load_signal_intents(
-                "force",
-                deadline=deadline,
-                monotonic=monotonic,
-            )
-            != force_intents
+            store._ledger_revision_locked(io=io) != revision
+            or store._load_sessions_with_io(io=io) != leases
+            or store._load_raw_processes_with_io(io=io) != processes
+            or store._load_signal_intents_with_io("term", io=io) != term_intents
+            or store._load_signal_intents_with_io("force", io=io) != force_intents
         ):
             raise UnsafeStatePath("authorized audit changed during capture")
     return AuthorizedAudit(
@@ -585,26 +555,23 @@ def _capture_final_audit(
     deadline: float | None,
     monotonic: Callable[[], float],
 ) -> AuditSnapshot:
+    io = DeadlineIO(DeadlineBudget(deadline, monotonic))
     _deadline_check(deadline, monotonic)
-    with store.locked(
+    with store._locked_with_io(
+        io=io,
         expected_root_token=authority.root_token,
-        remaining_timeout=_remaining_timeout(deadline, monotonic),
     ):
-        store.validate_root_binding(authority.root_binding)
-        store._recover_before_write_locked(deadline, monotonic)
-        if store.ledger_revision() != expected_revision:
+        store._validate_root_binding_with_io(authority.root_binding, io=io)
+        store._recover_before_write_locked(io=io)
+        if store._ledger_revision_locked(io=io) != expected_revision:
             raise UnsafeStatePath("cleanup lineage revision changed")
-        if (
-            store.sessions_digest(deadline=deadline, monotonic=monotonic)
-            != authority.sessions_digest
-        ):
+        if store._sessions_digest_with_io(io=io) != authority.sessions_digest:
             raise UnsafeStatePath("cleanup session set changed")
-        leases = store.load_sessions(deadline=deadline, monotonic=monotonic)
-        raw_processes = store.load_raw_processes(
-            deadline=deadline,
-            monotonic=monotonic,
+        leases = store._load_sessions_with_io(io=io)
+        raw_processes = store._load_raw_processes_with_io(io=io)
+        processes = tuple(
+            store._overlay_signal_intent(item, io=io) for item in raw_processes
         )
-        processes = tuple(store._overlay_signal_intent(item) for item in raw_processes)
     _deadline_check(deadline, monotonic)
     return classify.build_audit_from_records(
         processes,
@@ -653,26 +620,22 @@ def _verify_authorized_audit(
     deadline: float | None,
     monotonic: Callable[[], float],
 ) -> None:
+    io = DeadlineIO(DeadlineBudget(deadline, monotonic))
     _deadline_check(deadline, monotonic)
-    with store.locked(
+    with store._locked_with_io(
+        io=io,
         expected_root_token=authority.root_token,
-        remaining_timeout=_remaining_timeout(deadline, monotonic),
     ):
-        store.validate_root_binding(authority.root_binding)
-        store._recover_before_write_locked(deadline, monotonic)
+        store._validate_root_binding_with_io(authority.root_binding, io=io)
+        store._recover_before_write_locked(io=io)
         if (
-            store.ledger_revision() != authority.revision
-            or store.sessions_digest(deadline=deadline, monotonic=monotonic)
-            != authority.sessions_digest
-            or store.load_sessions(deadline=deadline, monotonic=monotonic)
-            != authority.leases
-            or store.load_raw_processes(deadline=deadline, monotonic=monotonic)
-            != authority.processes
-            or store.load_signal_intents("term", deadline=deadline, monotonic=monotonic)
+            store._ledger_revision_locked(io=io) != authority.revision
+            or store._sessions_digest_with_io(io=io) != authority.sessions_digest
+            or store._load_sessions_with_io(io=io) != authority.leases
+            or store._load_raw_processes_with_io(io=io) != authority.processes
+            or store._load_signal_intents_with_io("term", io=io)
             != authority.term_intents
-            or store.load_signal_intents(
-                "force", deadline=deadline, monotonic=monotonic
-            )
+            or store._load_signal_intents_with_io("force", io=io)
             != authority.force_intents
         ):
             raise UnsafeStatePath("cleanup authority changed after audit")
