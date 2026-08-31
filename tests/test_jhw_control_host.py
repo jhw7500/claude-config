@@ -3826,7 +3826,8 @@ def test_fresh_isolated_process_covers_provider_preflight_and_task(
 
 def test_global_task_guidance_uses_only_installed_host_launcher() -> None:
     guidance = (REPO / "claude-md" / "global-guidance.md").read_text(encoding="utf-8")
-    task_rule = next(line for line in guidance.splitlines() if line.startswith("9. **Task 등록 권유"))
+    start = guidance.index("9. **Task 등록 권유")
+    task_rule = guidance[start : guidance.index("\n---", start)]
 
     assert '"$HOME/.local/bin/jhw-control-host" preflight' in task_rule
     assert '"$HOME/.local/bin/jhw-control-host" task start' in task_rule
@@ -3843,6 +3844,19 @@ def test_global_task_guidance_uses_only_installed_host_launcher() -> None:
     assert "control.env" not in task_rule
     assert "source" not in task_rule
     assert "credential" not in task_rule.lower()
+    assert "registered" in task_rule
+    assert "unregistered" in task_rule
+    assert "unknown" in task_rule
+    assert "backlog" in task_rule
+    assert "GitHub Issue만" in task_rule
+    assert "Task/Claim" in task_rule
+    assert "기존 GitHub Issue·승인된 계획·Handoff" in task_rule
+    assert "아키텍처 작업" in task_rule
+    assert "GitHub Issue 생성, Project/Repository 등록, Formal 또는 Temporary Task 시작은 각각 별도의 명시적 사용자 승인" in task_rule
+    assert task_rule.index("이미 결정했거나 제외 작업") < task_rule.index("backlog")
+    assert task_rule.index("backlog") < task_rule.index("즉시 작업의 unknown")
+    assert task_rule.index("즉시 작업의 unknown") < task_rule.index("registered(등록) 저장소")
+    assert task_rule.index("registered(등록) 저장소") < task_rule.index("unregistered(미등록) 저장소")
 
 
 def _readme_inline_code_spans(markdown: str) -> list[str]:

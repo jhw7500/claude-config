@@ -31,6 +31,8 @@ source ~/.bashrc
   - **항상**: `timestamp`(프롬프트/완료) · `stop-text-required`(조기종료 방지) · `general-continuation` · `bg-task-progress`(Pre/Post/SubagentStop, `Agent|Bash`) · `post-info-tool-continuation`
   - **notion 환경**: `notion-continuous-exec` · `post-action-tool-report`
   - `carl-hook`은 파일만 동기화하고 자동 배선하지 않음(APEX/CARL 사용 시 수동 배선)
+- **Task nudge (Claude/Codex)**: `task_nudge.py`와 Claude/Codex adapter는 심볼릭 링크가 아닌 owner-only 중립 사본으로 설치된다. source update 뒤에는 `./install.sh`를 다시 실행한다. Claude `settings.json`과 Codex `~/.codex/hooks.json`은 기존 항목을 보존하는 additive merge이며, 활성 전역 AGENTS의 `claude-config:task-nudge:START/END` marker 밖 내용도 보존한다.
+  - 설치기는 portfolio 조회나 자격증명 접근을 실행하지 않는다. 새 설치 또는 파일 hash가 바뀐 뒤에는 Codex에서 `/hooks`를 열어 변경 hash를 직접 검토한 뒤 trust한다; installer는 trust를 자동 승인하지 않는다.
 - `context-bar`(statusLine 교체)는 **미포함** (현재 OMC HUD와 상호배타라 별도 결정 필요)
 
 ## 토글 메커니즘 — 2종류 (대체 불가, 병행)
