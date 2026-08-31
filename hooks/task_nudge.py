@@ -289,7 +289,15 @@ def _bounded_launcher_run(argv: list[str]) -> tuple[int, bytes, bytes] | None:
                     selector.unregister(stream)
                     continue
                 captured.extend(chunk)
-        returncode = process.wait()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _terminate_and_reap(process)
+            return None
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            _terminate_and_reap(process)
+            return None
         stdout = bytes(streams[process.stdout])
         stderr = bytes(streams[process.stderr])
         return returncode, stdout, stderr

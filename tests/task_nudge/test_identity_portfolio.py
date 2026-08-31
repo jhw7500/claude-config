@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -94,6 +96,16 @@ def test_portfolio_rejects_duplicate_json_keys(core):
     assert result.reason == "PORTFOLIO_UNAVAILABLE"
 
 
+@pytest.mark.parametrize("raw", [b"[]", b"null", b"true"])
+def test_portfolio_rejects_non_object_json_roots(core, raw):
+    result = core.parse_portfolio_output(raw, "jhw7500/claude-config")
+    assert result == core.RegistrationResult(
+        core.RegistrationStatus.UNKNOWN,
+        "jhw7500/claude-config",
+        "PORTFOLIO_UNAVAILABLE",
+    )
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -170,3 +182,29 @@ def test_query_registration_uses_exact_launcher_and_rejects_injected_oversized_o
     assert calls[0][1]["stdin"] is subprocess.DEVNULL
     assert calls[0][1]["capture_output"] is True
     assert calls[0][1]["timeout"] == 15
+
+
+def test_bounded_launcher_reaps_child_that_closes_pipes_before_timeout(core, monkeypatch):
+    processes = []
+    original_popen = core.subprocess.Popen
+
+    def tracked_popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(core.subprocess, "Popen", tracked_popen)
+    monkeypatch.setattr(core, "LAUNCHER_TIMEOUT_SECONDS", 0.05)
+    started = time.monotonic()
+    result = core._bounded_launcher_run(
+        [
+            sys.executable,
+            "-c",
+            "import os, time; os.close(1); os.close(2); time.sleep(5)",
+        ]
+    )
+
+    assert result is None
+    assert time.monotonic() - started < 1
+    assert len(processes) == 1
+    assert processes[0].poll() is not None
