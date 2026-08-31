@@ -167,7 +167,7 @@ def render_nudge_message(result: RegistrationResult) -> str:
     return (
         "[TASK-NUDGE] " + identity + "\n"
         "정책 우선순서: (1) 이미 결정됨·제외 작업(조회/Q&A·단순 문서/설정·subagent)은 Task 없이 진행; "
-        "(2) backlog(unknown 포함)는 등록 상태와 무관하게 GitHub Issue만 제안; "
+        "(2) backlog(unknown 포함)는 등록 상태와 무관하게 GitHub Issue만 제안하고 Task/Claim을 선점하거나 시작하지 않음; "
         "(3) 즉시 작업의 unknown이면 등록 여부를 가정하지 말고 현재 변경을 중단하고 복구가 필요하다고 알린다; "
         "(4) 등록 저장소의 즉시 작업은 기존 Issue 또는 반복 증거면 Formal Issue Task, "
         "현재 세션에서 끝낼 제한 작업이면 Temporary Task, 조정 비용보다 작으면 Task 없음; "

@@ -38,6 +38,7 @@ def test_nudge_message_is_canonical_safe_korean_policy(core):
     assert message.startswith("[TASK-NUDGE]")
     assert "즉시 작업의 unknown이면" in message
     assert "backlog(unknown 포함)" in message
+    assert "GitHub Issue만 제안하고 Task/Claim을 선점하거나 시작하지 않음" in message
     assert "GitHub Issue 생성" in message
     assert "Project/Repository 등록" in message
     assert "Task 시작" in message
