@@ -1,5 +1,8 @@
 import json
+import os
+import shutil
 import stat
+import subprocess
 
 import pytest
 
@@ -28,6 +31,24 @@ def _pretool_entries(path):
     return json.loads(path.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
 
 
+def _task_target_snapshot(home):
+    snapshot = {}
+    for path in _task_targets(home):
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            snapshot[path] = ("absent",)
+        else:
+            mode = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISLNK(metadata.st_mode):
+                snapshot[path] = ("symlink", mode, os.readlink(path))
+            elif stat.S_ISREG(metadata.st_mode):
+                snapshot[path] = ("regular", mode, path.read_bytes())
+            else:
+                snapshot[path] = ("other", stat.S_IFMT(metadata.st_mode), mode)
+    return snapshot
+
+
 def test_fresh_install_adds_neutral_hooks_codex_config_and_agents(home, run_install):
     result = run_install(home)
     assert result.returncode == 0, result.stderr
@@ -50,6 +71,7 @@ def test_fresh_install_adds_neutral_hooks_codex_config_and_agents(home, run_inst
     agents = (home / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
     assert agents.count(START) == agents.count(END) == 1
     assert "/hooks" in result.stdout
+    assert "직접 검토" in result.stdout and "신뢰" in result.stdout
 
 
 def test_install_preserves_unrelated_codex_and_agents_content(home, run_install):
@@ -113,24 +135,23 @@ def test_nonempty_override_receives_active_agents_block(home, run_install):
 
 
 @pytest.mark.parametrize(
-    ("name", "payload"),
+    ("payload",),
     [
-        ("hooks.json", '{"hooks": {}, "hooks": {}}'),
-        ("hooks.json", '{"hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "' + CODEX_COMMAND + '"}]}, {"matcher": "Edit", "hooks": [{"type": "command", "command": "' + CODEX_COMMAND + '"}]}]}}'),
+        ("{malformed-json",),
+        ('{"hooks": {}, "hooks": {}}',),
+        ('{"hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [{"type": "command", "command": "' + CODEX_COMMAND + '"}]}, {"matcher": "Edit", "hooks": [{"type": "command", "command": "' + CODEX_COMMAND + '"}]}]}}',),
     ],
-    ids=["duplicate-json", "contradictory-managed-hook"],
+    ids=["malformed-json", "duplicate-json", "contradictory-managed-hook"],
 )
-def test_invalid_codex_input_leaves_task_nudge_targets_unchanged(home, run_install, name, payload):
-    codex = home / ".codex"
-    codex.mkdir()
-    target = codex / name
+def test_corrupt_codex_config_leaves_all_task_nudge_targets_unchanged(home, run_install, payload):
+    first = run_install(home)
+    assert first.returncode == 0, first.stderr
+    target = home / ".codex" / "hooks.json"
     target.write_text(payload, encoding="utf-8")
-    before = {target: target.read_bytes()}
+    before = _task_target_snapshot(home)
     result = run_install(home)
     assert result.returncode != 0
-    assert {target: target.read_bytes()} == before
-    assert not (home / ".local" / "share" / "claude-config" / "hooks").exists()
-    assert not (home / ".claude" / "hooks" / "task-nudge.sh").exists()
+    assert _task_target_snapshot(home) == before
 
 
 def test_malformed_agents_marker_leaves_task_nudge_targets_unchanged(home, run_install):
@@ -152,22 +173,43 @@ def test_real_task_nudge_change_creates_exactly_one_backup(home, run_install):
     target.write_text("stale task nudge\n", encoding="utf-8")
     second = run_install(home)
     assert second.returncode == 0, second.stderr
-    backups = list(target.parent.glob("task_nudge.py.bak.*"))
+    backups = list(target.parent.glob("task_nudge.py.bak.task-nudge.*"))
     assert len(backups) == 1
     assert backups[0].read_text(encoding="utf-8") == "stale task nudge\n"
     third = run_install(home)
     assert third.returncode == 0, third.stderr
-    assert list(target.parent.glob("task_nudge.py.bak.*")) == backups
+    assert list(target.parent.glob("task_nudge.py.bak.task-nudge.*")) == backups
 
 
-def test_install_never_runs_provider_canary(home, run_install, tmp_path):
-    launcher = home / ".local" / "bin" / "jhw-control-host"
-    launcher.parent.mkdir(parents=True)
+def test_install_never_runs_installed_provider_canary(home, tmp_path):
+    copied_repo = tmp_path / "claude-config-copy"
+    shutil.copytree(
+        REPO,
+        copied_repo,
+        ignore=shutil.ignore_patterns(".git", ".superpowers", ".pytest_cache", "__pycache__"),
+    )
     canary = tmp_path / "provider-canary.log"
-    launcher.write_text("#!/bin/sh\nprintf provider >> \"$CANARY\"\n", encoding="utf-8")
-    launcher.chmod(0o700)
-    result = run_install(home)
+    source_launcher = copied_repo / "scripts" / "jhw-control-host.py"
+    source_launcher.write_text(
+        "#!/bin/sh\nprintf provider-canary >> \"$TASK_NUDGE_PROVIDER_CANARY\"\n",
+        encoding="utf-8",
+    )
+    source_launcher.chmod(0o700)
+    env = dict(
+        os.environ,
+        HOME=str(home),
+        TASK_NUDGE_PROVIDER_CANARY=str(canary),
+    )
+    result = subprocess.run(
+        ["/bin/bash", "-c", 'umask 022; exec /bin/bash "$1"', "install-canary", str(copied_repo / "install.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
     assert result.returncode == 0, result.stderr
+    installed_launcher = home / ".local" / "lib" / "jhw-control-host" / "jhw-control-host.py"
+    assert installed_launcher.read_bytes() == source_launcher.read_bytes()
     assert not canary.exists()
 
 
