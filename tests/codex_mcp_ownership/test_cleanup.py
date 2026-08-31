@@ -3036,6 +3036,121 @@ def test_term_post_delivery_deadline_accounts_later_process_without_boundary(
     assert post_send_checks == 1
 
 
+def test_term_final_intent_status_deadline_returns_complete_report_without_boundary(
+    orphan_context, monkeypatch
+) -> None:
+    store, tree, clock, _snapshot, process, lease = orphan_context
+    snapshot = _add_second_orphan_process(store, tree, clock, process, lease)
+    actions = cleanup.plan_cleanup(snapshot)
+    assert len(actions) == 2
+    final_persistence_started = False
+    persistence_checks = 0
+    original_transition = store.transition
+    signaler = FakeSignalBackend()
+
+    def expire_in_final_intent_status(*args, **kwargs):
+        nonlocal final_persistence_started
+        updated = args[3]
+        if (
+            isinstance(updated, model.SignalIntent)
+            and updated.status != "pending"
+            and updated.delivered_keys
+        ):
+            assert [call[0] for call in signaler.calls].count("send") == 1
+            final_persistence_started = True
+        return original_transition(*args, **kwargs)
+
+    def monotonic():
+        nonlocal persistence_checks
+        if not final_persistence_started:
+            return 0.0
+        persistence_checks += 1
+        if persistence_checks > 1:
+            raise AssertionError("boundary started after final persistence deadline")
+        return 1.0
+
+    monkeypatch.setattr(store, "transition", expire_in_final_intent_status)
+
+    report = cleanup.execute_cleanup(
+        actions,
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+        deadline=0.5,
+        monotonic=monotonic,
+    )
+
+    assert report.outcomes == (
+        model.CleanupOutcome(actions[0], "survived", "sigterm_survived"),
+        model.CleanupOutcome(actions[1], "skipped", "cleanup_deadline_exhausted"),
+    )
+    assert report.attempted == 1
+    assert report.partial_force is False
+    assert report.authority_lost is False
+    assert report.after_state_available is False
+    assert [call[0] for call in signaler.calls] == ["open", "send", "close"]
+    assert persistence_checks == 1
+
+
+def test_force_final_intent_status_deadline_preserves_partial_force_without_boundary(
+    stubborn_context, monkeypatch
+) -> None:
+    store, tree, clock, snapshot, _process, _lease, classification = stubborn_context
+    action = cleanup.plan_cleanup(snapshot, force=True)[0]
+    token = cleanup.issue_force_token(classification, clock)
+    final_persistence_started = False
+    persistence_checks = 0
+    original_transition = store.transition
+    signaler = FakeSignalBackend()
+
+    def expire_in_final_intent_status(*args, **kwargs):
+        nonlocal final_persistence_started
+        updated = args[3]
+        if (
+            isinstance(updated, model.SignalIntent)
+            and updated.status != "pending"
+            and updated.delivered_keys
+        ):
+            assert [call[0] for call in signaler.calls].count("send") == 1
+            final_persistence_started = True
+        return original_transition(*args, **kwargs)
+
+    def monotonic():
+        nonlocal persistence_checks
+        if not final_persistence_started:
+            return 0.0
+        persistence_checks += 1
+        if persistence_checks > 1:
+            raise AssertionError("boundary started after final persistence deadline")
+        return 1.0
+
+    monkeypatch.setattr(store, "transition", expire_in_final_intent_status)
+
+    report = cleanup.execute_cleanup(
+        (action,),
+        store,
+        tree,
+        signaler,
+        clock,
+        apply=True,
+        confirm_token=token,
+        deadline=0.5,
+        monotonic=monotonic,
+    )
+
+    assert report.outcomes == (
+        model.CleanupOutcome(action, "survived", "sigkill_survived"),
+    )
+    assert report.attempted == 1
+    assert report.partial_force is True
+    assert report.authority_lost is False
+    assert report.after_state_available is False
+    assert [call[0] for call in signaler.calls] == ["open", "send", "close"]
+    assert persistence_checks == 1
+
+
 def test_term_immediate_post_transition_deadline_accounts_same_process_remainder(
     orphan_context, monkeypatch
 ) -> None:

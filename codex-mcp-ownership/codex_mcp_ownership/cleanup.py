@@ -385,7 +385,9 @@ def _persist_intent_status(
             deadline=deadline,
             monotonic=monotonic,
         )
-    except (FileNotFoundError, TimeoutError, UnsafeStatePath, CleanupDeadlineExceeded):
+    except CleanupDeadlineExceeded:
+        raise
+    except (FileNotFoundError, TimeoutError, UnsafeStatePath):
         return None
 
 
@@ -1286,22 +1288,38 @@ def _execute_cleanup_protocol(
                     )
                 )
                 final_intent = replace(intent, status=status)
-        next_revision = _persist_intent_status(
-            store,
-            authority,
-            revision,
-            intent,
-            final_intent,
-            _cleanup_event(
-                classification,
-                before.generated.wall_iso,
-                event_name,
-                event_state,
-                classification.reason_codes + final_reasons,
-            ),
-            deadline,
-            monotonic,
-        )
+        try:
+            next_revision = _persist_intent_status(
+                store,
+                authority,
+                revision,
+                intent,
+                final_intent,
+                _cleanup_event(
+                    classification,
+                    before.generated.wall_iso,
+                    event_name,
+                    event_state,
+                    classification.reason_codes + final_reasons,
+                ),
+                deadline,
+                monotonic,
+            )
+        except CleanupDeadlineExceeded:
+            if not irreversible_effect_delivered:
+                raise
+            if forced:
+                partial_force = True
+            _complete_deadline_outcomes(actions, outcomes, forced=has_force)
+            return _unavailable_report(
+                before,
+                before_count,
+                before_rss_kib,
+                outcomes,
+                attempted,
+                authority_lost=authority_lost,
+                partial_force=partial_force,
+            )
         if next_revision is None:
             authority_lost = True
             if forced and delivered_keys:

@@ -1008,7 +1008,11 @@ class StateStore:
             except FileNotFoundError:
                 target_fd = None
             if target_fd is not None:
-                io.close_fd(target_fd)
+                try:
+                    io.close_fd(target_fd)
+                except Exception:
+                    close_finalizer_failed = True
+                    raise
             io.replace(
                 temporary,
                 name,
@@ -1031,8 +1035,8 @@ class StateStore:
                 fd = None
                 try:
                     io.close_fd(closing_fd)
-                except OSError:
-                    pass
+                except Exception:
+                    close_finalizer_failed = True
             if (
                 not close_finalizer_failed
                 and not io.budget.expired()

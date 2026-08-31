@@ -635,6 +635,133 @@ def test_atomic_json_close_failure_starts_no_stat_or_unlink_recovery(
     assert temporary.exists()
 
 
+def test_atomic_json_target_close_failure_starts_no_stat_or_unlink_recovery(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    lease = sample_lease()
+    store.save_session(lease)
+    target = next((store.root / "sessions").iterdir())
+    before = target.read_bytes()
+    token = "f" * 32
+    temporary = store.root / "sessions" / f".tmp-{token}"
+    temporary_opened = False
+    target_fds = []
+    close_calls = []
+    recovery_boundaries = []
+    original_open = deadline_io.DeadlineIO.open_fd
+    original_close = deadline_io.DeadlineIO.close_fd
+    original_stat = deadline_io.os.stat
+    original_unlink = deadline_io.os.unlink
+    close_error = OSError("atomic target close failed")
+
+    def capture_target_fd(io, name, *args, **kwargs):
+        nonlocal temporary_opened
+        fd = original_open(io, name, *args, **kwargs)
+        if name == f".tmp-{token}":
+            temporary_opened = True
+        elif temporary_opened and name == target.name:
+            target_fds.append(fd)
+        return fd
+
+    def fail_target_close(io, fd):
+        if fd in target_fds:
+            close_calls.append(fd)
+            original_close(io, fd)
+            raise close_error
+        return original_close(io, fd)
+
+    def record_temp_stat(name, *args, **kwargs):
+        if os.fspath(name) == f".tmp-{token}":
+            recovery_boundaries.append("stat")
+        return original_stat(name, *args, **kwargs)
+
+    def record_temp_unlink(name, *args, **kwargs):
+        if os.fspath(name) == f".tmp-{token}":
+            recovery_boundaries.append("unlink")
+        return original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(state.secrets, "token_hex", lambda size: token)
+    monkeypatch.setattr(store, "_bump_ledger_revision_locked", lambda **_kwargs: 2)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "open_fd", capture_target_fd)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "close_fd", fail_target_close)
+    monkeypatch.setattr(deadline_io.os, "stat", record_temp_stat)
+    monkeypatch.setattr(deadline_io.os, "unlink", record_temp_unlink)
+
+    with pytest.raises(OSError) as error:
+        store.save_session(lease)
+
+    assert error.value is close_error
+    assert error.value.__cause__ is None
+    assert len(target_fds) == 1
+    assert close_calls == target_fds
+    assert recovery_boundaries == []
+    assert temporary.exists()
+    assert target.read_bytes() == before
+
+
+def test_atomic_json_cleanup_close_failure_preserves_body_error_without_recovery(
+    tmp_path, monkeypatch
+):
+    store = state.StateStore(tmp_path / "state")
+    store.save_session(sample_lease())
+    token = "a" * 32
+    temporary = store.root / "sessions" / f".tmp-{token}"
+    temp_fds = []
+    close_calls = []
+    recovery_boundaries = []
+    original_open = deadline_io.DeadlineIO.open_fd
+    original_close = deadline_io.DeadlineIO.close_fd
+    original_stat = deadline_io.os.stat
+    original_unlink = deadline_io.os.unlink
+    body_error = OSError("atomic body failed")
+    close_error = OSError("atomic cleanup close failed")
+
+    def capture_temp_fd(io, name, *args, **kwargs):
+        fd = original_open(io, name, *args, **kwargs)
+        if name == f".tmp-{token}":
+            temp_fds.append(fd)
+        return fd
+
+    def fail_temp_close(io, fd):
+        if fd in temp_fds:
+            close_calls.append(fd)
+            original_close(io, fd)
+            raise close_error
+        return original_close(io, fd)
+
+    def fail_body(*_args, **_kwargs):
+        raise body_error
+
+    def record_temp_stat(name, *args, **kwargs):
+        if os.fspath(name) == f".tmp-{token}":
+            recovery_boundaries.append("stat")
+        return original_stat(name, *args, **kwargs)
+
+    def record_temp_unlink(name, *args, **kwargs):
+        if os.fspath(name) == f".tmp-{token}":
+            recovery_boundaries.append("unlink")
+        return original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(state.secrets, "token_hex", lambda size: token)
+    monkeypatch.setattr(store, "_bump_ledger_revision_locked", lambda **_kwargs: 2)
+    monkeypatch.setattr(state, "_write_all_with_io", fail_body)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "open_fd", capture_temp_fd)
+    monkeypatch.setattr(deadline_io.DeadlineIO, "close_fd", fail_temp_close)
+    monkeypatch.setattr(deadline_io.os, "stat", record_temp_stat)
+    monkeypatch.setattr(deadline_io.os, "unlink", record_temp_unlink)
+
+    with pytest.raises(OSError) as error:
+        store.save_session(sample_lease("session:second"))
+
+    assert error.value is body_error
+    assert error.value is not close_error
+    assert len(temp_fds) == 1
+    assert close_calls == temp_fds
+    assert recovery_boundaries == []
+    assert temporary.exists()
+
+
 def test_lock_contention_times_out_without_replacing_lock_inode(tmp_path):
     store = state.StateStore(tmp_path / "state")
     store.save_session(sample_lease())
