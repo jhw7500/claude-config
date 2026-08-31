@@ -17,8 +17,13 @@ _BACKLOG_SEMANTIC_VARIANTS = {
     "native-hook": "Task / Claim 을 선점하거나 시작하지 않음",
     "codex-agents": "Task / Claim 을 시작하지 않음",
 }
-_TASK_OR_CLAIM = r"(?<![A-Za-z])(?:Task|Claim)(?![A-Za-z])"
-_TASK_CLAIM_PAIR = rf"{_TASK_OR_CLAIM}\s*(?:/|와|과|및|,)\s*{_TASK_OR_CLAIM}"
+_TASK = r"(?<![A-Za-z])Task(?![A-Za-z])"
+_CLAIM = r"(?<![A-Za-z])Claim(?![A-Za-z])"
+_TASK_OR_CLAIM = rf"(?:{_TASK}|{_CLAIM})"
+_TASK_CLAIM_PAIR = (
+    rf"(?:{_TASK}\s*(?:/|와|과|및|,)\s*{_CLAIM}"
+    rf"|{_CLAIM}\s*(?:/|와|과|및|,)\s*{_TASK})"
+)
 _KOREAN_PARTICLE = r"\s*(?:을|를|은|는|이|가)?\s*"
 _NO_PRECLAIM_OR_START = (
     r"(?:"
@@ -158,6 +163,17 @@ def test_backlog_contract_accepts_task_claim_particle_and_spacing_variants(guida
     assert replacements == 1
 
     _assert_backlog_does_not_preclaim(variant)
+
+
+@pytest.mark.parametrize(
+    "same_token_pair",
+    ("Task / Task 을 시작하지 않음", "Claim / Claim 을 선점하지 않는다"),
+)
+def test_backlog_contract_rejects_same_token_pairs(same_token_pair):
+    section = f"(2) backlog는 GitHub Issue만 제안하고 {same_token_pair}."
+
+    with pytest.raises(AssertionError):
+        _assert_backlog_does_not_preclaim(section)
 
 
 @pytest.mark.parametrize("name", _GUIDANCE_SURFACE_NAMES)
