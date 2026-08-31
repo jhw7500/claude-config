@@ -11,11 +11,28 @@ _STAGE_ANCHORS = {
     "unregistered": ("(5) unregistered(미등록) 저장소", "(5) 미등록 저장소"),
 }
 _STAGE_NAMES = tuple(_STAGE_ANCHORS)
-_NO_PRECLAIM = {
-    "claude-global": ("Task/Claim", "선점하지 않는다"),
-    "native-hook": ("Task/Claim", "선점하거나 시작하지 않음"),
-    "codex-agents": ("Task/Claim", "시작하지 않음"),
+_GUIDANCE_SURFACE_NAMES = ("claude-global", "native-hook", "codex-agents")
+_BACKLOG_SEMANTIC_VARIANTS = {
+    "claude-global": "Task / Claim 을 선점하지 않는다",
+    "native-hook": "Task / Claim 을 선점하거나 시작하지 않음",
+    "codex-agents": "Task / Claim 을 시작하지 않음",
 }
+_TASK_OR_CLAIM = r"(?<![A-Za-z])(?:Task|Claim)(?![A-Za-z])"
+_TASK_CLAIM_PAIR = rf"{_TASK_OR_CLAIM}\s*(?:/|와|과|및|,)\s*{_TASK_OR_CLAIM}"
+_KOREAN_PARTICLE = r"\s*(?:을|를|은|는|이|가)?\s*"
+_NO_PRECLAIM_OR_START = (
+    r"(?:"
+    r"선점\s*(?:하(?:거나|고)?|거나|고)?\s*시작\s*하지\s*(?:않(?:음|는다|고)|말(?:아|고|라))"
+    r"|(?:선점|시작)\s*하지\s*(?:않(?:음|는다|고)|말(?:아|고|라))"
+    r"|(?:선점|시작)\s*(?:금지|불가)"
+    r")"
+)
+_BACKLOG_TASK_CLAIM_PROHIBITION = re.compile(
+    rf"{_TASK_CLAIM_PAIR}{_KOREAN_PARTICLE}{_NO_PRECLAIM_OR_START}"
+)
+_UNREGISTERED_TASK_CLAIM_ACTION = re.compile(
+    rf"{_TASK_OR_CLAIM}{_KOREAN_PARTICLE}(?:선점|시작|생성)(?!\s*하지\s*(?:않|말))"
+)
 
 
 @pytest.fixture
@@ -63,12 +80,11 @@ def _assert_unknown_stops_pending_classification(section):
     assert "Temporary Task" not in section
 
 
-def _assert_backlog_does_not_preclaim(name, section):
+def _assert_backlog_does_not_preclaim(section):
     assert "Issue만" in section
-    task_claim, prohibition = _NO_PRECLAIM[name]
-    assert task_claim in section
-    assert prohibition in section
-    assert "Task/Claim 시작" not in section
+    assert _BACKLOG_TASK_CLAIM_PROHIBITION.search(section), (
+        "missing Task/Claim no-preclaim/no-start prohibition"
+    )
 
 
 def _assert_unregistered_registration_only(section):
@@ -79,8 +95,7 @@ def _assert_unregistered_registration_only(section):
     assert "GitHub Issue" not in section
     assert "Formal Issue Task" not in section
     assert "Temporary Task" not in section
-    assert "Task/Claim" not in section
-    assert "Task 시작" not in section
+    assert _UNREGISTERED_TASK_CLAIM_ACTION.search(section) is None
 
 
 def _assert_no_task_choice(section):
@@ -94,7 +109,7 @@ def test_all_guidance_surfaces_follow_the_ordered_task_policy(guidance_surfaces)
         assert "subagent" in sections["suppressed"]
         assert "Task 없이" in sections["suppressed"]
 
-        _assert_backlog_does_not_preclaim(name, sections["backlog"])
+        _assert_backlog_does_not_preclaim(sections["backlog"])
         _assert_unknown_stops_pending_classification(sections["unknown"])
 
         registered = sections["registered"]
@@ -122,20 +137,41 @@ def test_stage_contract_rejects_a_reordered_policy(guidance_surfaces):
         _stage_sections(reordered)
 
 
-def test_unregistered_contract_rejects_issue_or_task_claim_mutation(guidance_surfaces):
-    unregistered = _stage_sections(guidance_surfaces["native-hook"])["unregistered"]
-    contradictory = unregistered + " GitHub Issue 생성과 Task/Claim 시작을 제안."
+@pytest.mark.parametrize("name", _GUIDANCE_SURFACE_NAMES)
+@pytest.mark.parametrize("task_claim_action", ("Claim을 시작", "Claim 을 선점", "Task를 생성"))
+def test_unregistered_contract_rejects_standalone_task_claim_actions(
+    guidance_surfaces, name, task_claim_action
+):
+    unregistered = _stage_sections(guidance_surfaces[name])["unregistered"]
+    contradictory = unregistered + f" {task_claim_action}."
 
     with pytest.raises(AssertionError):
         _assert_unregistered_registration_only(contradictory)
 
 
-def test_backlog_contract_rejects_removed_task_claim_prohibition(guidance_surfaces):
-    backlog = _stage_sections(guidance_surfaces["native-hook"])["backlog"]
-    contradictory = backlog.replace("Task/Claim을 선점하거나 시작하지 않음", "Task/Claim을 시작함")
+@pytest.mark.parametrize("name", _GUIDANCE_SURFACE_NAMES)
+def test_backlog_contract_accepts_task_claim_particle_and_spacing_variants(guidance_surfaces, name):
+    backlog = _stage_sections(guidance_surfaces[name])["backlog"]
+    variant, replacements = _BACKLOG_TASK_CLAIM_PROHIBITION.subn(
+        _BACKLOG_SEMANTIC_VARIANTS[name], backlog, count=1
+    )
+    assert replacements == 1
+
+    _assert_backlog_does_not_preclaim(variant)
+
+
+@pytest.mark.parametrize("name", _GUIDANCE_SURFACE_NAMES)
+def test_backlog_contract_rejects_only_task_claim_prohibition_mutation(guidance_surfaces, name):
+    backlog = _stage_sections(guidance_surfaces[name])["backlog"]
+    contradictory, replacements = _BACKLOG_TASK_CLAIM_PROHIBITION.subn(
+        "Task / Claim 을 시작함", backlog, count=1
+    )
+
+    assert replacements == 1
+    assert "Issue만" in contradictory
 
     with pytest.raises(AssertionError):
-        _assert_backlog_does_not_preclaim("native-hook", contradictory)
+        _assert_backlog_does_not_preclaim(contradictory)
 
 
 def test_all_guidance_surfaces_keep_approvals_separate_and_non_transitive(guidance_surfaces):
