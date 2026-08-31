@@ -161,6 +161,59 @@ def test_links_are_still_created(home: Path) -> None:
     assert os.access(launcher, os.X_OK)
 
 
+def test_session_handoff_commands_are_linked_without_touching_unrelated_commands(
+    home: Path,
+) -> None:
+    commands = home / ".claude" / "commands"
+    commands.mkdir(parents=True)
+    unrelated = commands / "revive.md"
+    unrelated.write_text("keep local command\n", encoding="utf-8")
+
+    result = run_install(home)
+
+    assert result.returncode == 0, result.stderr
+    for name in ("handoff.md", "resume.md"):
+        installed = commands / name
+        assert installed.is_symlink()
+        assert installed.resolve() == (REPO / "commands" / name).resolve()
+    assert unrelated.read_text(encoding="utf-8") == "keep local command\n"
+    assert not unrelated.is_symlink()
+
+
+@pytest.mark.parametrize("name", ["handoff.md", "resume.md"])
+def test_session_handoff_command_replacement_preserves_existing_file(
+    home: Path, name: str,
+) -> None:
+    commands = home / ".claude" / "commands"
+    commands.mkdir(parents=True)
+    installed = commands / name
+    installed.write_text(f"legacy {name}\n", encoding="utf-8")
+
+    result = run_install(home)
+
+    assert result.returncode == 0, result.stderr
+    assert installed.is_symlink()
+    saved = sorted(commands.glob(f"{name}.replaced.*"))
+    assert len(saved) == 1
+    assert saved[0].read_text(encoding="utf-8") == f"legacy {name}\n"
+
+
+def test_session_handoff_command_rerun_adds_no_replacement_backup(home: Path) -> None:
+    commands = home / ".claude" / "commands"
+    commands.mkdir(parents=True)
+    installed = commands / "resume.md"
+    installed.write_text("legacy resume\n", encoding="utf-8")
+
+    first = run_install(home)
+    assert first.returncode == 0, first.stderr
+    saved_after_first = sorted(commands.glob("resume.md.replaced.*"))
+    second = run_install(home)
+
+    assert second.returncode == 0, second.stderr
+    assert sorted(commands.glob("resume.md.replaced.*")) == saved_after_first
+    assert len(saved_after_first) == 1
+
+
 def test_launcher_install_never_executes_leading_path_canaries(home: Path, tmp_path: Path) -> None:
     """Restoring ambient command lookup would execute one of these fakes."""
     poison = tmp_path / "poison-bin"

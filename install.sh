@@ -1,5 +1,5 @@
 #!/bin/bash
-# 다른 호스트에서 실행: 개인 Claude Code 자산 설치 (스킬 + 셸 함수 + 스크립트 + 지침)
+# 다른 호스트에서 실행: 개인 Claude Code 자산 설치 (스킬 + 커맨드 + 셸 함수 + 스크립트 + 지침)
 # Installer-owned command lookup: never inherit the caller's PATH while
 # selecting tools that install the credential-bearing launcher.
 PATH=/usr/bin:/bin
@@ -108,6 +108,19 @@ if [ -f "$REPO_DIR/hooks/README.md" ]; then
   link_safely "$REPO_DIR/hooks/README.md" ~/.claude/hooks/README.md || true
 fi
 echo "[install] 훅 링크: ~/.claude/hooks/ (${HOOK_LINKS}개)"
+
+# 3.75) session-handoff 커맨드 링크 — 다른 로컬 커맨드는 건드리지 않는다.
+private_dir ~/.claude/commands
+COMMAND_LINKS=0
+for f in handoff.md resume.md; do
+  if link_safely "$REPO_DIR/commands/$f" ~/.claude/commands/"$f"; then
+    COMMAND_LINKS=$((COMMAND_LINKS + 1))
+  else
+    echo "[install] 오류: session-handoff 커맨드 $f 링크 실패" >&2
+    exit 1
+  fi
+done
+echo "[install] session-handoff 커맨드 링크: ~/.claude/commands/ (${COMMAND_LINKS}개)"
 
 # 4) 전역 지침 머지 (env-aware) — 항상 global-guidance, 환경에 있는 것만 추가 import.
 #    OMC 블록(inline/file-split 무관)은 절대 건드리지 않고 claude-config:START/END 블록만 관리.

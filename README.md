@@ -1,6 +1,6 @@
 # claude-config
 
-개인 Claude Code 설정 동기화 (스킬 + 셸 함수 + 스크립트 + 글로벌 지침). 여러 호스트에서 공유.
+개인 Claude Code 설정 동기화 (스킬 + 커맨드 + 셸 함수 + 스크립트 + 글로벌 지침). 여러 호스트에서 공유.
 
 ## 포함
 
@@ -12,6 +12,7 @@
 | `shell/plug.sh` | `plug on\|off <key>` 셸 함수 (bkit/docs/pw/pyright/compound) |
 | `scripts/` | 개인 hook/toggle과 **jhw-control-host.py** secure launcher: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, apex-toggle.sh, setup-mcp.sh |
 | `hooks/` | 커스텀 훅 6개: carl·notion-continuous·general-continuation·post-info·post-action·bg-task. install.sh가 env-aware **자동 배선** |
+| `commands/` | session-handoff 사용자 커맨드: `/handoff [세션명]`, `/resume [세션명]` |
 | `manifest/` | `mcp.json` — MCP 서버 정의(공개 6 + 사내 4). `setup-mcp.sh`가 사용 |
 | `claude-md/` | 글로벌 지침: **global-guidance.md**(공통·항상) + CLAUDE-notion.md(notion 환경) + RTK.md(rtk 환경) |
 
@@ -23,7 +24,7 @@ cd claude-config && ./install.sh
 source ~/.bashrc
 ```
 
-- `skills/`·`hooks/`·일반 `scripts/`는 **심볼릭 링크**라 `git pull`로 갱신됩니다. host-control
+- `skills/`·`hooks/`·`commands/`·일반 `scripts/`는 **심볼릭 링크**라 `git pull`로 갱신됩니다. `commands/`는 `handoff.md`·`resume.md`만 배포하며 기존 동명 파일은 교체 전에 백업합니다. host-control
   launcher는 mode `0500` 보안 사본이므로 launcher 갱신에는 `./install.sh` 재실행이 필요합니다.
 - **CLAUDE.md 전역지침 (env-aware)**: `~/.claude/CLAUDE.md`의 `claude-config:START/END` 블록만 관리 — 항상 `@global-guidance.md`, **notion MCP 있으면** `@CLAUDE-notion.md`, **`rtk` 있으면** `@RTK.md`를 자동 추가. **OMC 블록은 미변경**(inline/file-split 무관), 실행 전 `.bak` 백업
 - **훅 자동 배선**: `settings.json`에 멱등 추가 — `.bak` 백업, `statusLine`·기존 훅 보존
