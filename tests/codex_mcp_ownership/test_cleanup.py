@@ -2896,8 +2896,9 @@ def test_force_second_pidfd_deadline_returns_complete_partial_report(
         assert [call[0] for call in signaler.calls].count("close") == 1
 
 
+@pytest.mark.parametrize("expiry_point", ["before_second_open", "after_second_open"])
 def test_term_second_pidfd_deadline_returns_unavailable_nonpartial_report(
-    orphan_context,
+    orphan_context, expiry_point, monkeypatch
 ) -> None:
     store, tree, clock, _snapshot, process, _lease = orphan_context
     write_proc_entry(
@@ -2915,6 +2916,16 @@ def test_term_second_pidfd_deadline_returns_unavailable_nonpartial_report(
     actions = cleanup.plan_cleanup(snapshot)
     assert len(actions) == 2
     now = [0.0]
+    first_sent = [False]
+    original_boottime = clock.boottime
+
+    def expire_after_first_delivery_time():
+        result = original_boottime()
+        if expiry_point == "before_second_open" and first_sent[0]:
+            now[0] = 1.0
+        return result
+
+    monkeypatch.setattr(clock, "boottime", expire_after_first_delivery_time)
 
     class ExpiringBackend(FakeSignalBackend):
         def __init__(self):
@@ -2924,9 +2935,13 @@ def test_term_second_pidfd_deadline_returns_unavailable_nonpartial_report(
         def open(self, identity):
             self.opens += 1
             pidfd = super().open(identity)
-            if self.opens == 2:
+            if self.opens == 2 and expiry_point == "after_second_open":
                 now[0] = 1.0
             return pidfd
+
+        def send(self, pidfd, signum):
+            super().send(pidfd, signum)
+            first_sent[0] = True
 
     signaler = ExpiringBackend()
     report = cleanup.execute_cleanup(
@@ -2946,7 +2961,10 @@ def test_term_second_pidfd_deadline_returns_unavailable_nonpartial_report(
     assert len(report.outcomes) == len(actions)
     assert report.outcomes[-1].reason == "cleanup_deadline_exhausted"
     assert [call[0] for call in signaler.calls].count("send") == 1
-    assert [call[0] for call in signaler.calls].count("close") == 2
+    if expiry_point == "after_second_open":
+        assert [call[0] for call in signaler.calls].count("close") == 2
+    else:
+        assert [call[0] for call in signaler.calls].count("close") == 1
 
 
 def test_final_lexical_binding_check_prevents_signal_at_effect_seam(

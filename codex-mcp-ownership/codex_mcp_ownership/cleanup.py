@@ -817,14 +817,19 @@ def _execute_cleanup_protocol(
             try:
                 _deadline_check(deadline, monotonic)
             except CleanupDeadlineExceeded:
-                if forced and delivered_keys:
-                    partial_force = True
+                if delivered_keys:
                     deadline_expired = True
+                    if forced:
+                        partial_force = True
                     for remaining in process_actions[index:]:
                         outcome = CleanupOutcome(
                             remaining,
                             "skipped",
-                            "partial_force_deadline_exhausted",
+                            (
+                                "partial_force_deadline_exhausted"
+                                if forced
+                                else "cleanup_deadline_exhausted"
+                            ),
                         )
                         outcomes.append(outcome)
                         group_outcomes.append(outcome)
