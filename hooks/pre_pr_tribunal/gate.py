@@ -11,6 +11,7 @@ from .git_state import (
     GitStateError,
     _command_output,
     _physical_root,
+    _validate_base,
     _validated_cwd,
     _worktree_is_dirty,
     capture_snapshot,
@@ -53,13 +54,12 @@ _UNSAFE_VERDICT_CODES = {
     "VERDICT_NOT_IGNORED",
 }
 _UNSUPPORTED_GIT_CODES = {
-    "BASE_INVALID",
     "DETACHED_HEAD",
     "NOT_GIT_REPOSITORY",
     "PATH_INVALID",
     "REPOSITORY_UNSUPPORTED",
 }
-_STALE_GIT_CODES = {"EMPTY_DIFF", "SNAPSHOT_CHANGED"}
+_STALE_GIT_CODES = {"BASE_INVALID", "EMPTY_DIFF", "SNAPSHOT_CHANGED"}
 
 
 def _decision(block: bool, code: GateCode) -> GateDecision:
@@ -104,6 +104,8 @@ def _read_current_verdict(root: Path):
     except SchemaError as error:
         if error.code == "VERDICT_MISSING":
             return None, GateCode.TRIBUNAL_REQUIRED
+        if error.code == "VERDICT_SCHEMA_UNSUPPORTED":
+            return None, GateCode.VERDICT_STALE
         if error.code in _UNSAFE_VERDICT_CODES or error.code.endswith("_UNSAFE"):
             return None, GateCode.VERDICT_UNSAFE
         return None, GateCode.VERDICT_INVALID
@@ -114,6 +116,12 @@ def _read_current_verdict(root: Path):
 
 
 def _current_snapshot(root: Path, base_ref: str):
+    try:
+        _validate_base(root, base_ref)
+    except GitStateError:
+        return None, GateCode.VERDICT_INVALID
+    except Exception:
+        return None, GateCode.VERDICT_INVALID
     try:
         return capture_snapshot(root, base_ref), None
     except GitStateError as error:
@@ -186,7 +194,10 @@ def _evaluate_direct_pr_create(cwd: Path) -> GateDecision:
 def evaluate_gate(cwd: Path, command: str) -> GateDecision:
     """Return a bounded decision without executing the candidate command."""
 
-    scan = scan_pr_create(command)
+    try:
+        scan = scan_pr_create(command)
+    except Exception:
+        return _decision(False, GateCode.NOT_PR_CREATE)
     if scan.kind is ScanKind.NO_MATCH:
         return _decision(False, GateCode.NOT_PR_CREATE)
     if scan.kind is ScanKind.AMBIGUOUS_CANDIDATE:

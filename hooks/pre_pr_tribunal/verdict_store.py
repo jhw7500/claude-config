@@ -399,6 +399,10 @@ def _parse_history(value: object) -> tuple[RoundSummary, ...]:
 
 def _parse_verdict(raw: bytes) -> Verdict:
     data = m._load_json(raw, limit=m.MAX_VERDICT_BYTES, too_large="VERDICT_TOO_LARGE")
+    if isinstance(data, dict):
+        schema = data.get("schema")
+        if isinstance(schema, int) and not isinstance(schema, bool) and schema != 1:
+            raise SchemaError("VERDICT_SCHEMA_UNSUPPORTED")
     obj = m._object(
         data,
         {

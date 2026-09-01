@@ -12,7 +12,8 @@ import pytest
 
 from pre_pr_tribunal import gate, hook_common
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
-from pre_pr_tribunal.verdict_store import begin_round, finalize_round
+from pre_pr_tribunal.model import SchemaError
+from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict
 
 
 PACKAGE = Path(__file__).resolve().parents[2] / "hooks" / "pre_pr_tribunal"
@@ -286,6 +287,30 @@ def test_scan_precedes_repository_and_verdict_work(git_repo: Path):
     assert ambiguous == (type(ambiguous))(True, GateCode.COMMAND_AMBIGUOUS)
 
 
+def test_scanner_exception_on_unrelated_request_is_silent(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+):
+    canary = "ghp_scanner_exception_canary_123456"
+    raw = json.dumps(payload(git_repo, "gh pr view")).encode()
+
+    class Stdin:
+        buffer = io.BytesIO(raw)
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    monkeypatch.setattr(hook_common.sys, "stdin", Stdin())
+    monkeypatch.setattr(hook_common.sys, "stdout", stdout)
+    monkeypatch.setattr(hook_common.sys, "stderr", stderr)
+    monkeypatch.setattr(
+        gate,
+        "scan_pr_create",
+        lambda _command: (_ for _ in ()).throw(RuntimeError(canary)),
+    )
+
+    assert hook_common.adapter_main("claude") == 0
+    assert stdout.getvalue() == stderr.getvalue() == ""
+
+
 def test_missing_verdict_requires_tribunal(git_repo: Path):
     assert_decision(git_repo, GateCode.TRIBUNAL_REQUIRED)
 
@@ -325,7 +350,11 @@ def test_unsafe_store_state_is_bounded(git_repo: Path, unsafe: str):
     (
         "not json",
         '{"schema":1,"schema":1}',
-        '{"schema":99}',
+        "[]",
+        "{}",
+        '{"schema":true}',
+        '{"schema":"99"}',
+        '{"schema":99.0}',
     ),
 )
 def test_malformed_or_non_strict_verdict_is_invalid(git_repo: Path, raw: str):
@@ -334,6 +363,17 @@ def test_malformed_or_non_strict_verdict_is_invalid(git_repo: Path, raw: str):
     verdict.write_text(raw, encoding="utf-8")
     verdict.chmod(0o600)
     assert_decision(git_repo, GateCode.VERDICT_INVALID)
+
+
+def test_newer_integer_verdict_schema_is_distinct_and_stale(git_repo: Path):
+    _passing_verdict(git_repo)
+    verdict = git_repo / ".review/verdict.json"
+    verdict.write_text('{"schema":99}', encoding="utf-8")
+    verdict.chmod(0o600)
+
+    with pytest.raises(SchemaError, match="VERDICT_SCHEMA_UNSUPPORTED"):
+        read_verdict(git_repo)
+    assert_decision(git_repo, GateCode.VERDICT_STALE)
 
 
 def test_in_progress_review_is_incomplete(git_repo: Path):
@@ -386,6 +426,20 @@ def test_remote_base_move_is_stale(git_repo: Path):
     assert_decision(git_repo, GateCode.VERDICT_STALE)
 
 
+def test_deleted_remote_base_ref_is_stale(git_repo: Path):
+    _passing_verdict(git_repo)
+    _git(git_repo, "update-ref", "-d", "refs/remotes/origin/master")
+    assert_decision(git_repo, GateCode.VERDICT_STALE)
+
+
+def test_malformed_stored_base_ref_is_invalid(git_repo: Path):
+    _passing_verdict(git_repo)
+    value = _verdict_payload(git_repo)
+    value["base"]["ref"] = "bad..ref"
+    _replace_verdict(git_repo, value)
+    assert_decision(git_repo, GateCode.VERDICT_INVALID)
+
+
 def test_head_move_is_stale(git_repo: Path):
     _passing_verdict(git_repo)
     _commit(git_repo, "head moved\n")
@@ -397,6 +451,32 @@ def test_dirty_worktree_precedes_unsafe_verdict(git_repo: Path):
     (git_repo / ".review/verdict.json").chmod(0o644)
     (git_repo / "dirty-canary.txt").write_text("dirty", encoding="utf-8")
     assert_decision(git_repo, GateCode.WORKTREE_DIRTY)
+
+
+def test_strict_invalid_verdict_precedes_later_snapshot_drift(git_repo: Path):
+    _passing_verdict(git_repo)
+    _commit(git_repo, "head moved after verdict corruption\n")
+    verdict = git_repo / ".review/verdict.json"
+    verdict.write_text("not-json", encoding="utf-8")
+    verdict.chmod(0o600)
+    assert_decision(git_repo, GateCode.VERDICT_INVALID)
+
+
+def test_snapshot_drift_precedes_schema_valid_in_progress_state(git_repo: Path):
+    begin_round(git_repo, base="master", runtime="codex", round_number=1)
+    _commit(git_repo, "head moved during review\n")
+    assert_decision(git_repo, GateCode.VERDICT_STALE)
+
+
+def test_exact_root_precedes_dirty_and_malformed_verdict(git_repo: Path):
+    _passing_verdict(git_repo)
+    nested = git_repo / ".review/nested"
+    nested.mkdir()
+    verdict = git_repo / ".review/verdict.json"
+    verdict.write_text("not-json", encoding="utf-8")
+    verdict.chmod(0o600)
+    (git_repo / "dirty.txt").write_text("dirty", encoding="utf-8")
+    assert_decision(nested, GateCode.REPOSITORY_UNSUPPORTED)
 
 
 def test_subdirectory_non_github_and_non_git_roots_are_unsupported(
