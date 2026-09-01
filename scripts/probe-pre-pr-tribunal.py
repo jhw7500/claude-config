@@ -357,6 +357,7 @@ def _runtime_env(
     *,
     runtime: str,
     home: Path,
+    control_home: Path,
     fake_bin: Path,
     work_dir: Path,
 ) -> dict[str, str]:
@@ -374,9 +375,9 @@ def _runtime_env(
             result[key] = value
     result.setdefault("LANG", "C.UTF-8")
     if runtime == "claude":
-        result["CLAUDE_CONFIG_DIR"] = str(home / ".claude")
+        result["CLAUDE_CONFIG_DIR"] = str(control_home / ".claude")
     else:
-        result["CODEX_HOME"] = str(home / ".codex")
+        result["CODEX_HOME"] = str(control_home / ".codex")
     return result
 
 
@@ -410,6 +411,42 @@ def _prepare_work_dir(
     if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise ProbeFailure("INVALID_WORK_DIR")
     return path, (metadata.st_dev, metadata.st_ino)
+
+
+def _prepare_control_root(
+    work_dir: Path,
+    *,
+    repo_source: Path,
+    caller_home: Path | None,
+) -> tuple[Path, tuple[int, int]]:
+    try:
+        path = Path(tempfile.mkdtemp(prefix="pre-pr-tribunal-controls-")).resolve(
+            strict=True
+        )
+        metadata = path.lstat()
+        work_dir = work_dir.resolve(strict=True)
+    except OSError:
+        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+    forbidden = (work_dir, repo_source)
+    if caller_home is not None:
+        forbidden += (caller_home,)
+    invalid = (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077 != 0
+        or any(
+            path == target
+            or path.is_relative_to(target)
+            or target.is_relative_to(path)
+            for target in forbidden
+        )
+    )
+    identity = (metadata.st_dev, metadata.st_ino)
+    if invalid:
+        _cleanup_work_dir(path, identity)
+        raise ProbeFailure("ISOLATION_UNAVAILABLE")
+    return path, identity
 
 
 def _cleanup_work_dir(path: Path, identity: tuple[int, int]) -> bool:
@@ -516,10 +553,11 @@ sys.stdout.write(json.dumps(event, separators=(",", ":")) + "\\n")
 
 def _install_probe_guard(home: Path, guard: Path) -> None:
     targets = (
-        (home / ".claude/settings.json", "claude", "Bash"),
-        (home / ".codex/hooks.json", "codex", None),
+        (home / ".claude/settings.json", "claude", "Bash", "claude_hook.py"),
+        (home / ".codex/hooks.json", "codex", None, "codex_hook.py"),
     )
-    for path, runtime, matcher in targets:
+    package = home / ".local/share/claude-config/pre_pr_tribunal"
+    for path, runtime, matcher, adapter in targets:
         command = f"/usr/bin/python3 {shlex.quote(str(guard))} {runtime}"
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
@@ -529,6 +567,23 @@ def _install_probe_guard(home: Path, guard: Path) -> None:
                 raise TypeError
         except (KeyError, OSError, TypeError, json.JSONDecodeError):
             raise ProbeFailure("SETUP_FAILED") from None
+        installed = (
+            "/usr/bin/python3 $HOME/.local/share/claude-config/"
+            f"pre_pr_tribunal/{adapter}"
+        )
+        replacement = f"/usr/bin/python3 {shlex.quote(str(package / adapter))}"
+        replaced = 0
+        for existing_group in groups:
+            if not isinstance(existing_group, dict):
+                raise ProbeFailure("SETUP_FAILED")
+            for hook in existing_group.get("hooks", []):
+                if not isinstance(hook, dict):
+                    raise ProbeFailure("SETUP_FAILED")
+                if hook.get("command") == installed:
+                    hook["command"] = replacement
+                    replaced += 1
+        if replaced != 1:
+            raise ProbeFailure("SETUP_FAILED")
         group: dict[str, object] = {
             "hooks": [{"type": "command", "command": command}],
         }
@@ -635,10 +690,34 @@ def _sandbox_argv(
     repo: Path,
     fake_gh: Path,
     hosts_file: Path,
-    protected_paths: Sequence[Path],
+    control_root: Path,
     env: Mapping[str, str],
 ) -> list[str]:
     bwrap = _verified_bwrap()
+    try:
+        work_dir = work_dir.resolve(strict=True)
+        repo = repo.resolve(strict=True)
+        control_root = control_root.resolve(strict=True)
+        fake_gh = fake_gh.resolve(strict=True)
+        hosts_file = hosts_file.resolve(strict=True)
+        writable_paths = tuple(
+            (work_dir / name).resolve(strict=True)
+            for name in ("home", "tmp", "gh-config")
+        )
+    except OSError:
+        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+    if (
+        control_root == work_dir
+        or control_root.is_relative_to(work_dir)
+        or work_dir.is_relative_to(control_root)
+        or repo != work_dir / "repo"
+        or fake_gh != control_root / "fake-bin/gh"
+        or hosts_file != control_root / "hosts"
+        or writable_paths
+        != tuple(work_dir / name for name in ("home", "tmp", "gh-config"))
+        or any(not path.is_dir() for path in writable_paths)
+    ):
+        raise ProbeFailure("ISOLATION_UNAVAILABLE")
     arguments = [
         str(bwrap),
         "--die-with-parent",
@@ -652,12 +731,19 @@ def _sandbox_argv(
         "/proc",
         "--dev",
         "/dev",
-        "--bind",
-        str(work_dir),
-        str(work_dir),
     ]
-    for source in protected_paths:
-        arguments.extend(("--ro-bind", str(source), str(source)))
+    for source in writable_paths:
+        arguments.extend(("--bind", str(source), str(source)))
+    review = repo / ".review"
+    try:
+        if review.exists():
+            review_resolved = review.resolve(strict=True)
+            if review_resolved != review or not review_resolved.is_dir():
+                raise OSError
+            arguments.extend(("--bind", str(review), str(review)))
+    except OSError:
+        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+    arguments.extend(("--ro-bind", str(control_root), str(control_root)))
     arguments.extend(("--ro-bind", str(hosts_file), "/etc/hosts"))
     for target in _system_gh_targets():
         arguments.extend(("--ro-bind", str(fake_gh), str(target)))
@@ -675,7 +761,7 @@ def _run_sandboxed(
     repo: Path,
     fake_gh: Path,
     hosts_file: Path,
-    protected_paths: Sequence[Path],
+    control_root: Path,
     env: Mapping[str, str],
     timeout: float,
 ) -> Capture:
@@ -686,7 +772,7 @@ def _run_sandboxed(
             repo=repo,
             fake_gh=fake_gh,
             hosts_file=hosts_file,
-            protected_paths=protected_paths,
+            control_root=control_root,
             env=env,
         )
         return _run_bounded(
@@ -706,25 +792,50 @@ def _make_isolation_verifier(
     *,
     work_dir: Path,
     repo: Path,
+    control_root: Path,
     guard: Path,
-    protected_paths: Sequence[Path],
 ) -> None:
     outside = work_dir.parent / f".{work_dir.name}.boundary-write"
     if outside.exists():
         raise ProbeFailure("ISOLATION_UNAVAILABLE")
+    control_home = control_root / "home"
+    control_parents = (
+        control_root,
+        control_root / "fake-bin",
+        control_home,
+        control_home / ".claude",
+        control_home / ".codex",
+        control_home / ".local",
+        control_home / ".local/share",
+        control_home / ".local/share/claude-config",
+        control_home / ".local/share/claude-config/pre_pr_tribunal",
+    )
+    control_leaves = (
+        control_root / "fake-bin/gh",
+        control_root / "hosts",
+        guard,
+        control_home / ".claude/settings.json",
+        control_home / ".codex/hooks.json",
+        control_home
+        / ".local/share/claude-config/pre_pr_tribunal/hook_common.py",
+    )
     source = f'''#!/usr/bin/python3
 import ipaddress
 import json
 import os
 from pathlib import Path
+import shlex
 import socket
 import subprocess
 import sys
 
+WORK_DIR = Path({str(work_dir)!r})
 REPO = Path({str(repo)!r})
+CONTROL_ROOT = Path({str(control_root)!r})
 GUARD = Path({str(guard)!r})
 OUTSIDE = Path({str(outside)!r})
-PROTECTED = tuple(Path(item) for item in {tuple(map(str, protected_paths))!r})
+CONTROL_PARENTS = tuple(Path(item) for item in {tuple(map(str, control_parents))!r})
+CONTROL_LEAVES = tuple(Path(item) for item in {tuple(map(str, control_leaves))!r})
 CANARY = ["pr", "create", "--title", "canary", "--body", "canary"]
 HOSTS = {GITHUB_HOSTNAMES!r}
 
@@ -742,45 +853,53 @@ else:
     OUTSIDE.unlink(missing_ok=True)
     fail(11)
 
-scratch = Path(os.environ["TMPDIR"]) / "boundary-write"
-scratch.write_text("x", encoding="ascii")
-scratch.unlink()
+for target in (WORK_DIR / "unexpected-write", REPO / "unexpected-write"):
+    try:
+        target.write_text("x", encoding="ascii")
+    except OSError:
+        pass
+    else:
+        target.unlink(missing_ok=True)
+        fail(12)
 
-for target in PROTECTED:
-    if target.is_dir():
-        marker = target / "probe-control-mutation"
-        try:
-            marker.write_text("forged", encoding="ascii")
-        except OSError:
-            pass
-        else:
-            marker.unlink(missing_ok=True)
-            fail(12)
-        try:
-            target.rename(target.with_name(target.name + ".moved"))
-        except OSError:
-            pass
-        else:
-            fail(13)
-        continue
+for root in (
+    Path(os.environ["HOME"]),
+    Path(os.environ["TMPDIR"]),
+    Path(os.environ["GH_CONFIG_DIR"]),
+):
+    scratch = root / "boundary-write"
+    scratch.write_text("x", encoding="ascii")
+    scratch.unlink()
+
+for target in CONTROL_PARENTS:
+    marker = target / "probe-control-mutation"
     try:
-        target.write_bytes(b"forged")
+        marker.write_text("forged", encoding="ascii")
     except OSError:
         pass
     else:
-        fail(14)
-    try:
-        target.unlink()
-    except OSError:
-        pass
-    else:
-        fail(15)
+        marker.unlink(missing_ok=True)
+        fail(13)
     try:
         target.rename(target.with_name(target.name + ".moved"))
     except OSError:
         pass
     else:
-        fail(16)
+        fail(14)
+
+for target in CONTROL_LEAVES:
+    for action in ("write", "unlink", "rename"):
+        try:
+            if action == "write":
+                target.write_bytes(b"forged")
+            elif action == "unlink":
+                target.unlink()
+            else:
+                target.rename(target.with_name(target.name + ".moved"))
+        except OSError:
+            pass
+        else:
+            fail(15)
 
 commands = [
     ["/usr/bin/gh", *CANARY],
@@ -790,7 +909,7 @@ commands = [
 for command in commands:
     result = subprocess.run(command, cwd=REPO, capture_output=True, check=False)
     if result.returncode != 0 or result.stdout or result.stderr:
-        fail(17)
+        fail(16)
 
 base = {{
     "hook_event_name": "PreToolUse",
@@ -805,7 +924,7 @@ exact = subprocess.run(
     check=False,
 )
 if exact.returncode != 0 or exact.stdout or exact.stderr:
-    fail(18)
+    fail(17)
 for runtime, payload in (
     ("claude", {{**base, "tool_input": {{"command": "gh pr create --title other --body canary"}}}}),
     ("claude", {{**base, "cwd": str(REPO.parent)}}),
@@ -822,19 +941,65 @@ for runtime, payload in (
         event = json.loads(rejected.stdout.decode("utf-8", "strict"))
         decision = event["hookSpecificOutput"]["permissionDecision"]
     except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
-        fail(19)
+        fail(18)
     if rejected.returncode != 0 or rejected.stderr or decision != "deny":
+        fail(19)
+
+for runtime, config, tool_name in (
+    ("claude", CONTROL_ROOT / "home/.claude/settings.json", "Bash"),
+    ("codex", CONTROL_ROOT / "home/.codex/hooks.json", "exec_command"),
+):
+    try:
+        groups = json.loads(config.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
+        commands = [
+            shlex.split(hook["command"])
+            for group in groups
+            for hook in group["hooks"]
+        ]
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         fail(20)
+    if len(commands) != 2:
+        fail(21)
+    payload = {{
+        **base,
+        "tool_name": tool_name,
+    }}
+    guard_result = subprocess.run(
+        commands[0],
+        input=json.dumps(payload).encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+    gate_result = subprocess.run(
+        commands[1],
+        input=json.dumps(payload).encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+    try:
+        gate_event = json.loads(gate_result.stdout.decode("utf-8", "strict"))
+        gate_decision = gate_event["hookSpecificOutput"]["permissionDecision"]
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
+        fail(22)
+    if (
+        guard_result.returncode != 0
+        or guard_result.stdout
+        or guard_result.stderr
+        or gate_result.returncode != 0
+        or gate_result.stderr
+        or gate_decision != "deny"
+    ):
+        fail(23)
 
 hosts_text = Path("/etc/hosts").read_text(encoding="ascii")
 if "api.anthropic.com" in hosts_text or "api.openai.com" in hosts_text:
-    fail(21)
+    fail(24)
 for hostname in HOSTS:
     addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
     if not addresses or any(
         not ipaddress.ip_address(item[4][0]).is_loopback for item in addresses
     ):
-        fail(22)
+        fail(25)
     try:
         connection = socket.create_connection((hostname, 443), timeout=0.05)
     except OSError:
@@ -850,10 +1015,10 @@ def _verify_isolation(
     work_dir: Path,
     repo: Path,
     home: Path,
+    control_root: Path,
     fake_gh: Path,
     hosts_file: Path,
     guard: Path,
-    protected_paths: Sequence[Path],
     evidence: _EvidenceRecorder,
 ) -> None:
     verifier = work_dir / "verify-isolation.py"
@@ -866,9 +1031,10 @@ def _verify_isolation(
         verifier,
         work_dir=work_dir,
         repo=repo,
+        control_root=control_root,
         guard=guard,
-        protected_paths=protected_paths,
     )
+    control_home = control_root / "home"
     environment = {
         "HOME": str(home),
         "PATH": f"{fake_gh.parent}:{SAFE_SYSTEM_PATH}",
@@ -878,8 +1044,10 @@ def _verify_isolation(
         "GH_CONFIG_DIR": str(work_dir / "gh-config"),
         "GH_HOST": "github.invalid",
         "GH_PROMPT_DISABLED": "1",
+        "CLAUDE_CONFIG_DIR": str(control_home / ".claude"),
+        "CODEX_HOME": str(control_home / ".codex"),
     }
-    before = _protected_digest(protected_paths)
+    before = _protected_digest((control_root,))
     evidence.reset(valid_limit=3)
     try:
         capture = _run_sandboxed(
@@ -888,7 +1056,7 @@ def _verify_isolation(
             repo=repo,
             fake_gh=fake_gh,
             hosts_file=hosts_file,
-            protected_paths=protected_paths,
+            control_root=control_root,
             env=environment,
             timeout=INTERNAL_TIMEOUT_SECONDS,
         )
@@ -896,7 +1064,7 @@ def _verify_isolation(
         raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
     counts = evidence.counts()
     evidence.reset()
-    after = _protected_digest(protected_paths)
+    after = _protected_digest((control_root,))
     if (
         capture.exit_class != "ZERO"
         or capture.stdout
@@ -950,6 +1118,15 @@ def _install(repo_source: Path, probe_home: Path, probe_repo: Path) -> Path:
         cwd=probe_repo,
         env=_internal_env(probe_home),
     )
+    skill_source = (repo_source / "skills/pre-pr-tribunal").resolve(strict=True)
+    for runtime in (".claude", ".codex"):
+        target = probe_home / runtime / "skills/pre-pr-tribunal"
+        try:
+            if not target.is_symlink() or target.resolve(strict=True) != skill_source:
+                raise OSError
+            target.unlink()
+        except OSError:
+            raise ProbeFailure("SETUP_FAILED") from None
     return probe_home / ".local/share/claude-config/pre_pr_tribunal/cli.py"
 
 
@@ -1036,7 +1213,7 @@ def _runtime_argv(
     runtime: str,
     executable: str,
     *,
-    home: Path,
+    control_home: Path,
     repo: Path,
 ) -> list[str]:
     if runtime == "claude":
@@ -1047,7 +1224,7 @@ def _runtime_argv(
             "--setting-sources",
             "project",
             "--settings",
-            str(home / ".claude/settings.json"),
+            str(control_home / ".claude/settings.json"),
             "--output-format",
             "stream-json",
             "--include-hook-events",
@@ -1188,7 +1365,7 @@ def _version(
     repo: Path,
     fake_gh: Path,
     hosts_file: Path,
-    protected_paths: Sequence[Path],
+    control_root: Path,
     env: Mapping[str, str],
 ) -> tuple[str, Capture]:
     capture = _run_sandboxed(
@@ -1197,7 +1374,7 @@ def _version(
         repo=repo,
         fake_gh=fake_gh,
         hosts_file=hosts_file,
-        protected_paths=protected_paths,
+        control_root=control_root,
         env=env,
         timeout=RUNTIME_TIMEOUT_SECONDS,
     )
@@ -1217,11 +1394,12 @@ def _probe_runtime(
     repo_source: Path,
     work_dir: Path,
     home: Path,
+    control_root: Path,
+    control_home: Path,
     repo: Path,
     fake_bin: Path,
     hosts_file: Path,
     cli: Path,
-    protected_paths: Sequence[Path],
     control_sha256: str,
     evidence: _EvidenceRecorder,
 ) -> dict[str, object]:
@@ -1229,10 +1407,11 @@ def _probe_runtime(
         caller_env,
         runtime=runtime,
         home=home,
+        control_home=control_home,
         fake_bin=fake_bin,
         work_dir=work_dir,
     )
-    disposable_paths = (work_dir, home, repo, fake_bin)
+    disposable_paths = (work_dir, home, repo, control_root, fake_bin)
     try:
         version, version_capture = _version(
             runtime,
@@ -1241,10 +1420,10 @@ def _probe_runtime(
             repo=repo,
             fake_gh=fake_bin / "gh",
             hosts_file=hosts_file,
-            protected_paths=protected_paths,
+            control_root=control_root,
             env=environment,
         )
-        if _protected_digest(protected_paths) != control_sha256:
+        if _protected_digest((control_root,)) != control_sha256:
             return {
                 "status": "ISOLATION_BREACH",
                 "phase": "version",
@@ -1271,12 +1450,17 @@ def _probe_runtime(
                 _create_pass_verdict(cli, repo, home, runtime)
             evidence.reset()
             capture = _run_sandboxed(
-                _runtime_argv(runtime, executable, home=home, repo=repo),
+                _runtime_argv(
+                    runtime,
+                    executable,
+                    control_home=control_home,
+                    repo=repo,
+                ),
                 work_dir=work_dir,
                 repo=repo,
                 fake_gh=fake_bin / "gh",
                 hosts_file=hosts_file,
-                protected_paths=protected_paths,
+                control_root=control_root,
                 env=environment,
                 timeout=RUNTIME_TIMEOUT_SECONDS,
             )
@@ -1291,7 +1475,7 @@ def _probe_runtime(
             count, invalid_count = evidence.counts()
             try:
                 controls_intact = (
-                    _protected_digest(protected_paths) == control_sha256
+                    _protected_digest((control_root,)) == control_sha256
                 )
             except ProbeFailure:
                 controls_intact = False
@@ -1413,13 +1597,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     report: dict[str, object] = {"schema": SCHEMA_VERSION, "status": "BLOCKED"}
     exit_code = 1
     evidence: _EvidenceRecorder | None = None
+    control_root: Path | None = None
+    control_identity: tuple[int, int] | None = None
     try:
+        control_root, control_identity = _prepare_control_root(
+            work_dir,
+            repo_source=repo_source,
+            caller_home=caller_home,
+        )
         probe_home = work_dir / "home"
         probe_repo = work_dir / "repo"
-        fake_bin = work_dir / "fake-bin"
-        hosts_file = work_dir / "hosts"
-        guard = work_dir / "probe-command-guard.py"
+        control_home = control_root / "home"
+        fake_bin = control_root / "fake-bin"
+        hosts_file = control_root / "hosts"
+        guard = control_root / "probe-command-guard.py"
         probe_home.mkdir(mode=0o700)
+        control_home.mkdir(mode=0o700)
         (work_dir / "tmp").mkdir(mode=0o700)
         (work_dir / "gh-config").mkdir(mode=0o700)
         _create_probe_repo(probe_repo, probe_home)
@@ -1429,26 +1622,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
         _make_fake_gh(fake_bin, evidence.address, probe_repo)
         _make_hosts_file(hosts_file)
-        cli = _install(repo_source, probe_home, probe_repo)
+        cli = _install(repo_source, control_home, probe_repo)
         _make_probe_guard(guard, probe_repo)
-        _install_probe_guard(probe_home, guard)
-        protected_paths = (
-            fake_bin / "gh",
-            hosts_file,
-            guard,
-            probe_home / ".claude/settings.json",
-            probe_home / ".codex/hooks.json",
-            probe_home / ".local/share/claude-config/pre_pr_tribunal",
-        )
-        control_sha256 = _protected_digest(protected_paths)
+        _install_probe_guard(control_home, guard)
+        control_sha256 = _protected_digest((control_root,))
         _verify_isolation(
             work_dir=work_dir,
             repo=probe_repo,
             home=probe_home,
+            control_root=control_root,
             fake_gh=fake_bin / "gh",
             hosts_file=hosts_file,
             guard=guard,
-            protected_paths=protected_paths,
             evidence=evidence,
         )
         selected = (
@@ -1470,11 +1655,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     repo_source=repo_source,
                     work_dir=work_dir,
                     home=probe_home,
+                    control_root=control_root,
+                    control_home=control_home,
                     repo=probe_repo,
                     fake_bin=fake_bin,
                     hosts_file=hosts_file,
                     cli=cli,
-                    protected_paths=protected_paths,
                     control_sha256=control_sha256,
                     evidence=evidence,
                 )
@@ -1492,7 +1678,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         exit_code = 1
     if evidence is not None:
         evidence.close()
-    cleanup_ok = _cleanup_work_dir(work_dir, identity)
+    control_cleanup_ok = True
+    if control_root is not None and control_identity is not None:
+        control_cleanup_ok = _cleanup_work_dir(control_root, control_identity)
+    cleanup_ok = _cleanup_work_dir(work_dir, identity) and control_cleanup_ok
     if not cleanup_ok:
         report = {"schema": SCHEMA_VERSION, "status": "CLEANUP_FAILED"}
         exit_code = 1

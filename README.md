@@ -53,15 +53,16 @@ review 상태는 현재 저장소의 ignored `.review/`에만 남고 HOME이나 
 필요하다. 설치·복구와 검증 절차는 [hook 운영 문서](hooks/README.md#pre-pr-tribunal-운영)를 따른다.
 
 실제 runtime canary harness는 verified `/usr/bin/bwrap`을 필수로 사용한다. root filesystem은
-read-only로 두고 disposable probe tree만 writable로 bind하며, worktree-owned hosts sinkhole,
-fixed system PATH의 모든 기존 `gh` 위 fake executable bind, neutral GitHub config/host environment,
-exact command/cwd/tool pre-tool guard를 runtime 시작 전에 검증한다. Writable probe tree 안의 guard,
-fake `gh`, hosts source, installed hook package, Claude/Codex hook config는 각각 다시 read-only로
-self-bind하고 inode/content hash 불변을 확인한다. Fake-call evidence는 probe tree의 writable count
-file이 아니라 harness process가 소유한 memory channel에 기록되어 runtime tool이 file을 forge하거나
-reset할 수 없다. 이 경계가 준비되지 않으면 `ISOLATION_UNAVAILABLE`로 중단한다. Provider API 연결을
-유지하기 위해 network namespace는 공유하므로, 이 harness는 일반적인 outbound-network 차단을
-제공하거나 provider 장애를 보호한다고 주장하지 않는다.
+read-only로 두고 writable work tree 밖에 별도의 controller-owned control root를 만든 뒤, 그 전체를
+하나의 read-only mount로 고정한다. Fake `gh`, hosts sinkhole, exact command/cwd/tool guard, 양쪽 hook
+config와 installed hook package는 모두 이 immutable root 아래에 있고 PATH/config/hook command도 그
+경로만 참조한다. Runtime HOME, TMPDIR, neutral GH config와 pass-phase의 기존 `.review` lock state만
+각각 명시적인 writable submount다. Repository 나머지와 work-root parent는 read-only이므로 control
+parent를 rename/recreate할 writable alias가 없다. Whole-root inode/content hash도 dispatch 전후에
+확인한다. Fake-call evidence는 harness process가 소유한 memory channel에 기록되어 runtime tool이
+file로 forge하거나 reset할 수 없다. 이 경계가 준비되지 않으면 `ISOLATION_UNAVAILABLE`로 중단한다.
+Provider API 연결을 유지하기 위해 network namespace는 공유하므로, 이 harness는 일반적인
+outbound-network 차단을 제공하거나 provider 장애를 보호한다고 주장하지 않는다.
 
 ## 토글 메커니즘 — 2종류 (대체 불가, 병행)
 

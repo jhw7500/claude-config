@@ -117,15 +117,17 @@ rtk python3 -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py tests/pre_p
 exit class, deny/count와 capture hash만 포함하며 raw model output, prompt, credential, 절대 경로를
 기록하지 않는다.
 
-canary는 root-owned, non-writable `/usr/bin/bwrap`을 검증한 뒤 read-only root와 writable disposable
-probe tree를 구성한다. worktree-owned `/etc/hosts` overlay는 GitHub hostname을 loopback으로 보내고,
-fixed system PATH에서 발견되는 모든 `gh` target은 exact argv/cwd/단일 호출을 검증하는 fake `gh`로
-overlay된다. `/usr/bin/gh`, PATH reset, `command -p gh`, direct GitHub hostname client, 그리고
-exact command/cwd/tool에서 벗어난 hook payload를 runtime dispatch 전에 검증한다. Codex의 matcherless
-guard는 command-less, non-shell, unknown tool도 모두 deny한다. Writable tree 안의 guard, fake `gh`,
-hosts source, installed package, Claude/Codex hook config는 source path 자체를 read-only로 다시 bind하고
-rename/unlink/write 방지와 inode/content hash 불변을 검사한다. Valid/invalid call evidence는 writable
-ledger가 아닌 harness-owned memory channel에만 누적한다. `GH_CONFIG_DIR`, `GH_HOST`,
+canary는 root-owned, non-writable `/usr/bin/bwrap`을 검증한 뒤 read-only root를 구성한다. Runtime
+work tree 밖의 별도 controller-owned control root에 hosts, fake `gh`, guard, 양쪽 hook config와 installed
+package를 완성하고 그 root 전체를 read-only로 mount한다. PATH/config/hook command에는 이 root 밖의
+writable ancestor alias가 없다. Runtime HOME, TMPDIR, neutral `GH_CONFIG_DIR`, pass verdict의 existing
+`.review` lock state만 별도 writable submount이고, repository 나머지와 work-root parent는 read-only다.
+
+Control root/fake-bin/config/package parent의 rename·recreate, control leaf replace, whole-root inode/content
+hash 불변을 runtime dispatch 전에 검사한다. `/usr/bin/gh`, PATH reset, `command -p gh`, direct GitHub
+hostname client, 그리고 exact command/cwd/tool에서 벗어난 payload도 같은 경계에서 검증한다. Codex의
+matcherless guard는 command-less, non-shell, unknown tool을 모두 deny한다. Valid/invalid call evidence는
+writable ledger가 아닌 harness-owned memory channel에만 누적한다. `GH_HOST`와
 `GH_PROMPT_DISABLED`도 harness-owned neutral 값만 사용한다. 이 중 하나라도 실패하면
 `ISOLATION_UNAVAILABLE`이며 live config나 real `gh`로 fallback하지 않는다.
 

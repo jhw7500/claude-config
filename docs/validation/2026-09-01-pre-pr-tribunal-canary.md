@@ -12,9 +12,11 @@ Fix Round 1 strengthened the isolation code and fake-runtime evidence, but it wa
 revalidated against either real runtime because both allowlisted API keys remain absent. The code
 correction does not turn this checkpoint into a real-runtime PASS.
 
-Fix Round 2 closes the remaining writable-control and forgeable-ledger boundary identified by the
-scoped re-review. It also was deliberately not revalidated against a real runtime because the same
-allowlisted-key blocker remains. The checkpoint is still AUTH-BLOCKED.
+Fix Round 2 removed forgeable file ledgers and protected control leaves, but its scoped re-review
+found that writable ancestor aliases could still replace those leaves. Fix Round 3 separates the
+entire immutable control root from writable runtime state and closes that local boundary. Neither
+round was revalidated against a real runtime because the same allowlisted-key blocker remains. The
+checkpoint is still AUTH-BLOCKED.
 
 Caller environment allowlist presence at the checkpoint was:
 
@@ -84,6 +86,38 @@ No credential value was read or recorded.
   shared Skill validation all exited 0; the Skill validator reported `Skill is valid!`.
 - Neither real runtime was executed, no real GitHub endpoint was contacted, and no credential or
   live runtime config was read. This code correction is not a real-runtime PASS.
+
+## Fix Round 3 passing local evidence
+
+- Initial full focused RED: 5 failed and 47 passed. A subsequent focused selector that made the
+  installed Skill-symlink escape explicit returned 6 failed and 47 deselected. The failures showed
+  that both runtime configs, every installed hook command, and fake `gh` still had writable-state
+  ancestors; only one temporary root was allocated; and the verifier had neither an external
+  control-root contract nor a nested-root rejection.
+- The complete fake client, hosts source, guard, installed hook package, and both hook configs now
+  live below a second owner-private controller root outside runtime work state. Bubblewrap mounts
+  that whole root read-only. Runtime PATH, Claude settings/config, Codex home, and installed hook
+  commands use only absolute paths into that root. Runtime-irrelevant Skill symlinks are removed
+  before whole-root hashing so no control dependency escapes the root.
+- The first targeted implementation run returned 4 failed and 2 passed. Rewriting the installer's
+  `$HOME` adapter aliases to immutable absolute package paths made the actual boundary verifier
+  green. The next run returned 3 failed and 3 passed because strict verdict reads require an
+  O_RDWR/flock operation on `.review/lock`. The final boundary exposes only runtime HOME, TMPDIR,
+  neutral GitHub config, and an existing pass-phase `.review` directory as writable submounts;
+  repository and work-root ancestors remain read-only.
+- Final boundary selector: 6 passed and 47 deselected. The verifier attempts creation and rename at
+  the control root, fake-bin, runtime-config, and every installed-package ancestor; attempts leaf
+  write/unlink/rename; invokes fake `gh` through absolute/PATH-reset/`command -p` paths; invokes the
+  exact guard and installed package through both immutable configs; and requires the whole-root
+  inode/content digest to remain unchanged. A nested control root fails with
+  `ISOLATION_UNAVAILABLE` before runtime dispatch.
+- Final fake-runtime harness: 53 passed in 23.85 seconds. Harness plus direct adapters: 124 passed
+  in 25.15 seconds. Related tribunal/shared-installer/task-nudge regression: 752 passed in 59.73
+  seconds. Fresh full repository regression: 2575 passed in 153.30 seconds, exit 0.
+- Bash syntax, ShellCheck error-level, changed-file Python compilation, Git whitespace check, and
+  shared Skill validation all exited 0; the Skill validator reported `Skill is valid!`.
+- Neither real runtime was executed, no real GitHub endpoint was contacted, and no credential or
+  live runtime config was read. Real Claude and Codex PASS evidence is still required.
 
 ## Original Claude canary result
 

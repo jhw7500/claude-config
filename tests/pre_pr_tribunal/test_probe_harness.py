@@ -145,16 +145,19 @@ def _fake_runtime_source(
             raise SystemExit(0)
 
         home = Path(os.environ["HOME"])
+        state_root = home.parent
         prompt = "Use the shell tool exactly once to run: " + CANARY
         if RUNTIME == "claude":
+            config_root = Path(os.environ["CLAUDE_CONFIG_DIR"])
             expected = [
                 "-p", "--no-session-persistence", "--setting-sources", "project",
-                "--settings", str(home / ".claude" / "settings.json"),
+                "--settings", str(config_root / "settings.json"),
                 "--output-format", "stream-json", "--include-hook-events", "--verbose",
                 "--tools", "Bash", "--permission-mode", "bypassPermissions",
                 "--max-budget-usd", "0.25", prompt,
             ]
         else:
+            config_root = Path(os.environ["CODEX_HOME"])
             expected = [
                 "exec", "-C", os.getcwd(), "--ephemeral", "--json",
                 "--ignore-user-config", "--ignore-rules",
@@ -164,12 +167,23 @@ def _fake_runtime_source(
         if sys.argv[1:] != expected:
             print(json.dumps({{"type": "argument_error"}}))
             raise SystemExit(8)
-        config = (
-            home / ".claude" / "settings.json"
-            if RUNTIME == "claude"
-            else Path(os.environ["CODEX_HOME"]) / "hooks.json"
-        )
+        config = config_root / ("settings.json" if RUNTIME == "claude" else "hooks.json")
         value = json.loads(config.read_text(encoding="utf-8"))
+
+        if MODE == "control_layout":
+            control_paths = [path_head, config_root]
+            for group in value.get("hooks", {{}}).get("PreToolUse", []):
+                for hook_spec in group.get("hooks", []):
+                    for argument in shlex.split(hook_spec["command"]):
+                        if argument.startswith("$"):
+                            print(json.dumps({{"type": "control_layout_error"}}))
+                            raise SystemExit(9)
+                        candidate = Path(argument)
+                        if candidate.is_absolute():
+                            control_paths.append(candidate)
+            if any(path == state_root or state_root in path.parents for path in control_paths):
+                print(json.dumps({{"type": "control_layout_error"}}))
+                raise SystemExit(9)
 
         if MODE in {{"malformed_after_valid", "nonzero_after_valid"}}:
             subprocess.run(
@@ -376,6 +390,19 @@ def test_probe_requires_block_then_allow_for_each_runtime(
     assert "test-openai-key" not in serialized
 
 
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_runtime_control_references_have_no_writable_state_ancestor(
+    fake_runtimes, tmp_path, runtime
+):
+    fake = fake_runtimes(**{runtime: "control_layout"})
+    result, work_dir = _run_probe(fake, tmp_path, runtime=runtime)
+    report = json.loads(result.stdout)
+
+    assert report[runtime]["status"] == "PASS"
+    assert result.returncode == 0
+    assert not work_dir.exists()
+
+
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
@@ -477,12 +504,17 @@ def test_probe_default_work_dir_uses_mkdtemp_and_is_cleaned(
     fake = fake_runtimes(claude="success")
     for key, value in fake.env.items():
         monkeypatch.setenv(key, value)
-    allocated = tmp_path / "default-probe"
+    allocated = {
+        "pre-pr-tribunal-probe-": tmp_path / "default-probe",
+        "pre-pr-tribunal-controls-": tmp_path / "default-controls",
+    }
+    prefixes = []
 
     def allocate(*, prefix):
-        assert prefix == "pre-pr-tribunal-probe-"
-        allocated.mkdir(mode=0o700)
-        return str(allocated)
+        prefixes.append(prefix)
+        target = allocated[prefix]
+        target.mkdir(mode=0o700)
+        return str(target)
 
     monkeypatch.setattr(module.tempfile, "mkdtemp", allocate)
     stdout = io.StringIO()
@@ -493,7 +525,8 @@ def test_probe_default_work_dir_uses_mkdtemp_and_is_cleaned(
 
     assert exit_code == 0
     assert json.loads(stdout.getvalue())["status"] == "PASS"
-    assert not allocated.exists()
+    assert prefixes == ["pre-pr-tribunal-probe-", "pre-pr-tribunal-controls-"]
+    assert all(not target.exists() for target in allocated.values())
 
 
 @pytest.mark.parametrize(
@@ -756,52 +789,102 @@ def test_evidence_counts_are_not_manufactured_by_writable_probe_files(tmp_path):
         assert evidence.counts() == (1, 0)
 
 
-def test_isolation_verifier_intercepts_system_gh_and_sinkholes_github(tmp_path):
+def test_probe_install_removes_runtime_irrelevant_skill_symlinks(tmp_path):
     module = _load_probe_module()
+    work_dir = tmp_path / "work"
+    repo = work_dir / "repo"
+    home = tmp_path / "controls" / "home"
+    work_dir.mkdir()
+    home.mkdir(parents=True)
+    module._create_probe_repo(repo, work_dir)
+
+    module._install(REPO, home, repo)
+
+    for runtime in (".claude", ".codex"):
+        target = home / runtime / "skills/pre-pr-tribunal"
+        assert not target.exists()
+        assert not target.is_symlink()
+
+
+def _probe_boundary_layout(module, tmp_path, *, nested_controls):
     work_dir = tmp_path / "boundary"
     repo = work_dir / "repo"
     home = work_dir / "home"
-    fake_bin = work_dir / "fake-bin"
+    control_root = (
+        work_dir / "controls" if nested_controls else tmp_path / "controls"
+    )
+    control_home = control_root / "home"
+    fake_bin = control_root / "fake-bin"
     work_dir.mkdir()
-    repo.mkdir()
     home.mkdir()
-    hosts_file = work_dir / "hosts"
-    guard = work_dir / "guard.py"
-    claude_config = home / ".claude" / "settings.json"
-    codex_config = home / ".codex" / "hooks.json"
-    package = home / ".local/share/claude-config/pre_pr_tribunal"
-    claude_config.parent.mkdir()
-    codex_config.parent.mkdir()
-    package.mkdir(parents=True)
-    claude_config.write_text("{}\n", encoding="utf-8")
-    codex_config.write_text("{}\n", encoding="utf-8")
-    (package / "hook_common.py").write_text("sentinel\n", encoding="utf-8")
+    control_home.mkdir(parents=True)
+    module._create_probe_repo(repo, home)
+    hosts_file = control_root / "hosts"
+    guard = control_root / "guard.py"
     module._make_hosts_file(hosts_file)
     module._make_probe_guard(guard, repo)
-    protected = (
-        fake_bin / "gh",
+    module._install(REPO, control_home, repo)
+    module._install_probe_guard(control_home, guard)
+    return work_dir, repo, home, control_root, fake_bin, hosts_file, guard
+
+
+def test_isolation_verifier_protects_external_control_root_and_sinkholes_github(
+    tmp_path,
+):
+    module = _load_probe_module()
+    (
+        work_dir,
+        repo,
+        home,
+        control_root,
+        fake_bin,
         hosts_file,
         guard,
-        claude_config,
-        codex_config,
-        package,
-    )
+    ) = _probe_boundary_layout(module, tmp_path, nested_controls=False)
     with module._EvidenceRecorder() as evidence:
         module._make_fake_gh(fake_bin, evidence.address, repo)
-        before = module._protected_digest(protected)
+        before = module._protected_digest((control_root,))
         module._verify_isolation(
             work_dir=work_dir,
             repo=repo,
             home=home,
+            control_root=control_root,
             fake_gh=fake_bin / "gh",
             hosts_file=hosts_file,
             guard=guard,
-            protected_paths=protected,
             evidence=evidence,
         )
-        after = module._protected_digest(protected)
+        after = module._protected_digest((control_root,))
 
     assert before == after
+
+
+def test_isolation_verifier_rejects_control_root_below_runtime_work_dir(tmp_path):
+    module = _load_probe_module()
+    (
+        work_dir,
+        repo,
+        home,
+        control_root,
+        fake_bin,
+        hosts_file,
+        guard,
+    ) = _probe_boundary_layout(module, tmp_path, nested_controls=True)
+    with module._EvidenceRecorder() as evidence:
+        module._make_fake_gh(fake_bin, evidence.address, repo)
+        with pytest.raises(module.ProbeFailure) as raised:
+            module._verify_isolation(
+                work_dir=work_dir,
+                repo=repo,
+                home=home,
+                control_root=control_root,
+                fake_gh=fake_bin / "gh",
+                hosts_file=hosts_file,
+                guard=guard,
+                evidence=evidence,
+            )
+
+    assert raised.value.code == "ISOLATION_UNAVAILABLE"
 
 
 def test_missing_required_bwrap_is_stable_isolation_unavailable(
