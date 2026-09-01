@@ -213,6 +213,76 @@ def test_recursion_depth_17_is_bounded_not_executed():
     assert result.reason == "RECURSION_LIMIT"
 
 
+def test_candidate_hint_is_bounded_for_extreme_depth_and_token_volume():
+    extreme_depth = 5_000
+    deep_candidate = "$(" * extreme_depth + "gh pr create" + ")" * extreme_depth
+    deep_data = "$(" * extreme_depth + "printf x" + ")" * extreme_depth
+    token_heavy_candidate = "x;" * 20_000 + "gh pr create"
+    token_heavy_data = "x;" * 20_000 + "printf gh pr create"
+
+    result = scan_pr_create(deep_candidate)
+    assert result.kind is ScanKind.AMBIGUOUS_CANDIDATE
+    assert result.reason == "RECURSION_LIMIT"
+    result = scan_pr_create(deep_data)
+    assert result.kind is ScanKind.NO_MATCH
+    assert result.reason == "RECURSION_LIMIT"
+    result = scan_pr_create(token_heavy_candidate)
+    assert result.kind is ScanKind.AMBIGUOUS_CANDIDATE
+    assert result.reason == "TOKEN_LIMIT"
+    result = scan_pr_create(token_heavy_data)
+    assert result.kind is ScanKind.NO_MATCH
+    assert result.reason == "TOKEN_LIMIT"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo &>out gh pr create",
+        "echo &>>out gh pr create",
+        "echo &>gh pr create",
+        "echo &>>'gh pr create'",
+    ],
+)
+def test_bash_compound_redirection_operand_and_following_words_are_data(command):
+    assert scan_pr_create(command).kind is ScanKind.NO_MATCH
+
+
+def test_command_boundary_after_bash_compound_redirection_is_still_executable():
+    assert scan_pr_create("echo &>out; gh pr create").kind is ScanKind.PR_CREATE
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $((gh pr create))",
+        "((gh pr create))",
+    ],
+)
+def test_arithmetic_text_is_not_an_executable_command_context(command):
+    assert scan_pr_create(command).kind is ScanKind.NO_MATCH
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $(( $(gh pr create) + 1 ))",
+        "(( $(gh pr create) ))",
+    ],
+)
+def test_command_substitution_inside_arithmetic_is_executable(command):
+    assert scan_pr_create(command).kind is ScanKind.PR_CREATE
+
+
+def test_comment_cannot_supply_a_redirection_operand():
+    candidate = scan_pr_create("gh pr create > # missing operand")
+    unrelated = scan_pr_create("printf > # missing operand")
+
+    assert candidate.kind is ScanKind.AMBIGUOUS_CANDIDATE
+    assert candidate.reason == "PARSE_ERROR"
+    assert unrelated.kind is ScanKind.NO_MATCH
+    assert unrelated.reason == "PARSE_ERROR"
+
+
 @pytest.mark.parametrize("command", [None, b"gh pr create", "gh\x00pr create"])
 def test_non_strings_and_nul_are_deterministic_no_match(command):
     assert scan_pr_create(command).kind is ScanKind.NO_MATCH
