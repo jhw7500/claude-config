@@ -29,7 +29,10 @@ _SECRET = re.compile(
     r"BEGIN PRIVATE KEY|ghp_[A-Za-z0-9]{8}|github_pat_[A-Za-z0-9_]{8}|"
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8}|AKIA[A-Z0-9]{12}"
 )
-_HOME_PATH = re.compile(r"(?:^|[\s'\"])(?:/home/[^/\s]+|/Users/[^/\s]+)(?:/|\b)")
+_HOME_PATH = re.compile(
+    r"(?:(?<![A-Za-z0-9._~/])|(?<=-[A-Za-z]))"
+    r"(?:/home/[^/\s]+|/Users/[^/\s]+)(?:/|\b)"
+)
 
 
 class TribunalError(Exception):

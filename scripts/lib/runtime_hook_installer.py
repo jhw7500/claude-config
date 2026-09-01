@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Sequence, TypeAlias
 import ctypes
 import errno
+import hashlib
 import json
 import os
 import re
@@ -56,6 +57,14 @@ class SelectorPrecondition:
 
 
 @dataclass(frozen=True)
+class SourcePrecondition:
+    path: Path
+    identity: tuple[int, int, int]
+    content_sha256: str | None = None
+    entry_names: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
 class PlannedWrite:
     path: Path
     data: bytes
@@ -71,6 +80,7 @@ class PlannedSymlink:
     path: Path
     target: Path
     precondition: TargetSnapshot | None = None
+    source_preconditions: tuple[SourcePrecondition, ...] = ()
 
 
 PlannedEntry: TypeAlias = PlannedWrite | PlannedSymlink
@@ -93,6 +103,12 @@ class _CreatedDirectory:
     parent_descriptor: int
     name: str
     identity: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class _SourceHandle:
+    precondition: SourcePrecondition
+    descriptor: int
 
 
 class InstallError(Exception):
@@ -409,6 +425,170 @@ def read_python_source_group(
         if _python_source_names(descriptor) != names:
             raise InstallError("Python source set changed during validation")
         return captured
+
+
+def capture_source_directory(path: Path) -> SourcePrecondition:
+    """Capture one component-safe directory identity and complete name set."""
+    if not path.is_absolute():
+        raise InstallError("source precondition path must be absolute")
+    descriptor = _open_absolute_directory(path)
+    assert descriptor is not None
+    try:
+        return SourcePrecondition(
+            path=path,
+            identity=_identity(os.fstat(descriptor)),
+            entry_names=tuple(sorted(os.listdir(descriptor))),
+        )
+    except OSError as error:
+        raise InstallError("cannot capture source directory safely") from error
+    finally:
+        os.close(descriptor)
+
+
+def capture_source_file(path: Path) -> SourcePrecondition:
+    """Capture one component-safe regular-file identity and content digest."""
+    if not path.is_absolute():
+        raise InstallError("source precondition path must be absolute")
+    descriptor = _open_absolute_directory(path.parent)
+    assert descriptor is not None
+    try:
+        result = _read_regular_at(descriptor, path.name)
+        if result is None:
+            raise InstallError("required source file is missing")
+        data, metadata = result
+        return SourcePrecondition(
+            path=path,
+            identity=_identity(metadata),
+            content_sha256=hashlib.sha256(data).hexdigest(),
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _validate_source_precondition_shape(precondition: SourcePrecondition) -> None:
+    if (
+        not isinstance(precondition, SourcePrecondition)
+        or not precondition.path.is_absolute()
+    ):
+        raise InstallError("invalid source precondition")
+    if (
+        not isinstance(precondition.identity, tuple)
+        or len(precondition.identity) != 3
+        or any(not isinstance(value, int) for value in precondition.identity)
+    ):
+        raise InstallError("invalid source precondition")
+    is_file = precondition.content_sha256 is not None
+    is_directory = precondition.entry_names is not None
+    if is_file == is_directory:
+        raise InstallError("invalid source precondition")
+    if is_file and (
+        not isinstance(precondition.content_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", precondition.content_sha256) is None
+    ):
+        raise InstallError("invalid source precondition")
+    if is_directory and (
+        not isinstance(precondition.entry_names, tuple)
+        or any(
+            not isinstance(name, str) or not name or Path(name).name != name
+            for name in precondition.entry_names
+        )
+        or tuple(sorted(precondition.entry_names)) != precondition.entry_names
+        or len(set(precondition.entry_names)) != len(precondition.entry_names)
+    ):
+        raise InstallError("invalid source precondition")
+
+
+def _collect_source_preconditions(
+    entries: Sequence[PlannedEntry],
+) -> tuple[SourcePrecondition, ...]:
+    collected: dict[Path, SourcePrecondition] = {}
+    for entry in entries:
+        if not isinstance(entry, PlannedSymlink):
+            continue
+        if not isinstance(entry.source_preconditions, tuple):
+            raise InstallError("source preconditions must be immutable")
+        for precondition in entry.source_preconditions:
+            _validate_source_precondition_shape(precondition)
+            previous = collected.get(precondition.path)
+            if previous is not None and previous != precondition:
+                raise InstallError("conflicting source preconditions")
+            collected[precondition.path] = precondition
+    return tuple(collected[path] for path in sorted(collected, key=os.fspath))
+
+
+def _open_source_handles(
+    preconditions: Sequence[SourcePrecondition],
+) -> tuple[_SourceHandle, ...]:
+    handles: list[_SourceHandle] = []
+    try:
+        for precondition in preconditions:
+            directory = (
+                precondition.path
+                if precondition.entry_names is not None
+                else precondition.path.parent
+            )
+            descriptor = _open_absolute_directory(directory)
+            assert descriptor is not None
+            handles.append(_SourceHandle(precondition, descriptor))
+        _validate_source_handles(handles)
+        return tuple(handles)
+    except BaseException:
+        for handle in handles:
+            os.close(handle.descriptor)
+        raise
+
+
+def _validate_source_handles(handles: Sequence[_SourceHandle]) -> None:
+    """Revalidate retained source descriptors and their canonical anchors."""
+    for handle in handles:
+        precondition = handle.precondition
+        if precondition.entry_names is not None:
+            reopened = _open_absolute_directory(precondition.path)
+            assert reopened is not None
+            try:
+                if _identity(os.fstat(reopened)) != precondition.identity:
+                    raise InstallError("source directory identity changed")
+            finally:
+                os.close(reopened)
+            try:
+                names = tuple(sorted(os.listdir(handle.descriptor)))
+            except OSError as error:
+                raise InstallError("cannot revalidate source directory") from error
+            if names != precondition.entry_names:
+                raise InstallError("source directory name set changed")
+            continue
+
+        parent = _ParentHandle(precondition.path.parent, handle.descriptor)
+        _require_parent_anchor(parent)
+        result = _read_regular_at(handle.descriptor, precondition.path.name)
+        if result is None:
+            raise InstallError("source file changed")
+        data, metadata = result
+        if (
+            _identity(metadata) != precondition.identity
+            or hashlib.sha256(data).hexdigest() != precondition.content_sha256
+        ):
+            raise InstallError("source file changed")
+
+
+def _close_source_handles(handles: Sequence[_SourceHandle]) -> None:
+    for handle in handles:
+        try:
+            os.close(handle.descriptor)
+        except OSError:
+            pass
+
+
+def _transaction_phase(
+    handles: Sequence[_SourceHandle],
+    phase_hook: Callable[[str, Path], None] | None,
+    phase: str,
+    path: Path,
+) -> None:
+    _validate_source_handles(handles)
+    if phase_hook is not None:
+        phase_hook(phase, path)
+    _validate_source_handles(handles)
 
 
 def inspect_target(entry: PlannedEntry) -> TargetSnapshot:
@@ -781,13 +961,14 @@ def _remove_created_directories(
     return failed
 
 
-def apply_transaction(
+def _apply_transaction_with_source_handles(
     entries: list[PlannedEntry],
     *,
     namespace: str,
     replace: Callable | None = None,
     stamp: str | None = None,
     phase_hook: Callable[[str, Path], None] | None = None,
+    source_handles: Sequence[_SourceHandle] = (),
 ) -> list[Path]:
     """Apply a descriptor-anchored write set and roll it back on failure."""
     if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", namespace) is None:
@@ -816,6 +997,8 @@ def apply_transaction(
             ):
                 raise InstallError("conflicting selector preconditions")
             selector_preconditions[selector.path] = selector.snapshot
+
+    _validate_source_handles(source_handles)
 
     snapshots: dict[Path, TargetSnapshot] = {}
     for plan in ordered:
@@ -855,6 +1038,7 @@ def apply_transaction(
         )
     ]
     if not changed:
+        _validate_source_handles(source_handles)
         return []
 
     backup_names = {
@@ -928,13 +1112,21 @@ def apply_transaction(
             if backup_name is None:
                 continue
             handle = handles[plan.path]
-            if phase_hook is not None:
-                phase_hook("before_backup_revalidate", plan.path)
+            _transaction_phase(
+                source_handles,
+                phase_hook,
+                "before_backup_revalidate",
+                plan.path,
+            )
             _require_parent_anchor(handle)
             if not snapshot_matches(_snapshot_at(handle, plan), snapshots[plan.path]):
                 raise InstallError("planned target changed before backup")
-            if phase_hook is not None:
-                phase_hook("before_backup_create", plan.path.with_name(backup_name))
+            _transaction_phase(
+                source_handles,
+                phase_hook,
+                "before_backup_create",
+                plan.path.with_name(backup_name),
+            )
             _require_parent_anchor(handle)
             created_backups[plan.path] = _write_backup_at(
                 handle,
@@ -943,15 +1135,23 @@ def apply_transaction(
             )
         for plan in changed:
             handle = handles[plan.path]
-            if phase_hook is not None:
-                phase_hook("before_replace_revalidate", plan.path)
+            _transaction_phase(
+                source_handles,
+                phase_hook,
+                "before_replace_revalidate",
+                plan.path,
+            )
             _require_parent_anchor(handle)
             if not snapshot_matches(_snapshot_at(handle, plan), snapshots[plan.path]):
                 raise InstallError("planned target changed before replacement")
             stage = staged[plan.path]
             if snapshots[plan.path].exists:
-                if phase_hook is not None:
-                    phase_hook("before_target_claim", plan.path)
+                _transaction_phase(
+                    source_handles,
+                    phase_hook,
+                    "before_target_claim",
+                    plan.path,
+                )
                 _require_parent_anchor(handle)
                 quarantine = _claim_target_at(
                     handle,
@@ -963,8 +1163,12 @@ def apply_transaction(
                 captured = _snapshot_at(handle, plan, entry_name=quarantine.name)
                 if not snapshot_matches(captured, snapshots[plan.path]):
                     raise InstallError("atomically claimed target did not match snapshot")
-            if phase_hook is not None:
-                phase_hook("after_target_claim", plan.path)
+            _transaction_phase(
+                source_handles,
+                phase_hook,
+                "after_target_claim",
+                plan.path,
+            )
             _require_parent_anchor(handle)
             try:
                 if replace is None:
@@ -985,6 +1189,12 @@ def apply_transaction(
             _require_parent_anchor(handle)
         for handle in handles.values():
             _require_parent_anchor(handle)
+        _transaction_phase(
+            source_handles,
+            phase_hook,
+            "before_commit_cleanup",
+            changed[-1].path,
+        )
         for plan, quarantine in list(quarantines.items()):
             _unlink_owned(handles[plan], quarantine)
             del quarantines[plan]
@@ -1066,3 +1276,27 @@ def apply_transaction(
                 pass
         if created_directories:
             _remove_created_directories(created_directories)
+
+
+def apply_transaction(
+    entries: list[PlannedEntry],
+    *,
+    namespace: str,
+    replace: Callable | None = None,
+    stamp: str | None = None,
+    phase_hook: Callable[[str, Path], None] | None = None,
+) -> list[Path]:
+    """Apply one transaction while retaining all attached source guards."""
+    preconditions = _collect_source_preconditions(entries)
+    source_handles = _open_source_handles(preconditions)
+    try:
+        return _apply_transaction_with_source_handles(
+            entries,
+            namespace=namespace,
+            replace=replace,
+            stamp=stamp,
+            phase_hook=phase_hook,
+            source_handles=source_handles,
+        )
+    finally:
+        _close_source_handles(source_handles)

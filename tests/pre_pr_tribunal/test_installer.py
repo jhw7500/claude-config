@@ -196,7 +196,7 @@ def test_skill_source_change_after_plan_aborts_before_any_transaction_change(
     reference = source / "skills/pre-pr-tribunal/references/reviewer-a.md"
     reference.write_bytes(reference.read_bytes() + b"changed\n")
 
-    with pytest.raises(installer.InstallError, match="Skill source changed"):
+    with pytest.raises(installer.InstallError):
         installer.apply_transaction(
             plans,
             namespace="pre-pr-tribunal",
@@ -205,6 +205,85 @@ def test_skill_source_change_after_plan_aborts_before_any_transaction_change(
 
     assert _snapshot(_targets(home)) == before
     assert _artifacts(home) == {}
+
+
+def test_list_conversion_cannot_strip_skill_source_guards(installer, tmp_path, home):
+    source = _source_repo(tmp_path)
+    plans = list(installer.build_plan(source, home))
+    links = [entry for entry in plans if isinstance(entry, installer.PlannedSymlink)]
+    assert len(links) == 2
+    assert all(entry.source_preconditions for entry in links)
+    reference = source / "skills/pre-pr-tribunal/references/reviewer-a.md"
+    reference.write_bytes(reference.read_bytes() + b"changed\n")
+    before = _snapshot(_targets(home))
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            plans,
+            namespace="pre-pr-tribunal",
+            stamp="20260901073737",
+        )
+
+    assert _snapshot(_targets(home)) == before
+    assert _artifacts(home) == {}
+
+
+def test_tribunal_boundary_rejects_managed_skill_link_without_source_guards(
+    installer, home
+):
+    target = home / ".codex/skills/pre-pr-tribunal"
+    unguarded = installer.PlannedSymlink(target, installer.SKILL_SOURCE)
+
+    with pytest.raises(installer.InstallError, match="source preconditions required"):
+        installer.apply_transaction(
+            [unguarded],
+            namespace="pre-pr-tribunal",
+            stamp="20260901074747",
+        )
+
+    assert not os.path.lexists(target)
+
+
+def test_tribunal_boundary_rejects_incomplete_skill_source_guards(installer, home):
+    target = home / ".codex/skills/pre-pr-tribunal"
+    root_guard = installer.capture_source_directory(installer.SKILL_SOURCE)
+    incomplete = installer.PlannedSymlink(
+        target,
+        installer.SKILL_SOURCE,
+        source_preconditions=(root_guard,),
+    )
+
+    with pytest.raises(installer.InstallError, match="source metadata required"):
+        installer.apply_transaction(
+            [incomplete],
+            namespace="pre-pr-tribunal",
+            stamp="20260901075757",
+        )
+
+    assert not os.path.lexists(target)
+
+
+def test_main_cli_path_applies_both_managed_links_with_source_guards(
+    installer, home, monkeypatch
+):
+    real_apply = installer._apply_transaction
+    observed = []
+
+    def inspect_and_apply(entries, **kwargs):
+        links = [entry for entry in entries if isinstance(entry, installer.PlannedSymlink)]
+        assert len(links) == 2
+        assert all(entry.source_preconditions for entry in links)
+        observed.extend(links)
+        return real_apply(entries, **kwargs)
+
+    monkeypatch.setattr(installer, "_apply_transaction", inspect_and_apply)
+
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 0
+    assert {entry.path for entry in observed} == {
+        home / ".claude/skills/pre-pr-tribunal",
+        home / ".codex/skills/pre-pr-tribunal",
+    }
+    assert all(entry.path.is_symlink() for entry in observed)
 
 
 @pytest.mark.parametrize("kind", ["symlink", "directory", "fifo"])

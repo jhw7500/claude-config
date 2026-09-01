@@ -6,7 +6,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 import argparse
-import hashlib
 import os
 import stat
 import sys
@@ -20,8 +19,11 @@ from runtime_hook_installer import (  # noqa: E402
     InstallError,
     PlannedSymlink,
     PlannedWrite,
+    SourcePrecondition,
     TargetSnapshot,
     apply_transaction as _apply_transaction,
+    capture_source_directory,
+    capture_source_file,
     inspect_target,
     merge_pre_tool_hook,
     read_python_source_group,
@@ -38,23 +40,7 @@ SKILL_REQUIRED_NAMES = (
     "reviewer-c.md",
     "report-schema.md",
 )
-
-SkillSourceSnapshot = tuple[tuple[str, tuple[int, int, int], str], ...]
-
-
-class TribunalPlan(list[PlannedWrite | PlannedSymlink]):
-    """A transaction plan bound to the exact preflighted Skill tree."""
-
-    def __init__(
-        self,
-        entries: Sequence[PlannedWrite | PlannedSymlink],
-        *,
-        skill_source: Path,
-        skill_snapshot: SkillSourceSnapshot,
-    ) -> None:
-        super().__init__(entries)
-        self.skill_source = skill_source
-        self.skill_snapshot = skill_snapshot
+_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
 PACKAGE_NAMES = (
@@ -115,161 +101,43 @@ def read_validated_sources(
     )
 
 
-def _identity(metadata: os.stat_result) -> tuple[int, int, int]:
-    return (metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode))
-
-
-def _open_absolute_directory_no_symlinks(path: Path) -> int:
-    """Open every absolute directory component without following symlinks."""
-    if not path.is_absolute():
-        raise InstallError("Skill source path must be absolute")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    descriptor = -1
-    try:
-        descriptor = os.open("/", flags)
-        for component in path.parts[1:]:
-            if component in {"", ".", ".."}:
-                raise InstallError("Skill source path is invalid")
-            child = os.open(component, flags, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = child
-        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise InstallError("Skill source directory is unavailable")
-        return descriptor
-    except InstallError:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise
-    except OSError as error:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise InstallError("cannot open Skill source directory safely") from error
-
-
-def _read_markdown_at(
-    descriptor: int,
-    name: str,
-    path: Path,
-    before_open: Callable[[Path], None] | None,
-) -> tuple[bytes, tuple[int, int, int]]:
-    try:
-        before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-    except OSError as error:
-        raise InstallError("required Skill source is missing") from error
-    if not stat.S_ISREG(before.st_mode):
-        raise InstallError("Skill source is not a regular file")
-    if before_open is not None:
-        before_open(path)
-    source = -1
-    try:
-        source = os.open(
-            name,
-            os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=descriptor,
-        )
-        after = os.fstat(source)
-        if not stat.S_ISREG(after.st_mode) or _identity(before) != _identity(after):
-            raise InstallError("Skill source identity changed during validation")
-        chunks: list[bytes] = []
-        while chunk := os.read(source, 64 * 1024):
-            chunks.append(chunk)
-        data = b"".join(chunks)
-        if not data:
-            raise InstallError("required Skill source is empty")
-        return data, _identity(after)
-    except InstallError:
-        raise
-    except OSError as error:
-        raise InstallError("cannot read Skill source safely") from error
-    finally:
-        if source >= 0:
-            os.close(source)
-
-
 def preflight_skill_sources(
     skill: Path,
     *,
     before_source_open: Callable[[Path], None] | None = None,
     before_source_recheck: Callable[[Path], None] | None = None,
-) -> SkillSourceSnapshot:
-    """Validate SKILL.md and every references/*.md through retained directories."""
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    skill_descriptor = -1
-    references_descriptor = -1
-    reopened_skill_descriptor = -1
-    try:
-        skill_descriptor = _open_absolute_directory_no_symlinks(skill)
-        skill_identity = _identity(os.fstat(skill_descriptor))
-        skill_data, skill_file_identity = _read_markdown_at(
-            skill_descriptor,
-            "SKILL.md",
-            skill / "SKILL.md",
-            before_source_open,
-        )
-        references_descriptor = os.open(
-            "references",
-            flags,
-            dir_fd=skill_descriptor,
-        )
-        reference_identity = _identity(os.fstat(references_descriptor))
-        names = tuple(
-            sorted(name for name in os.listdir(references_descriptor) if name.endswith(".md"))
-        )
-        if not set(SKILL_REQUIRED_NAMES).issubset(names):
-            raise InstallError("required Skill reference is missing")
-        references: list[tuple[str, tuple[int, int, int], str]] = []
-        for name in names:
-            data, identity = _read_markdown_at(
-                references_descriptor,
-                name,
-                skill / "references" / name,
-                before_source_open,
-            )
-            references.append(
-                (
-                    f"references/{name}",
-                    identity,
-                    hashlib.sha256(data).hexdigest(),
-                )
-            )
-        if before_source_recheck is not None:
-            before_source_recheck(skill)
-        if tuple(
-            sorted(name for name in os.listdir(references_descriptor) if name.endswith(".md"))
-        ) != names:
-            raise InstallError("Skill source set changed during validation")
-        reopened_skill_descriptor = _open_absolute_directory_no_symlinks(skill)
-        current_references = os.stat(
-            "references",
-            dir_fd=skill_descriptor,
-            follow_symlinks=False,
-        )
-        if (
-            _identity(os.fstat(reopened_skill_descriptor)) != skill_identity
-            or _identity(current_references) != reference_identity
-        ):
-            raise InstallError("Skill source parent changed during validation")
-        return (
-            (".", skill_identity, ""),
-            ("references", reference_identity, ""),
-            (
-                "SKILL.md",
-                skill_file_identity,
-                hashlib.sha256(skill_data).hexdigest(),
-            ),
-            *references,
-        )
-    except InstallError:
-        raise
-    except OSError as error:
-        raise InstallError("cannot preflight Skill sources safely") from error
-    finally:
-        if reopened_skill_descriptor >= 0:
-            os.close(reopened_skill_descriptor)
-        if references_descriptor >= 0:
-            os.close(references_descriptor)
-        if skill_descriptor >= 0:
-            os.close(skill_descriptor)
+) -> tuple[SourcePrecondition, ...]:
+    """Validate SKILL.md and every references/*.md as immutable guards."""
+    references = skill / "references"
+    skill_directory = capture_source_directory(skill)
+    reference_directory = capture_source_directory(references)
+    if not {"SKILL.md", "references"}.issubset(skill_directory.entry_names or ()):
+        raise InstallError("required Skill source is missing")
+    markdown_names = tuple(
+        name for name in (reference_directory.entry_names or ()) if name.endswith(".md")
+    )
+    if not set(SKILL_REQUIRED_NAMES).issubset(markdown_names):
+        raise InstallError("required Skill reference is missing")
+    files = (skill / "SKILL.md", *(references / name for name in markdown_names))
+    captured: list[SourcePrecondition] = [skill_directory, reference_directory]
+    for path in files:
+        if before_source_open is not None:
+            before_source_open(path)
+        guard = capture_source_file(path)
+        if guard.content_sha256 == _EMPTY_SHA256:
+            raise InstallError("required Skill source is empty")
+        captured.append(guard)
+    result = tuple(captured)
+    if before_source_recheck is not None:
+        before_source_recheck(skill)
+    rechecked = (
+        capture_source_directory(skill),
+        capture_source_directory(references),
+        *(capture_source_file(path) for path in files),
+    )
+    if rechecked != result:
+        raise InstallError("Skill source changed during validation")
+    return result
 
 
 def _config_snapshots(home: Path) -> tuple[TargetSnapshot, TargetSnapshot]:
@@ -381,7 +249,7 @@ def build_plan(
         before_source_recheck=before_source_recheck,
     )
     skill_source = repo / "skills" / "pre-pr-tribunal"
-    skill_snapshot = preflight_skill_sources(
+    skill_preconditions = preflight_skill_sources(
         skill_source,
         before_source_open=before_source_open,
         before_source_recheck=before_source_recheck,
@@ -410,24 +278,74 @@ def build_plan(
                 target,
                 skill_source,
                 precondition=inspect_target(link),
+                source_preconditions=skill_preconditions,
             )
         )
-    return TribunalPlan(
-        plans,
-        skill_source=skill_source,
-        skill_snapshot=skill_snapshot,
-    )
+    return plans
 
 
 def apply_transaction(
     entries: list[PlannedWrite | PlannedSymlink],
     **kwargs,
 ) -> list[Path]:
-    """Revalidate a bound Skill source before applying any target mutation."""
-    if isinstance(entries, TribunalPlan):
-        current = preflight_skill_sources(entries.skill_source)
-        if current != entries.skill_snapshot:
-            raise InstallError("Skill source changed since plan was built")
+    """Require source guards on every transaction-owned tribunal Skill link."""
+    for entry in entries:
+        if not isinstance(entry, PlannedSymlink):
+            continue
+        managed_target = (
+            entry.path.name == "pre-pr-tribunal"
+            and entry.path.parent.name == "skills"
+            and entry.path.parent.parent.name in {".claude", ".codex"}
+        )
+        if not managed_target:
+            continue
+        if (
+            not isinstance(entry.source_preconditions, tuple)
+            or not entry.source_preconditions
+            or not all(
+                isinstance(precondition, SourcePrecondition)
+                for precondition in entry.source_preconditions
+            )
+        ):
+            raise InstallError("managed Skill source preconditions required")
+        by_path = {
+            precondition.path: precondition
+            for precondition in entry.source_preconditions
+        }
+        if len(by_path) != len(entry.source_preconditions):
+            raise InstallError("managed Skill source preconditions conflict")
+        if any(
+            precondition.path != entry.target
+            and entry.target not in precondition.path.parents
+            for precondition in entry.source_preconditions
+        ):
+            raise InstallError("managed Skill source preconditions conflict")
+        root = by_path.get(entry.target)
+        references_path = entry.target / "references"
+        references = by_path.get(references_path)
+        if (
+            root is None
+            or root.entry_names is None
+            or not {"SKILL.md", "references"}.issubset(root.entry_names)
+            or references is None
+            or references.entry_names is None
+        ):
+            raise InstallError("managed Skill source metadata required")
+        markdown_names = tuple(
+            name for name in references.entry_names if name.endswith(".md")
+        )
+        required_files = (
+            entry.target / "SKILL.md",
+            *(references_path / name for name in markdown_names),
+        )
+        if (
+            not set(SKILL_REQUIRED_NAMES).issubset(markdown_names)
+            or any(
+                path not in by_path or by_path[path].content_sha256 is None
+                for path in required_files
+            )
+        ):
+            raise InstallError("managed Skill source metadata required")
     return _apply_transaction(entries, **kwargs)
 
 

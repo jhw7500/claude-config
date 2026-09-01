@@ -284,3 +284,101 @@ def test_canonical_parent_drift_rolls_back_without_touching_substitution(
     assert (moved_parent / "settings.json").read_bytes() == b"original"
     assert list(moved_parent.glob(".pre-pr-tribunal-*")) == []
     assert list(moved_parent.glob("*.bak.pre-pr-tribunal.*")) == []
+
+
+@pytest.mark.parametrize("drift", ["content", "parent", "name-set"])
+def test_symlink_source_preconditions_rollback_mid_transaction_drift(
+    common_installer, tmp_path, drift
+):
+    source = tmp_path / "skill-source"
+    references = source / "references"
+    references.mkdir(parents=True)
+    skill_file = source / "SKILL.md"
+    reference = references / "reviewer-a.md"
+    skill_file.write_bytes(b"skill\n")
+    reference.write_bytes(b"reviewer\n")
+    guards = (
+        common_installer.capture_source_directory(source),
+        common_installer.capture_source_directory(references),
+        common_installer.capture_source_file(skill_file),
+        common_installer.capture_source_file(reference),
+    )
+    link = tmp_path / "a-home" / "skills" / "pre-pr-tribunal"
+    config = tmp_path / "z-home" / "settings.json"
+    config.parent.mkdir()
+    config.write_bytes(b"original")
+    outside = tmp_path / "outside-source"
+
+    entries = [
+        common_installer.PlannedSymlink(
+            link,
+            source,
+            source_preconditions=guards,
+        ),
+        common_installer.PlannedWrite(config, b"updated", 0o600, False),
+    ]
+
+    def inject(phase, path):
+        if phase != "after_target_claim" or path != config:
+            return
+        if drift == "content":
+            reference.write_bytes(b"changed\n")
+        elif drift == "parent":
+            source.rename(outside)
+            source.symlink_to(outside, target_is_directory=True)
+        else:
+            (references / "peer.md").write_bytes(b"peer\n")
+
+    with pytest.raises(common_installer.InstallError, match="transaction failed"):
+        common_installer.apply_transaction(
+            entries,
+            namespace="pre-pr-tribunal",
+            stamp="20260901101010",
+            phase_hook=inject,
+        )
+
+    assert not os.path.lexists(link)
+    assert config.read_bytes() == b"original"
+    assert list(tmp_path.rglob(".pre-pr-tribunal-*")) == []
+    assert list(tmp_path.rglob("*.bak.pre-pr-tribunal.*")) == []
+    if drift == "parent":
+        assert source.is_symlink() and source.resolve() == outside
+        assert (outside / "SKILL.md").read_bytes() == b"skill\n"
+
+
+def test_source_drift_before_commit_cleanup_rolls_back_all_targets(
+    common_installer, tmp_path
+):
+    source = tmp_path / "skill-source"
+    source.mkdir()
+    skill_file = source / "SKILL.md"
+    skill_file.write_bytes(b"skill\n")
+    guards = (
+        common_installer.capture_source_directory(source),
+        common_installer.capture_source_file(skill_file),
+    )
+    first = tmp_path / "a-target"
+    second = tmp_path / "b-target"
+    entries = [
+        common_installer.PlannedSymlink(
+            first,
+            source,
+            source_preconditions=guards,
+        ),
+        common_installer.PlannedWrite(second, b"new", 0o600, False),
+    ]
+
+    def inject(phase, _path):
+        if phase == "before_commit_cleanup":
+            skill_file.write_bytes(b"late drift\n")
+
+    with pytest.raises(common_installer.InstallError, match="transaction failed"):
+        common_installer.apply_transaction(
+            entries,
+            namespace="pre-pr-tribunal",
+            stamp="20260901111111",
+            phase_hook=inject,
+        )
+
+    assert not os.path.lexists(first)
+    assert not second.exists()

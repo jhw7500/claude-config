@@ -267,6 +267,52 @@ def test_execution_requires_exact_typed_sanitized_evidence(snapshot, change, cod
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("command", "tool --cwd=/home/alice/private"),
+        ("command", "tool --cwd:(/Users/alice/private)"),
+        ("command", 'tool "${X:-/home/alice/private}"'),
+        ("command", "tool -C/home/alice/private"),
+        ("stdout_excerpt", "cwd=/home/alice/private"),
+        ("stderr_excerpt", "failed:(/Users/alice/private)"),
+    ],
+)
+def test_assignment_and_punctuation_embedded_home_paths_are_rejected(
+    snapshot, field, value
+):
+    item = execution()
+    item[field] = value
+    with pytest.raises(SchemaError, match="EVIDENCE_SECRET_DETECTED"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://example.com/home/alice/private",
+        "https://example.com/Users/alice/private",
+    ],
+)
+def test_url_paths_that_resemble_home_directories_are_not_false_positives(
+    snapshot, value
+):
+    item = execution(command=f"curl {value}")
+    item["stdout_excerpt"] = value
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+    assert parsed.executions[0].command == f"curl {value}"
+
+
 def test_report_and_evidence_byte_limits_are_enforced(snapshot):
     with pytest.raises(SchemaError, match="REPORT_TOO_LARGE"):
         parse_reviewer_report(

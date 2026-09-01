@@ -4,6 +4,8 @@ Reviewer reports are strict JSON objects with exactly `schema`, `reviewer`, `rou
 
 IDs are round-local. Decisions are written after a round and enter only through the following round's `begin --decisions`. A prior decision may be acknowledged only by the originating reviewer. Evidence excerpts are sanitized and bounded; raw secret-bearing output, tokens, private keys, credentials, and absolute home paths invalidate evidence.
 
+A finding path may be any normalized repository-relative path, including outside the diff. Finding scope does not authorize source changes: only controller automatic fixes are limited to round-1 `initial_paths`.
+
 ## Complete Reviewer A finding report
 
 <!-- valid-reviewer-a -->
