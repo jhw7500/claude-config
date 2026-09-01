@@ -739,7 +739,6 @@ def parse_decisions(
         if (
             int(decision_match.group(1)) != expected_round
             or decision_match.group(2) != expected_reviewer.value
-            or decision_match.group(3) != expected_id.rsplit("-", 1)[1]
         ):
             raise SchemaError("DECISION_CROSS_REFERENCE_INVALID")
         disposition = obj["disposition"]

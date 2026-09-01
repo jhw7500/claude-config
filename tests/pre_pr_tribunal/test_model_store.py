@@ -110,9 +110,9 @@ def commit_fix(repo):
     )
 
 
-def decision(disposition="fixed"):
+def decision(disposition="fixed", *, identifier="D-R1-A-001"):
     return {
-        "id": "D-R1-A-001",
+        "id": identifier,
         "finding_ref": {"round": 1, "id": "A-R1-001", "reviewer": "A"},
         "disposition": disposition,
         "rationale": "The failure is now covered by an independent test.",
@@ -307,11 +307,13 @@ def test_decisions_reject_unknown_duplicate_and_incomplete_blocker_coverage():
         parse_decisions(b"[]", prior_blockers=("A-R1-001",))
 
 
-def test_decision_id_suffix_must_bind_to_referenced_finding():
-    mismatched = decision()
-    mismatched["id"] = "D-R1-A-002"
-    with pytest.raises(SchemaError, match="DECISION_CROSS_REFERENCE_INVALID"):
-        parse_decisions(json.dumps([mismatched]).encode(), prior_blockers=("A-R1-001",))
+def test_independently_numbered_decision_binds_through_finding_ref():
+    independent = decision(identifier="D-R1-A-002")
+    parsed = parse_decisions(
+        json.dumps([independent]).encode(), prior_blockers=("A-R1-001",)
+    )
+    assert parsed[0].id == "D-R1-A-002"
+    assert parsed[0].finding_id == "A-R1-001"
 
 
 def test_reviewer_b_claims_and_behavioral_findings_require_execution(snapshot):
@@ -544,6 +546,93 @@ def test_persisted_fixed_decision_requires_head_change_from_prior_summary(git_re
     write_json(verdict_path, payload)
     with pytest.raises(SchemaError, match="FIXED_HEAD_UNCHANGED"):
         read_verdict(git_repo)
+
+
+def test_independent_decision_numbers_survive_rounds_and_persisted_history(git_repo):
+    first = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo, first.snapshot, overrides={"A": {"findings": [finding()]}}
+        ),
+        now=NOW,
+    )
+    commit_fix(git_repo)
+    first_decision = write_json(
+        git_repo / ".review/inbox/round-1/decisions.json",
+        [decision(identifier="D-R1-A-002")],
+    )
+    second = begin_round(
+        git_repo,
+        base="master",
+        runtime="codex",
+        round_number=2,
+        decisions_path=first_decision,
+        now=NOW,
+    )
+    first_response = {
+        "decision_id": "D-R1-A-002",
+        "outcome": "reissued",
+        "replacement_finding_id": "A-R2-001",
+    }
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo,
+            second.snapshot,
+            round_number=2,
+            overrides={
+                "A": {
+                    "findings": [finding("A-R2-001")],
+                    "prior_decisions": [first_response],
+                }
+            },
+        ),
+        now=NOW,
+    )
+    assert read_verdict(git_repo).decisions[0].id == "D-R1-A-002"
+    commit_fix(git_repo)
+    second_decision = {
+        "id": "D-R2-A-009",
+        "finding_ref": {"round": 2, "id": "A-R2-001", "reviewer": "A"},
+        "disposition": "fixed",
+        "rationale": "Covered by a new regression test.",
+        "executions": [execution("D-R2-E001")],
+    }
+    second_decisions_path = write_json(
+        git_repo / ".review/inbox/round-2/decisions.json", [second_decision]
+    )
+    third = begin_round(
+        git_repo,
+        base="master",
+        runtime="codex",
+        round_number=3,
+        decisions_path=second_decisions_path,
+        now=NOW,
+    )
+    pending = read_verdict(git_repo)
+    assert pending.decisions[0].id == "D-R2-A-009"
+    assert pending.history[1].decision_outcomes[0]["decision_id"] == "D-R1-A-002"
+    second_response = {
+        "decision_id": "D-R2-A-009",
+        "outcome": "accepted",
+        "replacement_finding_id": None,
+    }
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo,
+            third.snapshot,
+            round_number=3,
+            overrides={"A": {"prior_decisions": [second_response]}},
+        ),
+        now=NOW,
+    )
+    stored = read_verdict(git_repo)
+    assert stored.gate.status.value == "pass"
+    assert stored.decisions[0].finding_id == "A-R2-001"
 
 
 @pytest.mark.parametrize(

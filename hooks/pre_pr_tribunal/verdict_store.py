@@ -371,19 +371,20 @@ def _parse_history(value: object) -> tuple[RoundSummary, ...]:
             raise SchemaError("VERDICT_INVALID")
         if number > 1:
             previous = result[-1] if result else None
-            expected_ids = (
-                {
-                    "D-R{}-{}-{}".format(
-                        previous.round,
-                        blocker["reviewer"],
-                        blocker["id"].rsplit("-", 1)[1],
-                    )
+            if previous is None or any(
+                sum(
+                    1
+                    for outcome in outcomes
+                    if m._DECISION_ID.fullmatch(outcome["decision_id"]).group(2)
+                    == reviewer
+                )
+                != sum(
+                    1
                     for blocker in previous.blocking_findings
-                }
-                if previous is not None
-                else set()
-            )
-            if previous is None or outcome_ids != expected_ids:
+                    if blocker["reviewer"] == reviewer
+                )
+                for reviewer in "ABC"
+            ):
                 raise SchemaError("VERDICT_INVALID")
         result.append(
             RoundSummary(number, head, digest, tuple(blockers), tuple(outcomes))
