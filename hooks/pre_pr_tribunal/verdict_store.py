@@ -306,21 +306,33 @@ def _parse_history(value: object) -> tuple[RoundSummary, ...]:
         ):
             raise SchemaError("VERDICT_INVALID")
         blockers: list[dict[str, str]] = []
+        blocker_ids: set[str] = set()
         for raw_blocker in m._array(
             obj["blocking_findings"], m.MAX_FINDINGS_PER_REVIEWER * 3, "VERDICT_INVALID"
         ):
             blocker = m._object(
                 raw_blocker, {"id", "reviewer", "severity"}, "VERDICT_INVALID"
             )
+            identifier = blocker["id"]
+            reviewer = blocker["reviewer"]
+            severity = blocker["severity"]
             if (
-                not isinstance(blocker["id"], str)
-                or m._FINDING_ID.fullmatch(blocker["id"]) is None
-                or blocker["reviewer"] not in "ABC"
-                or blocker["severity"] not in {"CRITICAL", "HIGH"}
+                not isinstance(identifier, str)
+                or (finding_match := m._FINDING_ID.fullmatch(identifier)) is None
+                or not isinstance(reviewer, str)
+                or reviewer not in {"A", "B", "C"}
+                or finding_match.group(1) != reviewer
+                or int(finding_match.group(2)) != number
+                or not isinstance(severity, str)
+                or severity not in {"CRITICAL", "HIGH"}
+                or identifier in blocker_ids
             ):
                 raise SchemaError("VERDICT_INVALID")
             blockers.append(dict(blocker))
+            blocker_ids.add(identifier)
         outcomes: list[dict[str, object]] = []
+        outcome_ids: set[str] = set()
+        replacement_ids: set[str] = set()
         for raw_outcome in m._array(
             obj["decision_outcomes"], m.MAX_FINDINGS_PER_REVIEWER * 3, "VERDICT_INVALID"
         ):
@@ -330,7 +342,49 @@ def _parse_history(value: object) -> tuple[RoundSummary, ...]:
                 "VERDICT_INVALID",
             )
             response = m._parse_prior_response(outcome)
+            decision_match = m._DECISION_ID.fullmatch(response.decision_id)
+            if (
+                decision_match is None
+                or int(decision_match.group(1)) != number - 1
+                or response.decision_id in outcome_ids
+            ):
+                raise SchemaError("VERDICT_INVALID")
+            if response.outcome == "reissued":
+                replacement = response.replacement_finding_id
+                replacement_match = (
+                    m._FINDING_ID.fullmatch(replacement)
+                    if isinstance(replacement, str)
+                    else None
+                )
+                if (
+                    replacement_match is None
+                    or int(replacement_match.group(2)) != number
+                    or replacement_match.group(1) != decision_match.group(2)
+                    or replacement not in blocker_ids
+                    or replacement in replacement_ids
+                ):
+                    raise SchemaError("VERDICT_INVALID")
+                replacement_ids.add(replacement)
             outcomes.append(response.to_json())
+            outcome_ids.add(response.decision_id)
+        if not blockers or (number == 1 and outcomes):
+            raise SchemaError("VERDICT_INVALID")
+        if number > 1:
+            previous = result[-1] if result else None
+            expected_ids = (
+                {
+                    "D-R{}-{}-{}".format(
+                        previous.round,
+                        blocker["reviewer"],
+                        blocker["id"].rsplit("-", 1)[1],
+                    )
+                    for blocker in previous.blocking_findings
+                }
+                if previous is not None
+                else set()
+            )
+            if previous is None or outcome_ids != expected_ids:
+                raise SchemaError("VERDICT_INVALID")
         result.append(
             RoundSummary(number, head, digest, tuple(blockers), tuple(outcomes))
         )
@@ -475,7 +529,10 @@ def _parse_verdict(raw: bytes) -> Verdict:
         minimum=0,
         maximum=m.MAX_FINDINGS_PER_REVIEWER * 3,
     )
-    complete = all(slot.status == "complete" for slot in reviewers.values())
+    pending_count = sum(slot.status == "pending" for slot in reviewers.values())
+    if pending_count not in {0, 3}:
+        raise SchemaError("VERDICT_INVALID")
+    complete = pending_count == 0
     if (status is GateStatus.IN_PROGRESS) != (not complete):
         raise SchemaError("VERDICT_INVALID")
     actual = sum(
@@ -491,7 +548,11 @@ def _parse_verdict(raw: bytes) -> Verdict:
         raise SchemaError("VERDICT_INVALID")
     if (status is GateStatus.PASS) != (complete and count == 0):
         raise SchemaError("VERDICT_INVALID")
-    return Verdict(
+    if any(item.disposition == "fixed" for item in decisions) and (
+        not history or head_sha == history[-1].head_sha
+    ):
+        raise SchemaError("FIXED_HEAD_UNCHANGED")
+    verdict = Verdict(
         1,
         repository,
         base_ref,
@@ -508,6 +569,16 @@ def _parse_verdict(raw: bytes) -> Verdict:
         GateSummary(status, count),
         created_at,
     )
+    if complete:
+        _validate_closure(
+            verdict,
+            {
+                key: reviewers[key].report
+                for key in "ABC"
+                if reviewers[key].report is not None
+            },
+        )
+    return verdict
 
 
 def _read_verdict_locked(review_fd: int) -> Verdict:
@@ -519,6 +590,15 @@ def _read_verdict_locked(review_fd: int) -> Verdict:
         unsafe="VERDICT_FILE_UNSAFE",
     )
     return _parse_verdict(raw)
+
+
+def _read_optional_verdict_locked(review_fd: int) -> Verdict | None:
+    try:
+        return _read_verdict_locked(review_fd)
+    except SchemaError as error:
+        if error.code == "VERDICT_MISSING":
+            return None
+        raise
 
 
 def _expected_input(root: Path, supplied: Path, relative: str, code: str) -> None:
@@ -555,6 +635,43 @@ def _round_fd(review_fd: int, round_number: int, *, create: bool) -> int:
         )
     finally:
         os.close(inbox_fd)
+
+
+def _invalidate_round_inputs(review_fd: int, round_number: int) -> None:
+    round_fd = _round_fd(review_fd, round_number, create=True)
+    try:
+        changed = False
+        for basename in ("A.json", "B.json", "C.json", "decisions.json"):
+            try:
+                file_fd = os.open(
+                    basename,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=round_fd,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise SchemaError("FILE_UNSAFE") from None
+            try:
+                opened = _safe_file(file_fd, "FILE_UNSAFE")
+                named = os.stat(basename, dir_fd=round_fd, follow_symlinks=False)
+                if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                    raise SchemaError("FILE_UNSAFE")
+            except SchemaError:
+                raise
+            except OSError:
+                raise SchemaError("FILE_UNSAFE") from None
+            finally:
+                os.close(file_fd)
+            try:
+                os.unlink(basename, dir_fd=round_fd)
+            except OSError:
+                raise SchemaError("FILE_UNSAFE") from None
+            changed = True
+        if changed:
+            os.fsync(round_fd)
+    finally:
+        os.close(round_fd)
 
 
 def _read_input(
@@ -654,12 +771,19 @@ def begin_round(
     _preflight_review_directory(root)
     _check_ignored(root)
     with _locked_review(root, create=True) as review_fd:
+        stored = _read_optional_verdict_locked(review_fd)
         previous: Verdict | None = None
         if round_number == 1:
             if decisions_path is not None:
                 raise SchemaError("DECISIONS_NOT_ALLOWED")
+            if stored is not None and stored.gate.status is GateStatus.FAIL:
+                if stored.round == 3:
+                    raise SchemaError("ROUND_LIMIT_EXHAUSTED")
+                raise SchemaError("ROUND_TRANSITION_INVALID")
         else:
-            previous = _read_verdict_locked(review_fd)
+            if stored is None:
+                raise SchemaError("VERDICT_MISSING")
+            previous = stored
             if previous.round == 3:
                 raise SchemaError("ROUND_LIMIT_EXHAUSTED")
             if (
@@ -705,8 +829,7 @@ def begin_round(
                 raise SchemaError("FIXED_HEAD_UNCHANGED")
             initial_paths = tuple(previous.initial_paths)
             history = tuple((*previous.history, _summary(previous))[-2:])
-        round_fd = _round_fd(review_fd, round_number, create=True)
-        os.close(round_fd)
+        _invalidate_round_inputs(review_fd, round_number)
         pending = Verdict(
             1,
             snapshot.repository,

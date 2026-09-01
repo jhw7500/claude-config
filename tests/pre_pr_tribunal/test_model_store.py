@@ -120,6 +120,46 @@ def decision(disposition="fixed"):
     }
 
 
+def finalized_round_two_pass(repo):
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    finalize_round(
+        repo,
+        reviewer_paths=report_paths(
+            repo, first.snapshot, overrides={"A": {"findings": [finding()]}}
+        ),
+        now=NOW,
+    )
+    commit_fix(repo)
+    decisions_path = write_json(
+        repo / ".review/inbox/round-1/decisions.json", [decision()]
+    )
+    second = begin_round(
+        repo,
+        base="master",
+        runtime="codex",
+        round_number=2,
+        decisions_path=decisions_path,
+        now=NOW,
+    )
+    accepted = {
+        "decision_id": "D-R1-A-001",
+        "outcome": "accepted",
+        "replacement_finding_id": None,
+    }
+    finalize_round(
+        repo,
+        reviewer_paths=report_paths(
+            repo,
+            second.snapshot,
+            round_number=2,
+            overrides={"A": {"prior_decisions": [accepted]}},
+        ),
+        now=NOW,
+    )
+    verdict_path = repo / ".review/verdict.json"
+    return verdict_path, json.loads(verdict_path.read_text(encoding="utf-8"))
+
+
 @pytest.mark.parametrize(
     ("raw", "code"),
     [
@@ -267,6 +307,13 @@ def test_decisions_reject_unknown_duplicate_and_incomplete_blocker_coverage():
         parse_decisions(b"[]", prior_blockers=("A-R1-001",))
 
 
+def test_decision_id_suffix_must_bind_to_referenced_finding():
+    mismatched = decision()
+    mismatched["id"] = "D-R1-A-002"
+    with pytest.raises(SchemaError, match="DECISION_CROSS_REFERENCE_INVALID"):
+        parse_decisions(json.dumps([mismatched]).encode(), prior_blockers=("A-R1-001",))
+
+
 def test_reviewer_b_claims_and_behavioral_findings_require_execution(snapshot):
     claim = {
         "id": "B-R1-C001",
@@ -357,6 +404,29 @@ def test_empty_reports_pass_and_round_one_restart_resets_pending(git_repo):
     assert restarted.gate.status.value == "in_progress"
     assert all(
         slot.status == "pending" for slot in read_verdict(git_repo).reviewers.values()
+    )
+
+
+def test_round_restart_invalidates_stale_reports_before_fresh_reports_pass(git_repo):
+    first = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    stale_paths = report_paths(git_repo, first.snapshot)
+    assert (
+        finalize_round(git_repo, reviewer_paths=stale_paths, now=NOW).gate.status.value
+        == "pass"
+    )
+    stale_decisions = write_json(git_repo / ".review/inbox/round-1/decisions.json", [])
+    restarted = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    assert not stale_decisions.exists()
+    with pytest.raises(SchemaError, match="REVIEWER_REPORT_MISSING"):
+        finalize_round(git_repo, reviewer_paths=stale_paths, now=NOW)
+    fresh_paths = report_paths(git_repo, restarted.snapshot)
+    assert (
+        finalize_round(git_repo, reviewer_paths=fresh_paths, now=NOW).gate.status.value
+        == "pass"
     )
 
 
@@ -458,6 +528,50 @@ def test_restart_rejects_existing_verdict_symlink_and_malformed_timestamp(git_re
     verdict_path.symlink_to(outside)
     with pytest.raises(SchemaError, match="VERDICT_FILE_UNSAFE"):
         begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+
+def test_persisted_complete_round_requires_originating_acceptance(git_repo):
+    verdict_path, payload = finalized_round_two_pass(git_repo)
+    payload["reviewers"]["A"]["prior_decisions"] = []
+    write_json(verdict_path, payload)
+    with pytest.raises(SchemaError, match="PRIOR_DECISION_RESPONSE_MISSING"):
+        read_verdict(git_repo)
+
+
+def test_persisted_fixed_decision_requires_head_change_from_prior_summary(git_repo):
+    verdict_path, payload = finalized_round_two_pass(git_repo)
+    payload["history"][0]["head_sha"] = payload["head_sha"]
+    write_json(verdict_path, payload)
+    with pytest.raises(SchemaError, match="FIXED_HEAD_UNCHANGED"):
+        read_verdict(git_repo)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("wrong_round", "wrong_reviewer", "non_scalar_reviewer", "duplicate", "outcome"),
+)
+def test_persisted_history_cross_references_fail_closed(git_repo, mutation):
+    verdict_path, payload = finalized_round_two_pass(git_repo)
+    blocker = payload["history"][0]["blocking_findings"][0]
+    if mutation == "wrong_round":
+        blocker["id"] = "A-R2-001"
+    elif mutation == "wrong_reviewer":
+        blocker["reviewer"] = "B"
+    elif mutation == "non_scalar_reviewer":
+        blocker["reviewer"] = []
+    elif mutation == "duplicate":
+        payload["history"][0]["blocking_findings"].append(dict(blocker))
+    else:
+        payload["history"][0]["decision_outcomes"] = [
+            {
+                "decision_id": "D-R1-A-001",
+                "outcome": "accepted",
+                "replacement_finding_id": None,
+            }
+        ]
+    write_json(verdict_path, payload)
+    with pytest.raises(SchemaError):
+        read_verdict(git_repo)
 
 
 def test_two_round_originating_reviewer_closure_and_round_limit(git_repo):
@@ -654,6 +768,109 @@ def test_fixed_decision_requires_changed_head_and_paths_stay_within_round_one(gi
         )
 
 
+def test_failed_round_cannot_be_reset_through_round_one(git_repo):
+    first = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo, first.snapshot, overrides={"A": {"findings": [finding()]}}
+        ),
+        now=NOW,
+    )
+    with pytest.raises(SchemaError, match="ROUND_TRANSITION_INVALID"):
+        begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+
+def test_round_three_failure_rejects_round_one_with_exhaustion(git_repo):
+    first = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo, first.snapshot, overrides={"A": {"findings": [finding()]}}
+        ),
+        now=NOW,
+    )
+    commit_fix(git_repo)
+    r1_decisions = write_json(
+        git_repo / ".review/inbox/round-1/decisions.json", [decision()]
+    )
+    second = begin_round(
+        git_repo,
+        base="master",
+        runtime="codex",
+        round_number=2,
+        decisions_path=r1_decisions,
+        now=NOW,
+    )
+    reissued = {
+        "decision_id": "D-R1-A-001",
+        "outcome": "reissued",
+        "replacement_finding_id": "A-R2-001",
+    }
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo,
+            second.snapshot,
+            round_number=2,
+            overrides={
+                "A": {
+                    "findings": [finding("A-R2-001")],
+                    "prior_decisions": [reissued],
+                }
+            },
+        ),
+        now=NOW,
+    )
+    with pytest.raises(SchemaError, match="ROUND_TRANSITION_INVALID"):
+        begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    commit_fix(git_repo)
+    r2_decision = {
+        "id": "D-R2-A-001",
+        "finding_ref": {"round": 2, "id": "A-R2-001", "reviewer": "A"},
+        "disposition": "fixed",
+        "rationale": "Covered by a new regression test.",
+        "executions": [execution("D-R2-E001")],
+    }
+    r2_decisions = write_json(
+        git_repo / ".review/inbox/round-2/decisions.json", [r2_decision]
+    )
+    third = begin_round(
+        git_repo,
+        base="master",
+        runtime="codex",
+        round_number=3,
+        decisions_path=r2_decisions,
+        now=NOW,
+    )
+    r3_response = {
+        "decision_id": "D-R2-A-001",
+        "outcome": "reissued",
+        "replacement_finding_id": "A-R3-001",
+    }
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo,
+            third.snapshot,
+            round_number=3,
+            overrides={
+                "A": {
+                    "findings": [finding("A-R3-001")],
+                    "prior_decisions": [r3_response],
+                }
+            },
+        ),
+        now=NOW,
+    )
+    with pytest.raises(SchemaError, match="ROUND_LIMIT_EXHAUSTED"):
+        begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+
 def test_cli_json_only_success_and_bounded_domain_error(git_repo):
     cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
     begun = subprocess.run(
@@ -777,3 +994,19 @@ def test_cli_usage_is_exit_two_without_traceback(git_repo):
     )
     assert result.returncode == 2 and result.stdout == ""
     assert "Traceback" not in result.stderr and len(result.stderr.encode()) < 512
+
+
+@pytest.mark.parametrize(
+    "arguments", (["--help"], ["-h"], ["begin", "--help"], ["begin", "-h"])
+)
+def test_cli_help_is_stable_usage_without_stdout(git_repo, arguments):
+    cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    result = subprocess.run(
+        [sys.executable, str(cli), *arguments],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "PRE_PR_TRIBUNAL:USAGE\n"

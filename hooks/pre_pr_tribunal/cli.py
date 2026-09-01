@@ -41,20 +41,20 @@ class _Parser(argparse.ArgumentParser):
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = _Parser(add_help=True)
+    parser = _Parser(add_help=False)
     commands = parser.add_subparsers(dest="command", required=True)
-    begin = commands.add_parser("begin")
+    begin = commands.add_parser("begin", add_help=False)
     begin.add_argument("--base", required=True)
     begin.add_argument("--runtime", required=True, choices=("claude", "codex"))
     begin.add_argument("--round", required=True, type=int, choices=(1, 2, 3))
     begin.add_argument("--decisions", type=Path)
-    context = commands.add_parser("context")
+    context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
-    finalize = commands.add_parser("finalize")
+    finalize = commands.add_parser("finalize", add_help=False)
     finalize.add_argument("--reviewer-a", required=True, type=Path)
     finalize.add_argument("--reviewer-b", required=True, type=Path)
     finalize.add_argument("--reviewer-c", required=True, type=Path)
-    commands.add_parser("status")
+    commands.add_parser("status", add_help=False)
     return parser
 
 
