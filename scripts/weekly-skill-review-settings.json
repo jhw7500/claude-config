@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)", "Bash(stat:*)", "Bash(cat:*)", "Bash(grep:*)", "Bash(wc:*)",
+      "Bash(head:*)", "Bash(tail:*)", "Bash(sed:*)", "Bash(awk:*)", "Bash(sort:*)",
+      "Bash(find:*)", "Bash(diff:*)", "Bash(readlink:*)", "Bash(basename:*)",
+      "Bash(dirname:*)", "Bash(date:*)", "Bash(sha256sum:*)", "Bash(md5sum:*)",
+      "Bash(mkdir:*)", "Bash(cp:*)", "Bash(chmod:*)", "Bash(zip:*)", "Bash(unzip:*)",
+      "Bash(tar:*)"
+    ]
+  }
+}
