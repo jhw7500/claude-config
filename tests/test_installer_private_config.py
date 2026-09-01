@@ -91,13 +91,23 @@ def test_fresh_install_creates_private_settings_with_all_non_notion_hooks(home: 
         ("UserPromptSubmit", "python3 $HOME/.claude/hooks/delegate-nudge-hook.py"),
         ("PostToolUse", "python3 $HOME/.claude/hooks/post-info-tool-continuation-hook.py"),
         ("PreToolUse", "python3 $HOME/.claude/hooks/agent-name-delivery-hook.py"),
+        ("PreToolUse", "python3 $HOME/.claude/hooks/verification-command-hygiene-hook.py"),
         ("UserPromptSubmit", "python3 $HOME/.claude/hooks/handoff-checkpoint-hook.py"),
             ("PostToolUse", "python3 $HOME/.claude/hooks/control-char-guard-hook.py"),
             ("PreToolUse", "$HOME/.claude/hooks/task-nudge.sh"),
             ("PreCompact", "$HOME/.claude/hooks/precompact-handoff.sh"),
         }
-    assert len(wired) == 14
+    assert len(wired) == 15
     assert set(wired) == expected
+
+    hygiene_groups = [
+        group
+        for group in data["hooks"]["PreToolUse"]
+        if group["hooks"][0]["command"]
+        == "python3 $HOME/.claude/hooks/verification-command-hygiene-hook.py"
+    ]
+    assert len(hygiene_groups) == 1
+    assert hygiene_groups[0]["matcher"] == "Bash"
 
 
 def test_identical_rerun_adds_no_backup(home: Path) -> None:
