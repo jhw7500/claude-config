@@ -5,6 +5,65 @@ import stat
 import pytest
 
 
+def test_python_source_group_discovers_sorted_top_level_python_only(
+    common_installer, tmp_path
+):
+    source = tmp_path / "package"
+    source.mkdir()
+    (source / "z.py").write_bytes(b"z\n")
+    (source / "a.py").write_bytes(b"a\n")
+    (source / "notes.txt").write_bytes(b"ignore\n")
+    cache = source / "__pycache__"
+    cache.mkdir()
+    (cache / "cached.py").write_bytes(b"ignore\n")
+
+    captured = common_installer.read_python_source_group(
+        source,
+        required_names=("a.py",),
+    )
+
+    assert list(captured) == ["a.py", "z.py"]
+    assert captured == {"a.py": b"a\n", "z.py": b"z\n"}
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory"])
+def test_python_source_group_rejects_nonregular_python_entry(
+    common_installer, tmp_path, kind
+):
+    source = tmp_path / "package"
+    source.mkdir()
+    (source / "required.py").write_bytes(b"required\n")
+    unsafe = source / "unsafe.py"
+    if kind == "symlink":
+        outside = tmp_path / "outside.py"
+        outside.write_bytes(b"outside\n")
+        unsafe.symlink_to(outside)
+    else:
+        unsafe.mkdir()
+
+    with pytest.raises(common_installer.InstallError):
+        common_installer.read_python_source_group(
+            source,
+            required_names=("required.py",),
+        )
+
+
+def test_python_source_group_rejects_name_set_drift(common_installer, tmp_path):
+    source = tmp_path / "package"
+    source.mkdir()
+    (source / "required.py").write_bytes(b"required\n")
+
+    def add_python_file(directory):
+        (directory / "raced.py").write_bytes(b"raced\n")
+
+    with pytest.raises(common_installer.InstallError, match="source set changed"):
+        common_installer.read_python_source_group(
+            source,
+            required_names=("required.py",),
+            before_recheck=add_python_file,
+        )
+
+
 def test_matcherless_group_omits_matcher_and_preserves_unrelated(common_installer):
     original = {
         "hooks": {
@@ -191,3 +250,37 @@ def test_mixed_transaction_rolls_back_files_symlink_modes_and_new_tree(
     assert not (tmp_path / "a-new-tree").exists()
     assert list(tmp_path.rglob(".pre-pr-tribunal-*")) == []
     assert list(tmp_path.rglob("*.bak.pre-pr-tribunal.*")) == []
+
+
+def test_canonical_parent_drift_rolls_back_without_touching_substitution(
+    common_installer, tmp_path
+):
+    parent = tmp_path / "target-parent"
+    parent.mkdir()
+    target = parent / "settings.json"
+    target.write_bytes(b"original")
+    target.chmod(0o600)
+    moved_parent = tmp_path / "validated-parent"
+    outside_parent = tmp_path / "outside-parent"
+    outside_parent.mkdir()
+    outside_target = outside_parent / "settings.json"
+    outside_target.write_bytes(b"substituted")
+
+    def swap(phase, path):
+        if phase == "before_replace_revalidate":
+            parent.rename(moved_parent)
+            parent.symlink_to(outside_parent, target_is_directory=True)
+
+    with pytest.raises(common_installer.InstallError):
+        common_installer.apply_transaction(
+            [common_installer.PlannedWrite(target, b"updated", 0o600, True)],
+            namespace="pre-pr-tribunal",
+            stamp="20260901070707",
+            phase_hook=swap,
+        )
+
+    assert parent.is_symlink() and parent.resolve() == outside_parent
+    assert outside_target.read_bytes() == b"substituted"
+    assert (moved_parent / "settings.json").read_bytes() == b"original"
+    assert list(moved_parent.glob(".pre-pr-tribunal-*")) == []
+    assert list(moved_parent.glob("*.bak.pre-pr-tribunal.*")) == []

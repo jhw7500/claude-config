@@ -332,7 +332,7 @@ def _retain_source_parent(path: Path):
     assert descriptor is not None
     token = _RETAINED_SOURCE_PARENT.set((path, descriptor))
     try:
-        yield
+        yield descriptor
     finally:
         _RETAINED_SOURCE_PARENT.reset(token)
         os.close(descriptor)
@@ -363,6 +363,52 @@ def read_regular_source(
     finally:
         if owns_descriptor:
             os.close(parent_descriptor)
+
+
+def _python_source_names(descriptor: int) -> tuple[str, ...]:
+    try:
+        names = os.listdir(descriptor)
+    except OSError as error:
+        raise InstallError("cannot enumerate source directory safely") from error
+    return tuple(sorted(name for name in names if name.endswith(".py")))
+
+
+def read_python_source_group(
+    directory: Path,
+    *,
+    required_names: Sequence[str] = (),
+    before_open: Callable[[Path], None] | None = None,
+    before_recheck: Callable[[Path], None] | None = None,
+) -> dict[str, bytes]:
+    """Capture every top-level Python source through one retained directory."""
+    if not directory.is_absolute():
+        raise InstallError("source directory must be absolute")
+    required = tuple(required_names)
+    if len(set(required)) != len(required) or any(
+        not isinstance(name, str)
+        or not name.endswith(".py")
+        or Path(name).name != name
+        for name in required
+    ):
+        raise InstallError("invalid required Python source name")
+    with _retain_source_parent(directory) as descriptor:
+        names = _python_source_names(descriptor)
+        if not names:
+            raise InstallError("required Python source set is empty")
+        if not set(required).issubset(names):
+            raise InstallError("required Python source is missing")
+        captured = {
+            name: read_regular_source(
+                directory / name,
+                before_open=before_open,
+            )
+            for name in names
+        }
+        if before_recheck is not None:
+            before_recheck(directory)
+        if _python_source_names(descriptor) != names:
+            raise InstallError("Python source set changed during validation")
+        return captured
 
 
 def inspect_target(entry: PlannedEntry) -> TargetSnapshot:
@@ -413,6 +459,19 @@ def _open_parent(
         if isinstance(error, InstallError):
             raise
         raise InstallError("cannot open target parent safely") from error
+
+
+def _require_parent_anchor(handle: _ParentHandle) -> None:
+    """Prove the canonical parent path still names the retained directory."""
+    reopened = _open_absolute_directory(handle.path)
+    assert reopened is not None
+    try:
+        if _identity(os.fstat(reopened)) != _identity(os.fstat(handle.descriptor)):
+            raise InstallError("planned target parent changed during transaction")
+    except OSError as error:
+        raise InstallError("cannot validate planned target parent") from error
+    finally:
+        os.close(reopened)
 
 
 def _read_regular_absolute(path: Path) -> tuple[bytes, os.stat_result]:
@@ -765,6 +824,7 @@ def apply_transaction(
             current = TargetSnapshot(False)
         else:
             try:
+                _require_parent_anchor(handle)
                 current = _snapshot_at(handle, plan)
             finally:
                 os.close(handle.descriptor)
@@ -811,6 +871,7 @@ def apply_transaction(
         handle = _open_parent(plan.path, create=False, created_directories=[])
         assert handle is not None
         try:
+            _require_parent_anchor(handle)
             if _entry_identity(handle, backup_name) is not None:
                 raise InstallError("transaction backup already exists")
         finally:
@@ -837,10 +898,12 @@ def apply_transaction(
             )
             assert handle is not None
             handles[plan.path] = handle
+            _require_parent_anchor(handle)
             if not snapshot_matches(_snapshot_at(handle, plan), snapshots[plan.path]):
                 raise InstallError("planned target changed after preflight")
         for plan in changed:
             handle = handles[plan.path]
+            _require_parent_anchor(handle)
             if isinstance(plan, PlannedWrite):
                 staged[plan.path] = _stage_regular_at(
                     handle,
@@ -867,10 +930,12 @@ def apply_transaction(
             handle = handles[plan.path]
             if phase_hook is not None:
                 phase_hook("before_backup_revalidate", plan.path)
+            _require_parent_anchor(handle)
             if not snapshot_matches(_snapshot_at(handle, plan), snapshots[plan.path]):
                 raise InstallError("planned target changed before backup")
             if phase_hook is not None:
                 phase_hook("before_backup_create", plan.path.with_name(backup_name))
+            _require_parent_anchor(handle)
             created_backups[plan.path] = _write_backup_at(
                 handle,
                 backup_name,
@@ -880,12 +945,14 @@ def apply_transaction(
             handle = handles[plan.path]
             if phase_hook is not None:
                 phase_hook("before_replace_revalidate", plan.path)
+            _require_parent_anchor(handle)
             if not snapshot_matches(_snapshot_at(handle, plan), snapshots[plan.path]):
                 raise InstallError("planned target changed before replacement")
             stage = staged[plan.path]
             if snapshots[plan.path].exists:
                 if phase_hook is not None:
                     phase_hook("before_target_claim", plan.path)
+                _require_parent_anchor(handle)
                 quarantine = _claim_target_at(
                     handle,
                     plan.path.name,
@@ -898,6 +965,7 @@ def apply_transaction(
                     raise InstallError("atomically claimed target did not match snapshot")
             if phase_hook is not None:
                 phase_hook("after_target_claim", plan.path)
+            _require_parent_anchor(handle)
             try:
                 if replace is None:
                     _rename_noreplace(
@@ -914,12 +982,17 @@ def apply_transaction(
                 raise
             replaced.append(plan)
             os.fsync(handle.descriptor)
+            _require_parent_anchor(handle)
+        for handle in handles.values():
+            _require_parent_anchor(handle)
         for plan, quarantine in list(quarantines.items()):
             _unlink_owned(handles[plan], quarantine)
             del quarantines[plan]
         for plan, restore in list(restores.items()):
             _unlink_owned(handles[plan], restore)
             del restores[plan]
+        for handle in handles.values():
+            _require_parent_anchor(handle)
         return [plan.path for plan in changed]
     except BaseException as error:
         for plan in reversed(replaced):

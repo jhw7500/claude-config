@@ -940,13 +940,17 @@ def test_destination_parent_swap_cannot_redirect_production_replace(installer, t
             parent.rename(moved_parent)
             parent.symlink_to(outside_parent, target_is_directory=True)
 
-    installer.apply_transaction(
-        [installer.PlannedWrite(target, b"updated", 0o600, True)],
-        stamp="20260831010101",
-        phase_hook=swap,
-    )
-    assert (moved_parent / "settings.json").read_bytes() == b"updated"
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            [installer.PlannedWrite(target, b"updated", 0o600, True)],
+            stamp="20260831010101",
+            phase_hook=swap,
+        )
+    assert parent.is_symlink() and parent.resolve() == outside_parent
+    assert (moved_parent / "settings.json").read_bytes() == b"original"
     assert outside_target.read_bytes() == b"substituted"
+    assert list(moved_parent.glob(".task-nudge-*")) == []
+    assert list(moved_parent.glob("*.bak.task-nudge.*")) == []
 
 
 def test_success_fsyncs_regular_files_and_parent_directories(installer, tmp_path, monkeypatch):

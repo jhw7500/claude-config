@@ -20,11 +20,10 @@ from runtime_hook_installer import (  # noqa: E402
     PlannedSymlink,
     PlannedWrite,
     TargetSnapshot,
-    _retain_source_parent,
     apply_transaction,
     inspect_target,
     merge_pre_tool_hook,
-    read_regular_source,
+    read_python_source_group,
     render_json_config,
     strict_json_object,
 )
@@ -63,7 +62,7 @@ def _real_directory(path: Path, *, label: str, private: bool = False) -> Path:
         raise InstallError(f"{label} is unavailable") from error
     if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
         raise InstallError(f"{label} is unavailable")
-    if private and metadata.st_uid != os.getuid():
+    if private and metadata.st_uid != os.geteuid():
         raise InstallError(f"{label} must be owner-private")
     try:
         resolved = path.resolve(strict=True)
@@ -77,17 +76,16 @@ def read_validated_sources(
     repo: Path,
     *,
     before_source_open: Callable[[Path], None] | None = None,
+    before_source_recheck: Callable[[Path], None] | None = None,
 ) -> dict[str, bytes]:
     """Capture the deterministic required top-level package sources."""
     package = repo / "hooks" / "pre_pr_tribunal"
-    with _retain_source_parent(package):
-        return {
-            name: read_regular_source(
-                package / name,
-                before_open=before_source_open,
-            )
-            for name in PACKAGE_NAMES
-        }
+    return read_python_source_group(
+        package,
+        required_names=PACKAGE_NAMES,
+        before_open=before_source_open,
+        before_recheck=before_source_recheck,
+    )
 
 
 def _config_snapshots(home: Path) -> tuple[TargetSnapshot, TargetSnapshot]:
@@ -138,7 +136,8 @@ def plan_package_and_configs(
     """Preflight every target, then bind captured data to those snapshots."""
     del repo
     package = home / ".local" / "share" / "claude-config" / "pre_pr_tribunal"
-    package_paths = [package / name for name in PACKAGE_NAMES]
+    source_names = tuple(sorted(sources))
+    package_paths = [package / name for name in source_names]
     package_snapshots = [
         inspect_target(PlannedWrite(path, b"", 0o600, True))
         for path in package_paths
@@ -155,7 +154,7 @@ def plan_package_and_configs(
             precondition=snapshot,
         )
         for name, path, snapshot in zip(
-            PACKAGE_NAMES,
+            source_names,
             package_paths,
             package_snapshots,
             strict=True,
@@ -187,11 +186,16 @@ def build_plan(
     home: Path,
     *,
     before_source_open: Callable[[Path], None] | None = None,
+    before_source_recheck: Callable[[Path], None] | None = None,
 ) -> list[PlannedWrite | PlannedSymlink]:
     """Capture and validate the complete tribunal transaction plan."""
     repo = _real_directory(Path(repo), label="repository")
     home = _real_directory(Path(home), label="HOME", private=True)
-    sources = read_validated_sources(repo, before_source_open=before_source_open)
+    sources = read_validated_sources(
+        repo,
+        before_source_open=before_source_open,
+        before_source_recheck=before_source_recheck,
+    )
     snapshots = _config_snapshots(home)
     configs = merge_runtime_configs(
         home,

@@ -8,9 +8,7 @@ import sys
 
 import pytest
 
-from conftest import REPO
-
-
+REPO = Path(__file__).resolve().parents[2]
 CLAUDE_COMMAND = (
     "/usr/bin/python3 $HOME/.local/share/claude-config/"
     "pre_pr_tribunal/claude_hook.py"
@@ -264,6 +262,59 @@ def test_source_identity_change_during_preflight_fails_without_writes(installer,
     assert _snapshot(_targets(home)) == before
     assert replacement.read_text(encoding="utf-8") == "replacement\n"
     assert _artifacts(home) == {}
+
+
+def test_extra_top_level_python_module_is_planned_and_installed(
+    installer, tmp_path, home
+):
+    source = _source_repo(tmp_path)
+    extra = source / "hooks/pre_pr_tribunal/extra_module.py"
+    extra.write_bytes(b"EXTRA = True\n")
+    target = home / ".local/share/claude-config/pre_pr_tribunal/extra_module.py"
+
+    plans = installer.build_plan(source, home)
+    by_path = {plan.path: plan for plan in plans}
+    assert by_path[target].data == b"EXTRA = True\n"
+
+    installer.apply_transaction(
+        plans,
+        namespace="pre-pr-tribunal",
+        stamp="20260901080808",
+    )
+    assert target.read_bytes() == b"EXTRA = True\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_tribunal_parent_drift_fails_without_false_install_or_outside_change(
+    installer, tmp_path, home
+):
+    package = home / ".local/share/claude-config/pre_pr_tribunal"
+    package.mkdir(parents=True)
+    moved_package = tmp_path / "validated-package"
+    outside_package = tmp_path / "outside-package"
+    outside_package.mkdir()
+    outside_target = outside_package / "__init__.py"
+    outside_target.write_bytes(b"outside-substitution\n")
+    plans = installer.build_plan(REPO, home)
+
+    def swap(phase, path):
+        if phase == "before_replace_revalidate" and path == package / "__init__.py":
+            package.rename(moved_package)
+            package.symlink_to(outside_package, target_is_directory=True)
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            plans,
+            namespace="pre-pr-tribunal",
+            stamp="20260901090909",
+            phase_hook=swap,
+        )
+
+    assert package.is_symlink() and package.resolve() == outside_package
+    assert outside_target.read_bytes() == b"outside-substitution\n"
+    assert list(moved_package.iterdir()) == []
+    assert not (home / ".claude/settings.json").exists()
+    assert not (home / ".codex/hooks.json").exists()
 
 
 @pytest.mark.parametrize("kind", ["missing", "regular", "symlink"])

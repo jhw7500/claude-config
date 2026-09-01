@@ -4,9 +4,7 @@ from pathlib import Path
 import stat
 import subprocess
 
-from conftest import REPO
-
-
+REPO = Path(__file__).resolve().parents[2]
 INSTALL = REPO / "install.sh"
 TASK_CLAUDE = "$HOME/.claude/hooks/task-nudge.sh"
 TASK_CODEX = "/usr/bin/python3 $HOME/.local/share/claude-config/hooks/task-nudge-codex.py"
@@ -32,8 +30,28 @@ def _matching(groups: list[dict[str, object]], command: str) -> list[dict[str, o
     return [group for group in groups if group.get("hooks") == [{"type": "command", "command": command}]]
 
 
-def _transaction_backups(home: Path) -> list[Path]:
-    return sorted(path for path in home.rglob("*.bak.*") if ".bak.pre-pr-tribunal." in path.name)
+def _backup_paths(home: Path) -> dict[str, list[Path]]:
+    settings = home / ".claude/settings.json"
+    hooks = home / ".codex/hooks.json"
+    return {
+        "generic-settings": sorted(settings.parent.glob("settings.json.bak.[0-9]*")),
+        "task-settings": sorted(settings.parent.glob("settings.json.bak.task-nudge.*")),
+        "tribunal-settings": sorted(
+            settings.parent.glob("settings.json.bak.pre-pr-tribunal.*")
+        ),
+        "task-codex": sorted(hooks.parent.glob("hooks.json.bak.task-nudge.*")),
+        "tribunal-codex": sorted(
+            hooks.parent.glob("hooks.json.bak.pre-pr-tribunal.*")
+        ),
+    }
+
+
+def _backup_snapshot(home: Path) -> dict[Path, tuple[bytes, int]]:
+    return {
+        path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        for paths in _backup_paths(home).values()
+        for path in paths
+    }
 
 
 def test_full_install_keeps_task_nudge_and_tribunal_hooks_coexisting_once(home):
@@ -70,6 +88,19 @@ def test_full_install_keeps_task_nudge_and_tribunal_hooks_coexisting_once(home):
     assert _matching(codex_data["hooks"]["PreToolUse"], TRIBUNAL_CODEX) == [
         {"hooks": [{"type": "command", "command": TRIBUNAL_CODEX}]}
     ]
+    backups_by_namespace = _backup_paths(home)
+    assert {name: len(paths) for name, paths in backups_by_namespace.items()} == {
+        "generic-settings": 1,
+        "task-settings": 1,
+        "tribunal-settings": 1,
+        "task-codex": 1,
+        "tribunal-codex": 1,
+    }
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o600
+        for paths in backups_by_namespace.values()
+        for path in paths
+    )
 
     source_names = sorted(path.name for path in (REPO / "hooks/pre_pr_tribunal").glob("*.py"))
     installed = home / ".local/share/claude-config/pre_pr_tribunal"
@@ -92,11 +123,12 @@ def test_full_install_keeps_task_nudge_and_tribunal_hooks_coexisting_once(home):
 
     tracked = [*(installed / name for name in source_names), claude / "settings.json", codex / "hooks.json"]
     before = {path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode)) for path in tracked}
-    backups = _transaction_backups(home)
+    backups = _backup_snapshot(home)
     second = _run_install(home)
     assert second.returncode == 0, second.stderr
     assert {path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode)) for path in tracked} == before
-    assert _transaction_backups(home) == backups
+    assert _backup_snapshot(home) == backups
+    assert _backup_paths(home) == backups_by_namespace
 
 
 def test_install_stops_after_tribunal_failure_without_partial_tribunal_targets(home, tmp_path):

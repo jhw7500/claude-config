@@ -1,14 +1,13 @@
 import json
 import os
+from pathlib import Path
 import shutil
 import stat
 import subprocess
 
 import pytest
 
-from conftest import REPO
-
-
+REPO = Path(__file__).resolve().parents[2]
 CLAUDE_COMMAND = "$HOME/.claude/hooks/task-nudge.sh"
 CODEX_COMMAND = "/usr/bin/python3 $HOME/.local/share/claude-config/hooks/task-nudge-codex.py"
 TRIBUNAL_CODEX_COMMAND = "/usr/bin/python3 $HOME/.local/share/claude-config/pre_pr_tribunal/codex_hook.py"
