@@ -66,8 +66,8 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     except OSError:
         pass
     try:
-        process.wait(timeout=GIT_TERMINATION_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
+        time.sleep(GIT_TERMINATION_GRACE_SECONDS)
+    except Exception:
         pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -80,14 +80,29 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
             process.kill()
         except OSError:
             pass
-        process.wait()
+        try:
+            process.wait()
+        except Exception:
+            pass
+    except Exception:
+        pass
     for pipe in (process.stdout, process.stderr):
         if pipe is not None:
-            pipe.close()
+            try:
+                pipe.close()
+            except Exception:
+                pass
 
 
 def _run_git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
     argv = [GIT, "-C", str(cwd), *arguments]
+    try:
+        selector = selectors.DefaultSelector()
+    except Exception:
+        raise GitStateError("GIT_COMMAND_FAILED") from None
+
+    process: subprocess.Popen[bytes] | None = None
+    completed = False
     try:
         process = subprocess.Popen(
             argv,
@@ -98,15 +113,10 @@ def _run_git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
             env=_git_environment(),
             start_new_session=True,
         )
-    except (OSError, TypeError, ValueError):
-        raise GitStateError("GIT_COMMAND_FAILED") from None
-    assert process.stdout is not None
-    assert process.stderr is not None
-
-    selector = selectors.DefaultSelector()
-    stdout = bytearray()
-    stderr = bytearray()
-    try:
+        if process.stdout is None or process.stderr is None:
+            raise RuntimeError("missing Git capture pipe")
+        stdout = bytearray()
+        stderr = bytearray()
         selector.register(
             process.stdout,
             selectors.EVENT_READ,
@@ -140,16 +150,25 @@ def _run_git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
         if remaining <= 0:
             raise GitStateError("GIT_COMMAND_FAILED")
         returncode = process.wait(timeout=remaining)
-    except GitStateError:
-        _terminate_process_group(process)
-        raise
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        _terminate_process_group(process)
+        completed = True
+        result = subprocess.CompletedProcess(
+            argv, returncode, bytes(stdout), bytes(stderr)
+        )
+    except BaseException as error:
+        if process is not None and not completed:
+            _terminate_process_group(process)
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        if isinstance(error, GitStateError):
+            raise
         raise GitStateError("GIT_COMMAND_FAILED") from None
     finally:
-        selector.close()
+        try:
+            selector.close()
+        except Exception:
+            pass
 
-    return subprocess.CompletedProcess(argv, returncode, bytes(stdout), bytes(stderr))
+    return result
 
 
 def _command_output(

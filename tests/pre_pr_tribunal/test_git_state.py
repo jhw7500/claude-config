@@ -480,6 +480,120 @@ def test_git_timeout_terminates_process_group_before_descendant_runs(
     assert not sentinel.exists()
 
 
+class _RecordingPipe:
+    def __init__(self, events, name):
+        self.events = events
+        self.name = name
+
+    def close(self):
+        self.events.append(("close", self.name))
+
+
+class _RecordingProcess:
+    pid = 4242
+
+    def __init__(self, events):
+        self.events = events
+        self.stdout = _RecordingPipe(events, "stdout")
+        self.stderr = _RecordingPipe(events, "stderr")
+
+    def wait(self, timeout=None):
+        self.events.append(("wait", timeout))
+        return -9
+
+    def kill(self):
+        self.events.append(("kill-process", None))
+
+
+def test_group_kill_precedes_first_wait_and_reap(monkeypatch):
+    events = []
+    process = _RecordingProcess(events)
+    monkeypatch.setattr(
+        git_state.os,
+        "killpg",
+        lambda pid, sig: events.append(("kill-group", sig)),
+    )
+    monkeypatch.setattr(
+        git_state.time,
+        "sleep",
+        lambda seconds: events.append(("sleep", seconds)),
+    )
+
+    git_state._terminate_process_group(process)
+
+    first_wait = next(index for index, event in enumerate(events) if event[0] == "wait")
+    group_kill = events.index(("kill-group", git_state.signal.SIGKILL))
+    assert events[:3] == [
+        ("kill-group", git_state.signal.SIGTERM),
+        ("sleep", git_state.GIT_TERMINATION_GRACE_SECONDS),
+        ("kill-group", git_state.signal.SIGKILL),
+    ]
+    assert group_kill < first_wait
+    assert not any(event[0] == "kill-group" for event in events[first_wait + 1 :])
+    assert events[-2:] == [("close", "stdout"), ("close", "stderr")]
+
+
+def test_selector_constructor_failure_is_stable_and_prevents_spawn(monkeypatch):
+    spawn_calls = []
+
+    def fail_selector():
+        raise RuntimeError("selector constructor canary")
+
+    def record_spawn(*args, **kwargs):
+        spawn_calls.append((args, kwargs))
+        raise AssertionError("child must not spawn")
+
+    monkeypatch.setattr(git_state.selectors, "DefaultSelector", fail_selector)
+    monkeypatch.setattr(git_state.subprocess, "Popen", record_spawn)
+
+    with pytest.raises(GitStateError, match="^GIT_COMMAND_FAILED$"):
+        git_state._run_git(Path.cwd(), "version")
+
+    assert spawn_calls == []
+
+
+class _RegistrationFailureSelector:
+    def __init__(self):
+        self.closed = False
+
+    def register(self, *args, **kwargs):
+        raise RuntimeError("selector registration canary")
+
+    def close(self):
+        self.closed = True
+
+
+def test_selector_registration_failure_cleans_real_git_process_group(
+    git_repo, tmp_path, monkeypatch
+):
+    sentinel = tmp_path / "registration-survived"
+    command = tmp_path / "registration-child.sh"
+    _write_executable(
+        command,
+        '#!/bin/sh\n( /bin/sleep 0.4; : > "$CAP_SENTINEL" ) &\n/bin/sleep 0.8\n',
+    )
+    _git(git_repo, "config", "alias.registration-child", f"!{command}")
+    selector = _RegistrationFailureSelector()
+    monkeypatch.setenv("CAP_SENTINEL", str(sentinel))
+    monkeypatch.setattr(
+        git_state.selectors,
+        "DefaultSelector",
+        lambda: selector,
+    )
+
+    error = None
+    try:
+        git_state._run_git(git_repo, "registration-child")
+    except Exception as caught:
+        error = caught
+    time.sleep(0.55)
+
+    assert isinstance(error, GitStateError)
+    assert str(error) == "GIT_COMMAND_FAILED"
+    assert selector.closed
+    assert not sentinel.exists()
+
+
 class _ValueErrorPath:
     def __fspath__(self):
         raise ValueError("cwd canary must not escape")
