@@ -10,6 +10,11 @@ TASK_CLAUDE = "$HOME/.claude/hooks/task-nudge.sh"
 TASK_CODEX = "/usr/bin/python3 $HOME/.local/share/claude-config/hooks/task-nudge-codex.py"
 TRIBUNAL_CLAUDE = "/usr/bin/python3 $HOME/.local/share/claude-config/pre_pr_tribunal/claude_hook.py"
 TRIBUNAL_CODEX = "/usr/bin/python3 $HOME/.local/share/claude-config/pre_pr_tribunal/codex_hook.py"
+SKILL_SOURCE = REPO / "skills/pre-pr-tribunal"
+SKILL_TARGETS = (
+    Path(".claude/skills/pre-pr-tribunal"),
+    Path(".codex/skills/pre-pr-tribunal"),
+)
 
 
 def _run_install(home: Path) -> subprocess.CompletedProcess[str]:
@@ -54,6 +59,39 @@ def _backup_snapshot(home: Path) -> dict[Path, tuple[bytes, int]]:
     }
 
 
+def _tribunal_snapshot(home: Path) -> dict[Path, tuple[object, ...]]:
+    package = home / ".local/share/claude-config/pre_pr_tribunal"
+    paths = [
+        *sorted(package.glob("*.py")),
+        home / ".claude/settings.json",
+        home / ".codex/hooks.json",
+        *(home / relative for relative in SKILL_TARGETS),
+    ]
+    result = {}
+    for path in paths:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            result[path] = ("absent",)
+        else:
+            if stat.S_ISLNK(metadata.st_mode):
+                result[path] = ("symlink", os.readlink(path))
+            elif stat.S_ISREG(metadata.st_mode):
+                result[path] = (
+                    "regular",
+                    stat.S_IMODE(metadata.st_mode),
+                    path.read_bytes(),
+                )
+            elif stat.S_ISDIR(metadata.st_mode):
+                result[path] = (
+                    "directory",
+                    tuple(sorted(child.name for child in path.iterdir())),
+                )
+            else:
+                result[path] = ("other", stat.S_IFMT(metadata.st_mode))
+    return result
+
+
 def test_full_install_keeps_task_nudge_and_tribunal_hooks_coexisting_once(home):
     claude = home / ".claude"
     codex = home / ".codex"
@@ -70,7 +108,7 @@ def test_full_install_keeps_task_nudge_and_tribunal_hooks_coexisting_once(home):
 
     first = _run_install(home)
     assert first.returncode == 0, first.stderr
-    assert "[install] Pre-PR tribunal: Claude/Codex blocking hook" in first.stdout
+    assert "[install] Pre-PR tribunal: Claude/Codex Skill + blocking hook" in first.stdout
     assert "Codex에서 /hooks" in first.stdout
 
     claude_data = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
@@ -111,6 +149,11 @@ def test_full_install_keeps_task_nudge_and_tribunal_hooks_coexisting_once(home):
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
         assert target.read_bytes() == (REPO / "hooks/pre_pr_tribunal" / name).read_bytes()
 
+    for relative in SKILL_TARGETS:
+        target = home / relative
+        assert target.is_symlink()
+        assert target.readlink() == SKILL_SOURCE
+
     hook_result = subprocess.run(
         ["/usr/bin/python3", str(installed / "claude_hook.py")],
         input=json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "printf safe"}, "cwd": str(home)}),
@@ -129,6 +172,29 @@ def test_full_install_keeps_task_nudge_and_tribunal_hooks_coexisting_once(home):
     assert {path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode)) for path in tracked} == before
     assert _backup_snapshot(home) == backups
     assert _backup_paths(home) == backups_by_namespace
+    for relative in SKILL_TARGETS:
+        target = home / relative
+        assert target.is_symlink() and target.readlink() == SKILL_SOURCE
+
+
+def test_full_install_preserves_every_tribunal_target_on_conflicting_skill_directory(
+    home,
+):
+    first = _run_install(home)
+    assert first.returncode == 0, first.stderr
+    conflict = home / ".codex/skills/pre-pr-tribunal"
+    conflict.unlink()
+    conflict.mkdir()
+    (conflict / "sentinel").write_text("keep\n", encoding="utf-8")
+    before = _tribunal_snapshot(home)
+    backups = _backup_snapshot(home)
+
+    second = _run_install(home)
+
+    assert second.returncode != 0
+    assert _tribunal_snapshot(home) == before
+    assert _backup_snapshot(home) == backups
+    assert (conflict / "sentinel").read_text(encoding="utf-8") == "keep\n"
 
 
 def test_install_stops_after_tribunal_failure_without_partial_tribunal_targets(home, tmp_path):

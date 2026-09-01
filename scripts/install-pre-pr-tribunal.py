@@ -6,6 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 import argparse
+import hashlib
 import os
 import stat
 import sys
@@ -20,7 +21,7 @@ from runtime_hook_installer import (  # noqa: E402
     PlannedSymlink,
     PlannedWrite,
     TargetSnapshot,
-    apply_transaction,
+    apply_transaction as _apply_transaction,
     inspect_target,
     merge_pre_tool_hook,
     read_python_source_group,
@@ -30,6 +31,32 @@ from runtime_hook_installer import (  # noqa: E402
 
 
 PACKAGE_SOURCE = REPO / "hooks" / "pre_pr_tribunal"
+SKILL_SOURCE = REPO / "skills" / "pre-pr-tribunal"
+SKILL_REQUIRED_NAMES = (
+    "reviewer-a.md",
+    "reviewer-b.md",
+    "reviewer-c.md",
+    "report-schema.md",
+)
+
+SkillSourceSnapshot = tuple[tuple[str, tuple[int, int, int], str], ...]
+
+
+class TribunalPlan(list[PlannedWrite | PlannedSymlink]):
+    """A transaction plan bound to the exact preflighted Skill tree."""
+
+    def __init__(
+        self,
+        entries: Sequence[PlannedWrite | PlannedSymlink],
+        *,
+        skill_source: Path,
+        skill_snapshot: SkillSourceSnapshot,
+    ) -> None:
+        super().__init__(entries)
+        self.skill_source = skill_source
+        self.skill_snapshot = skill_snapshot
+
+
 PACKAGE_NAMES = (
     "__init__.py",
     "claude_hook.py",
@@ -86,6 +113,163 @@ def read_validated_sources(
         before_open=before_source_open,
         before_recheck=before_source_recheck,
     )
+
+
+def _identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return (metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode))
+
+
+def _open_absolute_directory_no_symlinks(path: Path) -> int:
+    """Open every absolute directory component without following symlinks."""
+    if not path.is_absolute():
+        raise InstallError("Skill source path must be absolute")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open("/", flags)
+        for component in path.parts[1:]:
+            if component in {"", ".", ".."}:
+                raise InstallError("Skill source path is invalid")
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise InstallError("Skill source directory is unavailable")
+        return descriptor
+    except InstallError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise InstallError("cannot open Skill source directory safely") from error
+
+
+def _read_markdown_at(
+    descriptor: int,
+    name: str,
+    path: Path,
+    before_open: Callable[[Path], None] | None,
+) -> tuple[bytes, tuple[int, int, int]]:
+    try:
+        before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+    except OSError as error:
+        raise InstallError("required Skill source is missing") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise InstallError("Skill source is not a regular file")
+    if before_open is not None:
+        before_open(path)
+    source = -1
+    try:
+        source = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=descriptor,
+        )
+        after = os.fstat(source)
+        if not stat.S_ISREG(after.st_mode) or _identity(before) != _identity(after):
+            raise InstallError("Skill source identity changed during validation")
+        chunks: list[bytes] = []
+        while chunk := os.read(source, 64 * 1024):
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if not data:
+            raise InstallError("required Skill source is empty")
+        return data, _identity(after)
+    except InstallError:
+        raise
+    except OSError as error:
+        raise InstallError("cannot read Skill source safely") from error
+    finally:
+        if source >= 0:
+            os.close(source)
+
+
+def preflight_skill_sources(
+    skill: Path,
+    *,
+    before_source_open: Callable[[Path], None] | None = None,
+    before_source_recheck: Callable[[Path], None] | None = None,
+) -> SkillSourceSnapshot:
+    """Validate SKILL.md and every references/*.md through retained directories."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    skill_descriptor = -1
+    references_descriptor = -1
+    reopened_skill_descriptor = -1
+    try:
+        skill_descriptor = _open_absolute_directory_no_symlinks(skill)
+        skill_identity = _identity(os.fstat(skill_descriptor))
+        skill_data, skill_file_identity = _read_markdown_at(
+            skill_descriptor,
+            "SKILL.md",
+            skill / "SKILL.md",
+            before_source_open,
+        )
+        references_descriptor = os.open(
+            "references",
+            flags,
+            dir_fd=skill_descriptor,
+        )
+        reference_identity = _identity(os.fstat(references_descriptor))
+        names = tuple(
+            sorted(name for name in os.listdir(references_descriptor) if name.endswith(".md"))
+        )
+        if not set(SKILL_REQUIRED_NAMES).issubset(names):
+            raise InstallError("required Skill reference is missing")
+        references: list[tuple[str, tuple[int, int, int], str]] = []
+        for name in names:
+            data, identity = _read_markdown_at(
+                references_descriptor,
+                name,
+                skill / "references" / name,
+                before_source_open,
+            )
+            references.append(
+                (
+                    f"references/{name}",
+                    identity,
+                    hashlib.sha256(data).hexdigest(),
+                )
+            )
+        if before_source_recheck is not None:
+            before_source_recheck(skill)
+        if tuple(
+            sorted(name for name in os.listdir(references_descriptor) if name.endswith(".md"))
+        ) != names:
+            raise InstallError("Skill source set changed during validation")
+        reopened_skill_descriptor = _open_absolute_directory_no_symlinks(skill)
+        current_references = os.stat(
+            "references",
+            dir_fd=skill_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _identity(os.fstat(reopened_skill_descriptor)) != skill_identity
+            or _identity(current_references) != reference_identity
+        ):
+            raise InstallError("Skill source parent changed during validation")
+        return (
+            (".", skill_identity, ""),
+            ("references", reference_identity, ""),
+            (
+                "SKILL.md",
+                skill_file_identity,
+                hashlib.sha256(skill_data).hexdigest(),
+            ),
+            *references,
+        )
+    except InstallError:
+        raise
+    except OSError as error:
+        raise InstallError("cannot preflight Skill sources safely") from error
+    finally:
+        if reopened_skill_descriptor >= 0:
+            os.close(reopened_skill_descriptor)
+        if references_descriptor >= 0:
+            os.close(references_descriptor)
+        if skill_descriptor >= 0:
+            os.close(skill_descriptor)
 
 
 def _config_snapshots(home: Path) -> tuple[TargetSnapshot, TargetSnapshot]:
@@ -196,6 +380,12 @@ def build_plan(
         before_source_open=before_source_open,
         before_source_recheck=before_source_recheck,
     )
+    skill_source = repo / "skills" / "pre-pr-tribunal"
+    skill_snapshot = preflight_skill_sources(
+        skill_source,
+        before_source_open=before_source_open,
+        before_source_recheck=before_source_recheck,
+    )
     snapshots = _config_snapshots(home)
     configs = merge_runtime_configs(
         home,
@@ -203,13 +393,42 @@ def build_plan(
         CODEX_COMMAND,
         snapshots=snapshots,
     )
-    return plan_package_and_configs(
+    plans: list[PlannedWrite | PlannedSymlink] = plan_package_and_configs(
         repo,
         home,
         sources,
         configs,
         config_snapshots=snapshots,
     )
+    for target in (
+        home / ".claude" / "skills" / "pre-pr-tribunal",
+        home / ".codex" / "skills" / "pre-pr-tribunal",
+    ):
+        link = PlannedSymlink(target, skill_source)
+        plans.append(
+            PlannedSymlink(
+                target,
+                skill_source,
+                precondition=inspect_target(link),
+            )
+        )
+    return TribunalPlan(
+        plans,
+        skill_source=skill_source,
+        skill_snapshot=skill_snapshot,
+    )
+
+
+def apply_transaction(
+    entries: list[PlannedWrite | PlannedSymlink],
+    **kwargs,
+) -> list[Path]:
+    """Revalidate a bound Skill source before applying any target mutation."""
+    if isinstance(entries, TribunalPlan):
+        current = preflight_skill_sources(entries.skill_source)
+        if current != entries.skill_snapshot:
+            raise InstallError("Skill source changed since plan was built")
+    return _apply_transaction(entries, **kwargs)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

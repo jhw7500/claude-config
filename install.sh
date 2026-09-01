@@ -43,6 +43,9 @@ private_dir ~/.claude/skills
 SKILL_ARCHIVE=~/.claude/archive/skills-replaced/"$(date +%Y%m%d%H%M%S)-$$"
 for d in "$REPO_DIR"/skills/*/; do
   name="$(basename "$d")"
+  case "$name" in
+    pre-pr-tribunal) continue ;;
+  esac
   # 백업을 ~/.claude/skills/ 밖(아카이브)으로 빼는 게 핵심이다. 옆에 두면 사본에
   # SKILL.md 가 남아 중복 스킬로 로드된다 — scripts/lib/link-safely.sh 주석 참조.
   if link_safely "${d%/}" ~/.claude/skills/"$name" "$SKILL_ARCHIVE"; then
@@ -323,7 +326,7 @@ PY
 /usr/bin/python3 "$REPO_DIR/scripts/install-pre-pr-tribunal.py" \
   --repo "$REPO_DIR" \
   --home "$HOME"
-echo "[install] Pre-PR tribunal: Claude/Codex blocking hook"
+echo "[install] Pre-PR tribunal: Claude/Codex Skill + blocking hook"
 echo "[주의] Codex에서 /hooks를 열어 새 tribunal hook hash를 직접 검토·신뢰하세요."
 
 echo "[install] Task nudge: Claude/Codex hook + active AGENTS block"

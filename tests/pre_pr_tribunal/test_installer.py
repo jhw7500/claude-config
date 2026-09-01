@@ -29,11 +29,21 @@ PACKAGE_NAMES = (
     "shell_scan.py",
     "verdict_store.py",
 )
+SKILL_SOURCE = REPO / "skills/pre-pr-tribunal"
+SKILL_TARGETS = (
+    Path(".claude/skills/pre-pr-tribunal"),
+    Path(".codex/skills/pre-pr-tribunal"),
+)
 
 
 def _targets(home: Path) -> list[Path]:
     package = home / ".local/share/claude-config/pre_pr_tribunal"
-    return [*(package / name for name in PACKAGE_NAMES), home / ".claude/settings.json", home / ".codex/hooks.json"]
+    return [
+        *(package / name for name in PACKAGE_NAMES),
+        home / ".claude/settings.json",
+        home / ".codex/hooks.json",
+        *(home / relative for relative in SKILL_TARGETS),
+    ]
 
 
 def _snapshot(paths: list[Path]) -> dict[Path, tuple[object, ...]]:
@@ -81,6 +91,7 @@ def _source_repo(tmp_path: Path) -> Path:
     package = source / "hooks" / "pre_pr_tribunal"
     package.parent.mkdir(parents=True)
     shutil.copytree(REPO / "hooks" / "pre_pr_tribunal", package)
+    shutil.copytree(SKILL_SOURCE, source / "skills/pre-pr-tribunal")
     return source
 
 
@@ -88,7 +99,7 @@ def _managed(groups: list[dict[str, object]], command: str) -> list[dict[str, ob
     return [group for group in groups if group.get("hooks") == [{"type": "command", "command": command}]]
 
 
-def test_build_plan_installs_one_shared_package_and_two_hooks(installer, home):
+def test_build_plan_installs_one_shared_package_two_hooks_and_two_skill_links(installer, home):
     plans = installer.build_plan(installer.REPO, home)
     by_path = {entry.path: entry for entry in plans}
     package = home / ".local/share/claude-config/pre_pr_tribunal"
@@ -96,6 +107,8 @@ def test_build_plan_installs_one_shared_package_and_two_hooks(installer, home):
         *(package / name for name in PACKAGE_NAMES),
         home / ".claude/settings.json",
         home / ".codex/hooks.json",
+        home / ".claude/skills/pre-pr-tribunal",
+        home / ".codex/skills/pre-pr-tribunal",
     }
     assert all(by_path[package / name].mode == 0o600 for name in PACKAGE_NAMES)
     claude = json.loads(by_path[home / ".claude/settings.json"].data)
@@ -106,6 +119,175 @@ def test_build_plan_installs_one_shared_package_and_two_hooks(installer, home):
     assert _managed(codex["hooks"]["PreToolUse"], CODEX_COMMAND) == [
         {"hooks": [{"type": "command", "command": CODEX_COMMAND}]}
     ]
+    for relative in SKILL_TARGETS:
+        entry = by_path[home / relative]
+        assert isinstance(entry, installer.PlannedSymlink)
+        assert entry.target == SKILL_SOURCE
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        Path("SKILL.md"),
+        Path("references/reviewer-a.md"),
+        Path("references/reviewer-b.md"),
+        Path("references/reviewer-c.md"),
+        Path("references/report-schema.md"),
+    ],
+)
+@pytest.mark.parametrize("kind", ["missing", "empty", "symlink", "directory", "fifo"])
+def test_every_required_skill_source_is_safely_preflighted(
+    installer, tmp_path, home, relative, kind
+):
+    source = _source_repo(tmp_path)
+    victim = source / "skills/pre-pr-tribunal" / relative
+    victim.unlink()
+    if kind == "empty":
+        victim.write_bytes(b"")
+    elif kind == "symlink":
+        outside = tmp_path / "outside.md"
+        outside.write_text("outside\n", encoding="utf-8")
+        victim.symlink_to(outside)
+    elif kind == "directory":
+        victim.mkdir()
+    elif kind == "fifo":
+        os.mkfifo(victim)
+    before = _snapshot(_targets(home))
+    with pytest.raises(installer.InstallError):
+        installer.build_plan(source, home)
+    assert _snapshot(_targets(home)) == before
+    assert _artifacts(home) == {}
+
+
+@pytest.mark.parametrize("relative", SKILL_TARGETS)
+@pytest.mark.parametrize("kind", ["wrong-link", "directory"])
+def test_conflicting_skill_target_aborts_before_any_transaction_change(
+    installer, tmp_path, home, relative, kind
+):
+    package = home / ".local/share/claude-config/pre_pr_tribunal"
+    package.mkdir(parents=True)
+    (package / "model.py").write_bytes(b"keep-package")
+    settings = home / ".claude/settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text('{"keep": "claude"}\n', encoding="utf-8")
+    hooks = home / ".codex/hooks.json"
+    hooks.parent.mkdir(parents=True, exist_ok=True)
+    hooks.write_text('{"keep": "codex"}\n', encoding="utf-8")
+    target = home / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "wrong-link":
+        target.symlink_to(tmp_path / "other-skill", target_is_directory=True)
+    else:
+        target.mkdir()
+        (target / "sentinel").write_text("keep\n", encoding="utf-8")
+    before = _snapshot(_targets(home))
+    with pytest.raises(installer.InstallError):
+        installer.build_plan(REPO, home)
+    assert _snapshot(_targets(home)) == before
+    assert _artifacts(home) == {}
+
+
+def test_skill_source_change_after_plan_aborts_before_any_transaction_change(
+    installer, tmp_path, home
+):
+    source = _source_repo(tmp_path)
+    plans = installer.build_plan(source, home)
+    before = _snapshot(_targets(home))
+    reference = source / "skills/pre-pr-tribunal/references/reviewer-a.md"
+    reference.write_bytes(reference.read_bytes() + b"changed\n")
+
+    with pytest.raises(installer.InstallError, match="Skill source changed"):
+        installer.apply_transaction(
+            plans,
+            namespace="pre-pr-tribunal",
+            stamp="20260901070707",
+        )
+
+    assert _snapshot(_targets(home)) == before
+    assert _artifacts(home) == {}
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory", "fifo"])
+def test_dynamic_extra_markdown_reference_is_also_safely_preflighted(
+    installer, tmp_path, home, kind
+):
+    source = _source_repo(tmp_path)
+    extra = source / "skills/pre-pr-tribunal/references/extra.md"
+    if kind == "symlink":
+        outside = tmp_path / "outside-extra.md"
+        outside.write_text("outside\n", encoding="utf-8")
+        extra.symlink_to(outside)
+    elif kind == "directory":
+        extra.mkdir()
+    else:
+        os.mkfifo(extra)
+
+    before = _snapshot(_targets(home))
+    with pytest.raises(installer.InstallError):
+        installer.build_plan(source, home)
+
+    assert _snapshot(_targets(home)) == before
+    assert _artifacts(home) == {}
+
+
+def test_symlinked_skills_parent_cannot_redirect_preflight_outside_repo(
+    installer, tmp_path, home
+):
+    source = _source_repo(tmp_path)
+    skills = source / "skills"
+    outside = tmp_path / "outside-skills"
+    skills.rename(outside)
+    skills.symlink_to(outside, target_is_directory=True)
+    before = _snapshot(_targets(home))
+
+    with pytest.raises(installer.InstallError):
+        installer.build_plan(source, home)
+
+    assert skills.is_symlink() and skills.resolve() == outside
+    assert _snapshot(_targets(home)) == before
+    assert _artifacts(home) == {}
+
+
+def test_skills_parent_drift_after_plan_aborts_before_transaction_apply(
+    installer, tmp_path, home
+):
+    source = _source_repo(tmp_path)
+    plans = installer.build_plan(source, home)
+    skills = source / "skills"
+    outside = tmp_path / "outside-skills"
+    skills.rename(outside)
+    skills.symlink_to(outside, target_is_directory=True)
+    before = _snapshot(_targets(home))
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            plans,
+            namespace="pre-pr-tribunal",
+            stamp="20260901071717",
+        )
+
+    assert _snapshot(_targets(home)) == before
+    assert _artifacts(home) == {}
+
+
+def test_skill_target_drift_after_plan_aborts_every_package_and_config_write(
+    installer, home
+):
+    plans = installer.build_plan(REPO, home)
+    target = home / ".codex/skills/pre-pr-tribunal"
+    target.mkdir(parents=True)
+    (target / "sentinel").write_text("keep\n", encoding="utf-8")
+    before = _snapshot(_targets(home))
+
+    with pytest.raises(installer.InstallError):
+        installer.apply_transaction(
+            plans,
+            namespace="pre-pr-tribunal",
+            stamp="20260901072727",
+        )
+
+    assert _snapshot(_targets(home)) == before
+    assert _artifacts(home) == {}
 
 
 def test_merge_preserves_unrelated_top_level_keys_groups_and_order(installer, home):
@@ -366,7 +548,7 @@ def test_injected_staging_failure_rolls_back_every_target(
     plans = installer.build_plan(REPO, home)
     before = _snapshot(_targets(home))
     artifacts = _artifacts(home)
-    common = sys.modules[installer.apply_transaction.__module__]
+    common = sys.modules[installer._apply_transaction.__module__]
     real_stage = common._stage_regular_at
     stages = 0
 
