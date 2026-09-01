@@ -52,6 +52,14 @@ review 상태는 현재 저장소의 ignored `.review/`에만 남고 HOME이나 
 생성, `gh api`, alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가
 필요하다. 설치·복구와 검증 절차는 [hook 운영 문서](hooks/README.md#pre-pr-tribunal-운영)를 따른다.
 
+실제 runtime canary harness는 verified `/usr/bin/bwrap`을 필수로 사용한다. root filesystem은
+read-only로 두고 disposable probe tree만 writable로 bind하며, worktree-owned hosts sinkhole,
+fixed system PATH의 모든 기존 `gh` 위 fake executable bind, neutral GitHub config/host environment,
+exact command/cwd pre-tool guard를 runtime 시작 전에 검증한다. 이 경계가 준비되지 않으면
+`ISOLATION_UNAVAILABLE`로 중단한다. Provider API 연결을 유지하기 위해 network namespace는
+공유하므로, 이 harness는 일반적인 outbound-network 차단을 제공하거나 provider 장애를 보호한다고
+주장하지 않는다.
+
 ## 토글 메커니즘 — 2종류 (대체 불가, 병행)
 
 | 대상 | 메커니즘 | 도구 |

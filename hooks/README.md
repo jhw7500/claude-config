@@ -117,6 +117,20 @@ rtk python3 -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py tests/pre_p
 exit class, deny/count와 capture hash만 포함하며 raw model output, prompt, credential, 절대 경로를
 기록하지 않는다.
 
+canary는 root-owned, non-writable `/usr/bin/bwrap`을 검증한 뒤 read-only root와 writable disposable
+probe tree를 구성한다. worktree-owned `/etc/hosts` overlay는 GitHub hostname을 loopback으로 보내고,
+fixed system PATH에서 발견되는 모든 `gh` target은 exact argv/cwd/단일 호출을 검증하는 fake `gh`로
+overlay된다. `/usr/bin/gh`, PATH reset, `command -p gh`, direct GitHub hostname client, 그리고
+exact command/cwd에서 벗어난 hook payload를 runtime dispatch 전에 검증한다. `GH_CONFIG_DIR`,
+`GH_HOST`, `GH_PROMPT_DISABLED`도 harness-owned neutral 값만 사용한다. 이 중 하나라도 실패하면
+`ISOLATION_UNAVAILABLE`이며 live config나 real `gh`로 fallback하지 않는다.
+
+Provider API 연결을 보존하려고 network namespace는 공유한다. 따라서 GitHub sinkhole/fake executable
+경계 밖의 일반 egress 차단이나 provider connectivity 보장은 이 harness의 계약이 아니다. Runtime
+실패 결과는 phase, parse/deny 상태, valid/invalid fake-call count, exit class, capture hash와 coarse
+sensitivity category만 남긴다. High-risk literal은 `SENSITIVE_OUTPUT`이 우선하고, auth-marked nonzero에
+disposable/generic path metadata만 함께 있으면 `AUTH_UNAVAILABLE`과 별도 sensitivity fact로 기록한다.
+
 ```bash
 rtk python3 scripts/probe-pre-pr-tribunal.py --runtime claude --repo-source "$PWD"
 rtk python3 scripts/probe-pre-pr-tribunal.py --runtime codex --repo-source "$PWD"

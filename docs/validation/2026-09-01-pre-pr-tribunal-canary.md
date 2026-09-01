@@ -8,6 +8,10 @@ runtime configuration. Real Claude and Codex PASS evidence is still required bef
 be considered complete. Execution stopped before Codex; no fallback to live runtime config,
 credential files, or real `gh` was attempted.
 
+Fix Round 1 strengthened the isolation code and fake-runtime evidence, but it was deliberately not
+revalidated against either real runtime because both allowlisted API keys remain absent. The code
+correction does not turn this checkpoint into a real-runtime PASS.
+
 Caller environment allowlist presence at the checkpoint was:
 
 - `ANTHROPIC_API_KEY`: absent
@@ -15,7 +19,7 @@ Caller environment allowlist presence at the checkpoint was:
 
 No credential value was read or recorded.
 
-## Passing local evidence
+## Initial checkpoint passing evidence
 
 - Carried HOME-delimiter breaker: the new full-parser RED reproduced eight direct-path bypasses;
   the focused endpoint/direct/post-delimiter matrix is now 28 passed and the complete model/store
@@ -29,6 +33,30 @@ No credential value was read or recorded.
 - Full repository regression: 2541 passed in 172.24 seconds, exit 0.
 - Bash syntax, ShellCheck error-level, Python compilation, Git whitespace check, and shared Skill
   validation all exited 0; the Skill validator reported `Skill is valid!`.
+
+## Fix Round 1 passing local evidence
+
+- Strict RED after the review findings: 25 failed and 18 passed. The failures covered missing
+  bwrap enforcement, system-`gh`/hook adversaries, exact fake-call validation, and incomplete
+  sanitized failure facts; the legacy cap, timeout, work-directory, and raw-output checks stayed
+  green.
+- The actual bubblewrap verifier and stable missing-bubblewrap classification selector is 2 passed.
+  Inside the verified boundary it exercises read-only root/disposable writes, absolute system
+  `gh`, PATH reset, `command -p`, exact/nonexact guard payloads, loopback GitHub resolution, and a
+  loopback client attempt. Provider networking remains shared and is not claimed as isolated.
+- Fake-runtime harness: 43 passed. Harness plus direct gate adapters: 114 passed in 28.75 seconds.
+  Fake `gh` requires exact argv, exact repository cwd, and one valid call; wrong or duplicate calls
+  use a separate invalid ledger and block.
+- Failure reports retain phase, parse-valid/denied state, valid and invalid call counts, exit class,
+  capture hashes, and coarse sensitivity categories. High-risk literal leakage remains
+  `SENSITIVE_OUTPUT`; an auth-marked nonzero with only disposable/generic path metadata remains
+  `AUTH_UNAVAILABLE` with separate sensitivity facts.
+- Related tribunal, shared installer, and task-nudge regression: 742 passed in 80.38 seconds.
+- Fresh full repository regression: 2565 passed in 160.19 seconds, exit 0.
+- Bash syntax, ShellCheck error-level, Python compilation, Git whitespace check, and shared Skill
+  validation all exited 0; the Skill validator reported `Skill is valid!`.
+- No real Claude/Codex process, real GitHub endpoint, live config, or credential file was used in
+  this fix round.
 
 ## Original Claude canary result
 
