@@ -594,6 +594,71 @@ def test_selector_registration_failure_cleans_real_git_process_group(
     assert not sentinel.exists()
 
 
+class _ReapedThenFailedProcess:
+    pid = 4343
+
+    def __init__(self, events):
+        self.events = events
+        self.returncode = None
+        self.stdout = _RecordingPipe(events, "stdout")
+        self.stderr = _RecordingPipe(events, "stderr")
+        self.wait_calls = 0
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        self.returncode = 0
+        raise RuntimeError("async wait canary")
+
+
+class _CompletedPipesSelector:
+    def __init__(self, events):
+        self.events = events
+        self.pipes = []
+        self.closed = False
+
+    def register(self, pipe, *args):
+        self.pipes.append(pipe)
+
+    def get_map(self):
+        while self.pipes:
+            self.pipes.pop().close()
+        return {}
+
+    def close(self):
+        self.closed = True
+        self.events.append(("close", "selector"))
+
+
+def test_wait_exception_after_reap_never_signals_process_group(monkeypatch):
+    events = []
+    process = _ReapedThenFailedProcess(events)
+    selector = _CompletedPipesSelector(events)
+    monkeypatch.setattr(
+        git_state.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    monkeypatch.setattr(
+        git_state.selectors,
+        "DefaultSelector",
+        lambda: selector,
+    )
+    monkeypatch.setattr(
+        git_state.os,
+        "killpg",
+        lambda pid, sig: events.append(("kill-group", sig)),
+    )
+
+    with pytest.raises(GitStateError, match="^GIT_COMMAND_FAILED$"):
+        git_state._run_git(Path.cwd(), "version")
+
+    assert process.returncode == 0
+    assert process.wait_calls == 1
+    assert not any(event[0] == "kill-group" for event in events)
+    assert set(events[:2]) == {("close", "stdout"), ("close", "stderr")}
+    assert events[-1] == ("close", "selector")
+
+
 class _ValueErrorPath:
     def __fspath__(self):
         raise ValueError("cwd canary must not escape")

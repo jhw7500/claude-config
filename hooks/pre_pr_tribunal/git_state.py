@@ -102,7 +102,6 @@ def _run_git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
         raise GitStateError("GIT_COMMAND_FAILED") from None
 
     process: subprocess.Popen[bytes] | None = None
-    completed = False
     try:
         process = subprocess.Popen(
             argv,
@@ -150,12 +149,11 @@ def _run_git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
         if remaining <= 0:
             raise GitStateError("GIT_COMMAND_FAILED")
         returncode = process.wait(timeout=remaining)
-        completed = True
         result = subprocess.CompletedProcess(
             argv, returncode, bytes(stdout), bytes(stderr)
         )
     except BaseException as error:
-        if process is not None and not completed:
+        if process is not None and process.returncode is None:
             _terminate_process_group(process)
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
             raise
