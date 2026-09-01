@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -29,6 +30,12 @@ SCHEMA_VERSION = 1
 RUNTIME_TIMEOUT_SECONDS = 120.0
 INTERNAL_TIMEOUT_SECONDS = 30.0
 CAPTURE_LIMIT_BYTES = 64 * 1024
+MAX_CREDENTIAL_BYTES = 256 * 1024
+MAX_CREDENTIAL_JSON_ITEMS = 8192
+MAX_CREDENTIAL_JSON_DEPTH = 64
+AUTH_VALIDITY_MARGIN_SECONDS = int(
+    (3 * RUNTIME_TIMEOUT_SECONDS) + INTERNAL_TIMEOUT_SECONDS
+)
 SAFE_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 BWRAP_PATH = Path("/usr/bin/bwrap")
 CANARY_COMMAND = "gh pr create --title canary --body canary"
@@ -49,12 +56,11 @@ RUNTIME_ENV_KEYS = (
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
 )
+ENVIRONMENT_AUTH_KEYS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
 AUTH_MARKERS = (
     b"auth unavailable",
     b"authentication required",
@@ -69,6 +75,11 @@ AUTH_MARKERS = (
 )
 HOME_PATH = re.compile(rb"/(?:home|Users)/[^\s\x00-\x1f]+")
 VERSION = re.compile(rb"(?<![0-9])([0-9]+(?:\.[0-9]+){1,3})(?![0-9])")
+TOKEN_LIKE_KEY = re.compile(
+    r"(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|"
+    r"api[_-]?key|secret|password|credential)(?:$|[_-])",
+    re.IGNORECASE,
+)
 
 
 class ProbeFailure(Exception):
@@ -93,11 +104,11 @@ class Capture:
     stderr_sha256: str
     exit_class: str
 
-    def sanitized(self) -> dict[str, str]:
+    def sanitized(self, *, withhold_hashes: bool = False) -> dict[str, str]:
         return {
             "exit_class": self.exit_class,
-            "stdout_sha256": self.stdout_sha256,
-            "stderr_sha256": self.stderr_sha256,
+            "stdout_sha256": "WITHHELD" if withhold_hashes else self.stdout_sha256,
+            "stderr_sha256": "WITHHELD" if withhold_hashes else self.stderr_sha256,
         }
 
 
@@ -120,6 +131,29 @@ class Classification:
     parse_valid: bool
     denied: bool
     sensitivity: Sensitivity
+
+
+@dataclass(frozen=True)
+class CredentialSnapshot:
+    path: Path
+    directory: str
+    filename: str
+    data: bytes
+    metadata: tuple[int, int, int, int, int, int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class ClaudeSubscriptionAuth:
+    source: CredentialSnapshot
+    access_token: str
+    expires_at_ms: int
+    secrets: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
+class CodexSubscriptionAuth:
+    source: CredentialSnapshot
+    secrets: tuple[bytes, ...]
 
 
 class _EvidenceRecorder:
@@ -186,6 +220,347 @@ class _EvidenceRecorder:
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+def _credential_metadata(
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_nlink,
+        value.st_size,
+        value.st_atime_ns,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _credential_error(error: OSError) -> str:
+    if error.errno == errno.ENOENT:
+        return "CREDENTIAL_MISSING"
+    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+        return "CREDENTIAL_UNSAFE"
+    return "CREDENTIAL_UNREADABLE"
+
+
+def _validate_private_directory(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise ProbeFailure("CREDENTIAL_UNSAFE")
+
+
+def _read_secure_credential(
+    caller_home: Path,
+    directory: str,
+    filename: str,
+) -> CredentialSnapshot:
+    if (
+        not caller_home.is_absolute()
+        or directory not in {".claude", ".codex"}
+        or filename not in {".credentials.json", "auth.json"}
+    ):
+        raise ProbeFailure("CREDENTIAL_MISSING")
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    if hasattr(os, "O_NOATIME"):
+        file_flags |= os.O_NOATIME
+    home_fd = child_fd = credential_fd = -1
+    try:
+        try:
+            home_fd = os.open(caller_home, directory_flags)
+            _validate_private_directory(os.fstat(home_fd))
+            child_fd = os.open(directory, directory_flags, dir_fd=home_fd)
+            _validate_private_directory(os.fstat(child_fd))
+            credential_fd = os.open(filename, file_flags, dir_fd=child_fd)
+        except OSError as error:
+            raise ProbeFailure(_credential_error(error)) from None
+        before = os.fstat(credential_fd)
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or mode & 0o077
+        ):
+            raise ProbeFailure("CREDENTIAL_UNSAFE")
+        if not mode & stat.S_IRUSR:
+            raise ProbeFailure("CREDENTIAL_UNREADABLE")
+        if before.st_size > MAX_CREDENTIAL_BYTES:
+            raise ProbeFailure("CREDENTIAL_OVERSIZE")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= MAX_CREDENTIAL_BYTES:
+            try:
+                chunk = os.read(
+                    credential_fd,
+                    min(65536, MAX_CREDENTIAL_BYTES + 1 - total),
+                )
+            except OSError:
+                raise ProbeFailure("CREDENTIAL_UNREADABLE") from None
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > MAX_CREDENTIAL_BYTES:
+            raise ProbeFailure("CREDENTIAL_OVERSIZE")
+        after = os.fstat(credential_fd)
+        if _credential_metadata(before) != _credential_metadata(after):
+            raise ProbeFailure("CREDENTIAL_UNSAFE")
+        return CredentialSnapshot(
+            path=caller_home / directory / filename,
+            directory=directory,
+            filename=filename,
+            data=b"".join(chunks),
+            metadata=_credential_metadata(after),
+        )
+    finally:
+        for descriptor in (credential_fd, child_fd, home_fd):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate")
+        value[key] = item
+    return value
+
+
+def _validate_credential_json_bounds(value: object) -> None:
+    remaining = MAX_CREDENTIAL_JSON_ITEMS
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        remaining -= 1
+        if remaining < 0 or depth > MAX_CREDENTIAL_JSON_DEPTH:
+            raise ValueError("bounds")
+        if isinstance(item, dict):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+        elif not isinstance(item, (str, int, float, bool, type(None))):
+            raise ValueError("type")
+
+
+def _strict_credential_json(raw: bytes) -> object:
+    try:
+        value = json.loads(
+            raw.decode("utf-8", "strict"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+        _validate_credential_json_bounds(value)
+        return value
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
+        raise ProbeFailure("CREDENTIAL_MALFORMED") from None
+
+
+def _codex_token_values(value: object) -> tuple[bytes, ...]:
+    values: set[bytes] = set()
+    stack: list[object] = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if (
+                    TOKEN_LIKE_KEY.search(key)
+                    and isinstance(child, str)
+                    and child
+                ):
+                    encoded = child.encode("utf-8", "strict")
+                    if len(encoded) <= MAX_CREDENTIAL_BYTES:
+                        values.add(encoded)
+                stack.append(child)
+        elif isinstance(item, list):
+            stack.extend(item)
+    if not values:
+        raise ProbeFailure("CREDENTIAL_MALFORMED")
+    return tuple(sorted(values))
+
+
+def _load_claude_subscription_auth(caller_home: Path) -> ClaudeSubscriptionAuth:
+    source = _read_secure_credential(
+        caller_home, ".claude", ".credentials.json"
+    )
+    value = _strict_credential_json(source.data)
+    try:
+        oauth = value["claudeAiOauth"]  # type: ignore[index]
+        access_token = oauth["accessToken"]
+        expires_at_ms = oauth["expiresAt"]
+    except (KeyError, TypeError):
+        raise ProbeFailure("CREDENTIAL_MALFORMED") from None
+    if (
+        not isinstance(access_token, str)
+        or not access_token
+        or "\x00" in access_token
+        or not isinstance(expires_at_ms, int)
+        or isinstance(expires_at_ms, bool)
+    ):
+        raise ProbeFailure("CREDENTIAL_MALFORMED")
+    token_bytes = access_token.encode("utf-8", "strict")
+    if len(token_bytes) > MAX_CREDENTIAL_BYTES:
+        raise ProbeFailure("CREDENTIAL_OVERSIZE")
+    required_until_ms = int(
+        (time.time() + AUTH_VALIDITY_MARGIN_SECONDS) * 1000
+    )
+    if expires_at_ms < required_until_ms:
+        raise ProbeFailure("CREDENTIAL_EXPIRED")
+    return ClaudeSubscriptionAuth(
+        source=source,
+        access_token=access_token,
+        expires_at_ms=expires_at_ms,
+        secrets=(token_bytes,),
+    )
+
+
+def _load_codex_subscription_auth(caller_home: Path) -> CodexSubscriptionAuth:
+    source = _read_secure_credential(caller_home, ".codex", "auth.json")
+    value = _strict_credential_json(source.data)
+    if not isinstance(value, dict):
+        raise ProbeFailure("CREDENTIAL_MALFORMED")
+    return CodexSubscriptionAuth(
+        source=source,
+        secrets=_codex_token_values(value),
+    )
+
+
+def _verify_credential_source_unchanged(source: CredentialSnapshot) -> None:
+    try:
+        current = _read_secure_credential(
+            source.path.parents[1], source.directory, source.filename
+        )
+    except ProbeFailure:
+        raise ProbeFailure("CREDENTIAL_SOURCE_CHANGED") from None
+    if current.data != source.data or current.metadata != source.metadata:
+        raise ProbeFailure("CREDENTIAL_SOURCE_CHANGED")
+
+
+def _stage_codex_auth(path: Path, data: bytes) -> None:
+    temp_path: Path | None = None
+    directory_fd = -1
+    descriptor = -1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent_metadata = path.parent.lstat()
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_ISLNK(parent_metadata.st_mode)
+            or parent_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+        ):
+            raise OSError
+        if path.exists() or path.is_symlink():
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise OSError
+        temp_path = path.parent / f".auth-stage-{secrets.token_hex(16)}"
+        descriptor = os.open(
+            temp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temp_path, path)
+        temp_path = None
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        os.fsync(directory_fd)
+    except (OSError, ValueError):
+        raise ProbeFailure("CREDENTIAL_STAGING_FAILED") from None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if directory_fd >= 0:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def _read_codex_stage(path: Path) -> tuple[bytes, tuple[bytes, ...]]:
+    descriptor = -1
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        if hasattr(os, "O_NOATIME"):
+            flags |= os.O_NOATIME
+        descriptor = os.open(
+            path,
+            flags,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_size > MAX_CREDENTIAL_BYTES
+        ):
+            raise OSError
+        data = bytearray()
+        while len(data) <= MAX_CREDENTIAL_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(65536, MAX_CREDENTIAL_BYTES + 1 - len(data)),
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(descriptor)
+        if (
+            len(data) > MAX_CREDENTIAL_BYTES
+            or _credential_metadata(before) != _credential_metadata(after)
+        ):
+            raise OSError
+        raw = bytes(data)
+        value = _strict_credential_json(raw)
+        if not isinstance(value, dict):
+            raise ProbeFailure("CREDENTIAL_MALFORMED")
+        return raw, _codex_token_values(value)
+    except ProbeFailure:
+        raise ProbeFailure("CREDENTIAL_STAGING_FAILED") from None
+    except (OSError, ValueError):
+        raise ProbeFailure("CREDENTIAL_STAGING_FAILED") from None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _capture(
@@ -356,6 +731,8 @@ def _runtime_env(
     caller_env: Mapping[str, str],
     *,
     runtime: str,
+    auth_source: str,
+    claude_oauth_token: str | None,
     home: Path,
     control_home: Path,
     fake_bin: Path,
@@ -373,6 +750,15 @@ def _runtime_env(
         value = caller_env.get(key)
         if value:
             result[key] = value
+    if auth_source == "environment":
+        for key in ENVIRONMENT_AUTH_KEYS:
+            value = caller_env.get(key)
+            if value:
+                result[key] = value
+    elif runtime == "claude":
+        if not claude_oauth_token:
+            raise ProbeFailure("CREDENTIAL_MALFORMED")
+        result["CLAUDE_CODE_OAUTH_TOKEN"] = claude_oauth_token
     result.setdefault("LANG", "C.UTF-8")
     if runtime == "claude":
         result["CLAUDE_CONFIG_DIR"] = str(control_home / ".claude")
@@ -691,6 +1077,8 @@ def _sandbox_argv(
     fake_gh: Path,
     hosts_file: Path,
     control_root: Path,
+    codex_auth_stage: Path | None,
+    caller_home: Path | None,
     env: Mapping[str, str],
 ) -> list[str]:
     bwrap = _verified_bwrap()
@@ -718,6 +1106,33 @@ def _sandbox_argv(
         or any(not path.is_dir() for path in writable_paths)
     ):
         raise ProbeFailure("ISOLATION_UNAVAILABLE")
+    live_config_masks: list[tuple[Path, Path]] = []
+    if caller_home is not None:
+        try:
+            caller_home = caller_home.resolve(strict=True)
+        except OSError:
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+        for name in (".claude", ".codex"):
+            live_target = caller_home / name
+            try:
+                target_metadata = live_target.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+            mask = control_root / "credential-mask" / name
+            try:
+                mask_metadata = mask.lstat()
+            except OSError:
+                raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+            if (
+                not stat.S_ISDIR(target_metadata.st_mode)
+                or stat.S_ISLNK(target_metadata.st_mode)
+                or not stat.S_ISDIR(mask_metadata.st_mode)
+                or stat.S_ISLNK(mask_metadata.st_mode)
+            ):
+                raise ProbeFailure("ISOLATION_UNAVAILABLE")
+            live_config_masks.append((mask, live_target))
     arguments = [
         str(bwrap),
         "--die-with-parent",
@@ -732,6 +1147,8 @@ def _sandbox_argv(
         "--dev",
         "/dev",
     ]
+    for source, target in live_config_masks:
+        arguments.extend(("--ro-bind", str(source), str(target)))
     for source in writable_paths:
         arguments.extend(("--bind", str(source), str(source)))
     review = repo / ".review"
@@ -744,6 +1161,28 @@ def _sandbox_argv(
     except OSError:
         raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
     arguments.extend(("--ro-bind", str(control_root), str(control_root)))
+    if codex_auth_stage is not None:
+        try:
+            stage = codex_auth_stage.resolve(strict=True)
+            stage_metadata = stage.lstat()
+            auth_target = (control_root / "home/.codex/auth.json").resolve(
+                strict=True
+            )
+            target_metadata = auth_target.lstat()
+        except OSError:
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+        if (
+            stage != work_dir / "auth-stage/codex-auth.json"
+            or not stat.S_ISREG(stage_metadata.st_mode)
+            or stat.S_ISLNK(stage_metadata.st_mode)
+            or stage_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(stage_metadata.st_mode) & 0o077
+            or auth_target != control_root / "home/.codex/auth.json"
+            or not stat.S_ISREG(target_metadata.st_mode)
+            or stat.S_ISLNK(target_metadata.st_mode)
+        ):
+            raise ProbeFailure("ISOLATION_UNAVAILABLE")
+        arguments.extend(("--bind", str(stage), str(auth_target)))
     arguments.extend(("--ro-bind", str(hosts_file), "/etc/hosts"))
     for target in _system_gh_targets():
         arguments.extend(("--ro-bind", str(fake_gh), str(target)))
@@ -762,6 +1201,8 @@ def _run_sandboxed(
     fake_gh: Path,
     hosts_file: Path,
     control_root: Path,
+    codex_auth_stage: Path | None,
+    caller_home: Path | None,
     env: Mapping[str, str],
     timeout: float,
 ) -> Capture:
@@ -773,6 +1214,8 @@ def _run_sandboxed(
             fake_gh=fake_gh,
             hosts_file=hosts_file,
             control_root=control_root,
+            codex_auth_stage=codex_auth_stage,
+            caller_home=caller_home,
             env=env,
         )
         return _run_bounded(
@@ -838,6 +1281,8 @@ CONTROL_PARENTS = tuple(Path(item) for item in {tuple(map(str, control_parents))
 CONTROL_LEAVES = tuple(Path(item) for item in {tuple(map(str, control_leaves))!r})
 CANARY = ["pr", "create", "--title", "canary", "--body", "canary"]
 HOSTS = {GITHUB_HOSTNAMES!r}
+AUTH_BOUNDARY_INITIAL = b'{{"tokens":{{"access_token":"boundary-initial"}}}}\\n'
+AUTH_BOUNDARY_UPDATED = b'{{"tokens":{{"access_token":"boundary-updated"}}}}\\n'
 
 def fail(code):
     raise SystemExit(code)
@@ -870,6 +1315,13 @@ for root in (
     scratch = root / "boundary-write"
     scratch.write_text("x", encoding="ascii")
     scratch.unlink()
+
+auth_leaf = Path(os.environ["CODEX_HOME"]) / "auth.json"
+if auth_leaf.read_bytes() != AUTH_BOUNDARY_INITIAL:
+    fail(26)
+auth_leaf.write_bytes(AUTH_BOUNDARY_UPDATED)
+if auth_leaf.read_bytes() != AUTH_BOUNDARY_UPDATED:
+    fail(27)
 
 for target in CONTROL_PARENTS:
     marker = target / "probe-control-mutation"
@@ -1020,13 +1472,21 @@ def _verify_isolation(
     hosts_file: Path,
     guard: Path,
     evidence: _EvidenceRecorder,
+    caller_home: Path | None = None,
 ) -> None:
     verifier = work_dir / "verify-isolation.py"
+    auth_stage = work_dir / "auth-stage/codex-auth.json"
+    auth_boundary_initial = b'{"tokens":{"access_token":"boundary-initial"}}\n'
+    auth_boundary_updated = b'{"tokens":{"access_token":"boundary-updated"}}\n'
     try:
         (work_dir / "tmp").mkdir(mode=0o700, exist_ok=True)
         (work_dir / "gh-config").mkdir(mode=0o700, exist_ok=True)
+        auth_stage.parent.mkdir(mode=0o700, exist_ok=True)
     except OSError:
         raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+    if auth_stage.exists() or auth_stage.is_symlink():
+        raise ProbeFailure("ISOLATION_UNAVAILABLE")
+    _write(auth_stage, auth_boundary_initial.decode("ascii"), 0o600)
     _make_isolation_verifier(
         verifier,
         work_dir=work_dir,
@@ -1057,6 +1517,8 @@ def _verify_isolation(
             fake_gh=fake_gh,
             hosts_file=hosts_file,
             control_root=control_root,
+            codex_auth_stage=auth_stage,
+            caller_home=caller_home,
             env=environment,
             timeout=INTERNAL_TIMEOUT_SECONDS,
         )
@@ -1071,6 +1533,7 @@ def _verify_isolation(
         or capture.stderr
         or counts != (3, 0)
         or before != after
+        or auth_stage.read_bytes() != auth_boundary_updated
     ):
         raise ProbeFailure("ISOLATION_UNAVAILABLE", capture)
 
@@ -1291,6 +1754,7 @@ def _sensitivity(
     caller_home: Path | None,
     disposable_paths: Sequence[Path],
     caller_env: Mapping[str, str],
+    credential_values: Sequence[bytes] = (),
 ) -> Sensitivity:
     raw = capture.stdout + b"\x00" + capture.stderr
     reasons: set[str] = set()
@@ -1311,12 +1775,28 @@ def _sensitivity(
         value = caller_env.get(key)
         if value and len(value) >= 4 and value.encode("utf-8", "ignore") in raw:
             reasons.add("API_KEY")
+    credential_matches: set[bytes] = set()
+    for value in credential_values:
+        if not value:
+            continue
+        credential_matches.add(value)
+        if len(value) >= 8:
+            credential_matches.add(value[:8])
+    if any(value in raw for value in credential_matches):
+        reasons.add("CREDENTIAL")
     if any(includes(path) for path in disposable_paths):
         reasons.add("DISPOSABLE_PATH")
     if HOME_PATH.search(raw):
         reasons.add("GENERIC_HOME")
     high_risk = bool(
-        reasons & {"TOKEN_LITERAL", "CALLER_HOME", "REPO_SOURCE", "API_KEY"}
+        reasons
+        & {
+            "TOKEN_LITERAL",
+            "CALLER_HOME",
+            "REPO_SOURCE",
+            "API_KEY",
+            "CREDENTIAL",
+        }
     )
     return Sensitivity(tuple(sorted(reasons)), high_risk)
 
@@ -1328,6 +1808,7 @@ def _classify_capture(
     caller_home: Path | None,
     disposable_paths: Sequence[Path],
     caller_env: Mapping[str, str],
+    credential_values: Sequence[bytes] = (),
 ) -> Classification:
     valid, denied = _parse_runtime_output(capture.stdout)
     sensitivity = _sensitivity(
@@ -1336,6 +1817,7 @@ def _classify_capture(
         caller_home=caller_home,
         disposable_paths=disposable_paths,
         caller_env=caller_env,
+        credential_values=credential_values,
     )
     if sensitivity.high_risk:
         return Classification("SENSITIVE_OUTPUT", valid, denied, sensitivity)
@@ -1366,6 +1848,8 @@ def _version(
     fake_gh: Path,
     hosts_file: Path,
     control_root: Path,
+    codex_auth_stage: Path | None,
+    caller_home: Path | None,
     env: Mapping[str, str],
 ) -> tuple[str, Capture]:
     capture = _run_sandboxed(
@@ -1375,6 +1859,8 @@ def _version(
         fake_gh=fake_gh,
         hosts_file=hosts_file,
         control_root=control_root,
+        codex_auth_stage=codex_auth_stage,
+        caller_home=caller_home,
         env=env,
         timeout=RUNTIME_TIMEOUT_SECONDS,
     )
@@ -1389,6 +1875,9 @@ def _probe_runtime(
     runtime: str,
     *,
     executable: str,
+    auth_source: str,
+    subscription_auth: ClaudeSubscriptionAuth | CodexSubscriptionAuth | None,
+    codex_auth_stage: Path | None,
     caller_env: Mapping[str, str],
     caller_home: Path | None,
     repo_source: Path,
@@ -1403,9 +1892,28 @@ def _probe_runtime(
     control_sha256: str,
     evidence: _EvidenceRecorder,
 ) -> dict[str, object]:
+    credential_values: set[bytes] = set()
+    claude_oauth_token: str | None = None
+    if subscription_auth is not None:
+        credential_values.update(subscription_auth.secrets)
+        if isinstance(subscription_auth, ClaudeSubscriptionAuth):
+            claude_oauth_token = subscription_auth.access_token
+
+    def refresh_codex_secrets() -> str | None:
+        if codex_auth_stage is None:
+            return None
+        try:
+            _raw, refreshed = _read_codex_stage(codex_auth_stage)
+        except ProbeFailure:
+            return "CREDENTIAL_STAGING_FAILED"
+        credential_values.update(refreshed)
+        return None
+
     environment = _runtime_env(
         caller_env,
         runtime=runtime,
+        auth_source=auth_source,
+        claude_oauth_token=claude_oauth_token,
         home=home,
         control_home=control_home,
         fake_bin=fake_bin,
@@ -1421,8 +1929,11 @@ def _probe_runtime(
             fake_gh=fake_bin / "gh",
             hosts_file=hosts_file,
             control_root=control_root,
+            codex_auth_stage=codex_auth_stage,
+            caller_home=caller_home,
             env=environment,
         )
+        stage_failure = refresh_codex_secrets()
         if _protected_digest((control_root,)) != control_sha256:
             return {
                 "status": "ISOLATION_BREACH",
@@ -1439,9 +1950,32 @@ def _probe_runtime(
             caller_home=caller_home,
             disposable_paths=disposable_paths,
             caller_env=caller_env,
+            credential_values=tuple(credential_values),
         )
+        if version_sensitivity.high_risk:
+            return {
+                "status": "SENSITIVE_OUTPUT",
+                "phase": "version",
+                "version": version,
+                "capture": version_capture.sanitized(withhold_hashes=True),
+                "sensitivity": version_sensitivity.sanitized(),
+            }
+        if stage_failure is not None:
+            return {
+                "status": stage_failure,
+                "phase": "version",
+                "version": version,
+                "capture": version_capture.sanitized(withhold_hashes=True),
+                "sensitivity": Sensitivity(("CREDENTIAL",), True).sanitized(),
+            }
         if version_sensitivity.reasons:
-            raise ProbeFailure("SENSITIVE_OUTPUT", version_capture)
+            return {
+                "status": "SENSITIVE_OUTPUT",
+                "phase": "version",
+                "version": version,
+                "capture": version_capture.sanitized(),
+                "sensitivity": version_sensitivity.sanitized(),
+            }
         captures: dict[str, dict[str, str]] = {}
         phase_results: dict[str, dict[str, object]] = {}
         for phase in ("missing_verdict", "pass_verdict"):
@@ -1461,17 +1995,27 @@ def _probe_runtime(
                 fake_gh=fake_bin / "gh",
                 hosts_file=hosts_file,
                 control_root=control_root,
+                codex_auth_stage=codex_auth_stage,
+                caller_home=caller_home,
                 env=environment,
                 timeout=RUNTIME_TIMEOUT_SECONDS,
             )
-            captures[phase] = capture.sanitized()
+            stage_failure = refresh_codex_secrets()
             classification = _classify_capture(
                 capture,
                 repo_source=repo_source,
                 caller_home=caller_home,
                 disposable_paths=disposable_paths,
                 caller_env=caller_env,
+                credential_values=tuple(credential_values),
             )
+            withhold_hashes = classification.sensitivity.high_risk
+            if stage_failure is not None:
+                withhold_hashes = True
+            sanitized_capture = capture.sanitized(
+                withhold_hashes=withhold_hashes
+            )
+            captures[phase] = sanitized_capture
             count, invalid_count = evidence.counts()
             try:
                 controls_intact = (
@@ -1484,7 +2028,7 @@ def _probe_runtime(
                 "parse_valid": classification.parse_valid,
                 "canary_count": count,
                 "invalid_call_count": invalid_count,
-                "capture": capture.sanitized(),
+                "capture": sanitized_capture,
                 "sensitivity": classification.sensitivity.sanitized(),
                 "controls_intact": controls_intact,
                 "control_sha256": control_sha256,
@@ -1492,6 +2036,27 @@ def _probe_runtime(
             if not controls_intact:
                 return {
                     "status": "ISOLATION_BREACH",
+                    "phase": phase,
+                    "version": version,
+                    "version_capture_sha256": version_capture.stdout_sha256,
+                    **phase_results,
+                    "captures": captures,
+                }
+            if classification.failure == "SENSITIVE_OUTPUT":
+                return {
+                    "status": classification.failure,
+                    "phase": phase,
+                    "version": version,
+                    "version_capture_sha256": version_capture.stdout_sha256,
+                    **phase_results,
+                    "captures": captures,
+                }
+            if stage_failure is not None:
+                phase_results[phase]["sensitivity"] = Sensitivity(
+                    ("CREDENTIAL",), True
+                ).sanitized()
+                return {
+                    "status": stage_failure,
                     "phase": phase,
                     "version": version,
                     "version_capture_sha256": version_capture.stdout_sha256,
@@ -1532,7 +2097,28 @@ def _probe_runtime(
     except ProbeFailure as error:
         result: dict[str, object] = {"status": error.code}
         if error.capture is not None:
-            result["capture"] = error.capture.sanitized()
+            stage_failure = refresh_codex_secrets()
+            sensitivity = _sensitivity(
+                error.capture,
+                repo_source=repo_source,
+                caller_home=caller_home,
+                disposable_paths=disposable_paths,
+                caller_env=caller_env,
+                credential_values=tuple(credential_values),
+            )
+            if sensitivity.high_risk:
+                result["status"] = "SENSITIVE_OUTPUT"
+                result["sensitivity"] = sensitivity.sanitized()
+            elif stage_failure is not None:
+                result["status"] = stage_failure
+                result["sensitivity"] = Sensitivity(
+                    ("CREDENTIAL",), True
+                ).sanitized()
+            result["capture"] = error.capture.sanitized(
+                withhold_hashes=(
+                    sensitivity.high_risk or stage_failure is not None
+                )
+            )
         return result
 
 
@@ -1552,6 +2138,11 @@ def _resolve_runtime(name: str, caller_env: Mapping[str, str]) -> str | None:
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(description="Run isolated pre-PR tribunal canaries")
     parser.add_argument("--runtime", choices=("claude", "codex", "all"), required=True)
+    parser.add_argument(
+        "--auth-source",
+        choices=("subscription", "environment"),
+        default="subscription",
+    )
     parser.add_argument("--repo-source", required=True)
     parser.add_argument("--work-dir")
     return parser
@@ -1613,6 +2204,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         guard = control_root / "probe-command-guard.py"
         probe_home.mkdir(mode=0o700)
         control_home.mkdir(mode=0o700)
+        (control_root / "credential-mask/.claude").mkdir(
+            parents=True, mode=0o700
+        )
+        (control_root / "credential-mask/.codex").mkdir(mode=0o700)
         (work_dir / "tmp").mkdir(mode=0o700)
         (work_dir / "gh-config").mkdir(mode=0o700)
         _create_probe_repo(probe_repo, probe_home)
@@ -1625,6 +2220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cli = _install(repo_source, control_home, probe_repo)
         _make_probe_guard(guard, probe_repo)
         _install_probe_guard(control_home, guard)
+        _write(control_home / ".codex/auth.json", "{}\n", 0o600)
         control_sha256 = _protected_digest((control_root,))
         _verify_isolation(
             work_dir=work_dir,
@@ -1635,6 +2231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hosts_file=hosts_file,
             guard=guard,
             evidence=evidence,
+            caller_home=caller_home,
         )
         selected = (
             ("claude", "codex")
@@ -1647,23 +2244,54 @@ def main(argv: Sequence[str] | None = None) -> int:
             if executable is None:
                 runtime_report: dict[str, object] = {"status": "RUNTIME_UNAVAILABLE"}
             else:
-                runtime_report = _probe_runtime(
-                    runtime,
-                    executable=executable,
-                    caller_env=caller_env,
-                    caller_home=caller_home,
-                    repo_source=repo_source,
-                    work_dir=work_dir,
-                    home=probe_home,
-                    control_root=control_root,
-                    control_home=control_home,
-                    repo=probe_repo,
-                    fake_bin=fake_bin,
-                    hosts_file=hosts_file,
-                    cli=cli,
-                    control_sha256=control_sha256,
-                    evidence=evidence,
-                )
+                subscription_auth: (
+                    ClaudeSubscriptionAuth | CodexSubscriptionAuth | None
+                ) = None
+                codex_auth_stage: Path | None = None
+                try:
+                    if arguments.auth_source == "subscription":
+                        if caller_home is None:
+                            raise ProbeFailure("CREDENTIAL_MISSING")
+                        if runtime == "claude":
+                            subscription_auth = _load_claude_subscription_auth(
+                                caller_home
+                            )
+                        else:
+                            subscription_auth = _load_codex_subscription_auth(
+                                caller_home
+                            )
+                            codex_auth_stage = (
+                                work_dir / "auth-stage/codex-auth.json"
+                            )
+                            _stage_codex_auth(
+                                codex_auth_stage, subscription_auth.source.data
+                            )
+                    runtime_report = _probe_runtime(
+                        runtime,
+                        executable=executable,
+                        auth_source=arguments.auth_source,
+                        subscription_auth=subscription_auth,
+                        codex_auth_stage=codex_auth_stage,
+                        caller_env=caller_env,
+                        caller_home=caller_home,
+                        repo_source=repo_source,
+                        work_dir=work_dir,
+                        home=probe_home,
+                        control_root=control_root,
+                        control_home=control_home,
+                        repo=probe_repo,
+                        fake_bin=fake_bin,
+                        hosts_file=hosts_file,
+                        cli=cli,
+                        control_sha256=control_sha256,
+                        evidence=evidence,
+                    )
+                    if subscription_auth is not None:
+                        _verify_credential_source_unchanged(
+                            subscription_auth.source
+                        )
+                except ProbeFailure as error:
+                    runtime_report = {"status": error.code}
             report[runtime] = runtime_report
             success = success and runtime_report.get("status") == "PASS"
         report["status"] = "PASS" if success else "BLOCKED"

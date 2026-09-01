@@ -27,7 +27,7 @@
 - Passing verdict에서는 `allow`를 출력하지 않고 no-decision으로 기존 permission policy에 맡긴다.
 - v1은 `hooks/verification-command-hygiene-hook.py`를 수정하거나 import하지 않는다.
 - GitHub UI, `gh api`, REST/GraphQL client, 직접 HTTP, 동적으로 합성된 shell alias/function과 `eval`/`xargs`/`find -exec` 간접 실행은 v1 gate 범위가 아니다.
-- Installer와 automated test는 실제 사용자 HOME, credential store, live GitHub API 또는 persisted Codex hook trust를 변경하지 않는다.
+- Installer와 automated test는 실제 사용자 HOME, credential store, live GitHub API 또는 persisted Codex hook trust를 변경하지 않는다. 실제 runtime canary만 아래 Task 8의 bounded subscription-auth exception으로 caller credential을 읽거나 disposable copy할 수 있으며 live source는 변경하지 않는다.
 - 실제 runtime canary만 검토된 temporary config와 `--dangerously-bypass-hook-trust`를 사용할 수 있으며 fake `gh` 외 network command를 실행하지 않는다.
 - 각 Task는 failing test 확인, 최소 구현, focused PASS, commit 순서를 지킨다.
 
@@ -1559,7 +1559,7 @@ rtk git commit -m "feat: orchestrate independent pre-PR reviewers"
 
 **Interfaces:**
 
-- Consumes: installed `claude` and `codex` executables, current authenticated runtime environment, repository source.
+- Consumes: installed `claude` and `codex` executables, default caller subscription login or explicit environment auth, repository source.
 - Produces: sanitized JSON probe result for direct adapter plus actual Claude/Codex missing-verdict and pass-verdict cases; never invokes real GitHub.
 - Success condition: fake `gh` canary absent on missing verdict and present exactly once on valid pass for both runtimes.
 
@@ -1606,15 +1606,31 @@ The script must:
 3. Run `install-pre-pr-tribunal.py --repo "$REPO_SOURCE" --home "$PROBE_HOME"`.
 4. Missing phase: remove `.review`, invoke the selected runtime with a prompt requiring exactly `gh pr create --title canary --body canary`, and assert count 0 plus a deny event/reason.
 5. Pass phase: run CLI `begin`, write three schema-valid empty reports, run `finalize`, invoke the same runtime and assert count 1.
-6. Use a 120-second process timeout, cap stdout/stderr at 64 KiB, hash full captures and return only runtime/version, exit class, deny boolean, canary count and capture hashes.
+6. Use a 120-second process timeout, cap stdout/stderr at 64 KiB, hash full captures only after credential-leak classification, and return only runtime/version, exit class, deny boolean, canary count, safe capture hashes and categories. Withhold both hashes when credential material is detected or a refreshed stage cannot be safely classified.
 7. Never print prompts, environment, credentials, absolute paths or raw child output.
 
 For every runtime child set `HOME=$PROBE_HOME`, put the fake-bin directory at
-the front of a fixed safe PATH, set `CLAUDE_CONFIG_DIR=$PROBE_HOME/.claude`
-for Claude and `CODEX_HOME=$PROBE_HOME/.codex` for Codex. Build the child
-environment from HOME, PATH, locale, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` when present; do not inherit other
-project tokens.
+the front of a fixed safe PATH, set `CLAUDE_CONFIG_DIR` to the immutable Claude
+control config and `CODEX_HOME` to the immutable Codex control config. Locale
+and bounded proxy keys may be inherited. Authentication defaults to
+`--auth-source subscription`: securely open the caller-home credential through
+no-follow/close-on-exec descriptors, require a current-UID owner-only regular
+file with a stable bounded read, reject duplicate/malformed JSON, and never
+expose the live path in the sandbox. Claude must extract only non-empty
+`.claudeAiOauth.accessToken` plus integer `expiresAt`, require a validity margin
+covering the version probe and both 120-second phases, and pass the token only as
+`CLAUDE_CODE_OAUTH_TOKEN`. Codex must copy exact bounded `.codex/auth.json`
+bytes into disposable owner-only staging and leaf-bind only that staged file at
+isolated `CODEX_HOME/auth.json`; its parent and hook config remain immutable.
+The staged Codex leaf may refresh in place, and every initial/refreshed
+token-like value is retained only in memory for leak classification. Live
+credential bytes/metadata must remain unchanged and all staging is removed on
+success, failure, timeout, and setup exceptions.
+
+`--auth-source environment` is an explicit compatibility/billing opt-in. Only
+that mode may forward `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`; subscription
+mode must not forward or fall back to either. In every mode, do not inherit
+other project tokens.
 
 For real Claude use:
 
@@ -1636,7 +1652,14 @@ CODEX_HOME="$PROBE_HOME/.codex" codex exec -C "$PROBE_REPO" --ephemeral --json \
   "Use the shell tool exactly once to run: gh pr create --title canary --body canary"
 ```
 
-The harness inherits the caller's existing authentication mechanism without reading, copying or reporting credential files. If a runtime cannot authenticate in the temporary config, return `AUTH_UNAVAILABLE` and nonzero; do not weaken isolation or fall back to the real runtime settings.
+The bounded subscription exception may read the two exact live credential
+sources and make only the Codex disposable copy described above. It never
+persists Claude OAuth, copies credential bytes into the control root/digest, or
+reports a raw value, prefix, raw auth JSON, or secret-derived stable hash. A
+credential source or staging failure returns a stable credential status and
+nonzero. Runtime authentication failure remains `AUTH_UNAVAILABLE`; do not
+weaken isolation or fall back to live runtime settings, caller HOME, API keys,
+or real `gh`.
 
 - [ ] **Step 4: Harness unit tests와 direct adapters를 PASS시킨다**
 

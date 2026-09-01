@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 from dataclasses import dataclass
+import hashlib
 import importlib.util
 import io
 import json
@@ -23,6 +24,9 @@ SAFE_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 @dataclass(frozen=True)
 class FakeRuntimes:
     env: dict[str, str]
+    caller_home: Path
+    claude_token: str
+    codex_auth: bytes
 
 
 @pytest.fixture
@@ -31,6 +35,35 @@ def fake_runtimes(tmp_path):
         fake_bin = tmp_path / f"runtime-bin-{claude}-{codex}"
         fake_bin.mkdir(mode=0o700)
         caller_home = tmp_path / "caller-home"
+        claude_token = "fixture-claude-oauth-access-token"
+        codex_auth = (
+            b'{"auth_mode":"chatgpt","tokens":'
+            b'{"access_token":"fixture-codex-access-token",'
+            b'"refresh_token":"fixture-codex-refresh-token",'
+            b'"id_token":"fixture-codex-id-token"}}\n'
+        )
+        claude_dir = caller_home / ".claude"
+        codex_dir = caller_home / ".codex"
+        claude_dir.mkdir(mode=0o700, exist_ok=True)
+        codex_dir.mkdir(mode=0o700, exist_ok=True)
+        claude_credentials = claude_dir / ".credentials.json"
+        claude_credentials.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": claude_token,
+                        "expiresAt": 4_102_444_800_000,
+                    }
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        claude_credentials.chmod(0o600)
+        codex_credentials = codex_dir / "auth.json"
+        codex_credentials.write_bytes(codex_auth)
+        codex_credentials.chmod(0o600)
         for runtime, mode in (("claude", claude), ("codex", codex)):
             target = fake_bin / runtime
             target.write_text(
@@ -39,6 +72,8 @@ def fake_runtimes(tmp_path):
                     mode,
                     caller_home=caller_home,
                     repo_source=REPO,
+                    claude_token=claude_token,
+                    codex_auth=codex_auth,
                 ),
                 encoding="utf-8",
             )
@@ -52,7 +87,10 @@ def fake_runtimes(tmp_path):
                 "ANTHROPIC_API_KEY": "test-anthropic-key",
                 "OPENAI_API_KEY": "test-openai-key",
                 "UNRELATED_PROJECT_TOKEN": "TOKEN_CANARY-not-allowed",
-            }
+            },
+            caller_home=caller_home,
+            claude_token=claude_token,
+            codex_auth=codex_auth,
         )
 
     (tmp_path / "caller-home").mkdir(mode=0o700)
@@ -65,6 +103,8 @@ def _fake_runtime_source(
     *,
     caller_home: Path,
     repo_source: Path,
+    claude_token: str,
+    codex_auth: bytes,
 ) -> str:
     return textwrap.dedent(
         f"""\
@@ -82,16 +122,31 @@ def _fake_runtime_source(
         MODE = {mode!r}
         CALLER_HOME = {str(caller_home)!r}
         REPO_SOURCE = {str(repo_source)!r}
+        CLAUDE_TOKEN = {claude_token!r}
+        CODEX_AUTH = {codex_auth!r}
+        REFRESHED_CODEX_TOKEN = "rotated-codex-access-token"
         CANARY = "gh pr create --title canary --body canary"
         ALLOWED = {{
             "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE",
             "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
             "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
             "CLAUDE_CONFIG_DIR", "CODEX_HOME",
             "GH_CONFIG_DIR", "GH_HOST", "GH_PROMPT_DISABLED", "TMPDIR",
         }}
 
         if "--version" in sys.argv[1:]:
+            if MODE == "codex_version_refresh_leak":
+                refreshed = json.loads(CODEX_AUTH)
+                refreshed["tokens"]["access_token"] = REFRESHED_CODEX_TOKEN
+                auth_path = Path(os.environ["CODEX_HOME"]) / "auth.json"
+                auth_path.write_text(
+                    json.dumps(refreshed, separators=(",", ":")) + "\\n",
+                    encoding="utf-8",
+                )
+                auth_path.chmod(0o600)
+                print(REFRESHED_CODEX_TOKEN)
+                raise SystemExit(3)
             print(f"{{RUNTIME}} 9.9.9")
             raise SystemExit(0)
 
@@ -103,6 +158,60 @@ def _fake_runtime_source(
         if shutil.which("gh") != str(path_head):
             print(json.dumps({{"type": "path_order_error"}}))
             raise SystemExit(9)
+        for live_source in (
+            Path(CALLER_HOME) / ".claude/.credentials.json",
+            Path(CALLER_HOME) / ".codex/auth.json",
+        ):
+            try:
+                live_source.read_bytes()
+            except OSError:
+                continue
+            print(json.dumps({{"type": "live_credential_visible"}}))
+            raise SystemExit(9)
+
+        config_root = Path(
+            os.environ["CLAUDE_CONFIG_DIR"]
+            if RUNTIME == "claude"
+            else os.environ["CODEX_HOME"]
+        )
+        environment_auth = bool(
+            os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+        if environment_auth:
+            if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+                print(json.dumps({{"type": "auth_exposure_error"}}))
+                raise SystemExit(9)
+        elif RUNTIME == "claude":
+            if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") != CLAUDE_TOKEN:
+                print(json.dumps({{"type": "auth_exposure_error"}}))
+                raise SystemExit(9)
+            if "ANTHROPIC_API_KEY" in os.environ or "OPENAI_API_KEY" in os.environ:
+                print(json.dumps({{"type": "auth_exposure_error"}}))
+                raise SystemExit(9)
+        else:
+            auth_path = config_root / "auth.json"
+            try:
+                auth_bytes = auth_path.read_bytes()
+                auth_metadata = auth_path.lstat()
+                auth_value = json.loads(auth_bytes)
+                access_token = auth_value["tokens"]["access_token"]
+            except (KeyError, OSError, TypeError, json.JSONDecodeError):
+                print(json.dumps({{"type": "auth_exposure_error"}}))
+                raise SystemExit(9)
+            if auth_bytes != CODEX_AUTH and access_token != REFRESHED_CODEX_TOKEN:
+                print(json.dumps({{"type": "auth_exposure_error"}}))
+                raise SystemExit(9)
+            if (
+                auth_path == Path(CALLER_HOME) / ".codex/auth.json"
+                or auth_path.is_symlink()
+                or auth_metadata.st_mode & 0o077
+            ):
+                print(json.dumps({{"type": "auth_exposure_error"}}))
+                raise SystemExit(9)
+            if "ANTHROPIC_API_KEY" in os.environ or "OPENAI_API_KEY" in os.environ:
+                print(json.dumps({{"type": "auth_exposure_error"}}))
+                raise SystemExit(9)
         if MODE == "timeout":
             time.sleep(60)
             raise SystemExit(0)
@@ -148,7 +257,6 @@ def _fake_runtime_source(
         state_root = home.parent
         prompt = "Use the shell tool exactly once to run: " + CANARY
         if RUNTIME == "claude":
-            config_root = Path(os.environ["CLAUDE_CONFIG_DIR"])
             expected = [
                 "-p", "--no-session-persistence", "--setting-sources", "project",
                 "--settings", str(config_root / "settings.json"),
@@ -157,7 +265,6 @@ def _fake_runtime_source(
                 "--max-budget-usd", "0.25", prompt,
             ]
         else:
-            config_root = Path(os.environ["CODEX_HOME"])
             expected = [
                 "exec", "-C", os.getcwd(), "--ephemeral", "--json",
                 "--ignore-user-config", "--ignore-rules",
@@ -169,6 +276,36 @@ def _fake_runtime_source(
             raise SystemExit(8)
         config = config_root / ("settings.json" if RUNTIME == "claude" else "hooks.json")
         value = json.loads(config.read_text(encoding="utf-8"))
+
+        if MODE in {{"codex_refresh", "codex_refresh_leak"}}:
+            refreshed = json.loads(CODEX_AUTH)
+            refreshed["tokens"]["access_token"] = REFRESHED_CODEX_TOKEN
+            auth_path = config_root / "auth.json"
+            auth_path.write_text(
+                json.dumps(refreshed, separators=(",", ":")) + "\\n",
+                encoding="utf-8",
+            )
+            auth_path.chmod(0o600)
+            if MODE == "codex_refresh_leak":
+                print(REFRESHED_CODEX_TOKEN)
+                raise SystemExit(3)
+        if MODE == "credential_leak":
+            if RUNTIME == "claude":
+                print(os.environ["CLAUDE_CODE_OAUTH_TOKEN"])
+            else:
+                print(json.loads((config_root / "auth.json").read_text())["tokens"]["access_token"])
+            raise SystemExit(3)
+        if MODE == "credential_prefix_leak":
+            if RUNTIME == "claude":
+                secret = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+            else:
+                secret = json.loads((config_root / "auth.json").read_text())["tokens"]["access_token"]
+            print(secret[:12])
+            raise SystemExit(3)
+        if MODE == "raw_auth_leak" and RUNTIME == "codex":
+            sys.stdout.buffer.write((config_root / "auth.json").read_bytes())
+            sys.stdout.flush()
+            raise SystemExit(3)
 
         if MODE == "control_layout":
             control_paths = [path_head, config_root]
@@ -295,8 +432,13 @@ def _run_probe(
     tmp_path: Path,
     *,
     runtime: str = "all",
+    auth_source: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     work_dir = tmp_path / "probe"
+    auth_arguments = (
+        [] if auth_source is None else ["--auth-source", auth_source]
+    )
     result = subprocess.run(
         [
             sys.executable,
@@ -307,6 +449,7 @@ def _run_probe(
             str(REPO),
             "--work-dir",
             str(work_dir),
+            *auth_arguments,
         ],
         env=fake.env,
         text=True,
@@ -391,6 +534,194 @@ def test_probe_requires_block_then_allow_for_each_runtime(
 
 
 @pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_subscription_is_default_and_environment_auth_is_explicit_opt_in(
+    fake_runtimes, tmp_path, runtime
+):
+    fake = fake_runtimes()
+    default_result, default_work = _run_probe(
+        fake, tmp_path / "subscription", runtime=runtime
+    )
+    environment_result, environment_work = _run_probe(
+        fake,
+        tmp_path / "environment",
+        runtime=runtime,
+        auth_source="environment",
+    )
+
+    assert default_result.returncode == environment_result.returncode == 0
+    assert json.loads(default_result.stdout)[runtime]["status"] == "PASS"
+    assert json.loads(environment_result.stdout)[runtime]["status"] == "PASS"
+    assert not default_work.exists()
+    assert not environment_work.exists()
+
+
+@pytest.mark.parametrize(
+    ("runtime", "relative_path"),
+    [
+        ("claude", Path(".claude/.credentials.json")),
+        ("codex", Path(".codex/auth.json")),
+    ],
+)
+def test_subscription_missing_credentials_fail_closed_without_environment_fallback(
+    fake_runtimes, tmp_path, runtime, relative_path
+):
+    fake = fake_runtimes()
+    (fake.caller_home / relative_path).unlink()
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime=runtime)
+
+    runtime_report = json.loads(result.stdout)[runtime]
+    assert result.returncode != 0
+    assert runtime_report["status"] == "CREDENTIAL_MISSING"
+    assert "test-anthropic-key" not in result.stdout
+    assert "test-openai-key" not in result.stdout
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("runtime", "relative_path"),
+    [
+        ("claude", Path(".claude/.credentials.json")),
+        ("codex", Path(".codex/auth.json")),
+    ],
+)
+def test_subscription_rejects_symlink_and_non_owner_only_credentials(
+    fake_runtimes, tmp_path, runtime, relative_path
+):
+    fake = fake_runtimes()
+    credential = fake.caller_home / relative_path
+    original = credential.read_bytes()
+    credential.unlink()
+    target = tmp_path / f"{runtime}-target"
+    target.write_bytes(original)
+    target.chmod(0o600)
+    credential.symlink_to(target)
+
+    symlink_result, symlink_work = _run_probe(
+        fake, tmp_path / "symlink", runtime=runtime
+    )
+    assert json.loads(symlink_result.stdout)[runtime]["status"] == "CREDENTIAL_UNSAFE"
+    assert not symlink_work.exists()
+
+    credential.unlink()
+    credential.write_bytes(original)
+    credential.chmod(0o640)
+    mode_result, mode_work = _run_probe(fake, tmp_path / "mode", runtime=runtime)
+    assert json.loads(mode_result.stdout)[runtime]["status"] == "CREDENTIAL_UNSAFE"
+    assert not mode_work.exists()
+
+
+def test_secure_credential_reader_rejects_wrong_owner_simulation(
+    fake_runtimes, monkeypatch
+):
+    module = _load_probe_module()
+    fake = fake_runtimes()
+    real_uid = os.geteuid()
+    monkeypatch.setattr(module.os, "geteuid", lambda: real_uid + 1)
+
+    with pytest.raises(module.ProbeFailure) as raised:
+        module._read_secure_credential(
+            fake.caller_home, ".claude", ".credentials.json"
+        )
+
+    assert raised.value.code == "CREDENTIAL_UNSAFE"
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("duplicate", "CREDENTIAL_MALFORMED"),
+        ("malformed", "CREDENTIAL_MALFORMED"),
+        ("oversize", "CREDENTIAL_OVERSIZE"),
+        ("expired", "CREDENTIAL_EXPIRED"),
+        ("bool_expiry", "CREDENTIAL_MALFORMED"),
+        ("empty_token", "CREDENTIAL_MALFORMED"),
+        ("unreadable", "CREDENTIAL_UNREADABLE"),
+    ],
+)
+def test_claude_subscription_credentials_fail_with_stable_status(
+    fake_runtimes, tmp_path, case, expected
+):
+    fake = fake_runtimes()
+    credential = fake.caller_home / ".claude/.credentials.json"
+    if case == "duplicate":
+        credential.write_text(
+            '{"claudeAiOauth":{"accessToken":"first","accessToken":"second",'
+            '"expiresAt":4102444800000}}',
+            encoding="utf-8",
+        )
+    elif case == "malformed":
+        credential.write_text("{", encoding="utf-8")
+    elif case == "oversize":
+        credential.write_bytes(b"{" + b"x" * (1024 * 1024) + b"}")
+    elif case == "expired":
+        credential.write_text(
+            '{"claudeAiOauth":{"accessToken":"expired-token",'
+            '"expiresAt":1}}',
+            encoding="utf-8",
+        )
+    elif case == "bool_expiry":
+        credential.write_text(
+            '{"claudeAiOauth":{"accessToken":"bool-token",'
+            '"expiresAt":true}}',
+            encoding="utf-8",
+        )
+    elif case == "empty_token":
+        credential.write_text(
+            '{"claudeAiOauth":{"accessToken":"",'
+            '"expiresAt":4102444800000}}',
+            encoding="utf-8",
+        )
+    else:
+        credential.chmod(0o000)
+    if case != "unreadable":
+        credential.chmod(0o600)
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime="claude")
+
+    assert json.loads(result.stdout)["claude"]["status"] == expected
+    assert result.returncode != 0
+    assert str(fake.caller_home) not in result.stdout
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("duplicate", "CREDENTIAL_MALFORMED"),
+        ("malformed", "CREDENTIAL_MALFORMED"),
+        ("oversize", "CREDENTIAL_OVERSIZE"),
+        ("unreadable", "CREDENTIAL_UNREADABLE"),
+    ],
+)
+def test_codex_subscription_credentials_fail_with_stable_status(
+    fake_runtimes, tmp_path, case, expected
+):
+    fake = fake_runtimes()
+    credential = fake.caller_home / ".codex/auth.json"
+    if case == "duplicate":
+        credential.write_text(
+            '{"tokens":{"access_token":"first","access_token":"second"}}',
+            encoding="utf-8",
+        )
+    elif case == "malformed":
+        credential.write_text("{", encoding="utf-8")
+    elif case == "oversize":
+        credential.write_bytes(b"{" + b"x" * (1024 * 1024) + b"}")
+    else:
+        credential.chmod(0o000)
+    if case != "unreadable":
+        credential.chmod(0o600)
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime="codex")
+
+    assert json.loads(result.stdout)["codex"]["status"] == expected
+    assert result.returncode != 0
+    assert str(fake.caller_home) not in result.stdout
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
 def test_runtime_control_references_have_no_writable_state_ancestor(
     fake_runtimes, tmp_path, runtime
 ):
@@ -400,6 +731,165 @@ def test_runtime_control_references_have_no_writable_state_ancestor(
 
     assert report[runtime]["status"] == "PASS"
     assert result.returncode == 0
+    assert not work_dir.exists()
+
+
+def test_claude_expiry_must_cover_the_complete_two_phase_runtime_budget(
+    fake_runtimes, monkeypatch
+):
+    module = _load_probe_module()
+    fake = fake_runtimes()
+    now = 2_000_000_000.0
+    expires_at = int(
+        (now + module.AUTH_VALIDITY_MARGIN_SECONDS - 1) * 1000
+    )
+    credential = fake.caller_home / ".claude/.credentials.json"
+    credential.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": fake.claude_token,
+                    "expiresAt": expires_at,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    credential.chmod(0o600)
+    monkeypatch.setattr(module.time, "time", lambda: now)
+
+    with pytest.raises(module.ProbeFailure) as raised:
+        module._load_claude_subscription_auth(fake.caller_home)
+
+    assert raised.value.code == "CREDENTIAL_EXPIRED"
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_probe_preserves_live_subscription_source_bytes_and_metadata(
+    fake_runtimes, tmp_path, runtime
+):
+    fake = fake_runtimes()
+    credential = fake.caller_home / (
+        ".claude/.credentials.json" if runtime == "claude" else ".codex/auth.json"
+    )
+    before_bytes = credential.read_bytes()
+    before = credential.stat()
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime=runtime)
+
+    after = credential.stat()
+    assert result.returncode == 0
+    assert credential.read_bytes() == before_bytes
+    assert (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_uid,
+        after.st_gid,
+        after.st_nlink,
+        after.st_size,
+        after.st_atime_ns,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_uid,
+        before.st_gid,
+        before.st_nlink,
+        before.st_size,
+        before.st_atime_ns,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    assert not work_dir.exists()
+
+
+def test_codex_staged_auth_can_refresh_without_mutating_live_source(
+    fake_runtimes, tmp_path
+):
+    fake = fake_runtimes(codex="codex_refresh")
+    source = fake.caller_home / ".codex/auth.json"
+    before_bytes = source.read_bytes()
+    before = source.stat()
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime="codex")
+
+    after = source.stat()
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["codex"]["status"] == "PASS"
+    assert source.read_bytes() == before_bytes
+    assert (
+        after.st_ino,
+        after.st_mode,
+        after.st_atime_ns,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) == (
+        before.st_ino,
+        before.st_mode,
+        before.st_atime_ns,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    assert "rotated-codex-access-token" not in result.stdout
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("runtime", "mode"),
+    [
+        ("claude", "credential_leak"),
+        ("claude", "credential_prefix_leak"),
+        ("codex", "credential_leak"),
+        ("codex", "credential_prefix_leak"),
+        ("codex", "raw_auth_leak"),
+        ("codex", "codex_refresh_leak"),
+    ],
+)
+def test_subscription_secret_leaks_are_sensitive_and_capture_hashes_are_withheld(
+    fake_runtimes, tmp_path, runtime, mode
+):
+    fake = fake_runtimes(**{runtime: mode})
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime=runtime)
+
+    runtime_report = json.loads(result.stdout)[runtime]
+    phase = runtime_report["missing_verdict"]
+    assert runtime_report["status"] == "SENSITIVE_OUTPUT"
+    assert phase["sensitivity"]["high_risk"] is True
+    assert "CREDENTIAL" in phase["sensitivity"]["reasons"]
+    assert phase["capture"]["stdout_sha256"] == "WITHHELD"
+    assert phase["capture"]["stderr_sha256"] == "WITHHELD"
+    assert fake.claude_token not in result.stdout
+    for secret in (
+        "fixture-codex-access-token",
+        "fixture-codex-refresh-token",
+        "fixture-codex-id-token",
+        "rotated-codex-access-token",
+    ):
+        assert secret not in result.stdout
+        assert hashlib.sha256(secret.encode()).hexdigest() not in result.stdout
+    assert not work_dir.exists()
+
+
+def test_codex_version_refresh_leak_is_classified_from_post_execution_stage(
+    fake_runtimes, tmp_path
+):
+    fake = fake_runtimes(codex="codex_version_refresh_leak")
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime="codex")
+
+    runtime_report = json.loads(result.stdout)["codex"]
+    assert runtime_report["status"] == "SENSITIVE_OUTPUT"
+    assert runtime_report["sensitivity"] == {
+        "detected": True,
+        "high_risk": True,
+        "reasons": ["CREDENTIAL"],
+    }
+    assert runtime_report["capture"]["stdout_sha256"] == "WITHHELD"
+    assert "rotated-codex-access-token" not in result.stdout
     assert not work_dir.exists()
 
 
@@ -446,12 +936,13 @@ def test_probe_hard_caps_runtime_output(fake_runtimes, tmp_path):
     assert not work_dir.exists()
 
 
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
 def test_probe_times_out_runtime_and_cleans_only_its_work_dir(
-    fake_runtimes, tmp_path, monkeypatch
+    fake_runtimes, tmp_path, monkeypatch, runtime
 ):
     module = _load_probe_module()
     monkeypatch.setattr(module, "RUNTIME_TIMEOUT_SECONDS", 0.1)
-    fake = fake_runtimes(claude="timeout")
+    fake = fake_runtimes(**{runtime: "timeout"})
     for key, value in fake.env.items():
         monkeypatch.setenv(key, value)
     outside = tmp_path / "outside"
@@ -462,7 +953,7 @@ def test_probe_times_out_runtime_and_cleans_only_its_work_dir(
         exit_code = module.main(
             [
                 "--runtime",
-                "claude",
+                runtime,
                 "--repo-source",
                 str(REPO),
                 "--work-dir",
@@ -472,7 +963,7 @@ def test_probe_times_out_runtime_and_cleans_only_its_work_dir(
 
     report = json.loads(stdout.getvalue())
     assert exit_code != 0
-    assert report["claude"]["status"] == "TIMEOUT"
+    assert report[runtime]["status"] == "TIMEOUT"
     assert outside.read_text(encoding="utf-8") == "preserve"
     assert not work_dir.exists()
 
@@ -806,6 +1297,61 @@ def test_probe_install_removes_runtime_irrelevant_skill_symlinks(tmp_path):
         assert not target.is_symlink()
 
 
+def test_control_digest_excludes_codex_staged_credential_bytes(tmp_path):
+    module = _load_probe_module()
+    control_root = tmp_path / "controls"
+    placeholder = control_root / "home/.codex/auth.json"
+    placeholder.parent.mkdir(parents=True, mode=0o700)
+    placeholder.write_text("{}\n", encoding="utf-8")
+    placeholder.chmod(0o600)
+    stage = tmp_path / "work/auth-stage/codex-auth.json"
+    module._stage_codex_auth(stage, b'{"tokens":{"access_token":"first-secret"}}\n')
+    before = module._protected_digest((control_root,))
+
+    module._stage_codex_auth(
+        stage, b'{"tokens":{"access_token":"different-secret"}}\n'
+    )
+    after = module._protected_digest((control_root,))
+
+    assert before == after
+    assert placeholder.read_bytes() == b"{}\n"
+
+
+def test_codex_staging_failure_is_stable_and_cleans_all_disposable_state(
+    fake_runtimes, tmp_path, monkeypatch
+):
+    module = _load_probe_module()
+    fake = fake_runtimes()
+    for key, value in fake.env.items():
+        monkeypatch.setenv(key, value)
+
+    def fail_stage(_path, _data):
+        raise module.ProbeFailure("CREDENTIAL_STAGING_FAILED")
+
+    monkeypatch.setattr(module, "_stage_codex_auth", fail_stage)
+    allocated = {
+        "pre-pr-tribunal-probe-": tmp_path / "default-probe",
+        "pre-pr-tribunal-controls-": tmp_path / "default-controls",
+    }
+
+    def allocate(*, prefix):
+        target = allocated[prefix]
+        target.mkdir(mode=0o700)
+        return str(target)
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", allocate)
+    stdout = io.StringIO()
+    with redirect_stdout(stdout):
+        exit_code = module.main(
+            ["--runtime", "codex", "--repo-source", str(REPO)]
+        )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code != 0
+    assert report["codex"]["status"] == "CREDENTIAL_STAGING_FAILED"
+    assert all(not path.exists() for path in allocated.values())
+
+
 def _probe_boundary_layout(module, tmp_path, *, nested_controls):
     work_dir = tmp_path / "boundary"
     repo = work_dir / "repo"
@@ -825,6 +1371,8 @@ def _probe_boundary_layout(module, tmp_path, *, nested_controls):
     module._make_probe_guard(guard, repo)
     module._install(REPO, control_home, repo)
     module._install_probe_guard(control_home, guard)
+    (control_home / ".codex/auth.json").write_text("{}\n", encoding="utf-8")
+    (control_home / ".codex/auth.json").chmod(0o600)
     return work_dir, repo, home, control_root, fake_bin, hosts_file, guard
 
 
@@ -1025,7 +1573,10 @@ def test_auth_nonzero_precedes_disposable_sensitivity_and_retains_reason(
 )
 def test_high_risk_leak_precedes_auth_classification(fake_runtimes, tmp_path, mode):
     fake = fake_runtimes(claude=mode)
-    result, work_dir = _run_probe(fake, tmp_path, runtime="claude")
+    auth_source = "environment" if mode == "auth_api_key_leak" else None
+    result, work_dir = _run_probe(
+        fake, tmp_path, runtime="claude", auth_source=auth_source
+    )
 
     runtime = json.loads(result.stdout)["claude"]
     sensitivity = runtime["missing_verdict"]["sensitivity"]

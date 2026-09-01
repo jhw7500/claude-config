@@ -2,11 +2,10 @@
 
 ## Status
 
-**BLOCKED — no real-runtime success is claimed.** The fake-runtime harness and repository
-regressions pass, but the isolated Claude canary could not authenticate from the temporary
-runtime configuration. Real Claude and Codex PASS evidence is still required before Task 8 can
-be considered complete. Execution stopped before Codex; no fallback to live runtime config,
-credential files, or real `gh` was attempted.
+**BLOCKED — no real-runtime success is claimed.** Real Claude and Codex PASS evidence is still
+required before Task 8 can be considered complete. Fix Round 4 implements the approved bounded
+subscription-auth exception, but controller review is required before either real runtime is run.
+No real runtime or GitHub endpoint was invoked in this implementation round.
 
 Fix Round 1 strengthened the isolation code and fake-runtime evidence, but it was deliberately not
 revalidated against either real runtime because both allowlisted API keys remain absent. The code
@@ -18,12 +17,20 @@ entire immutable control root from writable runtime state and closes that local 
 round was revalidated against a real runtime because the same allowlisted-key blocker remains. The
 checkpoint is still AUTH-BLOCKED.
 
-Caller environment allowlist presence at the checkpoint was:
+Fix Round 4 removes the earlier API-key-only contradiction. Default auth now securely reads the
+caller Claude OAuth credential just in time and stages an exact disposable Codex subscription cache
+copy, while masking both live runtime config directories in the sandbox. It never forwards API keys
+unless `--auth-source environment` is explicitly selected, never mutates live sources, and never
+places credential bytes in the immutable control root/digest. This is implementation evidence only,
+not a real-runtime PASS.
+
+Historical caller environment allowlist presence at the original checkpoint was:
 
 - `ANTHROPIC_API_KEY`: absent
 - `OPENAI_API_KEY`: absent
 
-No credential value was read or recorded.
+No credential value was read or recorded in that original checkpoint. Fix Round 4 tests use only
+disposable fixture credentials; no live credential was inspected during implementation.
 
 ## Initial checkpoint passing evidence
 
@@ -118,6 +125,26 @@ No credential value was read or recorded.
   shared Skill validation all exited 0; the Skill validator reported `Skill is valid!`.
 - Neither real runtime was executed, no real GitHub endpoint was contacted, and no credential or
   live runtime config was read. Real Claude and Codex PASS evidence is still required.
+
+## Fix Round 4 passing local evidence
+
+- Initial subscription-auth RED: `26 failed, 54 passed in 37.68s`. The failures covered missing
+  credential loading/staging, default API-key exposure, unsafe metadata and JSON/expiry cases,
+  source preservation, digest exclusion, cleanup, and credential leak classification. Existing
+  fake-GitHub isolation, guard, evidence, timeout, cap, and sanitized-output cases stayed green.
+- Follow-up adversarial REDs made secret-prefix classification and the post-version refresh path
+  explicit. In particular, a Codex version command that wrote and printed a newly rotated staged
+  token returned `RUNTIME_UNAVAILABLE` instead of `SENSITIVE_OUTPUT` until captured-exception paths
+  reread and classified the disposable stage.
+- Final focused fake-runtime harness: `85 passed in 37.17s`. Harness plus direct adapters:
+  `156 passed in 43.06s`. Related tribunal/shared-installer/task-nudge regression:
+  `784 passed in 67.24s`.
+- Fresh full repository regression: `2607 passed in 203.44s`, exit 0.
+- Bash syntax, error-level ShellCheck, changed-file Python compilation, Git whitespace validation,
+  and shared Skill validation all exited 0. The validator returned `Skill is valid!`.
+- Tests use only disposable owner-private Claude/Codex credential fixtures. Neither real runtime
+  was executed, no real GitHub endpoint was contacted, and no live credential value was inspected
+  or copied. This remains a controller-review checkpoint, not real-runtime PASS evidence.
 
 ## Original Claude canary result
 

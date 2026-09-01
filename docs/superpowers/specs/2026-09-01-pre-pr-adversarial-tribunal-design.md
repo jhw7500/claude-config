@@ -519,6 +519,25 @@ scanner corpus와 함께 기존 #19 전체 test suite도 실행해 동작 격리
 Claude와 Codex 각각 격리된 temporary HOME/CODEX_HOME 및 temporary Git repository를
 사용한다. PATH 앞에는 실행 시 canary file을 만드는 fake `gh`를 둔다.
 
+기본 인증원은 caller의 기존 subscription login이다. 이는 live runtime 설정 전체를 상속한다는
+뜻이 아니라 canary에 필요한 credential 하나만 controller가 bounded exception으로 다룬다는 뜻이다.
+Claude는 caller HOME의 `.claude/.credentials.json`을 no-follow/close-on-exec로 열어 현재 UID 소유,
+owner-only regular file, stable metadata, bounded duplicate-free JSON, non-empty OAuth access token과
+version probe 및 두 phase 전체를 덮는 expiry margin을 확인한 뒤 child environment의
+`CLAUDE_CODE_OAUTH_TOKEN`으로만 전달한다. Codex는 같은 검증을 거친 `.codex/auth.json`의 exact bounded
+bytes를 disposable owner-only file에 복사하고, immutable `CODEX_HOME` parent 아래 `auth.json` leaf에만
+mount한다. Refresh가 필요하면 disposable leaf만 쓸 수 있고 live source와 hook config parent는 쓸 수
+없다. Caller의 `.claude`/`.codex`는 sandbox 안에서 empty immutable directory로 가려 live fallback을
+막는다.
+
+두 live source는 probe 전후 bytes와 metadata가 같아야 하며 staged data는 control digest/evidence/output에
+들어가지 않고 모든 종료 경로에서 제거된다. Claude OAuth와 Codex auth의 token-like value(실행 중
+staged refresh로 생긴 값 포함)는 high-risk `CREDENTIAL`로 분류한다. 그런 값이 capture에 나타나면 raw
+value, prefix, raw auth JSON뿐 아니라 capture hash도 기록하지 않고 `SENSITIVE_OUTPUT`으로 실패한다.
+Missing, unsafe/symlink, unreadable, oversized, malformed/duplicate, expired 또는 staging 실패는 stable
+status로 fail closed한다. API-key 인증은 명시적인 `--auth-source environment`에서만 가능하며 default는
+`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`를 전달하거나 fallback하지 않는다.
+
 각 runtime에서 두 번 검증한다.
 
 1. verdict가 없을 때 모델이 `gh pr create`를 시도해도 hook이 deny하고 canary가 없음

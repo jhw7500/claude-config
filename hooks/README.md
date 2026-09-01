@@ -114,8 +114,8 @@ rtk python3 -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py tests/pre_p
 ```
 
 실제 runtime canary도 격리 harness와 harness가 만든 fake `gh`를 통해서만 실행한다. 출력은 version,
-exit class, deny/count와 capture hash만 포함하며 raw model output, prompt, credential, 절대 경로를
-기록하지 않는다.
+exit class, deny/count와 안전하다고 분류된 capture hash만 포함하며 raw model output, prompt,
+credential, 절대 경로를 기록하지 않는다. Credential 가능성이 있으면 hash도 `WITHHELD`다.
 
 canary는 root-owned, non-writable `/usr/bin/bwrap`을 검증한 뒤 read-only root를 구성한다. Runtime
 work tree 밖의 별도 controller-owned control root에 hosts, fake `gh`, guard, 양쪽 hook config와 installed
@@ -131,6 +131,19 @@ writable ledger가 아닌 harness-owned memory channel에만 누적한다. `GH_H
 `GH_PROMPT_DISABLED`도 harness-owned neutral 값만 사용한다. 이 중 하나라도 실패하면
 `ISOLATION_UNAVAILABLE`이며 live config나 real `gh`로 fallback하지 않는다.
 
+기본 `--auth-source subscription`은 caller의 기존 subscription login 중 canary에 필요한 exact
+credential만 bounded exception으로 다룬다. Claude source는 secure descriptor read와 strict
+OAuth/expiry validation 뒤 `CLAUDE_CODE_OAUTH_TOKEN`으로만 전달한다. Codex source는 exact bytes를
+disposable `0600` stage에 복사하고 immutable `CODEX_HOME`의 `auth.json` leaf에만 bind한다. 그 leaf는
+필요한 in-place refresh만 허용하며 parent/hook config는 immutable하다. Refresh 전후 token-like value를
+memory에서만 leak matcher로 유지하고, live source bytes/metadata 불변과 stage cleanup을 모든 종료에서
+확인한다. Caller의 live `.claude`/`.codex` directory는 sandbox 안에서 empty immutable mask다.
+
+Default mode는 API key를 child에 넘기지 않는다. `--auth-source environment`는 API-key billing을
+명시적으로 opt-in하는 compatibility mode이며 subscription failure에서 자동 선택되지 않는다.
+Credential literal/raw JSON이 capture에 섞이면 raw data, prefix와 두 capture hash를 모두 보류하고
+`SENSITIVE_OUTPUT`으로 차단한다. Source/stage validation 실패도 stable credential status로 fail closed한다.
+
 Provider API 연결을 보존하려고 network namespace는 공유한다. 따라서 GitHub sinkhole/fake executable
 경계 밖의 일반 egress 차단이나 provider connectivity 보장은 이 harness의 계약이 아니다. Runtime
 실패 결과는 phase, parse/deny 상태, valid/invalid fake-call count, exit class, capture hash와 coarse
@@ -140,6 +153,8 @@ disposable/generic path metadata만 함께 있으면 `AUTH_UNAVAILABLE`과 별�
 ```bash
 rtk python3 scripts/probe-pre-pr-tribunal.py --runtime claude --repo-source "$PWD"
 rtk python3 scripts/probe-pre-pr-tribunal.py --runtime codex --repo-source "$PWD"
+# API-key billing을 의도적으로 승인한 경우에만:
+rtk python3 scripts/probe-pre-pr-tribunal.py --runtime claude --auth-source environment --repo-source "$PWD"
 ```
 
 uninstall 또는 수동 복구 시 전체 `settings.json`, `hooks.json`, `hooks.PreToolUse`를 삭제하지 않는다.

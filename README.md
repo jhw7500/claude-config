@@ -61,6 +61,21 @@ config와 installed hook package는 모두 이 immutable root 아래에 있고 P
 parent를 rename/recreate할 writable alias가 없다. Whole-root inode/content hash도 dispatch 전후에
 확인한다. Fake-call evidence는 harness process가 소유한 memory channel에 기록되어 runtime tool이
 file로 forge하거나 reset할 수 없다. 이 경계가 준비되지 않으면 `ISOLATION_UNAVAILABLE`로 중단한다.
+
+Canary 인증 기본값은 기존 Claude/Codex subscription login이다. Harness는 caller HOME의 두 exact
+credential source만 no-follow/close-on-exec, current-UID owner-only regular-file, bounded stable-read
+조건으로 연다. Claude OAuth는 version probe와 두 phase 전체 expiry margin을 확인한 뒤
+`CLAUDE_CODE_OAUTH_TOKEN`으로만 child에 전달하고, Codex `auth.json`은 disposable `0600` staging
+leaf에 exact-copy하여 immutable `CODEX_HOME/auth.json`에만 mount한다. Live `.claude`/`.codex`는
+sandbox에서 empty immutable mask로 가려 fallback을 막고 source bytes/metadata는 실행 전후 동일해야
+한다. Staging은 control digest에 포함되지 않으며 모든 종료에서 삭제된다. Initial/refreshed credential이
+출력되면 raw value나 secret-derived capture hash 없이 `SENSITIVE_OUTPUT`으로 중단한다.
+
+API-key billing을 의도적으로 사용할 때만 `--auth-source environment`를 명시한다. 기본 subscription
+mode는 `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`를 전달하거나 fallback하지 않는다. Missing, unsafe,
+unreadable, oversized, malformed/duplicate, expired 또는 staging failure는 stable credential status로
+fail closed하며 live config나 real `gh`로 우회하지 않는다.
+
 Provider API 연결을 유지하기 위해 network namespace는 공유하므로, 이 harness는 일반적인
 outbound-network 차단을 제공하거나 provider 장애를 보호한다고 주장하지 않는다.
 
