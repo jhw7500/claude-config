@@ -442,7 +442,7 @@ def command_substitutions(command: str, oracle: BoundaryOracle):
         if char == "\\":
             cursor += 2
             continue
-        if char == "'":
+        if char == "'" and not quote:
             quote = "'"
             cursor += 1
             continue
@@ -521,7 +521,7 @@ def backtick_substitutions(command: str):
         if char == "\\":
             cursor += 2
             continue
-        if char == "'":
+        if char == "'" and not quote:
             quote = "'"
             cursor += 1
             continue

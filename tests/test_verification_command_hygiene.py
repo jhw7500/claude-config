@@ -256,6 +256,15 @@ def test_warns_inside_double_quoted_command_substitution() -> None:
     assert "[VERIFICATION-COMMAND-HYGIENE]" in result.stdout
 
 
+def test_apostrophe_in_double_quotes_does_not_hide_command_substitution() -> None:
+    result = run_hook(
+        "echo \"'$(rg CONFIG_BT . || echo '없음 → X뿐')\""
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "[VERIFICATION-COMMAND-HYGIENE]" in result.stdout
+
+
 def test_case_pattern_parenthesis_does_not_close_command_substitution() -> None:
     result = run_hook(
         'echo "$(case x in x) true;; esac; '
@@ -323,6 +332,15 @@ def test_single_quoted_command_substitution_is_literal() -> None:
 
 def test_warns_inside_double_quoted_backtick_substitution() -> None:
     result = run_hook("echo \"`rg CONFIG_BT . || echo '없음 → X뿐'`\"")
+
+    assert result.returncode == 0, result.stderr
+    assert "[VERIFICATION-COMMAND-HYGIENE]" in result.stdout
+
+
+def test_apostrophe_in_double_quotes_does_not_hide_backticks() -> None:
+    result = run_hook(
+        "echo \"'`rg CONFIG_BT . || echo '없음 → X뿐'`\""
+    )
 
     assert result.returncode == 0, result.stderr
     assert "[VERIFICATION-COMMAND-HYGIENE]" in result.stdout
