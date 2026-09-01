@@ -61,7 +61,7 @@ fi
 # 3) 개인 스크립트 심볼릭 링크
 private_dir ~/.claude/scripts
 SCRIPT_LINKS=0
-for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py hook-selfcheck.py delegation-ratio.py context-bar.sh apex-toggle.sh; do
+for f in stop-text-required.py timestamp-hook.py bg-hud-complete.py hook-selfcheck.py delegation-ratio.py context-bar.sh apex-toggle.sh weekly-skill-review.sh weekly-skill-review-settings.json; do
   [ -f "$REPO_DIR/scripts/$f" ] || continue
   link_safely "$REPO_DIR/scripts/$f" ~/.claude/scripts/"$f" && SCRIPT_LINKS=$((SCRIPT_LINKS + 1))
 done

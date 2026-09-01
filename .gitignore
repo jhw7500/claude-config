@@ -5,3 +5,8 @@ slack-bridge/.venv
 .superpowers/
 __pycache__/
 *.pyc
+
+# task-observer 관찰 로그 — 개인 작업 기록이라 PUBLIC 저장소에 올리지 않는다.
+# 실체는 여기 있고(스케줄 리뷰가 .claude/** 쓰기 게이트를 못 넘어 이 경로를 쓴다),
+# ~/.claude/projects/<id>/skill-observations 가 심링크로 가리킨다.
+skill-observations/
