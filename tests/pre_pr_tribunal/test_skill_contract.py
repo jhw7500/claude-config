@@ -151,6 +151,29 @@ def test_skill_requires_detached_per_reviewer_views_and_bounded_failure_cleanup(
     assert "do not delete" in steps[6]
 
 
+def test_partial_view_or_dispatch_failure_tracks_and_cleans_only_acquired_resources():
+    steps = numbered_steps(text("SKILL.md"))
+    creation = steps[5]
+    cleanup = steps[6]
+    assert "CREATED_VIEWS" in creation
+    assert "STARTED_REVIEWERS" in creation
+    assert creation.index("CREATED_VIEWS") < creation.index("git worktree add --detach")
+    assert creation.index("git worktree add --detach") < creation.index(
+        "immediately append"
+    )
+    assert "do not start another reviewer" in creation
+    assert "every started reviewer" in cleanup
+    assert "every successfully created view" in cleanup
+    assert cleanup.index("every started reviewer") < cleanup.index(
+        "every successfully created view"
+    )
+    assert "one bounded non-force cleanup attempt" in cleanup
+    assert cleanup.index("one bounded non-force cleanup attempt") < cleanup.index(
+        "stop for user intervention"
+    )
+    assert "do not reset" in cleanup and "do not delete" in cleanup
+
+
 def test_detached_reviewer_views_empirically_exclude_controller_review_state(
     git_repo, tmp_path
 ):

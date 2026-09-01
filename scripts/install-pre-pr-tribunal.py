@@ -288,17 +288,20 @@ def apply_transaction(
     entries: list[PlannedWrite | PlannedSymlink],
     **kwargs,
 ) -> list[Path]:
-    """Require source guards on every transaction-owned tribunal Skill link."""
+    """Require one complete, identical Claude/Codex tribunal Skill pair."""
+    managed: list[tuple[PlannedSymlink, Path, str]] = []
     for entry in entries:
         if not isinstance(entry, PlannedSymlink):
             continue
-        managed_target = (
+        if not (
             entry.path.name == "pre-pr-tribunal"
             and entry.path.parent.name == "skills"
             and entry.path.parent.parent.name in {".claude", ".codex"}
-        )
-        if not managed_target:
+        ):
             continue
+        runtime = entry.path.parent.parent.name
+        home = entry.path.parent.parent.parent
+        managed.append((entry, home, runtime))
         if (
             not isinstance(entry.source_preconditions, tuple)
             or not entry.source_preconditions
@@ -314,6 +317,8 @@ def apply_transaction(
         }
         if len(by_path) != len(entry.source_preconditions):
             raise InstallError("managed Skill source preconditions conflict")
+        if not entry.target.is_absolute():
+            raise InstallError("managed Skill links require the same guarded source")
         if any(
             precondition.path != entry.target
             and entry.target not in precondition.path.parents
@@ -334,18 +339,50 @@ def apply_transaction(
         markdown_names = tuple(
             name for name in references.entry_names if name.endswith(".md")
         )
-        required_files = (
+        required_files = {
             entry.target / "SKILL.md",
             *(references_path / name for name in markdown_names),
-        )
+        }
+        expected_paths = {entry.target, references_path, *required_files}
         if (
             not set(SKILL_REQUIRED_NAMES).issubset(markdown_names)
+            or set(by_path) != expected_paths
             or any(
-                path not in by_path or by_path[path].content_sha256 is None
+                path not in by_path
+                or by_path[path].content_sha256 is None
+                or by_path[path].content_sha256 == _EMPTY_SHA256
                 for path in required_files
             )
         ):
+            if any(
+                by_path.get(path) is not None
+                and by_path[path].content_sha256 == _EMPTY_SHA256
+                for path in required_files
+            ):
+                raise InstallError("managed Skill source file is empty")
             raise InstallError("managed Skill source metadata required")
+    if managed:
+        if len(managed) != 2:
+            raise InstallError("managed Skill exact runtime pair required")
+        homes = {home for _entry, home, _runtime in managed}
+        runtimes = {runtime for _entry, _home, runtime in managed}
+        home = managed[0][1]
+        expected_targets = {
+            home / ".claude/skills/pre-pr-tribunal",
+            home / ".codex/skills/pre-pr-tribunal",
+        }
+        if (
+            len(homes) != 1
+            or runtimes != {".claude", ".codex"}
+            or {entry.path for entry, _home, _runtime in managed} != expected_targets
+        ):
+            raise InstallError("managed Skill exact runtime pair required")
+        first, second = (entry for entry, _home, _runtime in managed)
+        if (
+            first.target != second.target
+            or first.source_preconditions != second.source_preconditions
+        ):
+            raise InstallError("managed Skill links require the same guarded source")
     return _apply_transaction(entries, **kwargs)
 
 

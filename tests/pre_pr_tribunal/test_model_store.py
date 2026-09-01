@@ -313,6 +313,53 @@ def test_url_paths_that_resemble_home_directories_are_not_false_positives(
     assert parsed.executions[0].command == f"curl {value}"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "tar -xC/home/alice/private archive.tar",
+        "curl -so/home/alice/private https://example.com",
+        "cat file:///home/alice/private",
+        "curl 'https://example.com/search?next=/home/alice/private'",
+        "curl 'https://example.com/page#file=/Users/alice/private'",
+    ],
+)
+def test_home_paths_outside_http_url_path_components_are_rejected(snapshot, value):
+    item = execution(command=value)
+    with pytest.raises(SchemaError, match="EVIDENCE_SECRET_DETECTED"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+def test_valid_http_url_hostname_ending_in_option_shape_is_allowed(snapshot):
+    value = "https://example-C/home/alice/private"
+    item = execution(command=f"curl {value}")
+    item["stdout_excerpt"] = value
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+    assert parsed.executions[0].stdout_excerpt == value
+
+
+def test_valid_http_url_path_in_shell_assignment_is_allowed(snapshot):
+    value = "https://example-C/home/alice/private"
+    command = f"URL={value} curl \"$URL\""
+    item = execution(command=command)
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+    assert parsed.executions[0].command == command
+
+
 def test_report_and_evidence_byte_limits_are_enforced(snapshot):
     with pytest.raises(SchemaError, match="REPORT_TOO_LARGE"):
         parse_reviewer_report(

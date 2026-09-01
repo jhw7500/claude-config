@@ -8,6 +8,7 @@ import json
 import re
 from typing import Mapping, Sequence
 import unicodedata
+from urllib.parse import urlsplit
 
 
 SCHEMA_VERSION = 1
@@ -29,9 +30,10 @@ _SECRET = re.compile(
     r"BEGIN PRIVATE KEY|ghp_[A-Za-z0-9]{8}|github_pat_[A-Za-z0-9_]{8}|"
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8}|AKIA[A-Z0-9]{12}"
 )
-_HOME_PATH = re.compile(
-    r"(?:(?<![A-Za-z0-9._~/])|(?<=-[A-Za-z]))"
-    r"(?:/home/[^/\s]+|/Users/[^/\s]+)(?:/|\b)"
+_HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>]+")
+_HTTP_URL_TOKEN = re.compile(
+    r"(?:^|[=\s'\"(<\[])(https?://[^\s'\"<>]+)",
+    re.IGNORECASE,
 )
 
 
@@ -377,16 +379,41 @@ def _text(value: object, maximum: int, *, allow_empty: bool = False) -> str:
     return value
 
 
+def _http_url_path_spans(text: str) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    for match in _HTTP_URL_TOKEN.finditer(text):
+        token = match.group(1)
+        try:
+            parsed = urlsplit(token)
+            hostname = parsed.hostname
+            parsed.port
+        except ValueError:
+            continue
+        if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+            continue
+        path_start = match.start(1) + len(parsed.scheme) + 3 + len(parsed.netloc)
+        spans.append((path_start, path_start + len(parsed.path)))
+    return tuple(spans)
+
+
+def _contains_home_path(text: str) -> bool:
+    url_paths = _http_url_path_spans(text)
+    return any(
+        not any(start <= match.start() and match.end() <= end for start, end in url_paths)
+        for match in _HOME_PATH.finditer(text)
+    )
+
+
 def _evidence(value: object) -> str:
     text = _text(value, MAX_EVIDENCE_TEXT_BYTES, allow_empty=True)
-    if _SECRET.search(text) or _HOME_PATH.search(text):
+    if _SECRET.search(text) or _contains_home_path(text):
         raise SchemaError("EVIDENCE_SECRET_DETECTED")
     return text
 
 
 def _command(value: object) -> str:
     text = _text(value, MAX_COMMAND_TEXT_BYTES)
-    if _SECRET.search(text) or _HOME_PATH.search(text):
+    if _SECRET.search(text) or _contains_home_path(text):
         raise SchemaError("EVIDENCE_SECRET_DETECTED")
     return text
 

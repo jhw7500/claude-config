@@ -95,6 +95,33 @@ def _source_repo(tmp_path: Path) -> Path:
     return source
 
 
+def _guarded_skill(installer, tmp_path: Path, name: str) -> tuple[Path, tuple]:
+    source = tmp_path / name
+    shutil.copytree(SKILL_SOURCE, source)
+    references = source / "references"
+    guards = (
+        installer.capture_source_directory(source),
+        installer.capture_source_directory(references),
+        installer.capture_source_file(source / "SKILL.md"),
+        *(
+            installer.capture_source_file(path)
+            for path in sorted(references.glob("*.md"))
+        ),
+    )
+    return source, guards
+
+
+def _skill_link_pair(installer, home: Path, source: Path, guards: tuple):
+    return [
+        installer.PlannedSymlink(
+            home / runtime / "skills/pre-pr-tribunal",
+            source,
+            source_preconditions=guards,
+        )
+        for runtime in (".claude", ".codex")
+    ]
+
+
 def _managed(groups: list[dict[str, object]], command: str) -> list[dict[str, object]]:
     return [group for group in groups if group.get("hooks") == [{"type": "command", "command": command}]]
 
@@ -261,6 +288,101 @@ def test_tribunal_boundary_rejects_incomplete_skill_source_guards(installer, hom
         )
 
     assert not os.path.lexists(target)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [Path("SKILL.md"), Path("references/reviewer-a.md"), Path("references/extra.md")],
+)
+def test_tribunal_boundary_rejects_empty_guarded_skill_files(
+    installer, tmp_path, home, relative
+):
+    source = tmp_path / "empty-guarded-skill"
+    shutil.copytree(SKILL_SOURCE, source)
+    victim = source / relative
+    victim.parent.mkdir(parents=True, exist_ok=True)
+    victim.write_bytes(b"")
+    references = source / "references"
+    guards = (
+        installer.capture_source_directory(source),
+        installer.capture_source_directory(references),
+        installer.capture_source_file(source / "SKILL.md"),
+        *(
+            installer.capture_source_file(path)
+            for path in sorted(references.glob("*.md"))
+        ),
+    )
+    links = _skill_link_pair(installer, home, source, guards)
+
+    with pytest.raises(installer.InstallError, match="source file is empty"):
+        installer.apply_transaction(
+            links,
+            namespace="pre-pr-tribunal",
+            stamp="20260901121212",
+        )
+
+    assert all(not os.path.lexists(entry.path) for entry in links)
+
+
+def test_tribunal_boundary_rejects_divergent_guarded_skill_sources(
+    installer, tmp_path, home
+):
+    claude_source, claude_guards = _guarded_skill(
+        installer, tmp_path, "claude-skill"
+    )
+    codex_source, codex_guards = _guarded_skill(installer, tmp_path, "codex-skill")
+    links = [
+        installer.PlannedSymlink(
+            home / ".claude/skills/pre-pr-tribunal",
+            claude_source,
+            source_preconditions=claude_guards,
+        ),
+        installer.PlannedSymlink(
+            home / ".codex/skills/pre-pr-tribunal",
+            codex_source,
+            source_preconditions=codex_guards,
+        ),
+    ]
+
+    with pytest.raises(installer.InstallError, match="same guarded source"):
+        installer.apply_transaction(
+            links,
+            namespace="pre-pr-tribunal",
+            stamp="20260901131313",
+        )
+
+    assert all(not os.path.lexists(entry.path) for entry in links)
+
+
+def test_tribunal_boundary_rejects_single_managed_skill_link(installer, tmp_path, home):
+    source, guards = _guarded_skill(installer, tmp_path, "single-skill")
+    link = _skill_link_pair(installer, home, source, guards)[0]
+
+    with pytest.raises(installer.InstallError, match="exact runtime pair required"):
+        installer.apply_transaction(
+            [link],
+            namespace="pre-pr-tribunal",
+            stamp="20260901141414",
+        )
+
+    assert not os.path.lexists(link.path)
+
+
+def test_tribunal_boundary_accepts_exact_matching_managed_skill_pair(
+    installer, tmp_path, home
+):
+    source, guards = _guarded_skill(installer, tmp_path, "paired-skill")
+    links = _skill_link_pair(installer, home, source, guards)
+
+    changed = installer.apply_transaction(
+        links,
+        namespace="pre-pr-tribunal",
+        stamp="20260901151515",
+    )
+
+    assert changed == [entry.path for entry in links]
+    assert all(entry.path.is_symlink() for entry in links)
+    assert all(entry.path.resolve() == source for entry in links)
 
 
 def test_main_cli_path_applies_both_managed_links_with_source_guards(
