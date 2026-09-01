@@ -6,7 +6,10 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import subprocess
+import time
 import unicodedata
 
 from .model import ChangedPath, SCHEMA_VERSION, Snapshot, TribunalError
@@ -16,6 +19,8 @@ GIT = "/usr/bin/git"
 MAX_GIT_STDOUT_BYTES = 32 * 1024 * 1024
 MAX_GIT_STDERR_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 30
+GIT_READ_CHUNK_BYTES = 64 * 1024
+GIT_TERMINATION_GRACE_SECONDS = 0.2
 
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _DIFF_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -44,31 +49,107 @@ def _git_environment() -> dict[str, str]:
             "LANG": "C",
             "GIT_PAGER": "cat",
             "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
         }
     )
     return environment
 
 
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=GIT_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=GIT_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        process.wait()
+    for pipe in (process.stdout, process.stderr):
+        if pipe is not None:
+            pipe.close()
+
+
 def _run_git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
     argv = [GIT, "-C", str(cwd), *arguments]
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             argv,
             shell=False,
-            check=False,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=_git_environment(),
-            timeout=GIT_TIMEOUT_SECONDS,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, TypeError, ValueError):
         raise GitStateError("GIT_COMMAND_FAILED") from None
-    if (
-        len(result.stdout) > MAX_GIT_STDOUT_BYTES
-        or len(result.stderr) > MAX_GIT_STDERR_BYTES
-    ):
-        raise GitStateError("GIT_OUTPUT_LIMIT")
-    return result
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    selector = selectors.DefaultSelector()
+    stdout = bytearray()
+    stderr = bytearray()
+    try:
+        selector.register(
+            process.stdout,
+            selectors.EVENT_READ,
+            (stdout, MAX_GIT_STDOUT_BYTES),
+        )
+        selector.register(
+            process.stderr,
+            selectors.EVENT_READ,
+            (stderr, MAX_GIT_STDERR_BYTES),
+        )
+        deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GitStateError("GIT_COMMAND_FAILED")
+            events = selector.select(remaining)
+            if not events:
+                raise GitStateError("GIT_COMMAND_FAILED")
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), GIT_READ_CHUNK_BYTES)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                buffer, limit = key.data
+                if len(buffer) + len(chunk) > limit:
+                    raise GitStateError("GIT_OUTPUT_LIMIT")
+                buffer.extend(chunk)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GitStateError("GIT_COMMAND_FAILED")
+        returncode = process.wait(timeout=remaining)
+    except GitStateError:
+        _terminate_process_group(process)
+        raise
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        _terminate_process_group(process)
+        raise GitStateError("GIT_COMMAND_FAILED") from None
+    finally:
+        selector.close()
+
+    return subprocess.CompletedProcess(argv, returncode, bytes(stdout), bytes(stderr))
 
 
 def _command_output(
@@ -120,6 +201,25 @@ def _physical_root(cwd: Path) -> Path:
     if not root.is_dir() or not physical_cwd.is_relative_to(root):
         raise GitStateError("NOT_GIT_REPOSITORY")
     return root
+
+
+def _validated_cwd(cwd: object) -> Path:
+    try:
+        raw = os.fspath(cwd)
+    except (OSError, TypeError, ValueError):
+        raise GitStateError("NOT_GIT_REPOSITORY") from None
+    if not isinstance(raw, str):
+        raise GitStateError("PATH_INVALID")
+    try:
+        raw.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        raise GitStateError("PATH_INVALID") from None
+    if any(unicodedata.category(character) in {"Cc", "Cs"} for character in raw):
+        raise GitStateError("PATH_INVALID")
+    try:
+        return Path(raw)
+    except (OSError, TypeError, ValueError):
+        raise GitStateError("NOT_GIT_REPOSITORY") from None
 
 
 def _validate_base(root: Path, base: str) -> None:
@@ -257,22 +357,74 @@ def _created_at(now: Callable[[], str] | None) -> str:
     return value
 
 
+def _revalidate_snapshot_state(
+    root: Path,
+    *,
+    symbolic_head: str,
+    head_sha: str,
+    remote_ref: str,
+    base_sha: str,
+    repository: str,
+) -> None:
+    final_symbolic_result = _run_git(root, "symbolic-ref", "-q", "HEAD")
+    if final_symbolic_result.returncode != 0:
+        raise GitStateError("SNAPSHOT_CHANGED")
+    try:
+        final_symbolic_head = _one_line_utf8(
+            final_symbolic_result.stdout, "SNAPSHOT_CHANGED"
+        )
+        final_head_sha = _sha(
+            _command_output(
+                root,
+                ("rev-parse", "--verify", "HEAD^{commit}"),
+                failure="SNAPSHOT_CHANGED",
+            ),
+            "SNAPSHOT_CHANGED",
+        )
+        final_base_sha = _sha(
+            _command_output(
+                root,
+                ("rev-parse", "--verify", remote_ref),
+                failure="SNAPSHOT_CHANGED",
+            ),
+            "SNAPSHOT_CHANGED",
+        )
+        final_origin = _command_output(
+            root,
+            ("remote", "get-url", "origin"),
+            failure="SNAPSHOT_CHANGED",
+        )
+        final_repository = _repository_from_origin(final_origin)
+    except GitStateError:
+        raise GitStateError("SNAPSHOT_CHANGED") from None
+    if (
+        final_symbolic_head != symbolic_head
+        or final_head_sha != head_sha
+        or final_base_sha != base_sha
+        or final_repository != repository
+    ):
+        raise GitStateError("SNAPSHOT_CHANGED")
+
+    final_status = _command_output(
+        root, ("status", "--porcelain=v2", "-z", "--untracked-files=all")
+    )
+    if _worktree_is_dirty(final_status):
+        raise GitStateError("WORKTREE_DIRTY")
+
+
 def capture_snapshot(
     cwd: Path,
     base: str,
     *,
     now: Callable[[], str] | None = None,
 ) -> Snapshot:
-    try:
-        requested_cwd = Path(cwd)
-    except TypeError:
-        raise GitStateError("NOT_GIT_REPOSITORY") from None
+    requested_cwd = _validated_cwd(cwd)
     root = _physical_root(requested_cwd)
 
     symbolic_head = _run_git(root, "symbolic-ref", "-q", "HEAD")
     if symbolic_head.returncode != 0:
         raise GitStateError("DETACHED_HEAD")
-    _one_line_utf8(symbolic_head.stdout, "GIT_STATE_INVALID")
+    symbolic_head_name = _one_line_utf8(symbolic_head.stdout, "GIT_STATE_INVALID")
 
     head_sha = _sha(_command_output(root, ("rev-parse", "--verify", "HEAD^{commit}")))
     _validate_base(root, base)
@@ -293,6 +445,12 @@ def capture_snapshot(
         ),
         "BASE_INVALID",
     )
+    origin = _command_output(
+        root,
+        ("remote", "get-url", "origin"),
+        failure="REPOSITORY_UNSUPPORTED",
+    )
+    repository = _repository_from_origin(origin)
 
     status = _command_output(
         root, ("status", "--porcelain=v2", "-z", "--untracked-files=all")
@@ -300,7 +458,7 @@ def capture_snapshot(
     if _worktree_is_dirty(status):
         raise GitStateError("WORKTREE_DIRTY")
 
-    revision_range = f"{merge_base_sha}..HEAD"
+    revision_range = f"{merge_base_sha}..{head_sha}"
     name_status = _command_output(
         root,
         ("diff", "--name-status", "-z", "--find-renames", revision_range),
@@ -324,13 +482,6 @@ def capture_snapshot(
     if _DIFF_SHA256.fullmatch(diff_sha256) is None:
         raise GitStateError("GIT_STATE_INVALID")
 
-    origin = _command_output(
-        root,
-        ("remote", "get-url", "origin"),
-        failure="REPOSITORY_UNSUPPORTED",
-    )
-    repository = _repository_from_origin(origin)
-
     initial_paths = {
         path
         for item in paths
@@ -339,6 +490,15 @@ def capture_snapshot(
     }
     ordered_initial_paths = tuple(
         sorted(initial_paths, key=lambda value: value.encode("utf-8"))
+    )
+    created_at = _created_at(now)
+    _revalidate_snapshot_state(
+        root,
+        symbolic_head=symbolic_head_name,
+        head_sha=head_sha,
+        remote_ref=remote_ref,
+        base_sha=base_sha,
+        repository=repository,
     )
     return Snapshot(
         schema=SCHEMA_VERSION,
@@ -350,7 +510,7 @@ def capture_snapshot(
         diff_sha256=diff_sha256,
         paths=paths,
         initial_paths=ordered_initial_paths,
-        created_at=_created_at(now),
+        created_at=created_at,
     )
 
 

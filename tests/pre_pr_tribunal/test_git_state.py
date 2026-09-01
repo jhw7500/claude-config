@@ -3,9 +3,11 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
+from pre_pr_tribunal import git_state
 from pre_pr_tribunal.git_state import (
     GitStateError,
     assert_auto_fix_scope,
@@ -46,6 +48,26 @@ def _commit(repo: Path, message: str) -> None:
 
 def _make_current_head_the_base(repo: Path) -> None:
     _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+
+
+def _write_executable(path: Path, source: str) -> None:
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o700)
+
+
+def _inject_after_initial_origin(monkeypatch, mutation) -> None:
+    original = git_state._run_git
+    injected = False
+
+    def run(cwd, *arguments):
+        nonlocal injected
+        result = original(cwd, *arguments)
+        if not injected and arguments == ("remote", "get-url", "origin"):
+            injected = True
+            mutation()
+        return result
+
+    monkeypatch.setattr(git_state, "_run_git", run)
 
 
 def test_snapshot_binds_repository_base_head_merge_base_diff_and_paths(git_repo):
@@ -410,3 +432,213 @@ def test_auto_fix_scope_rejects_any_path_outside_round_one(git_repo):
         assert_auto_fix_scope(snapshot.initial_paths, ("tracked.txt", "new.txt"))
     with pytest.raises(GitStateError, match="^AUTO_FIX_SCOPE_EXPANDED$"):
         assert_auto_fix_scope(snapshot.initial_paths, ("/absolute.txt",))
+
+
+@pytest.mark.parametrize("redirect", ["", ">&2"])
+def test_git_output_cap_terminates_process_group_before_descendant_runs(
+    git_repo, tmp_path, monkeypatch, redirect
+):
+    sentinel = tmp_path / "overflow-survived"
+    command = tmp_path / "stream-output.sh"
+    _write_executable(
+        command,
+        "#!/bin/sh\n"
+        '( /bin/sleep 0.4; : > "$CAP_SENTINEL" ) &\n'
+        f"/usr/bin/head -c 4096 /dev/zero {redirect}\n"
+        "/bin/sleep 0.8\n",
+    )
+    _git(git_repo, "config", "alias.stream-output", f"!{command}")
+    monkeypatch.setenv("CAP_SENTINEL", str(sentinel))
+    monkeypatch.setattr(git_state, "MAX_GIT_STDOUT_BYTES", 128)
+    monkeypatch.setattr(git_state, "MAX_GIT_STDERR_BYTES", 128)
+    monkeypatch.setattr(git_state, "GIT_TIMEOUT_SECONDS", 2)
+
+    with pytest.raises(GitStateError, match="^GIT_OUTPUT_LIMIT$"):
+        git_state._run_git(git_repo, "stream-output")
+
+    time.sleep(0.55)
+    assert not sentinel.exists()
+
+
+def test_git_timeout_terminates_process_group_before_descendant_runs(
+    git_repo, tmp_path, monkeypatch
+):
+    sentinel = tmp_path / "timeout-survived"
+    command = tmp_path / "slow-command.sh"
+    _write_executable(
+        command,
+        '#!/bin/sh\n( /bin/sleep 0.4; : > "$CAP_SENTINEL" ) &\n/bin/sleep 2\n',
+    )
+    _git(git_repo, "config", "alias.slow-command", f"!{command}")
+    monkeypatch.setenv("CAP_SENTINEL", str(sentinel))
+    monkeypatch.setattr(git_state, "GIT_TIMEOUT_SECONDS", 0.1)
+
+    with pytest.raises(GitStateError, match="^GIT_COMMAND_FAILED$"):
+        git_state._run_git(git_repo, "slow-command")
+
+    time.sleep(0.55)
+    assert not sentinel.exists()
+
+
+class _ValueErrorPath:
+    def __fspath__(self):
+        raise ValueError("cwd canary must not escape")
+
+
+@pytest.mark.parametrize(
+    ("cwd", "code"),
+    [
+        ("nul\x00cwd", "PATH_INVALID"),
+        ("surrogate\udcffcwd", "PATH_INVALID"),
+        (_ValueErrorPath(), "NOT_GIT_REPOSITORY"),
+    ],
+)
+def test_malformed_cwd_is_normalized_to_a_stable_code(cwd, code):
+    with pytest.raises(GitStateError, match=f"^{code}$"):
+        capture_snapshot(cwd, "master")
+
+
+def test_repo_local_fsmonitor_is_disabled_without_hiding_origin(git_repo, tmp_path):
+    sentinel = tmp_path / "fsmonitor-ran"
+    fsmonitor = tmp_path / "fsmonitor.sh"
+    _write_executable(
+        fsmonitor,
+        f"#!/bin/sh\n: > '{sentinel}'\n",
+    )
+    _git(git_repo, "config", "core.fsmonitor", str(fsmonitor))
+
+    snapshot = capture_snapshot(git_repo, "master")
+
+    assert snapshot.repository == "jhw7500/claude-config"
+    assert not sentinel.exists()
+
+
+def test_mid_capture_symbolic_head_change_fails_closed(git_repo, monkeypatch):
+    def change_branch():
+        _git(git_repo, "update-ref", "refs/heads/other", "HEAD")
+        _git(git_repo, "symbolic-ref", "HEAD", "refs/heads/other")
+
+    _inject_after_initial_origin(monkeypatch, change_branch)
+
+    with pytest.raises(GitStateError, match="^SNAPSHOT_CHANGED$"):
+        capture_snapshot(git_repo, "master")
+
+
+def test_mid_capture_head_sha_change_fails_closed(git_repo, monkeypatch):
+    def move_head():
+        head = _git_text(git_repo, "rev-parse", "HEAD^{commit}")
+        tree = _git_text(git_repo, "rev-parse", head + "^{tree}")
+        moved = _git_text(
+            git_repo,
+            "commit-tree",
+            tree,
+            "-p",
+            head,
+            input_text="move head\n",
+        )
+        _git(git_repo, "update-ref", "HEAD", moved)
+
+    _inject_after_initial_origin(monkeypatch, move_head)
+
+    with pytest.raises(GitStateError, match="^SNAPSHOT_CHANGED$"):
+        capture_snapshot(git_repo, "master")
+
+
+def test_mid_capture_remote_base_change_fails_closed(git_repo, monkeypatch):
+    def move_base():
+        base = _git_text(git_repo, "rev-parse", "refs/remotes/origin/master^{commit}")
+        tree = _git_text(git_repo, "rev-parse", base + "^{tree}")
+        moved = _git_text(
+            git_repo,
+            "commit-tree",
+            tree,
+            "-p",
+            base,
+            input_text="move base during capture\n",
+        )
+        _git(git_repo, "update-ref", "refs/remotes/origin/master", moved)
+
+    _inject_after_initial_origin(monkeypatch, move_base)
+
+    with pytest.raises(GitStateError, match="^SNAPSHOT_CHANGED$"):
+        capture_snapshot(git_repo, "master")
+
+
+def test_mid_capture_origin_change_fails_closed(git_repo, monkeypatch):
+    def move_origin():
+        _git(
+            git_repo,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/other/repository.git",
+        )
+
+    _inject_after_initial_origin(monkeypatch, move_origin)
+
+    with pytest.raises(GitStateError, match="^SNAPSHOT_CHANGED$"):
+        capture_snapshot(git_repo, "master")
+
+
+def test_mid_capture_dirty_worktree_remains_worktree_dirty(git_repo, monkeypatch):
+    original = git_state._run_git
+    injected = False
+
+    def dirty_worktree():
+        (git_repo / "late-dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+    def run(cwd, *arguments):
+        nonlocal injected
+        result = original(cwd, *arguments)
+        if not injected and arguments[:2] == ("diff", "--binary"):
+            injected = True
+            dirty_worktree()
+        return result
+
+    monkeypatch.setattr(git_state, "_run_git", run)
+
+    with pytest.raises(GitStateError, match="^WORKTREE_DIRTY$"):
+        capture_snapshot(git_repo, "master")
+
+
+def test_both_diff_commands_use_immutable_head_sha_during_drift(git_repo, monkeypatch):
+    original = git_state._run_git
+    initial_head = _git_text(git_repo, "rev-parse", "HEAD^{commit}")
+    base = _git_text(git_repo, "rev-parse", "refs/remotes/origin/master^{commit}")
+    merge_base = _git_text(git_repo, "merge-base", base, initial_head)
+    ranges = []
+    injected = False
+
+    def run(cwd, *arguments):
+        nonlocal injected
+        result = original(cwd, *arguments)
+        if arguments and arguments[0] == "diff":
+            ranges.append(arguments[-1])
+        if not injected and arguments[:4] == (
+            "diff",
+            "--name-status",
+            "-z",
+            "--find-renames",
+        ):
+            injected = True
+            tree = _git_text(git_repo, "rev-parse", initial_head + "^{tree}")
+            moved = _git_text(
+                git_repo,
+                "commit-tree",
+                tree,
+                "-p",
+                initial_head,
+                input_text="move between diffs\n",
+            )
+            _git(git_repo, "update-ref", "HEAD", moved)
+        return result
+
+    monkeypatch.setattr(git_state, "_run_git", run)
+
+    with pytest.raises(GitStateError, match="^SNAPSHOT_CHANGED$"):
+        capture_snapshot(git_repo, "master")
+
+    assert ranges == [
+        f"{merge_base}..{initial_head}",
+        f"{merge_base}..{initial_head}",
+    ]
