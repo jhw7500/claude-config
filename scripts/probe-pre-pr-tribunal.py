@@ -33,8 +33,13 @@ CAPTURE_LIMIT_BYTES = 64 * 1024
 MAX_CREDENTIAL_BYTES = 256 * 1024
 MAX_CREDENTIAL_JSON_ITEMS = 8192
 MAX_CREDENTIAL_JSON_DEPTH = 64
+RUNTIME_CHILD_DEADLINE_COUNT = 3
+VERDICT_CHILD_DEADLINE_COUNT = 2
+AUTH_SCHEDULING_CUSHION_SECONDS = 30
 AUTH_VALIDITY_MARGIN_SECONDS = int(
-    (3 * RUNTIME_TIMEOUT_SECONDS) + INTERNAL_TIMEOUT_SECONDS
+    (RUNTIME_CHILD_DEADLINE_COUNT * RUNTIME_TIMEOUT_SECONDS)
+    + (VERDICT_CHILD_DEADLINE_COUNT * INTERNAL_TIMEOUT_SECONDS)
+    + AUTH_SCHEDULING_CUSHION_SECONDS
 )
 SAFE_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 BWRAP_PATH = Path("/usr/bin/bwrap")
@@ -60,7 +65,6 @@ RUNTIME_ENV_KEYS = (
     "HTTPS_PROXY",
     "NO_PROXY",
 )
-ENVIRONMENT_AUTH_KEYS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
 AUTH_MARKERS = (
     b"auth unavailable",
     b"authentication required",
@@ -89,6 +93,12 @@ class ProbeFailure(Exception):
         self.capture = capture
 
 
+class _TerminationSignal(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         del message
@@ -105,6 +115,7 @@ class Capture:
     exit_class: str
 
     def sanitized(self, *, withhold_hashes: bool = False) -> dict[str, str]:
+        withhold_hashes = withhold_hashes or self.exit_class == "OUTPUT_LIMIT"
         return {
             "exit_class": self.exit_class,
             "stdout_sha256": "WITHHELD" if withhold_hashes else self.stdout_sha256,
@@ -148,12 +159,14 @@ class ClaudeSubscriptionAuth:
     access_token: str
     expires_at_ms: int
     secrets: tuple[bytes, ...]
+    documents: tuple[bytes, ...]
 
 
 @dataclass(frozen=True)
 class CodexSubscriptionAuth:
     source: CredentialSnapshot
     secrets: tuple[bytes, ...]
+    documents: tuple[bytes, ...]
 
 
 class _EvidenceRecorder:
@@ -168,6 +181,7 @@ class _EvidenceRecorder:
         self._valid = 0
         self._invalid = 0
         self._valid_limit = 1
+        self._closed = False
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
@@ -204,6 +218,9 @@ class _EvidenceRecorder:
             return self._valid, self._invalid
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._stop.set()
         try:
             wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -213,7 +230,10 @@ class _EvidenceRecorder:
         except OSError:
             pass
         self._thread.join(timeout=1.0)
-        self._socket.close()
+        try:
+            self._socket.close()
+        except OSError:
+            pass
 
     def __enter__(self) -> "_EvidenceRecorder":
         return self
@@ -368,6 +388,28 @@ def _strict_credential_json(raw: bytes) -> object:
         raise ProbeFailure("CREDENTIAL_MALFORMED") from None
 
 
+def _credential_secret_values(value: str) -> tuple[bytes, ...]:
+    try:
+        encoded = value.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        raise ProbeFailure("CREDENTIAL_MALFORMED") from None
+    if not encoded or len(encoded) < 8 or len(encoded) > MAX_CREDENTIAL_BYTES:
+        raise ProbeFailure("CREDENTIAL_MALFORMED")
+    if b"\x00" in encoded:
+        raise ProbeFailure("CREDENTIAL_MALFORMED")
+    representations = {encoded}
+    for ensure_ascii in (False, True):
+        try:
+            literal = json.dumps(value, ensure_ascii=ensure_ascii).encode(
+                "utf-8"
+            )
+        except UnicodeEncodeError:
+            raise ProbeFailure("CREDENTIAL_MALFORMED") from None
+        representations.add(literal)
+        representations.add(literal[1:-1])
+    return tuple(sorted(representations))
+
+
 def _codex_token_values(value: object) -> tuple[bytes, ...]:
     values: set[bytes] = set()
     stack: list[object] = [value]
@@ -375,14 +417,10 @@ def _codex_token_values(value: object) -> tuple[bytes, ...]:
         item = stack.pop()
         if isinstance(item, dict):
             for key, child in item.items():
-                if (
-                    TOKEN_LIKE_KEY.search(key)
-                    and isinstance(child, str)
-                    and child
-                ):
-                    encoded = child.encode("utf-8", "strict")
-                    if len(encoded) <= MAX_CREDENTIAL_BYTES:
-                        values.add(encoded)
+                if TOKEN_LIKE_KEY.search(key):
+                    if not isinstance(child, str):
+                        raise ProbeFailure("CREDENTIAL_MALFORMED")
+                    values.update(_credential_secret_values(child))
                 stack.append(child)
         elif isinstance(item, list):
             stack.extend(item)
@@ -410,9 +448,7 @@ def _load_claude_subscription_auth(caller_home: Path) -> ClaudeSubscriptionAuth:
         or isinstance(expires_at_ms, bool)
     ):
         raise ProbeFailure("CREDENTIAL_MALFORMED")
-    token_bytes = access_token.encode("utf-8", "strict")
-    if len(token_bytes) > MAX_CREDENTIAL_BYTES:
-        raise ProbeFailure("CREDENTIAL_OVERSIZE")
+    secrets = _credential_secret_values(access_token)
     required_until_ms = int(
         (time.time() + AUTH_VALIDITY_MARGIN_SECONDS) * 1000
     )
@@ -422,7 +458,8 @@ def _load_claude_subscription_auth(caller_home: Path) -> ClaudeSubscriptionAuth:
         source=source,
         access_token=access_token,
         expires_at_ms=expires_at_ms,
-        secrets=(token_bytes,),
+        secrets=secrets,
+        documents=(source.data,),
     )
 
 
@@ -434,6 +471,7 @@ def _load_codex_subscription_auth(caller_home: Path) -> CodexSubscriptionAuth:
     return CodexSubscriptionAuth(
         source=source,
         secrets=_codex_token_values(value),
+        documents=(source.data,),
     )
 
 
@@ -751,10 +789,10 @@ def _runtime_env(
         if value:
             result[key] = value
     if auth_source == "environment":
-        for key in ENVIRONMENT_AUTH_KEYS:
-            value = caller_env.get(key)
-            if value:
-                result[key] = value
+        key = "ANTHROPIC_API_KEY" if runtime == "claude" else "OPENAI_API_KEY"
+        value = caller_env.get(key)
+        if value:
+            result[key] = value
     elif runtime == "claude":
         if not claude_oauth_token:
             raise ProbeFailure("CREDENTIAL_MALFORMED")
@@ -846,6 +884,8 @@ def _cleanup_work_dir(path: Path, identity: tuple[int, int]) -> bool:
             return False
         shutil.rmtree(path)
         return not path.exists()
+    except FileNotFoundError:
+        return True
     except OSError:
         return False
 
@@ -1755,6 +1795,7 @@ def _sensitivity(
     disposable_paths: Sequence[Path],
     caller_env: Mapping[str, str],
     credential_values: Sequence[bytes] = (),
+    credential_documents: Sequence[bytes] = (),
 ) -> Sensitivity:
     raw = capture.stdout + b"\x00" + capture.stderr
     reasons: set[str] = set()
@@ -1780,9 +1821,12 @@ def _sensitivity(
         if not value:
             continue
         credential_matches.add(value)
+        if len(value) >= 7:
+            credential_matches.add(value[:7])
         if len(value) >= 8:
             credential_matches.add(value[:8])
-    if any(value in raw for value in credential_matches):
+    document_matches = {value for value in credential_documents if value}
+    if any(value in raw for value in credential_matches | document_matches):
         reasons.add("CREDENTIAL")
     if any(includes(path) for path in disposable_paths):
         reasons.add("DISPOSABLE_PATH")
@@ -1809,6 +1853,7 @@ def _classify_capture(
     disposable_paths: Sequence[Path],
     caller_env: Mapping[str, str],
     credential_values: Sequence[bytes] = (),
+    credential_documents: Sequence[bytes] = (),
 ) -> Classification:
     valid, denied = _parse_runtime_output(capture.stdout)
     sensitivity = _sensitivity(
@@ -1818,6 +1863,7 @@ def _classify_capture(
         disposable_paths=disposable_paths,
         caller_env=caller_env,
         credential_values=credential_values,
+        credential_documents=credential_documents,
     )
     if sensitivity.high_risk:
         return Classification("SENSITIVE_OUTPUT", valid, denied, sensitivity)
@@ -1839,8 +1885,7 @@ def _classify_capture(
     return Classification(None, valid, denied, sensitivity)
 
 
-def _version(
-    runtime: str,
+def _version_capture(
     executable: str,
     *,
     work_dir: Path,
@@ -1851,7 +1896,7 @@ def _version(
     codex_auth_stage: Path | None,
     caller_home: Path | None,
     env: Mapping[str, str],
-) -> tuple[str, Capture]:
+) -> Capture:
     capture = _run_sandboxed(
         [executable, "--version"],
         work_dir=work_dir,
@@ -1866,9 +1911,13 @@ def _version(
     )
     if capture.exit_class != "ZERO":
         raise ProbeFailure("RUNTIME_UNAVAILABLE", capture)
+    return capture
+
+
+def _extract_version(runtime: str, capture: Capture) -> str:
     match = VERSION.search(capture.stdout)
     version = match.group(1).decode("ascii") if match is not None else "unknown"
-    return f"{runtime}/{version}", capture
+    return f"{runtime}/{version}"
 
 
 def _probe_runtime(
@@ -1893,9 +1942,11 @@ def _probe_runtime(
     evidence: _EvidenceRecorder,
 ) -> dict[str, object]:
     credential_values: set[bytes] = set()
+    credential_documents: set[bytes] = set()
     claude_oauth_token: str | None = None
     if subscription_auth is not None:
         credential_values.update(subscription_auth.secrets)
+        credential_documents.update(subscription_auth.documents)
         if isinstance(subscription_auth, ClaudeSubscriptionAuth):
             claude_oauth_token = subscription_auth.access_token
 
@@ -1903,10 +1954,11 @@ def _probe_runtime(
         if codex_auth_stage is None:
             return None
         try:
-            _raw, refreshed = _read_codex_stage(codex_auth_stage)
+            raw, refreshed = _read_codex_stage(codex_auth_stage)
         except ProbeFailure:
             return "CREDENTIAL_STAGING_FAILED"
         credential_values.update(refreshed)
+        credential_documents.add(raw)
         return None
 
     environment = _runtime_env(
@@ -1920,9 +1972,18 @@ def _probe_runtime(
         work_dir=work_dir,
     )
     disposable_paths = (work_dir, home, repo, control_root, fake_bin)
+    environment_auth_key = (
+        "ANTHROPIC_API_KEY" if runtime == "claude" else "OPENAI_API_KEY"
+    )
+    auth_hashes_withheld = bool(
+        subscription_auth is not None
+        or (
+            auth_source == "environment"
+            and caller_env.get(environment_auth_key)
+        )
+    )
     try:
-        version, version_capture = _version(
-            runtime,
+        version_capture = _version_capture(
             executable,
             work_dir=work_dir,
             repo=repo,
@@ -1934,16 +1995,6 @@ def _probe_runtime(
             env=environment,
         )
         stage_failure = refresh_codex_secrets()
-        if _protected_digest((control_root,)) != control_sha256:
-            return {
-                "status": "ISOLATION_BREACH",
-                "phase": "version",
-                "version": version,
-                "version_capture_sha256": version_capture.stdout_sha256,
-                "controls_intact": False,
-                "control_sha256": control_sha256,
-                "capture": version_capture.sanitized(),
-            }
         version_sensitivity = _sensitivity(
             version_capture,
             repo_source=repo_source,
@@ -1951,12 +2002,14 @@ def _probe_runtime(
             disposable_paths=disposable_paths,
             caller_env=caller_env,
             credential_values=tuple(credential_values),
+            credential_documents=tuple(credential_documents),
         )
         if version_sensitivity.high_risk:
             return {
                 "status": "SENSITIVE_OUTPUT",
                 "phase": "version",
-                "version": version,
+                "version": "WITHHELD",
+                "version_capture_sha256": "WITHHELD",
                 "capture": version_capture.sanitized(withhold_hashes=True),
                 "sensitivity": version_sensitivity.sanitized(),
             }
@@ -1964,7 +2017,8 @@ def _probe_runtime(
             return {
                 "status": stage_failure,
                 "phase": "version",
-                "version": version,
+                "version": "WITHHELD",
+                "version_capture_sha256": "WITHHELD",
                 "capture": version_capture.sanitized(withhold_hashes=True),
                 "sensitivity": Sensitivity(("CREDENTIAL",), True).sanitized(),
             }
@@ -1972,9 +2026,28 @@ def _probe_runtime(
             return {
                 "status": "SENSITIVE_OUTPUT",
                 "phase": "version",
-                "version": version,
-                "capture": version_capture.sanitized(),
+                "version": "WITHHELD",
+                "version_capture_sha256": "WITHHELD",
+                "capture": version_capture.sanitized(withhold_hashes=True),
                 "sensitivity": version_sensitivity.sanitized(),
+            }
+        version = _extract_version(runtime, version_capture)
+        version_capture_sha256 = (
+            "WITHHELD"
+            if auth_hashes_withheld
+            else version_capture.stdout_sha256
+        )
+        if _protected_digest((control_root,)) != control_sha256:
+            return {
+                "status": "ISOLATION_BREACH",
+                "phase": "version",
+                "version": version,
+                "version_capture_sha256": version_capture_sha256,
+                "controls_intact": False,
+                "control_sha256": control_sha256,
+                "capture": version_capture.sanitized(
+                    withhold_hashes=auth_hashes_withheld
+                ),
             }
         captures: dict[str, dict[str, str]] = {}
         phase_results: dict[str, dict[str, object]] = {}
@@ -2008,8 +2081,11 @@ def _probe_runtime(
                 disposable_paths=disposable_paths,
                 caller_env=caller_env,
                 credential_values=tuple(credential_values),
+                credential_documents=tuple(credential_documents),
             )
-            withhold_hashes = classification.sensitivity.high_risk
+            withhold_hashes = (
+                auth_hashes_withheld or classification.sensitivity.high_risk
+            )
             if stage_failure is not None:
                 withhold_hashes = True
             sanitized_capture = capture.sanitized(
@@ -2033,21 +2109,12 @@ def _probe_runtime(
                 "controls_intact": controls_intact,
                 "control_sha256": control_sha256,
             }
-            if not controls_intact:
-                return {
-                    "status": "ISOLATION_BREACH",
-                    "phase": phase,
-                    "version": version,
-                    "version_capture_sha256": version_capture.stdout_sha256,
-                    **phase_results,
-                    "captures": captures,
-                }
             if classification.failure == "SENSITIVE_OUTPUT":
                 return {
                     "status": classification.failure,
                     "phase": phase,
                     "version": version,
-                    "version_capture_sha256": version_capture.stdout_sha256,
+                    "version_capture_sha256": version_capture_sha256,
                     **phase_results,
                     "captures": captures,
                 }
@@ -2059,7 +2126,16 @@ def _probe_runtime(
                     "status": stage_failure,
                     "phase": phase,
                     "version": version,
-                    "version_capture_sha256": version_capture.stdout_sha256,
+                    "version_capture_sha256": version_capture_sha256,
+                    **phase_results,
+                    "captures": captures,
+                }
+            if not controls_intact:
+                return {
+                    "status": "ISOLATION_BREACH",
+                    "phase": phase,
+                    "version": version,
+                    "version_capture_sha256": version_capture_sha256,
                     **phase_results,
                     "captures": captures,
                 }
@@ -2068,7 +2144,7 @@ def _probe_runtime(
                     "status": classification.failure,
                     "phase": phase,
                     "version": version,
-                    "version_capture_sha256": version_capture.stdout_sha256,
+                    "version_capture_sha256": version_capture_sha256,
                     **phase_results,
                     "captures": captures,
                 }
@@ -2083,14 +2159,14 @@ def _probe_runtime(
                     "status": "CANARY_MISMATCH",
                     "phase": phase,
                     "version": version,
-                    "version_capture_sha256": version_capture.stdout_sha256,
+                    "version_capture_sha256": version_capture_sha256,
                     **phase_results,
                     "captures": captures,
                 }
         return {
             "status": "PASS",
             "version": version,
-            "version_capture_sha256": version_capture.stdout_sha256,
+            "version_capture_sha256": version_capture_sha256,
             **phase_results,
             "captures": captures,
         }
@@ -2105,6 +2181,7 @@ def _probe_runtime(
                 disposable_paths=disposable_paths,
                 caller_env=caller_env,
                 credential_values=tuple(credential_values),
+                credential_documents=tuple(credential_documents),
             )
             if sensitivity.high_risk:
                 result["status"] = "SENSITIVE_OUTPUT"
@@ -2116,7 +2193,9 @@ def _probe_runtime(
                 ).sanitized()
             result["capture"] = error.capture.sanitized(
                 withhold_hashes=(
-                    sensitivity.high_risk or stage_failure is not None
+                    auth_hashes_withheld
+                    or sensitivity.high_risk
+                    or stage_failure is not None
                 )
             )
         return result
@@ -2152,45 +2231,70 @@ def _emit(report: Mapping[str, object]) -> None:
     sys.stdout.write(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n")
 
 
+def _install_termination_handlers() -> dict[int, object]:
+    previous: dict[int, object] = {}
+
+    def terminate(signum: int, _frame: object) -> None:
+        raise _TerminationSignal(signum)
+
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, terminate)
+    except (OSError, ValueError):
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
+        return {}
+    return previous
+
+
+def _set_termination_handlers(
+    handlers: Mapping[int, object],
+) -> None:
+    for signum, handler in handlers.items():
+        try:
+            signal.signal(signum, handler)
+        except (OSError, ValueError):
+            pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    report: dict[str, object] = {"schema": SCHEMA_VERSION, "status": "BLOCKED"}
+    exit_code = 1
+    evidence: _EvidenceRecorder | None = None
+    work_dir: Path | None = None
+    identity: tuple[int, int] | None = None
+    control_root: Path | None = None
+    control_identity: tuple[int, int] | None = None
+    cleanup_ok = True
+    previous_handlers = _install_termination_handlers()
     try:
         arguments = _parser().parse_args(argv)
-    except ProbeFailure as error:
-        _emit({"schema": SCHEMA_VERSION, "status": error.code})
-        return 2
-    repo_raw = Path(arguments.repo_source)
-    try:
-        if not repo_raw.is_absolute():
-            raise OSError
-        repo_source = repo_raw.resolve(strict=True)
-        if not repo_source.is_dir():
-            raise OSError
-    except OSError:
-        _emit({"schema": SCHEMA_VERSION, "status": "INVALID_REPO_SOURCE"})
-        return 2
-    caller_env = dict(os.environ)
-    caller_home: Path | None = None
-    home_raw = caller_env.get("HOME")
-    if home_raw and Path(home_raw).is_absolute():
+        repo_raw = Path(arguments.repo_source)
         try:
-            caller_home = Path(home_raw).resolve(strict=False)
-        except (OSError, RuntimeError):
-            caller_home = None
-    try:
+            if not repo_raw.is_absolute():
+                raise OSError
+            repo_source = repo_raw.resolve(strict=True)
+            if not repo_source.is_dir():
+                raise OSError
+        except OSError:
+            raise ProbeFailure("INVALID_REPO_SOURCE") from None
+        caller_env = dict(os.environ)
+        caller_home: Path | None = None
+        home_raw = caller_env.get("HOME")
+        if home_raw and Path(home_raw).is_absolute():
+            try:
+                caller_home = Path(home_raw).resolve(strict=False)
+            except (OSError, RuntimeError):
+                caller_home = None
         work_dir, identity = _prepare_work_dir(
             arguments.work_dir,
             repo_source=repo_source,
             caller_home=caller_home,
         )
-    except ProbeFailure as error:
-        _emit({"schema": SCHEMA_VERSION, "status": error.code})
-        return 2
-    report: dict[str, object] = {"schema": SCHEMA_VERSION, "status": "BLOCKED"}
-    exit_code = 1
-    evidence: _EvidenceRecorder | None = None
-    control_root: Path | None = None
-    control_identity: tuple[int, int] | None = None
-    try:
         control_root, control_identity = _prepare_control_root(
             work_dir,
             repo_source=repo_source,
@@ -2296,20 +2400,47 @@ def main(argv: Sequence[str] | None = None) -> int:
             success = success and runtime_report.get("status") == "PASS"
         report["status"] = "PASS" if success else "BLOCKED"
         exit_code = 0 if success else 1
+    except _TerminationSignal as error:
+        report = {"schema": SCHEMA_VERSION, "status": "INTERRUPTED"}
+        exit_code = 128 + error.signum
+    except KeyboardInterrupt:
+        report = {"schema": SCHEMA_VERSION, "status": "INTERRUPTED"}
+        exit_code = 130
     except ProbeFailure as error:
         report = {"schema": SCHEMA_VERSION, "status": error.code}
         if error.capture is not None:
             report["capture"] = error.capture.sanitized()
-        exit_code = 1
+        exit_code = (
+            2
+            if error.code
+            in {"USAGE", "INVALID_REPO_SOURCE", "INVALID_WORK_DIR"}
+            else 1
+        )
     except Exception:
         report = {"schema": SCHEMA_VERSION, "status": "SETUP_FAILED"}
         exit_code = 1
-    if evidence is not None:
-        evidence.close()
-    control_cleanup_ok = True
-    if control_root is not None and control_identity is not None:
-        control_cleanup_ok = _cleanup_work_dir(control_root, control_identity)
-    cleanup_ok = _cleanup_work_dir(work_dir, identity) and control_cleanup_ok
+    finally:
+        _set_termination_handlers(
+            {signum: signal.SIG_IGN for signum in previous_handlers}
+        )
+        evidence_cleanup_ok = True
+        if evidence is not None:
+            try:
+                evidence.close()
+            except Exception:
+                evidence_cleanup_ok = False
+        control_cleanup_ok = True
+        if control_root is not None and control_identity is not None:
+            control_cleanup_ok = _cleanup_work_dir(
+                control_root, control_identity
+            )
+        work_cleanup_ok = True
+        if work_dir is not None and identity is not None:
+            work_cleanup_ok = _cleanup_work_dir(work_dir, identity)
+        cleanup_ok = (
+            evidence_cleanup_ok and control_cleanup_ok and work_cleanup_ok
+        )
+        _set_termination_handlers(previous_handlers)
     if not cleanup_ok:
         report = {"schema": SCHEMA_VERSION, "status": "CLEANUP_FAILED"}
         exit_code = 1

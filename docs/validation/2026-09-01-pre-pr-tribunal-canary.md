@@ -3,8 +3,8 @@
 ## Status
 
 **BLOCKED — no real-runtime success is claimed.** Real Claude and Codex PASS evidence is still
-required before Task 8 can be considered complete. Fix Round 4 implements the approved bounded
-subscription-auth exception, but controller review is required before either real runtime is run.
+required before Task 8 can be considered complete. Fix Round 5 closes the final local
+subscription-auth/security review findings, but controller review is required before either real runtime is run.
 No real runtime or GitHub endpoint was invoked in this implementation round.
 
 Fix Round 1 strengthened the isolation code and fake-runtime evidence, but it was deliberately not
@@ -145,6 +145,36 @@ disposable fixture credentials; no live credential was inspected during implemen
 - Tests use only disposable owner-private Claude/Codex credential fixtures. Neither real runtime
   was executed, no real GitHub endpoint was contacted, and no live credential value was inspected
   or copied. This remains a controller-review checkpoint, not real-runtime PASS evidence.
+
+## Fix Round 5 passing local evidence
+
+- Focused adversarial RED: `21 failed, 7 passed, 77 deselected in 12.39s`. Failures reproduced
+  provider-key cross-exposure, short/structured token inventory gaps, the incomplete expiry budget,
+  7-byte and escaped-raw-document leaks, zero-exit version derivation/control-breach precedence,
+  cap-crossing hashes, and staged-work/control-root leaks after SIGINT/SIGTERM/KeyboardInterrupt.
+- Final focused GREEN, including refreshed escaped raw auth and unclassifiable refreshed-stage cap
+  coverage: `30 passed, 77 deselected in 14.68s`. Final harness plus direct Claude/Codex adapters:
+  `178 passed in 62.48s`. The final complete related `tests/pre_pr_tribunal` suite:
+  `570 passed in 95.74s`.
+- Final fresh full repository regression: `2629 passed in 204.33s`, exit 0.
+- Changed-Python compilation, Git whitespace validation, and the relevant shared Skill validator
+  exited 0; the validator returned `Skill is valid!`. No shell file changed, so Bash/ShellCheck
+  changed-shell gates were not applicable. Filename-only credential-shaped and live-auth-path scans
+  over all changed tracked files plus the ignored report returned zero matches without printing values.
+- `OUTPUT_LIMIT` now always publishes both hashes as `WITHHELD`. Credential-backed children also
+  withhold capture/version hashes because sub-8-byte prefixes are not safely classifiable. Initial
+  and refreshed raw auth documents and JSON-escaped token representations remain bounded in memory;
+  under-8-byte or structured token-like fields fail closed.
+- Version output is classified after a staged-Codex refresh read and before version/hash derivation
+  or control-digest evaluation. Catchable SIGINT/SIGTERM only raise a lifecycle termination signal;
+  the outer `finally` performs deadline-bounded process/evidence shutdown and identity-confined,
+  idempotent control/work cleanup.
+- Explicit environment auth is still opt-in only. Claude children receive only the Anthropic key;
+  Codex children receive only the OpenAI key. The centrally derived Claude validity margin is 450
+  seconds: 420 seconds of configured child deadlines plus a 30-second scheduling cushion.
+- All Round 5 tests use disposable synthetic credentials. No live credential/config was opened,
+  no real Claude/Codex process or GitHub/provider endpoint was invoked, and no Step 9/JHW action ran.
+  This remains a controller-review checkpoint, not real-runtime PASS evidence.
 
 ## Original Claude canary result
 

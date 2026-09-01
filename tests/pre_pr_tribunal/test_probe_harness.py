@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import textwrap
@@ -31,12 +32,17 @@ class FakeRuntimes:
 
 @pytest.fixture
 def fake_runtimes(tmp_path):
-    def make(*, claude: str = "success", codex: str = "success") -> FakeRuntimes:
+    def make(
+        *,
+        claude: str = "success",
+        codex: str = "success",
+        codex_auth_document: bytes | None = None,
+    ) -> FakeRuntimes:
         fake_bin = tmp_path / f"runtime-bin-{claude}-{codex}"
         fake_bin.mkdir(mode=0o700)
         caller_home = tmp_path / "caller-home"
         claude_token = "fixture-claude-oauth-access-token"
-        codex_auth = (
+        codex_auth = codex_auth_document or (
             b'{"auth_mode":"chatgpt","tokens":'
             b'{"access_token":"fixture-codex-access-token",'
             b'"refresh_token":"fixture-codex-refresh-token",'
@@ -135,7 +141,50 @@ def _fake_runtime_source(
             "GH_CONFIG_DIR", "GH_HOST", "GH_PROMPT_DISABLED", "TMPDIR",
         }}
 
+        if MODE == "environment_isolation":
+            provider_keys = {{
+                key for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+                if key in os.environ
+            }}
+            expected_keys = {{
+                "claude": {{"ANTHROPIC_API_KEY"}},
+                "codex": {{"OPENAI_API_KEY"}},
+            }}[RUNTIME]
+            if (
+                provider_keys != expected_keys
+                or "CLAUDE_CODE_OAUTH_TOKEN" in os.environ
+            ):
+                print(json.dumps({{"type": "provider_auth_isolation_error"}}))
+                raise SystemExit(9)
+
         if "--version" in sys.argv[1:]:
+            if MODE == "signal_wait_version":
+                marker = Path(os.environ["TMPDIR"]) / "signal-version-ready"
+                marker.write_text("ready", encoding="ascii")
+                time.sleep(60)
+                raise SystemExit(0)
+            if MODE == "version_initial_leak_zero":
+                if RUNTIME == "claude":
+                    secret = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+                else:
+                    secret = json.loads(
+                        (Path(os.environ["CODEX_HOME"]) / "auth.json").read_text()
+                    )["tokens"]["access_token"]
+                print(secret)
+                print(f"{{RUNTIME}} 9.9.9")
+                raise SystemExit(0)
+            if MODE == "codex_version_refresh_leak_zero":
+                refreshed = json.loads(CODEX_AUTH)
+                refreshed["tokens"]["access_token"] = REFRESHED_CODEX_TOKEN
+                auth_path = Path(os.environ["CODEX_HOME"]) / "auth.json"
+                auth_path.write_text(
+                    json.dumps(refreshed, separators=(",", ":")) + "\\n",
+                    encoding="utf-8",
+                )
+                auth_path.chmod(0o600)
+                print(REFRESHED_CODEX_TOKEN)
+                print("codex 9.9.9")
+                raise SystemExit(0)
             if MODE == "codex_version_refresh_leak":
                 refreshed = json.loads(CODEX_AUTH)
                 refreshed["tokens"]["access_token"] = REFRESHED_CODEX_TOKEN
@@ -212,6 +261,11 @@ def _fake_runtime_source(
             if "ANTHROPIC_API_KEY" in os.environ or "OPENAI_API_KEY" in os.environ:
                 print(json.dumps({{"type": "auth_exposure_error"}}))
                 raise SystemExit(9)
+        if MODE == "signal_wait_phase":
+            marker = Path(os.environ["TMPDIR"]) / "signal-phase-ready"
+            marker.write_text("ready", encoding="ascii")
+            time.sleep(60)
+            raise SystemExit(0)
         if MODE == "timeout":
             time.sleep(60)
             raise SystemExit(0)
@@ -304,6 +358,60 @@ def _fake_runtime_source(
             raise SystemExit(3)
         if MODE == "raw_auth_leak" and RUNTIME == "codex":
             sys.stdout.buffer.write((config_root / "auth.json").read_bytes())
+            sys.stdout.flush()
+            raise SystemExit(3)
+        if MODE == "credential_short_prefix_leak":
+            if RUNTIME == "claude":
+                secret = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+            else:
+                secret = json.loads(
+                    (config_root / "auth.json").read_text()
+                )["tokens"]["access_token"]
+            print(secret[:7])
+            raise SystemExit(3)
+        if MODE == "output_limit_stdout_credential_tail":
+            if RUNTIME == "claude":
+                secret = os.environ["CLAUDE_CODE_OAUTH_TOKEN"].encode()
+            else:
+                secret = json.loads(
+                    (config_root / "auth.json").read_text()
+                )["tokens"]["access_token"].encode()
+            sys.stdout.buffer.write((b"x" * (64 * 1024)) + secret)
+            sys.stdout.flush()
+            time.sleep(60)
+            raise SystemExit(0)
+        if MODE in {{
+            "codex_refresh_output_limit_stderr",
+            "codex_unclassifiable_output_limit_stderr",
+        }}:
+            auth_path = config_root / "auth.json"
+            if MODE == "codex_refresh_output_limit_stderr":
+                refreshed = json.loads(CODEX_AUTH)
+                refreshed["tokens"]["access_token"] = REFRESHED_CODEX_TOKEN
+                auth_path.write_text(
+                    json.dumps(refreshed, separators=(",", ":")) + "\\n",
+                    encoding="utf-8",
+                )
+                tail = REFRESHED_CODEX_TOKEN.encode()
+            else:
+                auth_path.write_bytes(
+                    b'{{"tokens":{{"access_token":["unclassifiable"]}}}}\\n'
+                )
+                tail = b"unclassifiable-refresh-tail"
+            auth_path.chmod(0o600)
+            sys.stderr.buffer.write((b"x" * (64 * 1024)) + tail)
+            sys.stderr.flush()
+            time.sleep(60)
+            raise SystemExit(0)
+        if MODE == "codex_refresh_escaped_raw_leak":
+            raw = (
+                b'{{"tokens":{{"access_token":'
+                b'"\\\\u2603-refreshed-escaped-token"}}}}\\n'
+            )
+            auth_path = config_root / "auth.json"
+            auth_path.write_bytes(raw)
+            auth_path.chmod(0o600)
+            sys.stdout.buffer.write(raw)
             sys.stdout.flush()
             raise SystemExit(3)
 
@@ -555,6 +663,25 @@ def test_subscription_is_default_and_environment_auth_is_explicit_opt_in(
     assert not environment_work.exists()
 
 
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_environment_auth_is_isolated_to_the_selected_runtime_provider(
+    fake_runtimes, tmp_path, runtime
+):
+    fake = fake_runtimes(**{runtime: "environment_isolation"})
+
+    result, work_dir = _run_probe(
+        fake,
+        tmp_path,
+        runtime=runtime,
+        auth_source="environment",
+    )
+
+    report = json.loads(result.stdout)
+    assert result.returncode == 0
+    assert report[runtime]["status"] == "PASS"
+    assert not work_dir.exists()
+
+
 @pytest.mark.parametrize(
     ("runtime", "relative_path"),
     [
@@ -721,6 +848,59 @@ def test_codex_subscription_credentials_fail_with_stable_status(
     assert not work_dir.exists()
 
 
+@pytest.mark.parametrize(
+    "token_value",
+    [
+        "short",
+        ["nested-list-secret"],
+        {"nested": "nested-object-secret"},
+    ],
+)
+def test_codex_rejects_short_or_structured_token_like_values(
+    fake_runtimes, token_value
+):
+    module = _load_probe_module()
+    fake = fake_runtimes()
+    credential = fake.caller_home / ".codex/auth.json"
+    credential.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": "valid-primary-access-token",
+                    "refresh_token": token_value,
+                }
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    credential.chmod(0o600)
+
+    with pytest.raises(module.ProbeFailure) as raised:
+        module._load_codex_subscription_auth(fake.caller_home)
+
+    assert raised.value.code == "CREDENTIAL_MALFORMED"
+
+
+def test_codex_benign_nested_metadata_does_not_enter_secret_inventory(
+    fake_runtimes, tmp_path
+):
+    auth_document = (
+        b'{"auth_mode":"chatgpt","tokens":'
+        b'{"access_token":"valid-primary-access-token"},'
+        b'"metadata":{"labels":["benign-public-value"]}}\n'
+    )
+    fake = fake_runtimes(codex_auth_document=auth_document)
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime="codex")
+
+    report = json.loads(result.stdout)
+    assert result.returncode == 0
+    assert report["codex"]["status"] == "PASS"
+    assert not work_dir.exists()
+
+
 @pytest.mark.parametrize("runtime", ["claude", "codex"])
 def test_runtime_control_references_have_no_writable_state_ancestor(
     fake_runtimes, tmp_path, runtime
@@ -740,8 +920,19 @@ def test_claude_expiry_must_cover_the_complete_two_phase_runtime_budget(
     module = _load_probe_module()
     fake = fake_runtimes()
     now = 2_000_000_000.0
+    configured_child_deadlines = (
+        (3 * module.RUNTIME_TIMEOUT_SECONDS)
+        + (2 * module.INTERNAL_TIMEOUT_SECONDS)
+    )
+    required_scheduling_cushion = 30
     expires_at = int(
-        (now + module.AUTH_VALIDITY_MARGIN_SECONDS - 1) * 1000
+        (
+            now
+            + configured_child_deadlines
+            + required_scheduling_cushion
+            - 1
+        )
+        * 1000
     )
     credential = fake.caller_home / ".claude/.credentials.json"
     credential.write_text(
@@ -844,8 +1035,11 @@ def test_codex_staged_auth_can_refresh_without_mutating_live_source(
         ("claude", "credential_prefix_leak"),
         ("codex", "credential_leak"),
         ("codex", "credential_prefix_leak"),
+        ("claude", "credential_short_prefix_leak"),
+        ("codex", "credential_short_prefix_leak"),
         ("codex", "raw_auth_leak"),
         ("codex", "codex_refresh_leak"),
+        ("codex", "codex_refresh_escaped_raw_leak"),
     ],
 )
 def test_subscription_secret_leaks_are_sensitive_and_capture_hashes_are_withheld(
@@ -874,6 +1068,31 @@ def test_subscription_secret_leaks_are_sensitive_and_capture_hashes_are_withheld
     assert not work_dir.exists()
 
 
+def test_exact_initial_codex_auth_document_with_escaped_token_is_sensitive(
+    fake_runtimes, tmp_path
+):
+    escaped_auth = (
+        b'{"auth_mode":"chatgpt","tokens":'
+        b'{"access_token":"\\u2603-long-escaped-token"}}\n'
+    )
+    fake = fake_runtimes(
+        codex="raw_auth_leak",
+        codex_auth_document=escaped_auth,
+    )
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime="codex")
+
+    runtime_report = json.loads(result.stdout)["codex"]
+    phase = runtime_report["missing_verdict"]
+    assert runtime_report["status"] == "SENSITIVE_OUTPUT"
+    assert phase["sensitivity"]["high_risk"] is True
+    assert "CREDENTIAL" in phase["sensitivity"]["reasons"]
+    assert phase["capture"]["stdout_sha256"] == "WITHHELD"
+    assert phase["capture"]["stderr_sha256"] == "WITHHELD"
+    assert "\\u2603-long-escaped-token" not in result.stdout
+    assert not work_dir.exists()
+
+
 def test_codex_version_refresh_leak_is_classified_from_post_execution_stage(
     fake_runtimes, tmp_path
 ):
@@ -890,6 +1109,74 @@ def test_codex_version_refresh_leak_is_classified_from_post_execution_stage(
     }
     assert runtime_report["capture"]["stdout_sha256"] == "WITHHELD"
     assert "rotated-codex-access-token" not in result.stdout
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("runtime", "mode"),
+    [
+        ("claude", "version_initial_leak_zero"),
+        ("codex", "version_initial_leak_zero"),
+        ("codex", "codex_version_refresh_leak_zero"),
+    ],
+)
+def test_zero_exit_version_credential_leaks_withhold_all_derived_fields(
+    fake_runtimes, tmp_path, runtime, mode
+):
+    fake = fake_runtimes(**{runtime: mode})
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime=runtime)
+
+    runtime_report = json.loads(result.stdout)[runtime]
+    assert runtime_report["status"] == "SENSITIVE_OUTPUT"
+    assert runtime_report["phase"] == "version"
+    assert runtime_report["version"] == "WITHHELD"
+    assert runtime_report.get("version_capture_sha256", "WITHHELD") == "WITHHELD"
+    assert runtime_report["capture"] == {
+        "exit_class": "ZERO",
+        "stdout_sha256": "WITHHELD",
+        "stderr_sha256": "WITHHELD",
+    }
+    assert not work_dir.exists()
+
+
+def test_version_sensitivity_precedes_a_colliding_control_digest_breach(
+    fake_runtimes, tmp_path, monkeypatch
+):
+    module = _load_probe_module()
+    fake = fake_runtimes(claude="version_initial_leak_zero")
+    for key, value in fake.env.items():
+        monkeypatch.setenv(key, value)
+    original_digest = module._protected_digest
+    calls = 0
+
+    def breach_after_isolation(paths):
+        nonlocal calls
+        calls += 1
+        digest = original_digest(paths)
+        return "0" * 64 if calls >= 4 else digest
+
+    monkeypatch.setattr(module, "_protected_digest", breach_after_isolation)
+    stdout = io.StringIO()
+    work_dir = tmp_path / "probe"
+    with redirect_stdout(stdout):
+        exit_code = module.main(
+            [
+                "--runtime",
+                "claude",
+                "--repo-source",
+                str(REPO),
+                "--work-dir",
+                str(work_dir),
+            ]
+        )
+
+    runtime_report = json.loads(stdout.getvalue())["claude"]
+    assert exit_code != 0
+    assert runtime_report["status"] == "SENSITIVE_OUTPUT"
+    assert runtime_report["version"] == "WITHHELD"
+    assert runtime_report["capture"]["stdout_sha256"] == "WITHHELD"
+    assert runtime_report["capture"]["stderr_sha256"] == "WITHHELD"
     assert not work_dir.exists()
 
 
@@ -932,7 +1219,39 @@ def test_probe_hard_caps_runtime_output(fake_runtimes, tmp_path):
     report = json.loads(result.stdout)
     assert result.returncode != 0
     assert report["claude"]["status"] == "OUTPUT_LIMIT"
+    capture = report["claude"]["missing_verdict"]["capture"]
+    assert capture["stdout_sha256"] == "WITHHELD"
+    assert capture["stderr_sha256"] == "WITHHELD"
     assert len(result.stdout.encode("utf-8")) < 16 * 1024
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("runtime", "mode", "expected_status"),
+    [
+        ("claude", "output_limit_stdout_credential_tail", "OUTPUT_LIMIT"),
+        ("codex", "codex_refresh_output_limit_stderr", "OUTPUT_LIMIT"),
+        (
+            "codex",
+            "codex_unclassifiable_output_limit_stderr",
+            "CREDENTIAL_STAGING_FAILED",
+        ),
+    ],
+)
+def test_output_limit_withholds_hashes_for_uninspected_credential_tails(
+    fake_runtimes, tmp_path, runtime, mode, expected_status
+):
+    fake = fake_runtimes(**{runtime: mode})
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime=runtime)
+
+    runtime_report = json.loads(result.stdout)[runtime]
+    phase = runtime_report["missing_verdict"]
+    assert result.returncode != 0
+    assert runtime_report["status"] == expected_status
+    assert phase["capture"]["stdout_sha256"] == "WITHHELD"
+    assert phase["capture"]["stderr_sha256"] == "WITHHELD"
+    assert "rotated-codex-access-token" not in result.stdout
     assert not work_dir.exists()
 
 
@@ -966,6 +1285,104 @@ def test_probe_times_out_runtime_and_cleans_only_its_work_dir(
     assert report[runtime]["status"] == "TIMEOUT"
     assert outside.read_text(encoding="utf-8") == "preserve"
     assert not work_dir.exists()
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize(
+    ("mode", "marker_name"),
+    [
+        ("signal_wait_version", "signal-version-ready"),
+        ("signal_wait_phase", "signal-phase-ready"),
+    ],
+)
+def test_probe_signals_cleanup_staged_codex_auth_and_control_roots(
+    fake_runtimes,
+    tmp_path,
+    signum,
+    mode,
+    marker_name,
+):
+    fake = fake_runtimes(codex=mode)
+    temp_root = tmp_path / "controller-tmp"
+    temp_root.mkdir(mode=0o700)
+    environment = dict(fake.env, TMPDIR=str(temp_root))
+    work_dir = tmp_path / "probe"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(PROBE_SCRIPT),
+            "--runtime",
+            "codex",
+            "--repo-source",
+            str(REPO),
+            "--work-dir",
+            str(work_dir),
+        ],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    marker = work_dir / "tmp" / marker_name
+    deadline = time.monotonic() + 15
+    while not marker.exists() and process.poll() is None:
+        if time.monotonic() >= deadline:
+            process.kill()
+            process.communicate(timeout=5)
+            pytest.fail(f"probe did not reach {marker_name}")
+        time.sleep(0.02)
+    assert process.poll() is None
+    assert (work_dir / "auth-stage/codex-auth.json").is_file()
+
+    os.kill(process.pid, signum)
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode != 0
+    assert stderr == ""
+    assert json.loads(stdout)["status"] == "INTERRUPTED"
+    assert not work_dir.exists()
+    assert not list(temp_root.glob("pre-pr-tribunal-controls-*"))
+
+
+def test_keyboard_interrupt_immediately_after_codex_staging_cleans_every_root(
+    fake_runtimes, tmp_path, monkeypatch
+):
+    module = _load_probe_module()
+    fake = fake_runtimes()
+    for key, value in fake.env.items():
+        monkeypatch.setenv(key, value)
+    allocated = {
+        "pre-pr-tribunal-probe-": tmp_path / "default-probe",
+        "pre-pr-tribunal-controls-": tmp_path / "default-controls",
+    }
+
+    def allocate(*, prefix):
+        target = allocated[prefix]
+        target.mkdir(mode=0o700)
+        return str(target)
+
+    def interrupt_after_stage(*_args, **_kwargs):
+        stage = allocated["pre-pr-tribunal-probe-"] / "auth-stage/codex-auth.json"
+        assert stage.is_file()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", allocate)
+    monkeypatch.setattr(module, "_probe_runtime", interrupt_after_stage)
+    stdout = io.StringIO()
+    interrupted = False
+    try:
+        with redirect_stdout(stdout):
+            exit_code = module.main(
+                ["--runtime", "codex", "--repo-source", str(REPO)]
+            )
+    except KeyboardInterrupt:
+        interrupted = True
+        exit_code = None
+
+    assert interrupted is False
+    assert exit_code != 0
+    assert json.loads(stdout.getvalue())["status"] == "INTERRUPTED"
+    assert all(not path.exists() for path in allocated.values())
 
 
 def test_probe_timeout_covers_descendants_holding_capture_pipes(tmp_path):
@@ -1541,8 +1958,8 @@ def test_phase_failure_retains_sanitized_facts(
     assert phase["canary_count"] == canary_count
     assert phase["invalid_call_count"] == invalid_call_count
     assert phase["capture"]["exit_class"] in {"ZERO", "NONZERO"}
-    assert len(phase["capture"]["stdout_sha256"]) == 64
-    assert len(phase["capture"]["stderr_sha256"]) == 64
+    assert phase["capture"]["stdout_sha256"] == "WITHHELD"
+    assert phase["capture"]["stderr_sha256"] == "WITHHELD"
     assert not work_dir.exists()
 
 

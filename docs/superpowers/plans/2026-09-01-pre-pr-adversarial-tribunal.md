@@ -1606,7 +1606,7 @@ The script must:
 3. Run `install-pre-pr-tribunal.py --repo "$REPO_SOURCE" --home "$PROBE_HOME"`.
 4. Missing phase: remove `.review`, invoke the selected runtime with a prompt requiring exactly `gh pr create --title canary --body canary`, and assert count 0 plus a deny event/reason.
 5. Pass phase: run CLI `begin`, write three schema-valid empty reports, run `finalize`, invoke the same runtime and assert count 1.
-6. Use a 120-second process timeout, cap stdout/stderr at 64 KiB, hash full captures only after credential-leak classification, and return only runtime/version, exit class, deny boolean, canary count, safe capture hashes and categories. Withhold both hashes when credential material is detected or a refreshed stage cannot be safely classified.
+6. Use a 120-second process timeout, cap stdout/stderr at 64 KiB, and return only runtime/version, exit class, deny boolean, canary count, safe capture hashes and categories. Always withhold both hashes on `OUTPUT_LIMIT`; no digest may cover bytes the classifier did not inspect. When credential material is in a child scope, withhold all capture hashes because sub-8-byte prefixes cannot be classified without ambiguity. Classify the bounded version capture, including any refreshed Codex stage, before deriving version/hash fields or evaluating a control-digest breach.
 7. Never print prompts, environment, credentials, absolute paths or raw child output.
 
 For every runtime child set `HOME=$PROBE_HOME`, put the fake-bin directory at
@@ -1618,19 +1618,24 @@ no-follow/close-on-exec descriptors, require a current-UID owner-only regular
 file with a stable bounded read, reject duplicate/malformed JSON, and never
 expose the live path in the sandbox. Claude must extract only non-empty
 `.claudeAiOauth.accessToken` plus integer `expiresAt`, require a validity margin
-covering the version probe and both 120-second phases, and pass the token only as
+covering the 120-second version probe, both 120-second phases, two 30-second
+pass-verdict child deadlines and a 30-second scheduling cushion (450 seconds total), and pass the token only as
 `CLAUDE_CODE_OAUTH_TOKEN`. Codex must copy exact bounded `.codex/auth.json`
 bytes into disposable owner-only staging and leaf-bind only that staged file at
 isolated `CODEX_HOME/auth.json`; its parent and hook config remain immutable.
-The staged Codex leaf may refresh in place, and every initial/refreshed
-token-like value is retained only in memory for leak classification. Live
-credential bytes/metadata must remain unchanged and all staging is removed on
-success, failure, timeout, and setup exceptions.
+The staged Codex leaf may refresh in place. Every bounded initial/refreshed raw
+auth document plus token value and JSON-escaped representation is retained only
+in memory for leak classification. Token-like fields with an under-8-byte value
+or structured/list value fail closed as malformed; a 7-byte prefix is classified
+as credential output. Live credential bytes/metadata must remain unchanged and
+all staging is removed on success, failure, timeout, setup exceptions, and
+catchable SIGINT/SIGTERM through an outer lifecycle `finally`.
 
 `--auth-source environment` is an explicit compatibility/billing opt-in. Only
-that mode may forward `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`; subscription
-mode must not forward or fall back to either. In every mode, do not inherit
-other project tokens.
+that mode may forward API keys, and it must isolate them by runtime: Claude
+version/two-phase children receive only `ANTHROPIC_API_KEY`, while Codex
+version/two-phase children receive only `OPENAI_API_KEY`. Subscription mode must
+not forward or fall back to either. In every mode, do not inherit other project tokens.
 
 For real Claude use:
 
@@ -1706,7 +1711,7 @@ rtk python3 scripts/probe-pre-pr-tribunal.py --runtime claude --repo-source "$PW
 rtk python3 scripts/probe-pre-pr-tribunal.py --runtime codex --repo-source "$PWD"
 ```
 
-Expected for each runtime: missing verdict `{denied: true, canary_count: 0}` and valid pass `{denied: false, canary_count: 1}`. Record runtime versions, sanitized result fields and capture hashes in `docs/validation/2026-09-01-pre-pr-tribunal-canary.md`; do not include raw model output, prompts, absolute paths or credentials. Any `AUTH_UNAVAILABLE`, timeout, malformed result or canary mismatch is a blocking failure, not a skipped success.
+Expected for each runtime: missing verdict `{denied: true, canary_count: 0}` and valid pass `{denied: false, canary_count: 1}`. Record runtime versions and sanitized result fields in `docs/validation/2026-09-01-pre-pr-tribunal-canary.md`; credential-backed capture/version hashes remain literal `WITHHELD`. Do not include raw model output, prompts, absolute paths or credentials. Any `AUTH_UNAVAILABLE`, timeout, malformed result or canary mismatch is a blocking failure, not a skipped success.
 
 - [ ] **Step 8: Docs, probe와 validation evidence를 커밋한다**
 

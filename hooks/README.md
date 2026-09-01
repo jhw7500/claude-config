@@ -136,13 +136,21 @@ credential만 bounded exception으로 다룬다. Claude source는 secure descrip
 OAuth/expiry validation 뒤 `CLAUDE_CODE_OAUTH_TOKEN`으로만 전달한다. Codex source는 exact bytes를
 disposable `0600` stage에 복사하고 immutable `CODEX_HOME`의 `auth.json` leaf에만 bind한다. 그 leaf는
 필요한 in-place refresh만 허용하며 parent/hook config는 immutable하다. Refresh 전후 token-like value를
-memory에서만 leak matcher로 유지하고, live source bytes/metadata 불변과 stage cleanup을 모든 종료에서
-확인한다. Caller의 live `.claude`/`.codex` directory는 sandbox 안에서 empty immutable mask다.
+raw auth document 및 JSON-escaped representation과 함께 memory에서만 leak matcher로 유지한다.
+8-byte 미만 또는 structured token-like value는 malformed로 거부한다. Live source bytes/metadata 불변과
+stage cleanup은 정상/실패/timeout/setup exception 및 catchable SIGINT/SIGTERM에서 확인한다. Caller의
+live `.claude`/`.codex` directory는 sandbox 안에서 empty immutable mask다. Claude expiry margin은 세
+runtime child deadline 360초, 두 verdict child deadline 60초와 30초 cushion을 합친 450초다.
 
 Default mode는 API key를 child에 넘기지 않는다. `--auth-source environment`는 API-key billing을
 명시적으로 opt-in하는 compatibility mode이며 subscription failure에서 자동 선택되지 않는다.
-Credential literal/raw JSON이 capture에 섞이면 raw data, prefix와 두 capture hash를 모두 보류하고
-`SENSITIVE_OUTPUT`으로 차단한다. Source/stage validation 실패도 stable credential status로 fail closed한다.
+그 mode에서도 Claude version/phase child는 `ANTHROPIC_API_KEY`만, Codex child는 `OPENAI_API_KEY`만
+받는다. Credential literal/raw JSON 또는 7-byte prefix가 capture에 섞이면 raw data와 derived field를
+보류하고 `SENSITIVE_OUTPUT`으로 차단한다. 더 짧은 prefix는 안전하게 분류할 수 없으므로 credential
+material이 child 범위에 있는 모든 capture hash는 `WITHHELD`다. `OUTPUT_LIMIT`도 classifier가 보지 못한
+tail과 무관하게 stdout/stderr hash를 항상 둘 다 보류한다. Source/stage validation 실패도 stable
+credential status로 fail closed한다. Version capture는 staged Codex auth를 다시 읽고 sensitivity를
+판정한 뒤에만 version/hash를 파생하며, sensitivity는 control-digest breach보다 우선한다.
 
 Provider API 연결을 보존하려고 network namespace는 공유한다. 따라서 GitHub sinkhole/fake executable
 경계 밖의 일반 egress 차단이나 provider connectivity 보장은 이 harness의 계약이 아니다. Runtime
