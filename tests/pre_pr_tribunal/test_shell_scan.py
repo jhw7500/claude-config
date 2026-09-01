@@ -234,6 +234,39 @@ def test_candidate_hint_is_bounded_for_extreme_depth_and_token_volume():
     assert result.reason == "TOKEN_LIMIT"
 
 
+def test_deep_hint_preserves_parent_state_after_quoted_substitution():
+    nesting = MAX_RECURSION + 3
+    prefix = "$(" * nesting
+    suffix = ")" * nesting
+    candidate = prefix + 'FOO="$(printf x)" gh pr create' + suffix
+    quoted_data = prefix + 'echo "$(printf x) gh pr create"' + suffix
+    argument_data = prefix + 'FOO="$(printf x)" printf gh pr create' + suffix
+
+    result = scan_pr_create(candidate)
+    assert result.kind is ScanKind.AMBIGUOUS_CANDIDATE
+    assert result.reason == "RECURSION_LIMIT"
+    result = scan_pr_create(quoted_data)
+    assert result.kind is ScanKind.NO_MATCH
+    assert result.reason == "RECURSION_LIMIT"
+    result = scan_pr_create(argument_data)
+    assert result.kind is ScanKind.NO_MATCH
+    assert result.reason == "RECURSION_LIMIT"
+
+
+@pytest.mark.parametrize("redirection", ["2>/tmp/x", "3>>/tmp/x"])
+def test_token_limited_hint_skips_numeric_fd_redirection(redirection):
+    exhausted = "x;" * MAX_TOKENS
+    candidate = f"{exhausted}{redirection} gh pr create"
+    argument_data = f"{exhausted}{redirection} printf gh pr create"
+
+    result = scan_pr_create(candidate)
+    assert result.kind is ScanKind.AMBIGUOUS_CANDIDATE
+    assert result.reason == "TOKEN_LIMIT"
+    result = scan_pr_create(argument_data)
+    assert result.kind is ScanKind.NO_MATCH
+    assert result.reason == "TOKEN_LIMIT"
+
+
 @pytest.mark.parametrize(
     "command",
     [

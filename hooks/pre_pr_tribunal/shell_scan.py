@@ -73,6 +73,21 @@ _GH_FLAG_OPTIONS = {"--help", "--version"}
 _ENV_FLAGS = {"-i", "--ignore-environment"}
 _ENV_VALUE_OPTIONS = {"-u", "-C"}
 _SHELLS = {"sh", "bash", "dash"}
+_SHELL_OPERATORS = ("&&", "||", ";", "|", "&")
+_SHELL_REDIRECTIONS = (
+    "&>>",
+    "&>",
+    "<<<",
+    "<<-",
+    "<<",
+    ">>",
+    "<&",
+    ">&",
+    "<>",
+    ">|",
+    "<",
+    ">",
+)
 
 
 def scan_pr_create(command: str) -> ScanResult:
@@ -415,26 +430,13 @@ class _Parser:
                 self.index = newline + 1
 
     def _operator(self) -> str | None:
-        for operator in ("&&", "||", ";", "|", "&"):
+        for operator in _SHELL_OPERATORS:
             if self.command.startswith(operator, self.index):
                 return operator
         return None
 
     def _redirection(self) -> str | None:
-        for operator in (
-            "&>>",
-            "&>",
-            "<<<",
-            "<<-",
-            "<<",
-            ">>",
-            "<&",
-            ">&",
-            "<>",
-            ">|",
-            "<",
-            ">",
-        ):
+        for operator in _SHELL_REDIRECTIONS:
             if self.command.startswith(operator, self.index):
                 return operator
         return None
@@ -681,6 +683,7 @@ class _StreamingHint:
         self.frames = [_HintFrame()]
         self.overflow_depth = 0
         self.overflow = _HintFrame(terminator=")")
+        self.overflow_checkpoints: list[tuple[int, _HintFrame]] = []
         self.work = work
 
     def run(self) -> bool:
@@ -771,7 +774,9 @@ class _StreamingHint:
             return False
         redirection = self._redirection()
         if redirection is not None:
-            if self._finish_word(frame):
+            if self._is_numeric_fd(frame):
+                frame.reset_word()
+            elif self._finish_word(frame):
                 return True
             frame.saved_phase = frame.phase
             frame.skip_operand = "HEREDOC" if redirection in {"<<", "<<-"} else "REDIR"
@@ -993,6 +998,7 @@ class _StreamingHint:
 
     def _push_command(self, terminator: str) -> None:
         if self.overflow_depth:
+            self._checkpoint_overflow()
             self.overflow_depth += 1
             self.overflow = _HintFrame(terminator=terminator)
         elif len(self.frames) < _HINT_FRAME_LIMIT:
@@ -1004,6 +1010,7 @@ class _StreamingHint:
     def _push_arithmetic(self) -> None:
         frame = _HintFrame(kind="ARITHMETIC", arithmetic_depth=2)
         if self.overflow_depth:
+            self._checkpoint_overflow()
             self.overflow_depth += 1
             self.overflow = frame
         elif len(self.frames) < _HINT_FRAME_LIMIT:
@@ -1016,7 +1023,13 @@ class _StreamingHint:
         if self.overflow_depth:
             self.overflow_depth -= 1
             if self.overflow_depth:
-                self.overflow = _HintFrame(terminator=")", phase="ARGS")
+                if (
+                    self.overflow_checkpoints
+                    and self.overflow_checkpoints[-1][0] == self.overflow_depth
+                ):
+                    _, self.overflow = self.overflow_checkpoints.pop()
+                else:
+                    self.overflow = _HintFrame(terminator=")", phase="ARGS")
             else:
                 parent = self.frames[-1]
                 parent.started = True
@@ -1028,6 +1041,33 @@ class _StreamingHint:
             if parent.kind == "COMMAND":
                 parent.started = True
                 parent.dynamic = True
+
+    def _checkpoint_overflow(self) -> None:
+        frame = self.overflow
+        needs_restore = (
+            frame.kind != "COMMAND"
+            or frame.quote is not None
+            or frame.phase != "EXEC"
+            or frame.assignment
+            or frame.skip_operand is not None
+            or bool(frame.heredocs)
+        )
+        if not needs_restore:
+            return
+        if len(self.overflow_checkpoints) == _HINT_FRAME_LIMIT:
+            self.overflow_checkpoints.pop(0)
+        self.overflow_checkpoints.append((self.overflow_depth, frame))
+
+    @staticmethod
+    def _is_numeric_fd(frame: _HintFrame) -> bool:
+        return (
+            frame.started
+            and not frame.quoted
+            and not frame.dynamic
+            and not frame.truncated
+            and bool(frame.chars)
+            and all(char.isascii() and char.isdigit() for char in frame.chars)
+        )
 
     def _consume_heredocs(self, frame: _HintFrame) -> None:
         for delimiter, strip_tabs in frame.heredocs:
@@ -1052,26 +1092,13 @@ class _StreamingHint:
             frame.truncated = True
 
     def _operator(self) -> str | None:
-        for operator in ("&&", "||", ";", "|", "&"):
+        for operator in _SHELL_OPERATORS:
             if self.command.startswith(operator, self.index):
                 return operator
         return None
 
     def _redirection(self) -> str | None:
-        for operator in (
-            "&>>",
-            "&>",
-            "<<<",
-            "<<-",
-            "<<",
-            ">>",
-            "<&",
-            ">&",
-            "<>",
-            ">|",
-            "<",
-            ">",
-        ):
+        for operator in _SHELL_REDIRECTIONS:
             if self.command.startswith(operator, self.index):
                 return operator
         return None
