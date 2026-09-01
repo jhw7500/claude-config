@@ -35,6 +35,23 @@ source ~/.bashrc
   - 설치기는 portfolio 조회나 자격증명 접근을 실행하지 않는다. 새 설치 또는 파일 hash가 바뀐 뒤에는 Codex에서 `/hooks`를 열어 변경 hash를 직접 검토한 뒤 trust한다; installer는 trust를 자동 승인하지 않는다.
 - `context-bar`(statusLine 교체)는 **미포함** (현재 OMC HUD와 상호배타라 별도 결정 필요)
 
+## pre-PR tribunal
+
+`./install.sh`는 Claude/Codex 공용 tribunal package와 Skill을 owner-only 대상으로 설치하고,
+Claude `settings.json`에는 `Bash` matcher를, Codex `hooks.json`에는 matcher 없는
+`PreToolUse` group을 기존 hook을 보존하며 추가한다. 설치 뒤 Codex에서는 `/hooks`를 열어 새 hook
+hash와 command를 직접 검토하고 trust해야 한다. installer는 trust를 대신 승인하지 않는다.
+
+PR을 만들기 전 Claude에서는 `/pre-pr-tribunal`, Codex에서는 `$pre-pr-tribunal`을 실행한다.
+review 상태는 현재 저장소의 ignored `.review/`에만 남고 HOME이나 다른 checkout과 공유되지 않는다.
+각 round는 독립 Reviewer A/B/C report로 finalize하며, blocker가 계속되면 최대 3 round에서 멈춰
+사용자 개입을 요청한다. 현재 snapshot에 결합된 pass verdict가 있을 때만 direct
+`gh pr create` shell command가 통과한다.
+
+이 gate는 Claude/Codex shell hook에 보이는 direct `gh pr create`만 다룬다. GitHub UI에서의 PR
+생성, `gh api`, alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가
+필요하다. 설치·복구와 검증 절차는 [hook 운영 문서](hooks/README.md#pre-pr-tribunal-운영)를 따른다.
+
 ## 토글 메커니즘 — 2종류 (대체 불가, 병행)
 
 | 대상 | 메커니즘 | 도구 |

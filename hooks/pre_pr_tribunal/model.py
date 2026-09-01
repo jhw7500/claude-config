@@ -30,7 +30,7 @@ _SECRET = re.compile(
     r"BEGIN PRIVATE KEY|ghp_[A-Za-z0-9]{8}|github_pat_[A-Za-z0-9_]{8}|"
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8}|AKIA[A-Z0-9]{12}"
 )
-_HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>\])]+")
+_HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>]+")
 _HTTP_URL_START = re.compile(r"https?://", re.IGNORECASE)
 _SHELL_CONTROL = frozenset(";|&()<>`")
 _MAX_SHELL_NESTING = 64
@@ -462,14 +462,25 @@ def _shell_quote_context(
     )
 
 
-def _http_url_candidate(text: str, start: int) -> tuple[str, int] | None:
+def _matching_url_terminator(text: str, start: int) -> str | None:
+    if start and text[start - 1] == "[":
+        return "]"
+    if start < 3 or text[start - 1] != "(" or text[start - 2] != "]":
+        return None
+    label_start = text.rfind("[", 0, start - 2)
+    if label_start < 0 or "\n" in text[label_start : start - 2]:
+        return None
+    return ")"
+
+
+def _http_url_candidate(text: str, start: int) -> tuple[str, int, str | None] | None:
     context = _shell_quote_context(text, start)
     if context is None:
         return None
     quote, interpolated, substitutions, backtick = context
     if interpolated or substitutions or backtick:
         return None
-    terminator: str | None = None
+    terminator = _matching_url_terminator(text, start)
     if start:
         previous = text[start - 1]
         if not (
@@ -478,8 +489,6 @@ def _http_url_candidate(text: str, start: int) -> tuple[str, int] | None:
             or previous in _SHELL_CONTROL
         ):
             return None
-        if previous == "[":
-            terminator = "]"
     index = start
     if quote is None:
         terminated = terminator is None
@@ -517,17 +526,17 @@ def _http_url_candidate(text: str, start: int) -> tuple[str, int] | None:
             return None
         if token_end is not None:
             index = token_end
-    return text[start:index], index
+    return text[start:index], index, terminator
 
 
-def _http_url_path_spans(text: str) -> tuple[tuple[int, int], ...]:
-    spans: list[tuple[int, int]] = []
+def _http_url_path_spans(text: str) -> tuple[tuple[int, int, str | None], ...]:
+    spans: list[tuple[int, int, str | None]] = []
     for match in _HTTP_URL_START.finditer(text):
         start = match.start()
         candidate = _http_url_candidate(text, start)
         if candidate is None:
             continue
-        token, _end = candidate
+        token, _end, terminator = candidate
         try:
             parsed = urlsplit(token)
             hostname = parsed.hostname
@@ -537,16 +546,26 @@ def _http_url_path_spans(text: str) -> tuple[tuple[int, int], ...]:
         if parsed.scheme.lower() not in {"http", "https"} or not hostname:
             continue
         path_start = start + len(parsed.scheme) + 3 + len(parsed.netloc)
-        spans.append((path_start, path_start + len(parsed.path)))
+        spans.append((path_start, path_start + len(parsed.path), terminator))
     return tuple(spans)
 
 
 def _contains_home_path(text: str) -> bool:
     url_paths = _http_url_path_spans(text)
-    return any(
-        not any(start <= match.start() and match.end() <= end for start, end in url_paths)
-        for match in _HOME_PATH.finditer(text)
-    )
+    for match in _HOME_PATH.finditer(text):
+        if any(
+            start <= match.start()
+            and (
+                match.end() <= end
+                or terminator is not None
+                and match.end() == end + 1
+                and text[end] == terminator
+            )
+            for start, end, terminator in url_paths
+        ):
+            continue
+        return True
+    return False
 
 
 def _evidence(value: object) -> str:

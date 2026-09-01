@@ -463,6 +463,30 @@ def test_delimited_http_home_endpoint_is_allowed(snapshot, field, value):
 @pytest.mark.parametrize(
     "value",
     [
+        "echo /home/]/private",
+        "echo /home/)/private",
+        "echo /Users/]/private",
+        "echo /Users/)/private",
+    ],
+)
+def test_delimiter_leading_direct_home_components_are_rejected(
+    snapshot, field, value
+):
+    item = execution()
+    item[field] = value
+    with pytest.raises(SchemaError, match="EVIDENCE_SECRET_DETECTED"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize("field", ["command", "stdout_excerpt"])
+@pytest.mark.parametrize(
+    "value",
+    [
         "echo [https://example.com/home/alice",
         "echo [https://example.com/home/alice]/home/bob",
         "echo [https://example.com/home/alice];/home/bob",

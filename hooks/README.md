@@ -60,12 +60,14 @@ fi
 | `task-nudge-claude.py` | Claude PreToolUse: `Edit\|Write\|NotebookEdit` | 공통 core 결과를 Claude 평문 `[TASK-NUDGE]`로 어댑트 |
 | `task-nudge-codex.py` | Codex PreToolUse: `apply_patch\|Edit\|Write` | 공통 core 결과를 Codex `systemMessage`로 어댑트; `--manual-check`는 state를 만들지 않는 fallback 확인 |
 | `task-nudge.sh` | Claude PreToolUse compatibility shim | 설치된 neutral Claude adapter를 호출 |
+| `pre_pr_tribunal/claude_hook.py` | Claude PreToolUse: `Bash` | direct `gh pr create`를 현재 repository snapshot의 tribunal pass verdict에 결합 |
+| `pre_pr_tribunal/codex_hook.py` | Codex PreToolUse: matcher 없음 | 미래 shell tool 이름도 포함해 같은 tribunal gate를 적용 |
 | `delegate-nudge-hook.py` | UserPromptSubmit | 직전 턴 메인 스레드 탐색성 호출·tool_result 바이트가 임계(기본 10회/100KB) 초과 시 위임 넛지 주입 — 세션당 최대 3회, 발화마다 임계 2배, 발화/억제를 `state/delegate-nudge/log.jsonl`에 기록 |
 | `precompact-handoff.sh` | PreCompact | HANDOFF 파일이 없거나 낡았으면 auto compaction 을 막고 /handoff 를 요구 (manual 은 경고만) |
 
 ## 동작 원칙
 
-1. **exit 0, permission deny 없음**: 모든 훅은 예외가 나도 exit 0이며 Claude/Codex의 도구 실행을 permission-deny하지 않는다. `task-nudge`만은 bounded `unknown`을 출력해 에이전트가 분류 복구 전 후속 실질 변경을 멈추게 하는 명시적 예외이고, 훅 자체는 여전히 차단하지 않는다.
+1. **bounded adapter**: 일반 reminder 훅은 예외가 나도 exit 0이며 permission-deny하지 않는다. `pre-pr-tribunal` adapter도 exit 0이지만 direct `gh pr create`에는 runtime-native deny JSON을 내는 명시적 gate다. `task-nudge`의 bounded `unknown`은 분류 복구 전 변경을 멈추게 하지만 훅 자체는 차단하지 않는다.
 2. **선택적 주입**: 트리거 조건이 맞지 않으면 stdout에 아무것도 쓰지 않는다 (훅이 없는 것과 동일).
 3. **Escape hatch**: 사용자 메시지 시작에 `#noreminder`, `#nr`, `#raw`, `#silent`, `#조용히` 중 하나가 있으면 UserPromptSubmit 훅들이 주입을 스킵한다.
 4. **전역 규칙 참조**: 훅 reminder는 행동 트리거만 담고, 세부 규칙은 `~/.claude/CLAUDE.md`를 참조하도록 설계.
@@ -79,6 +81,53 @@ fi
 ```
 
 정상 `registered`/`unregistered` 안내는 runtime+session별 atomic marker로 **최대 한 번**만 출력한다. `unknown`과 결정적 제외는 marker를 소비하지 않으므로, unknown은 다음 변경 후보에서 재조회·재안내할 수 있다. 두 adapter의 matcher 범위는 표의 exact scope뿐이며, 이 안내는 Task/Claim이나 Project Control mutation을 실행하지 않는다.
+
+## pre-PR tribunal 운영
+
+설치기는 Claude의 `Bash` matcher와 Codex의 matcherless `PreToolUse` group을 한 transaction으로
+추가한다. 관련 없는 command와 current pass verdict에 결합된 direct PR command에는 adapter가 아무
+decision도 출력하지 않는다. direct 후보가 모호하거나 현재 verdict가 없거나 안전하지 않으면
+`[PRE-PR-TRIBUNAL:<CODE>]` reason이 포함된 deny를 출력한다.
+
+deny reason code와 기본 복구는 다음과 같다.
+
+| Code | 의미와 복구 |
+|---|---|
+| `COMMAND_AMBIGUOUS` | direct command 여부를 보수적으로 확정할 수 없다. command를 지원되는 direct 형태로 단순화한 뒤 Skill을 다시 실행한다. |
+| `TRIBUNAL_REQUIRED`, `REVIEW_INCOMPLETE` | verdict가 없거나 round가 끝나지 않았다. `/pre-pr-tribunal` 또는 `$pre-pr-tribunal`로 현재 round를 완료한다. |
+| `BLOCKERS_OPEN` | Critical/High finding이 열려 있다. Skill의 decision/fix/re-review 흐름을 계속한다. |
+| `ROUND_LIMIT_EXHAUSTED` | 3 round 뒤에도 blocker가 남았다. 자동 진행을 멈추고 사용자 결정을 받는다. |
+| `WORKTREE_DIRTY`, `VERDICT_STALE` | HEAD/base/merge-base/diff 또는 clean 상태가 verdict와 다르다. 변경을 정리하고 새 snapshot으로 Skill을 다시 시작한다. |
+| `REPOSITORY_UNSUPPORTED` | exact repository root, GitHub origin 또는 supported Git 상태가 아니다. root와 remote를 확인한다. |
+| `VERDICT_UNSAFE`, `VERDICT_INVALID` | `.review` 권한·파일 형식·schema/state invariant가 안전하지 않다. 우회하지 말고 원인을 고친 뒤 Skill로 재생성한다. |
+
+verdict는 exact clean repository root, GitHub origin, remote base SHA, HEAD, merge-base, diff digest에
+결합된다. 그중 하나가 바뀌거나 untracked 파일을 포함해 worktree가 dirty면 stale/dirty deny다.
+`.review/`는 repository-local ignored state이며 directory는 `0700`, JSON/lock file은 `0600`의
+현재 사용자 소유 regular target이어야 한다. symlink, unsafe mode, 다른 checkout의 verdict 재사용은
+허용하지 않는다.
+
+직접 adapter와 fake-runtime harness 검증은 다음 exact command다.
+
+```bash
+rtk python3 -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py tests/pre_pr_tribunal/test_gate_adapters.py
+```
+
+실제 runtime canary도 격리 harness와 harness가 만든 fake `gh`를 통해서만 실행한다. 출력은 version,
+exit class, deny/count와 capture hash만 포함하며 raw model output, prompt, credential, 절대 경로를
+기록하지 않는다.
+
+```bash
+rtk python3 scripts/probe-pre-pr-tribunal.py --runtime claude --repo-source "$PWD"
+rtk python3 scripts/probe-pre-pr-tribunal.py --runtime codex --repo-source "$PWD"
+```
+
+uninstall 또는 수동 복구 시 전체 `settings.json`, `hooks.json`, `hooks.PreToolUse`를 삭제하지 않는다.
+Claude에서는 matcher가 `Bash`이고 command가 installed `pre_pr_tribunal/claude_hook.py`인 group만,
+Codex에서는 command가 installed `pre_pr_tribunal/codex_hook.py`인 matcherless group만 제거한다. 이어서
+두 runtime의 `skills/pre-pr-tribunal` link와
+`$HOME/.local/share/claude-config/pre_pr_tribunal/` package만 대상으로 한다. 다른 hook group과 Skill은
+보존하며, repository의 `.review/`는 해당 review를 명시적으로 폐기할 때만 별도로 제거한다.
 
 ## 검증 명령 위생 가드
 
