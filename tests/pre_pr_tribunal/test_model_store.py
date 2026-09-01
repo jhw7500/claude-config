@@ -392,6 +392,73 @@ def test_shell_control_or_interpolation_ends_http_url_path_exemption(
         )
 
 
+@pytest.mark.parametrize("field", ["command", "stdout_excerpt"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        'echo $(printf ")" https://example.com/home/alice/private)',
+        'echo $(printf "literal ) here"; curl https://example.com/home/alice/private)',
+        "echo $(printf `echo )`` https://example.com/home/alice/private)",
+        "curl 'https://example.com/x;/home/alice/private",
+        'curl "https://example.com/x;/home/alice/private',
+    ],
+)
+def test_unclosed_or_nested_shell_state_never_exempts_http_home_paths(
+    snapshot, field, value
+):
+    item = execution()
+    item[field] = value
+    with pytest.raises(SchemaError, match="EVIDENCE_SECRET_DETECTED"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize("field", ["command", "stdout_excerpt"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "echo [https://example.com/home/alice/private]",
+        "echo [label](https://example.com/home/alice/private)",
+        "echo <https://example.com/home/alice/private>",
+    ],
+)
+def test_delimited_http_home_path_is_allowed(snapshot, field, value):
+    item = execution()
+    item[field] = value
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+    assert getattr(parsed.executions[0], field) == value
+
+
+@pytest.mark.parametrize("field", ["command", "stdout_excerpt"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "echo [https://example.com/home/alice/private",
+        "echo [https://example.com/home/alice/private]/home/bob/private",
+        "echo [https://example.com/home/alice/private];/home/bob/private",
+    ],
+)
+def test_home_path_after_closing_url_bracket_is_rejected(snapshot, field, value):
+    item = execution()
+    item[field] = value
+    with pytest.raises(SchemaError, match="EVIDENCE_SECRET_DETECTED"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
 @pytest.mark.parametrize(
     "command",
     [

@@ -33,6 +33,7 @@ _SECRET = re.compile(
 _HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>]+")
 _HTTP_URL_START = re.compile(r"https?://", re.IGNORECASE)
 _SHELL_CONTROL = frozenset(";|&()<>`")
+_MAX_SHELL_NESTING = 64
 
 
 class TribunalError(Exception):
@@ -377,81 +378,116 @@ def _text(value: object, maximum: int, *, allow_empty: bool = False) -> str:
     return value
 
 
+@dataclass
+class _ShellFrame:
+    closer: str | None = None
+    quote: str | None = None
+    interpolated: bool = False
+    parenthesis_depth: int = 0
+
+
 def _shell_quote_context(
     text: str, end: int
-) -> tuple[str | None, bool, int, bool]:
-    quote: str | None = None
-    interpolated = False
-    substitutions = 0
-    backtick = False
+) -> tuple[str | None, bool, int, bool] | None:
+    frames = [_ShellFrame()]
     index = 0
     while index < end:
+        frame = frames[-1]
         character = text[index]
-        if quote == "'":
+        if frame.quote == "'":
             if character == "'":
-                quote = None
+                frame.quote = None
             index += 1
             continue
         if character == "\\":
             index += 2
             continue
-        if quote == '"':
+        if frame.quote == '"':
             if character == '"':
-                quote = None
-                interpolated = False
+                frame.quote = None
+                frame.interpolated = False
             elif character == "`":
-                interpolated = True
-                backtick = not backtick
+                frame.interpolated = True
+                if len(frames) >= _MAX_SHELL_NESTING:
+                    return None
+                frames.append(_ShellFrame(closer="`"))
+                index += 1
+                continue
             elif character == "$":
-                interpolated = True
+                frame.interpolated = True
                 if index + 1 < end and text[index + 1] == "(":
-                    substitutions += 1
-                    index += 1
-            elif substitutions and character == "(":
-                substitutions += 1
-            elif substitutions and character == ")":
-                substitutions -= 1
+                    if len(frames) >= _MAX_SHELL_NESTING:
+                        return None
+                    frames.append(_ShellFrame(closer=")"))
+                    index += 2
+                    continue
             index += 1
             continue
         if character == "`":
-            backtick = not backtick
+            if frame.closer == "`":
+                frames.pop()
+            else:
+                if len(frames) >= _MAX_SHELL_NESTING:
+                    return None
+                frames.append(_ShellFrame(closer="`"))
             index += 1
             continue
         if character == "$" and index + 1 < end and text[index + 1] == "(":
-            substitutions += 1
+            if len(frames) >= _MAX_SHELL_NESTING:
+                return None
+            frames.append(_ShellFrame(closer=")"))
             index += 2
             continue
-        if substitutions and character == "(":
-            substitutions += 1
+        if frame.closer == ")" and character == "(":
+            frame.parenthesis_depth += 1
             index += 1
             continue
-        if substitutions and character == ")":
-            substitutions -= 1
+        if frame.closer == ")" and character == ")":
+            if frame.parenthesis_depth:
+                frame.parenthesis_depth -= 1
+            else:
+                frames.pop()
             index += 1
             continue
         if character in {"'", '"'}:
-            quote = character
-            interpolated = False
+            frame.quote = character
+            frame.interpolated = False
         index += 1
-    return quote, interpolated, substitutions, backtick
+    frame = frames[-1]
+    return (
+        frame.quote,
+        frame.interpolated,
+        len(frames) - 1,
+        any(item.closer == "`" for item in frames),
+    )
 
 
 def _http_url_candidate(text: str, start: int) -> tuple[str, int] | None:
-    quote, interpolated, substitutions, backtick = _shell_quote_context(text, start)
+    context = _shell_quote_context(text, start)
+    if context is None:
+        return None
+    quote, interpolated, substitutions, backtick = context
     if interpolated or substitutions or backtick:
         return None
+    terminator: str | None = None
     if start:
         previous = text[start - 1]
         if not (
             previous.isspace()
-            or previous in {"=", "'", '"'}
+            or previous in {"=", "'", '"', "["}
             or previous in _SHELL_CONTROL
         ):
             return None
+        if previous == "[":
+            terminator = "]"
     index = start
     if quote is None:
+        terminated = terminator is None
         while index < len(text):
             character = text[index]
+            if character == terminator:
+                terminated = True
+                break
             if (
                 character.isspace()
                 or character in _SHELL_CONTROL
@@ -459,17 +495,28 @@ def _http_url_candidate(text: str, start: int) -> tuple[str, int] | None:
             ):
                 break
             index += 1
+        if not terminated:
+            return None
     else:
+        token_end: int | None = None
+        quote_closed = False
         while index < len(text):
             character = text[index]
             if quote == '"' and character in {"$", "`"}:
                 return None
             if character == quote:
+                quote_closed = True
                 break
+            if character == terminator and token_end is None:
+                token_end = index
             if quote == '"' and character == "\\":
                 index += 2
                 continue
             index += 1
+        if not quote_closed or terminator is not None and token_end is None:
+            return None
+        if token_end is not None:
+            index = token_end
     return text[start:index], index
 
 
