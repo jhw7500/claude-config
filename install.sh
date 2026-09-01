@@ -269,6 +269,7 @@ nc = "python3 %s/notion-continuous-exec-hook.py" % H
 pa = "python3 %s/post-action-tool-report-hook.py" % H
 dn = "python3 %s/delegate-nudge-hook.py" % H
 an = "python3 %s/agent-name-delivery-hook.py" % H
+vh = "python3 %s/verification-command-hygiene-hook.py" % H
 nr = "python3 %s/notion-recall-trigger-hook.py" % H
 hc = "python3 %s/handoff-checkpoint-hook.py" % H
 cg = "python3 %s/control-char-guard-hook.py" % H
@@ -295,6 +296,7 @@ if ensure("SubagentStop", bt, "*"): added.append("SubagentStop<-bg-task")
 if ensure("UserPromptSubmit", dn): added.append("UPS<-delegate-nudge")
 if ensure("PostToolUse", pi, PI_MATCH): added.append("Post<-post-info")
 if ensure("PreToolUse", an, "Agent"): added.append("Pre<-agent-name-delivery")
+if ensure("PreToolUse", vh, "Bash"): added.append("Pre<-verification-command-hygiene")
 if ensure("UserPromptSubmit", hc): added.append("UPS<-handoff-checkpoint")
 if ensure("PostToolUse", cg, CG_MATCH): added.append("Post<-ctrl-char-guard")
 if ensure("PreCompact", ph, "*"): added.append("PreCompact<-handoff-gate")

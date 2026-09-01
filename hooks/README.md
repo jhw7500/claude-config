@@ -55,6 +55,7 @@ fi
 | `general-continuation-hook.py` | UserPromptSubmit | "한번에/끝까지/연속으로" 등 사용자의 연속 실행 의도 감지 시 reminder 주입 |
 | `bg-task-progress-hook.py` | PreToolUse + PostToolUse | Agent / Bash `run_in_background=true` 시작·완료 알림 강제 + statusLine 카운터 관리 |
 | `control-char-guard-hook.py` | PostToolUse | Edit/Write/MultiEdit/NotebookEdit 로 **기록한 내용**에 raw 제어문자(C0/DEL)가 섞이면 위치와 함께 경고 |
+| `verification-command-hygiene-hook.py` | PreToolUse: `Bash` | 실제 `|| echo` fallback에 결론 연결 표지(`→`/`뿐`)가 있으면 중립 출력으로 바꾸도록 경고 |
 | `task_nudge.py` | Claude/Codex 공통 core | GitHub slug와 secure launcher의 등록 상태를 분류하고, 경계가 있는 정책 메시지와 세션당 1회 state를 관리 |
 | `task-nudge-claude.py` | Claude PreToolUse: `Edit\|Write\|NotebookEdit` | 공통 core 결과를 Claude 평문 `[TASK-NUDGE]`로 어댑트 |
 | `task-nudge-codex.py` | Codex PreToolUse: `apply_patch\|Edit\|Write` | 공통 core 결과를 Codex `systemMessage`로 어댑트; `--manual-check`는 state를 만들지 않는 fallback 확인 |
@@ -78,6 +79,32 @@ fi
 ```
 
 정상 `registered`/`unregistered` 안내는 runtime+session별 atomic marker로 **최대 한 번**만 출력한다. `unknown`과 결정적 제외는 marker를 소비하지 않으므로, unknown은 다음 변경 후보에서 재조회·재안내할 수 있다. 두 adapter의 matcher 범위는 표의 exact scope뿐이며, 이 안내는 Task/Claim이나 Project Control mutation을 실행하지 않는다.
+
+## 검증 명령 위생 가드
+
+2026-09-01 도입 전 `~/.claude/projects/*/*.jsonl` 1,345개를 원문 노출 없이
+raw 문자열로 집계했다. Bash 호출 35,585건 중 `|| echo`는 1,841건이었고, 넓은 후보
+(`→|뿐|없음`)는 726건이었다. 이 중 651건(89.7%)은 `→`나 `뿐` 없이
+`없음`만 포함해 `(없음)`, `파일 없음`, `출력 없음` 같은 상태 표기가 대부분이었다.
+반면 `→` 또는 `뿐`이 fallback에 들어간 경우는 75건(고유 명령 68건)이었다.
+
+구현 후 같은 날 live corpus를 셸 인식 파서로 재생한 시점에는 `|| echo` 후보가
+1,852건으로 늘어 있었고, 실제 경고 대상은 55건(고유 명령 48건)이었다. raw 수치와
+파서 수치의 차이는 따옴표·주석·heredoc 본문·후속 명령·리다이렉션에 있는 문자를
+실제 `echo` 출력으로 세지 않기 때문이다.
+
+따라서 이 훅은 `없음`을 포괄 차단하지 않는다. 따옴표 밖의 실제 셸 `||` 바로 뒤
+`echo`가 출력할 문구에 `→` 또는 `뿐`이 있을 때만 reminder를 주입한다. 검색 인자나
+문서 문자열 안의 `|| echo "…→…"`, 단순 부재 표기, `(no match)`는 통과한다.
+permission deny는 하지 않으며 모든 경로에서 exit 0이다.
+
+중첩 command/process substitution의 닫힘 경계는 `/bin/bash --noprofile --norc -n`의
+parse-only 결과로 확인한다. 한 hook 호출 전체에서 parse 시도는 최대 64회·총 0.5초,
+개별 시도는 최대 0.2초로 제한한다. process substitution 경계는 명령당 한 번만
+계산해 모든 fallback 검사에서 재사용하며, Bash를 사용할 수 없거나 공유 예산 안에
+구문 확인이 끝나지 않으면 명령을 실행하지 않고 fail-open한다.
+
+킬스위치: `CLAUDE_SKIP_VERIFICATION_COMMAND_HYGIENE=1`.
 
 ## 디버그 로깅
 
@@ -155,5 +182,6 @@ rm ~/.claude/logs/hook-debug.on   # 또는 unset CLAUDE_HOOK_DEBUG
 | general-continuation | 정규식 오류 | 동일 — 조용히 스킵 |
 | bg-task-progress | payload 키 불일치 | 카운터 증감/알림 누락, 도구 실행 자체는 정상 |
 | delegate-nudge | transcript 파싱/상태 기록 실패 | 넛지 미주입 (조용히 스킵), 본 동작 정상 |
+| verification-command-hygiene | payload/셸 토큰 파싱 실패 | 검증 명령 위생 경고 누락, Bash 실행 자체는 정상 |
 
 **모든 훅은 exit 0을 반환**하도록 설계되어 Claude Code의 UserPromptSubmit / PreToolUse / PostToolUse 흐름을 중단시키지 않는다.
