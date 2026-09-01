@@ -121,8 +121,12 @@ canary는 root-owned, non-writable `/usr/bin/bwrap`을 검증한 뒤 read-only r
 probe tree를 구성한다. worktree-owned `/etc/hosts` overlay는 GitHub hostname을 loopback으로 보내고,
 fixed system PATH에서 발견되는 모든 `gh` target은 exact argv/cwd/단일 호출을 검증하는 fake `gh`로
 overlay된다. `/usr/bin/gh`, PATH reset, `command -p gh`, direct GitHub hostname client, 그리고
-exact command/cwd에서 벗어난 hook payload를 runtime dispatch 전에 검증한다. `GH_CONFIG_DIR`,
-`GH_HOST`, `GH_PROMPT_DISABLED`도 harness-owned neutral 값만 사용한다. 이 중 하나라도 실패하면
+exact command/cwd/tool에서 벗어난 hook payload를 runtime dispatch 전에 검증한다. Codex의 matcherless
+guard는 command-less, non-shell, unknown tool도 모두 deny한다. Writable tree 안의 guard, fake `gh`,
+hosts source, installed package, Claude/Codex hook config는 source path 자체를 read-only로 다시 bind하고
+rename/unlink/write 방지와 inode/content hash 불변을 검사한다. Valid/invalid call evidence는 writable
+ledger가 아닌 harness-owned memory channel에만 누적한다. `GH_CONFIG_DIR`, `GH_HOST`,
+`GH_PROMPT_DISABLED`도 harness-owned neutral 값만 사용한다. 이 중 하나라도 실패하면
 `ISOLATION_UNAVAILABLE`이며 live config나 real `gh`로 fallback하지 않는다.
 
 Provider API 연결을 보존하려고 network namespace는 공유한다. 따라서 GitHub sinkhole/fake executable

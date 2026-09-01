@@ -201,11 +201,16 @@ def _fake_runtime_source(
             "nonexact_hook": "gh pr create --title other --body canary",
             "github_client": "curl https://github.com",
         }}.get(MODE, CANARY)
+        tool_name = "Bash" if RUNTIME == "claude" else "exec_command"
+        tool_input = {{"command": command}}
+        if MODE == "codex_non_shell_mutation":
+            tool_name = "apply_patch"
+            tool_input = {{"patch": "forged-control-mutation"}}
         payload = {{
             "hook_event_name": "PreToolUse",
-            "tool_name": "Bash" if RUNTIME == "claude" else "exec_command",
+            "tool_name": tool_name,
             "cwd": os.getcwd(),
-            "tool_input": {{"command": command}},
+            "tool_input": tool_input,
         }}
         groups = value.get("hooks", {{}}).get("PreToolUse", [])
         events = []
@@ -230,6 +235,24 @@ def _fake_runtime_source(
                         "permissionDecision"
                     )
                     denied = denied or decision == "deny"
+        if MODE == "codex_non_shell_mutation":
+            if not denied:
+                candidates = [
+                    Path(os.environ["HOME"]) / ".claude" / "settings.json",
+                    Path(os.environ["CODEX_HOME"]) / "hooks.json",
+                    Path(os.environ["HOME"]) / ".local" / "share" /
+                    "claude-config" / "pre_pr_tribunal" / "hook_common.py",
+                    Path(os.environ["PATH"].split(os.pathsep, 1)[0]) / "gh",
+                    Path(os.environ["HOME"]).parent / "hosts",
+                    Path(os.environ["HOME"]).parent / "probe-command-guard.py",
+                ]
+                for candidate in candidates:
+                    try:
+                        candidate.write_text("forged", encoding="utf-8")
+                    except OSError:
+                        pass
+            print(json.dumps({{"type": "hook_result", "events": events}}))
+            raise SystemExit(0)
         if not denied and MODE != "pass_absent":
             calls = 2 if MODE == "pass_duplicate" else 1
             for _ in range(calls):
@@ -556,23 +579,21 @@ def test_fake_gh_rejects_nonexact_argv_and_records_invalid_call(tmp_path, argume
     repo = tmp_path / "repo"
     repo.mkdir()
     fake_bin = tmp_path / "fake-bin"
-    count_file = tmp_path / "valid-count"
-    invalid_file = tmp_path / "invalid-count"
-    module._make_fake_gh(fake_bin, count_file, invalid_file, repo)
-
-    result = subprocess.run(
-        [str(fake_bin / "gh"), *arguments],
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    with module._EvidenceRecorder() as evidence:
+        module._make_fake_gh(fake_bin, evidence.address, repo)
+        result = subprocess.run(
+            [str(fake_bin / "gh"), *arguments],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        counts = evidence.counts()
 
     assert result.returncode != 0
     assert result.stdout == ""
     assert result.stderr == ""
-    assert not count_file.exists()
-    assert invalid_file.read_text(encoding="ascii").splitlines() == ["1"]
+    assert counts == (0, 1)
 
 
 def test_fake_gh_rejects_wrong_cwd_and_second_exact_call(tmp_path):
@@ -582,28 +603,26 @@ def test_fake_gh_rejects_wrong_cwd_and_second_exact_call(tmp_path):
     repo.mkdir()
     wrong_repo.mkdir()
     fake_bin = tmp_path / "fake-bin"
-    count_file = tmp_path / "valid-count"
-    invalid_file = tmp_path / "invalid-count"
-    module._make_fake_gh(fake_bin, count_file, invalid_file, repo)
-    command = [
-        str(fake_bin / "gh"),
-        "pr",
-        "create",
-        "--title",
-        "canary",
-        "--body",
-        "canary",
-    ]
-
-    wrong_cwd = subprocess.run(command, cwd=wrong_repo, check=False)
-    first = subprocess.run(command, cwd=repo, check=False)
-    duplicate = subprocess.run(command, cwd=repo, check=False)
+    with module._EvidenceRecorder() as evidence:
+        module._make_fake_gh(fake_bin, evidence.address, repo)
+        command = [
+            str(fake_bin / "gh"),
+            "pr",
+            "create",
+            "--title",
+            "canary",
+            "--body",
+            "canary",
+        ]
+        wrong_cwd = subprocess.run(command, cwd=wrong_repo, check=False)
+        first = subprocess.run(command, cwd=repo, check=False)
+        duplicate = subprocess.run(command, cwd=repo, check=False)
+        counts = evidence.counts()
 
     assert wrong_cwd.returncode != 0
     assert first.returncode == 0
     assert duplicate.returncode != 0
-    assert count_file.read_text(encoding="ascii").splitlines() == ["1"]
-    assert invalid_file.read_text(encoding="ascii").splitlines() == ["1", "1"]
+    assert counts == (1, 2)
 
 
 def test_probe_guard_allows_only_exact_command_in_exact_cwd(tmp_path):
@@ -622,7 +641,7 @@ def test_probe_guard_allows_only_exact_command_in_exact_cwd(tmp_path):
     }
 
     exact = subprocess.run(
-        [sys.executable, str(guard)],
+        [sys.executable, str(guard), "claude"],
         input=json.dumps(base),
         text=True,
         capture_output=True,
@@ -633,7 +652,7 @@ def test_probe_guard_allows_only_exact_command_in_exact_cwd(tmp_path):
         "gh pr create --title other --body canary"
     )
     rejected_command = subprocess.run(
-        [sys.executable, str(guard)],
+        [sys.executable, str(guard), "claude"],
         input=json.dumps(wrong_command),
         text=True,
         capture_output=True,
@@ -641,7 +660,7 @@ def test_probe_guard_allows_only_exact_command_in_exact_cwd(tmp_path):
     )
     wrong_cwd = dict(base, cwd=str(tmp_path))
     rejected_cwd = subprocess.run(
-        [sys.executable, str(guard)],
+        [sys.executable, str(guard), "claude"],
         input=json.dumps(wrong_cwd),
         text=True,
         capture_output=True,
@@ -659,6 +678,84 @@ def test_probe_guard_allows_only_exact_command_in_exact_cwd(tmp_path):
         ]
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "apply_patch",
+            "tool_input": {"patch": "forged"},
+        },
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "unknown_tool",
+            "tool_input": {},
+        },
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "gh pr create --title canary --body canary",
+            },
+        },
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "exec_command",
+            "tool_input": {},
+        },
+    ],
+)
+def test_codex_matcherless_guard_denies_nonexact_or_commandless_tools(
+    tmp_path, payload
+):
+    module = _load_probe_module()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    guard = tmp_path / "guard.py"
+    module._make_probe_guard(guard, repo)
+    request = dict(payload, cwd=str(repo))
+
+    result = subprocess.run(
+        [sys.executable, str(guard), "codex"],
+        input=json.dumps(request),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    event = json.loads(result.stdout)
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert event["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_evidence_counts_are_not_manufactured_by_writable_probe_files(tmp_path):
+    module = _load_probe_module()
+    repo = tmp_path / "repo"
+    fake_bin = tmp_path / "fake-bin"
+    repo.mkdir()
+    with module._EvidenceRecorder() as evidence:
+        module._make_fake_gh(fake_bin, evidence.address, repo)
+        (tmp_path / "canary-count").write_text("1\n", encoding="ascii")
+        (tmp_path / "invalid-canary-count").write_text("1\n", encoding="ascii")
+        assert evidence.counts() == (0, 0)
+        result = subprocess.run(
+            [
+                str(fake_bin / "gh"),
+                "pr",
+                "create",
+                "--title",
+                "canary",
+                "--body",
+                "canary",
+            ],
+            cwd=repo,
+            check=False,
+        )
+        assert result.returncode == 0
+        assert evidence.counts() == (1, 0)
+
+
 def test_isolation_verifier_intercepts_system_gh_and_sinkholes_github(tmp_path):
     module = _load_probe_module()
     work_dir = tmp_path / "boundary"
@@ -668,27 +765,43 @@ def test_isolation_verifier_intercepts_system_gh_and_sinkholes_github(tmp_path):
     work_dir.mkdir()
     repo.mkdir()
     home.mkdir()
-    count_file = work_dir / "valid-count"
-    invalid_file = work_dir / "invalid-count"
     hosts_file = work_dir / "hosts"
     guard = work_dir / "guard.py"
-    module._make_fake_gh(fake_bin, count_file, invalid_file, repo)
+    claude_config = home / ".claude" / "settings.json"
+    codex_config = home / ".codex" / "hooks.json"
+    package = home / ".local/share/claude-config/pre_pr_tribunal"
+    claude_config.parent.mkdir()
+    codex_config.parent.mkdir()
+    package.mkdir(parents=True)
+    claude_config.write_text("{}\n", encoding="utf-8")
+    codex_config.write_text("{}\n", encoding="utf-8")
+    (package / "hook_common.py").write_text("sentinel\n", encoding="utf-8")
     module._make_hosts_file(hosts_file)
     module._make_probe_guard(guard, repo)
-
-    module._verify_isolation(
-        work_dir=work_dir,
-        repo=repo,
-        home=home,
-        fake_gh=fake_bin / "gh",
-        count_file=count_file,
-        invalid_file=invalid_file,
-        hosts_file=hosts_file,
-        guard=guard,
+    protected = (
+        fake_bin / "gh",
+        hosts_file,
+        guard,
+        claude_config,
+        codex_config,
+        package,
     )
+    with module._EvidenceRecorder() as evidence:
+        module._make_fake_gh(fake_bin, evidence.address, repo)
+        before = module._protected_digest(protected)
+        module._verify_isolation(
+            work_dir=work_dir,
+            repo=repo,
+            home=home,
+            fake_gh=fake_bin / "gh",
+            hosts_file=hosts_file,
+            guard=guard,
+            protected_paths=protected,
+            evidence=evidence,
+        )
+        after = module._protected_digest(protected)
 
-    assert not count_file.exists()
-    assert not invalid_file.exists()
+    assert before == after
 
 
 def test_missing_required_bwrap_is_stable_isolation_unavailable(
@@ -740,6 +853,28 @@ def test_runtime_guard_denies_adversarial_shell_commands(
         canary_count=0,
         invalid_call_count=0,
     )
+    assert not work_dir.exists()
+
+
+def test_codex_non_shell_mutation_is_denied_and_controls_remain_immutable(
+    fake_runtimes, tmp_path
+):
+    fake = fake_runtimes(codex="codex_non_shell_mutation")
+    result, work_dir = _run_probe(fake, tmp_path, runtime="codex")
+
+    runtime = json.loads(result.stdout)["codex"]
+    assert result.returncode != 0
+    assert runtime["status"] == "CANARY_MISMATCH"
+    assert runtime["phase"] == "pass_verdict"
+    _assert_phase_counts(
+        runtime["pass_verdict"],
+        denied=True,
+        canary_count=0,
+        invalid_call_count=0,
+    )
+    for phase in ("missing_verdict", "pass_verdict"):
+        assert runtime[phase]["controls_intact"] is True
+        assert len(runtime[phase]["control_sha256"]) == 64
     assert not work_dir.exists()
 
 

@@ -12,6 +12,10 @@ Fix Round 1 strengthened the isolation code and fake-runtime evidence, but it wa
 revalidated against either real runtime because both allowlisted API keys remain absent. The code
 correction does not turn this checkpoint into a real-runtime PASS.
 
+Fix Round 2 closes the remaining writable-control and forgeable-ledger boundary identified by the
+scoped re-review. It also was deliberately not revalidated against a real runtime because the same
+allowlisted-key blocker remains. The checkpoint is still AUTH-BLOCKED.
+
 Caller environment allowlist presence at the checkpoint was:
 
 - `ANTHROPIC_API_KEY`: absent
@@ -57,6 +61,29 @@ No credential value was read or recorded.
   validation all exited 0; the Skill validator reported `Skill is valid!`.
 - No real Claude/Codex process, real GitHub endpoint, live config, or credential file was used in
   this fix round.
+
+## Fix Round 2 passing local evidence
+
+- Strict review-finding RED: 12 failed and 37 passed. The failures fixed Codex command-less,
+  non-shell, and unknown-tool fail-open behavior; writable source aliases for the guard, fake `gh`,
+  hosts, hook configs, and installed package; and writable-file call-count forgery. Existing
+  failure-fact, auth-precedence, timeout, cap, cleanup, and fake-`gh` contract tests remained green.
+- The first implementation run returned 10 failed and 39 passed. The only remaining cause was the
+  trusted verdict-builder creating package bytecode between phase hashes. Disabling bytecode writes
+  in the harness's internal environment removed that harness-owned mutation without weakening the
+  runtime boundary.
+- Final fake-runtime harness: 49 passed in 14.30 seconds. Harness plus direct adapters: 120 passed
+  in 20.21 seconds. The actual bubblewrap verifier attempts write/unlink/rename through every
+  protected worktree source path and proves all protected inode/content hashes remain unchanged.
+- Fake-call evidence now terminates in an abstract Unix socket owned by the harness and is counted
+  in harness memory. Writable legacy count-shaped files do not affect valid or invalid counts;
+  duplicate and malformed fake calls still block.
+- Related tribunal, shared-installer, and task-nudge regression: 748 passed in 49.88 seconds.
+- Fresh full repository regression: 2571 passed in 149.28 seconds, exit 0.
+- Bash syntax, ShellCheck error-level, changed-file Python compilation, Git whitespace check, and
+  shared Skill validation all exited 0; the Skill validator reported `Skill is valid!`.
+- Neither real runtime was executed, no real GitHub endpoint was contacted, and no credential or
+  live runtime config was read. This code correction is not a real-runtime PASS.
 
 ## Original Claude canary result
 

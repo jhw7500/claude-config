@@ -11,13 +11,16 @@ import os
 from pathlib import Path
 import re
 import selectors
+import secrets
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Mapping, Sequence
 
@@ -117,6 +120,72 @@ class Classification:
     parse_valid: bool
     denied: bool
     sensitivity: Sensitivity
+
+
+class _EvidenceRecorder:
+    def __init__(self) -> None:
+        self.address = "\x00pre-pr-tribunal-" + secrets.token_hex(16)
+        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._socket.bind(self.address)
+        self._socket.listen(8)
+        self._socket.settimeout(0.1)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._valid = 0
+        self._invalid = 0
+        self._valid_limit = 1
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                connection, _address = self._socket.accept()
+            except (OSError, socket.timeout):
+                continue
+            with connection:
+                try:
+                    event = connection.recv(2)
+                    with self._lock:
+                        if event == b"V" and self._valid < self._valid_limit:
+                            self._valid += 1
+                            accepted = True
+                        else:
+                            self._invalid += 1
+                            accepted = False
+                    connection.sendall(b"1" if accepted else b"0")
+                except OSError:
+                    continue
+
+    def reset(self, *, valid_limit: int = 1) -> None:
+        if valid_limit < 1:
+            raise ProbeFailure("ISOLATION_UNAVAILABLE")
+        with self._lock:
+            self._valid = 0
+            self._invalid = 0
+            self._valid_limit = valid_limit
+
+    def counts(self) -> tuple[int, int]:
+        with self._lock:
+            return self._valid, self._invalid
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            with wake:
+                wake.settimeout(0.2)
+                wake.connect(self.address)
+        except OSError:
+            pass
+        self._thread.join(timeout=1.0)
+        self._socket.close()
+
+    def __enter__(self) -> "_EvidenceRecorder":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 def _capture(
@@ -265,6 +334,7 @@ def _internal_env(home: Path) -> dict[str, str]:
         "GIT_AUTHOR_EMAIL": "probe@example.invalid",
         "GIT_COMMITTER_NAME": "Pre PR Tribunal Probe",
         "GIT_COMMITTER_EMAIL": "probe@example.invalid",
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
 
 
@@ -366,28 +436,29 @@ def _write(path: Path, data: str, mode: int) -> None:
 
 def _make_fake_gh(
     fake_bin: Path,
-    count_file: Path,
-    invalid_file: Path,
+    evidence_address: str,
     expected_cwd: Path,
 ) -> None:
     fake_bin.mkdir(mode=0o700)
     source = (
         "#!/usr/bin/python3\n"
         "import os\n"
-        "from pathlib import Path\n"
+        "import socket\n"
         "import sys\n"
-        f"valid_target = Path({str(count_file)!r})\n"
-        f"invalid_target = Path({str(invalid_file)!r})\n"
+        f"evidence_address = {evidence_address!r}\n"
         f"expected_cwd = {str(expected_cwd)!r}\n"
         "expected_argv = ['pr', 'create', '--title', 'canary', '--body', 'canary']\n"
         "valid = sys.argv[1:] == expected_argv and os.getcwd() == expected_cwd\n"
-        "if valid and not valid_target.exists():\n"
-        "    with valid_target.open('x', encoding='ascii') as handle:\n"
-        "        handle.write('1\\n')\n"
-        "    raise SystemExit(0)\n"
-        "with invalid_target.open('a', encoding='ascii') as handle:\n"
-        "    handle.write('1\\n')\n"
-        "raise SystemExit(64)\n"
+        "try:\n"
+        "    channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "    with channel:\n"
+        "        channel.settimeout(2.0)\n"
+        "        channel.connect(evidence_address)\n"
+        "        channel.sendall(b'V' if valid else b'I')\n"
+        "        accepted = channel.recv(1) == b'1'\n"
+        "except OSError:\n"
+        "    accepted = False\n"
+        "raise SystemExit(0 if valid and accepted else 64)\n"
     )
     _write(fake_bin / "gh", source, 0o700)
 
@@ -405,8 +476,11 @@ import sys
 
 EXPECTED_COMMAND = {CANARY_COMMAND!r}
 EXPECTED_CWD = {str(expected_cwd)!r}
+ALLOWED_TOOLS = {{"claude": "Bash", "codex": "exec_command"}}
 
 try:
+    runtime = sys.argv[1] if len(sys.argv) == 2 else ""
+    allowed_tool = ALLOWED_TOOLS.get(runtime)
     raw = sys.stdin.buffer.read({CAPTURE_LIMIT_BYTES + 1})
     if len(raw) > {CAPTURE_LIMIT_BYTES}:
         raise ValueError
@@ -414,13 +488,19 @@ try:
     tool_input = payload.get("tool_input", payload.get("toolInput", {{}}))
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     cwd = payload.get("cwd")
+    tool_name = payload.get("tool_name", payload.get("toolName"))
 except (AttributeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
     command = ""
     cwd = None
+    tool_name = None
+    allowed_tool = None
 
-if command is None:
-    raise SystemExit(0)
-if command == EXPECTED_COMMAND and cwd == EXPECTED_CWD:
+if (
+    allowed_tool is not None
+    and tool_name == allowed_tool
+    and command == EXPECTED_COMMAND
+    and cwd == EXPECTED_CWD
+):
     raise SystemExit(0)
 event = {{
     "hookSpecificOutput": {{
@@ -435,12 +515,12 @@ sys.stdout.write(json.dumps(event, separators=(",", ":")) + "\\n")
 
 
 def _install_probe_guard(home: Path, guard: Path) -> None:
-    command = f"/usr/bin/python3 {shlex.quote(str(guard))}"
     targets = (
-        (home / ".claude/settings.json", "Bash"),
-        (home / ".codex/hooks.json", None),
+        (home / ".claude/settings.json", "claude", "Bash"),
+        (home / ".codex/hooks.json", "codex", None),
     )
-    for path, matcher in targets:
+    for path, runtime, matcher in targets:
+        command = f"/usr/bin/python3 {shlex.quote(str(guard))} {runtime}"
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
             hooks = value["hooks"]
@@ -463,6 +543,50 @@ def _install_probe_guard(home: Path, guard: Path) -> None:
             path.chmod(0o600)
         except OSError:
             raise ProbeFailure("SETUP_FAILED") from None
+
+
+def _protected_digest(paths: Sequence[Path]) -> str:
+    digest = hashlib.sha256()
+    entries = 0
+    total_bytes = 0
+
+    def visit(path: Path, logical: bytes) -> None:
+        nonlocal entries, total_bytes
+        try:
+            metadata = path.lstat()
+        except OSError:
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+        entries += 1
+        if entries > 1024:
+            raise ProbeFailure("ISOLATION_UNAVAILABLE")
+        digest.update(logical)
+        digest.update(metadata.st_mode.to_bytes(8, "big"))
+        digest.update(metadata.st_dev.to_bytes(8, "big"))
+        digest.update(metadata.st_ino.to_bytes(8, "big"))
+        if stat.S_ISREG(metadata.st_mode):
+            if metadata.st_size > CAPTURE_LIMIT_BYTES:
+                raise ProbeFailure("ISOLATION_UNAVAILABLE")
+            try:
+                data = path.read_bytes()
+            except OSError:
+                raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+            total_bytes += len(data)
+            if total_bytes > 8 * 1024 * 1024:
+                raise ProbeFailure("ISOLATION_UNAVAILABLE")
+            digest.update(data)
+            return
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise ProbeFailure("ISOLATION_UNAVAILABLE")
+        try:
+            children = sorted(path.iterdir(), key=lambda item: os.fsencode(item.name))
+        except OSError:
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+        for child in children:
+            visit(child, logical + b"/" + os.fsencode(child.name))
+
+    for index, path in enumerate(paths):
+        visit(path, f"control-{index}".encode("ascii"))
+    return digest.hexdigest()
 
 
 def _verified_bwrap() -> Path:
@@ -511,6 +635,7 @@ def _sandbox_argv(
     repo: Path,
     fake_gh: Path,
     hosts_file: Path,
+    protected_paths: Sequence[Path],
     env: Mapping[str, str],
 ) -> list[str]:
     bwrap = _verified_bwrap()
@@ -530,10 +655,10 @@ def _sandbox_argv(
         "--bind",
         str(work_dir),
         str(work_dir),
-        "--ro-bind",
-        str(hosts_file),
-        "/etc/hosts",
     ]
+    for source in protected_paths:
+        arguments.extend(("--ro-bind", str(source), str(source)))
+    arguments.extend(("--ro-bind", str(hosts_file), "/etc/hosts"))
     for target in _system_gh_targets():
         arguments.extend(("--ro-bind", str(fake_gh), str(target)))
     arguments.extend(("--chdir", str(repo), "--clearenv"))
@@ -550,6 +675,7 @@ def _run_sandboxed(
     repo: Path,
     fake_gh: Path,
     hosts_file: Path,
+    protected_paths: Sequence[Path],
     env: Mapping[str, str],
     timeout: float,
 ) -> Capture:
@@ -560,6 +686,7 @@ def _run_sandboxed(
             repo=repo,
             fake_gh=fake_gh,
             hosts_file=hosts_file,
+            protected_paths=protected_paths,
             env=env,
         )
         return _run_bounded(
@@ -579,9 +706,8 @@ def _make_isolation_verifier(
     *,
     work_dir: Path,
     repo: Path,
-    count_file: Path,
-    invalid_file: Path,
     guard: Path,
+    protected_paths: Sequence[Path],
 ) -> None:
     outside = work_dir.parent / f".{work_dir.name}.boundary-write"
     if outside.exists():
@@ -596,24 +722,14 @@ import subprocess
 import sys
 
 REPO = Path({str(repo)!r})
-COUNT = Path({str(count_file)!r})
-INVALID = Path({str(invalid_file)!r})
 GUARD = Path({str(guard)!r})
 OUTSIDE = Path({str(outside)!r})
+PROTECTED = tuple(Path(item) for item in {tuple(map(str, protected_paths))!r})
 CANARY = ["pr", "create", "--title", "canary", "--body", "canary"]
 HOSTS = {GITHUB_HOSTNAMES!r}
 
 def fail(code):
     raise SystemExit(code)
-
-def clear_ledgers():
-    COUNT.unlink(missing_ok=True)
-    INVALID.unlink(missing_ok=True)
-
-def lines(target):
-    if not target.exists():
-        return []
-    return target.read_text(encoding="ascii").splitlines()
 
 if Path.cwd() != REPO:
     fail(10)
@@ -630,18 +746,51 @@ scratch = Path(os.environ["TMPDIR"]) / "boundary-write"
 scratch.write_text("x", encoding="ascii")
 scratch.unlink()
 
+for target in PROTECTED:
+    if target.is_dir():
+        marker = target / "probe-control-mutation"
+        try:
+            marker.write_text("forged", encoding="ascii")
+        except OSError:
+            pass
+        else:
+            marker.unlink(missing_ok=True)
+            fail(12)
+        try:
+            target.rename(target.with_name(target.name + ".moved"))
+        except OSError:
+            pass
+        else:
+            fail(13)
+        continue
+    try:
+        target.write_bytes(b"forged")
+    except OSError:
+        pass
+    else:
+        fail(14)
+    try:
+        target.unlink()
+    except OSError:
+        pass
+    else:
+        fail(15)
+    try:
+        target.rename(target.with_name(target.name + ".moved"))
+    except OSError:
+        pass
+    else:
+        fail(16)
+
 commands = [
     ["/usr/bin/gh", *CANARY],
     ["/usr/bin/env", "PATH=/usr/bin:/bin", "gh", *CANARY],
     ["/bin/sh", "-c", "command -p gh pr create --title canary --body canary"],
 ]
 for command in commands:
-    clear_ledgers()
     result = subprocess.run(command, cwd=REPO, capture_output=True, check=False)
     if result.returncode != 0 or result.stdout or result.stderr:
-        fail(12)
-    if lines(COUNT) != ["1"] or lines(INVALID):
-        fail(13)
+        fail(17)
 
 base = {{
     "hook_event_name": "PreToolUse",
@@ -650,19 +799,21 @@ base = {{
     "tool_input": {{"command": {CANARY_COMMAND!r}}},
 }}
 exact = subprocess.run(
-    ["/usr/bin/python3", str(GUARD)],
+    ["/usr/bin/python3", str(GUARD), "claude"],
     input=json.dumps(base).encode("utf-8"),
     capture_output=True,
     check=False,
 )
 if exact.returncode != 0 or exact.stdout or exact.stderr:
-    fail(14)
-for payload in (
-    {{**base, "tool_input": {{"command": "gh pr create --title other --body canary"}}}},
-    {{**base, "cwd": str(REPO.parent)}},
+    fail(18)
+for runtime, payload in (
+    ("claude", {{**base, "tool_input": {{"command": "gh pr create --title other --body canary"}}}}),
+    ("claude", {{**base, "cwd": str(REPO.parent)}}),
+    ("codex", {{**base, "tool_name": "apply_patch", "tool_input": {{"patch": "forged"}}}}),
+    ("codex", {{**base, "tool_name": "unknown_tool", "tool_input": {{}}}}),
 ):
     rejected = subprocess.run(
-        ["/usr/bin/python3", str(GUARD)],
+        ["/usr/bin/python3", str(GUARD), runtime],
         input=json.dumps(payload).encode("utf-8"),
         capture_output=True,
         check=False,
@@ -671,27 +822,25 @@ for payload in (
         event = json.loads(rejected.stdout.decode("utf-8", "strict"))
         decision = event["hookSpecificOutput"]["permissionDecision"]
     except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
-        fail(15)
+        fail(19)
     if rejected.returncode != 0 or rejected.stderr or decision != "deny":
-        fail(16)
+        fail(20)
 
 hosts_text = Path("/etc/hosts").read_text(encoding="ascii")
 if "api.anthropic.com" in hosts_text or "api.openai.com" in hosts_text:
-    fail(17)
+    fail(21)
 for hostname in HOSTS:
     addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
     if not addresses or any(
         not ipaddress.ip_address(item[4][0]).is_loopback for item in addresses
     ):
-        fail(18)
+        fail(22)
     try:
         connection = socket.create_connection((hostname, 443), timeout=0.05)
     except OSError:
         pass
     else:
         connection.close()
-
-clear_ledgers()
 '''
     _write(path, source, 0o700)
 
@@ -702,10 +851,10 @@ def _verify_isolation(
     repo: Path,
     home: Path,
     fake_gh: Path,
-    count_file: Path,
-    invalid_file: Path,
     hosts_file: Path,
     guard: Path,
+    protected_paths: Sequence[Path],
+    evidence: _EvidenceRecorder,
 ) -> None:
     verifier = work_dir / "verify-isolation.py"
     try:
@@ -717,9 +866,8 @@ def _verify_isolation(
         verifier,
         work_dir=work_dir,
         repo=repo,
-        count_file=count_file,
-        invalid_file=invalid_file,
         guard=guard,
+        protected_paths=protected_paths,
     )
     environment = {
         "HOME": str(home),
@@ -731,6 +879,8 @@ def _verify_isolation(
         "GH_HOST": "github.invalid",
         "GH_PROMPT_DISABLED": "1",
     }
+    before = _protected_digest(protected_paths)
+    evidence.reset(valid_limit=3)
     try:
         capture = _run_sandboxed(
             ["/usr/bin/python3", str(verifier)],
@@ -738,14 +888,22 @@ def _verify_isolation(
             repo=repo,
             fake_gh=fake_gh,
             hosts_file=hosts_file,
+            protected_paths=protected_paths,
             env=environment,
             timeout=INTERNAL_TIMEOUT_SECONDS,
         )
     except ProbeFailure:
         raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-    _reset_canary(count_file)
-    _reset_canary(invalid_file)
-    if capture.exit_class != "ZERO" or capture.stdout or capture.stderr:
+    counts = evidence.counts()
+    evidence.reset()
+    after = _protected_digest(protected_paths)
+    if (
+        capture.exit_class != "ZERO"
+        or capture.stdout
+        or capture.stderr
+        or counts != (3, 0)
+        or before != after
+    ):
         raise ProbeFailure("ISOLATION_UNAVAILABLE", capture)
 
 
@@ -1022,28 +1180,6 @@ def _classify_capture(
     return Classification(None, valid, denied, sensitivity)
 
 
-def _canary_count(path: Path) -> int:
-    if not path.exists():
-        return 0
-    try:
-        metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > CAPTURE_LIMIT_BYTES:
-            raise ProbeFailure("CANARY_MISMATCH")
-        values = path.read_text(encoding="ascii").splitlines()
-    except (OSError, UnicodeError):
-        raise ProbeFailure("CANARY_MISMATCH") from None
-    if any(value != "1" for value in values):
-        raise ProbeFailure("CANARY_MISMATCH")
-    return len(values)
-
-
-def _reset_canary(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        raise ProbeFailure("CANARY_MISMATCH") from None
-
-
 def _version(
     runtime: str,
     executable: str,
@@ -1052,6 +1188,7 @@ def _version(
     repo: Path,
     fake_gh: Path,
     hosts_file: Path,
+    protected_paths: Sequence[Path],
     env: Mapping[str, str],
 ) -> tuple[str, Capture]:
     capture = _run_sandboxed(
@@ -1060,6 +1197,7 @@ def _version(
         repo=repo,
         fake_gh=fake_gh,
         hosts_file=hosts_file,
+        protected_paths=protected_paths,
         env=env,
         timeout=RUNTIME_TIMEOUT_SECONDS,
     )
@@ -1081,10 +1219,11 @@ def _probe_runtime(
     home: Path,
     repo: Path,
     fake_bin: Path,
-    count_file: Path,
-    invalid_file: Path,
     hosts_file: Path,
     cli: Path,
+    protected_paths: Sequence[Path],
+    control_sha256: str,
+    evidence: _EvidenceRecorder,
 ) -> dict[str, object]:
     environment = _runtime_env(
         caller_env,
@@ -1093,7 +1232,7 @@ def _probe_runtime(
         fake_bin=fake_bin,
         work_dir=work_dir,
     )
-    disposable_paths = (work_dir, home, repo, fake_bin, count_file.parent)
+    disposable_paths = (work_dir, home, repo, fake_bin)
     try:
         version, version_capture = _version(
             runtime,
@@ -1102,8 +1241,19 @@ def _probe_runtime(
             repo=repo,
             fake_gh=fake_bin / "gh",
             hosts_file=hosts_file,
+            protected_paths=protected_paths,
             env=environment,
         )
+        if _protected_digest(protected_paths) != control_sha256:
+            return {
+                "status": "ISOLATION_BREACH",
+                "phase": "version",
+                "version": version,
+                "version_capture_sha256": version_capture.stdout_sha256,
+                "controls_intact": False,
+                "control_sha256": control_sha256,
+                "capture": version_capture.sanitized(),
+            }
         version_sensitivity = _sensitivity(
             version_capture,
             repo_source=repo_source,
@@ -1119,14 +1269,14 @@ def _probe_runtime(
             _remove_review(repo)
             if phase == "pass_verdict":
                 _create_pass_verdict(cli, repo, home, runtime)
-            _reset_canary(count_file)
-            _reset_canary(invalid_file)
+            evidence.reset()
             capture = _run_sandboxed(
                 _runtime_argv(runtime, executable, home=home, repo=repo),
                 work_dir=work_dir,
                 repo=repo,
                 fake_gh=fake_bin / "gh",
                 hosts_file=hosts_file,
+                protected_paths=protected_paths,
                 env=environment,
                 timeout=RUNTIME_TIMEOUT_SECONDS,
             )
@@ -1138,12 +1288,13 @@ def _probe_runtime(
                 disposable_paths=disposable_paths,
                 caller_env=caller_env,
             )
+            count, invalid_count = evidence.counts()
             try:
-                count: int | None = _canary_count(count_file)
-                invalid_count: int | None = _canary_count(invalid_file)
+                controls_intact = (
+                    _protected_digest(protected_paths) == control_sha256
+                )
             except ProbeFailure:
-                count = None
-                invalid_count = None
+                controls_intact = False
             phase_results[phase] = {
                 "denied": classification.denied,
                 "parse_valid": classification.parse_valid,
@@ -1151,19 +1302,21 @@ def _probe_runtime(
                 "invalid_call_count": invalid_count,
                 "capture": capture.sanitized(),
                 "sensitivity": classification.sensitivity.sanitized(),
+                "controls_intact": controls_intact,
+                "control_sha256": control_sha256,
             }
-            if classification.failure is not None:
+            if not controls_intact:
                 return {
-                    "status": classification.failure,
+                    "status": "ISOLATION_BREACH",
                     "phase": phase,
                     "version": version,
                     "version_capture_sha256": version_capture.stdout_sha256,
                     **phase_results,
                     "captures": captures,
                 }
-            if count is None or invalid_count is None:
+            if classification.failure is not None:
                 return {
-                    "status": "CANARY_MISMATCH",
+                    "status": classification.failure,
                     "phase": phase,
                     "version": version,
                     "version_capture_sha256": version_capture.stdout_sha256,
@@ -1259,32 +1412,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     report: dict[str, object] = {"schema": SCHEMA_VERSION, "status": "BLOCKED"}
     exit_code = 1
+    evidence: _EvidenceRecorder | None = None
     try:
         probe_home = work_dir / "home"
         probe_repo = work_dir / "repo"
         fake_bin = work_dir / "fake-bin"
-        count_file = work_dir / "canary-count"
-        invalid_file = work_dir / "invalid-canary-count"
         hosts_file = work_dir / "hosts"
         guard = work_dir / "probe-command-guard.py"
         probe_home.mkdir(mode=0o700)
         (work_dir / "tmp").mkdir(mode=0o700)
         (work_dir / "gh-config").mkdir(mode=0o700)
         _create_probe_repo(probe_repo, probe_home)
-        _make_fake_gh(fake_bin, count_file, invalid_file, probe_repo)
+        try:
+            evidence = _EvidenceRecorder()
+        except OSError:
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+        _make_fake_gh(fake_bin, evidence.address, probe_repo)
         _make_hosts_file(hosts_file)
         cli = _install(repo_source, probe_home, probe_repo)
         _make_probe_guard(guard, probe_repo)
         _install_probe_guard(probe_home, guard)
+        protected_paths = (
+            fake_bin / "gh",
+            hosts_file,
+            guard,
+            probe_home / ".claude/settings.json",
+            probe_home / ".codex/hooks.json",
+            probe_home / ".local/share/claude-config/pre_pr_tribunal",
+        )
+        control_sha256 = _protected_digest(protected_paths)
         _verify_isolation(
             work_dir=work_dir,
             repo=probe_repo,
             home=probe_home,
             fake_gh=fake_bin / "gh",
-            count_file=count_file,
-            invalid_file=invalid_file,
             hosts_file=hosts_file,
             guard=guard,
+            protected_paths=protected_paths,
+            evidence=evidence,
         )
         selected = (
             ("claude", "codex")
@@ -1307,10 +1472,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     home=probe_home,
                     repo=probe_repo,
                     fake_bin=fake_bin,
-                    count_file=count_file,
-                    invalid_file=invalid_file,
                     hosts_file=hosts_file,
                     cli=cli,
+                    protected_paths=protected_paths,
+                    control_sha256=control_sha256,
+                    evidence=evidence,
                 )
             report[runtime] = runtime_report
             success = success and runtime_report.get("status") == "PASS"
@@ -1324,6 +1490,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:
         report = {"schema": SCHEMA_VERSION, "status": "SETUP_FAILED"}
         exit_code = 1
+    if evidence is not None:
+        evidence.close()
     cleanup_ok = _cleanup_work_dir(work_dir, identity)
     if not cleanup_ok:
         report = {"schema": SCHEMA_VERSION, "status": "CLEANUP_FAILED"}

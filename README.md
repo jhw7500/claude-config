@@ -55,10 +55,13 @@ review 상태는 현재 저장소의 ignored `.review/`에만 남고 HOME이나 
 실제 runtime canary harness는 verified `/usr/bin/bwrap`을 필수로 사용한다. root filesystem은
 read-only로 두고 disposable probe tree만 writable로 bind하며, worktree-owned hosts sinkhole,
 fixed system PATH의 모든 기존 `gh` 위 fake executable bind, neutral GitHub config/host environment,
-exact command/cwd pre-tool guard를 runtime 시작 전에 검증한다. 이 경계가 준비되지 않으면
-`ISOLATION_UNAVAILABLE`로 중단한다. Provider API 연결을 유지하기 위해 network namespace는
-공유하므로, 이 harness는 일반적인 outbound-network 차단을 제공하거나 provider 장애를 보호한다고
-주장하지 않는다.
+exact command/cwd/tool pre-tool guard를 runtime 시작 전에 검증한다. Writable probe tree 안의 guard,
+fake `gh`, hosts source, installed hook package, Claude/Codex hook config는 각각 다시 read-only로
+self-bind하고 inode/content hash 불변을 확인한다. Fake-call evidence는 probe tree의 writable count
+file이 아니라 harness process가 소유한 memory channel에 기록되어 runtime tool이 file을 forge하거나
+reset할 수 없다. 이 경계가 준비되지 않으면 `ISOLATION_UNAVAILABLE`로 중단한다. Provider API 연결을
+유지하기 위해 network namespace는 공유하므로, 이 harness는 일반적인 outbound-network 차단을
+제공하거나 provider 장애를 보호한다고 주장하지 않는다.
 
 ## 토글 메커니즘 — 2종류 (대체 불가, 병행)
 
