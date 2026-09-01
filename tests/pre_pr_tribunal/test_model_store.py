@@ -442,6 +442,52 @@ def test_delimited_http_home_path_is_allowed(snapshot, field, value):
 @pytest.mark.parametrize(
     "value",
     [
+        "echo [https://example.com/home/alice]",
+        "echo [https://example.com/Users/alice]",
+        "echo [label](https://example.com/home/alice)",
+    ],
+)
+def test_delimited_http_home_endpoint_is_allowed(snapshot, field, value):
+    item = execution()
+    item[field] = value
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+    assert getattr(parsed.executions[0], field) == value
+
+
+@pytest.mark.parametrize("field", ["command", "stdout_excerpt"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "echo [https://example.com/home/alice",
+        "echo [https://example.com/home/alice]/home/bob",
+        "echo [https://example.com/home/alice];/home/bob",
+        "echo [label](https://example.com/home/alice)/home/bob",
+        "echo [label](https://example.com/home/alice);/home/bob",
+        "echo /home/alice]",
+        "echo /Users/alice)",
+    ],
+)
+def test_delimited_home_endpoint_boundaries_are_rejected(snapshot, field, value):
+    item = execution()
+    item[field] = value
+    with pytest.raises(SchemaError, match="EVIDENCE_SECRET_DETECTED"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize("field", ["command", "stdout_excerpt"])
+@pytest.mark.parametrize(
+    "value",
+    [
         "echo [https://example.com/home/alice/private",
         "echo [https://example.com/home/alice/private]/home/bob/private",
         "echo [https://example.com/home/alice/private];/home/bob/private",

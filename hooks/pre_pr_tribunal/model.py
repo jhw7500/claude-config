@@ -30,7 +30,7 @@ _SECRET = re.compile(
     r"BEGIN PRIVATE KEY|ghp_[A-Za-z0-9]{8}|github_pat_[A-Za-z0-9_]{8}|"
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8}|AKIA[A-Z0-9]{12}"
 )
-_HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>]+")
+_HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>\])]+")
 _HTTP_URL_START = re.compile(r"https?://", re.IGNORECASE)
 _SHELL_CONTROL = frozenset(";|&()<>`")
 _MAX_SHELL_NESTING = 64
