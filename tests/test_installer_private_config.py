@@ -68,7 +68,10 @@ def test_fresh_install_creates_private_settings_with_all_non_notion_hooks(home: 
     assert result.returncode == 0, result.stderr
     assert settings.is_file(), result.stdout
     assert mode_of(settings) == 0o600
-    assert backups(settings) == []
+    # The generic Claude writer creates settings first; the dedicated task-nudge
+    # transaction then records that just-created configuration before its merge.
+    assert len(backups(settings)) == 1
+    assert mode_of(backups(settings)[0]) == 0o600
 
     data = json.loads(settings.read_text(encoding="utf-8"))
     wired = [
@@ -89,10 +92,10 @@ def test_fresh_install_creates_private_settings_with_all_non_notion_hooks(home: 
         ("PostToolUse", "python3 $HOME/.claude/hooks/post-info-tool-continuation-hook.py"),
         ("PreToolUse", "python3 $HOME/.claude/hooks/agent-name-delivery-hook.py"),
         ("UserPromptSubmit", "python3 $HOME/.claude/hooks/handoff-checkpoint-hook.py"),
-        ("PostToolUse", "python3 $HOME/.claude/hooks/control-char-guard-hook.py"),
-        ("PreToolUse", "$HOME/.claude/hooks/task-nudge.sh"),
-        ("PreCompact", "$HOME/.claude/hooks/precompact-handoff.sh"),
-    }
+            ("PostToolUse", "python3 $HOME/.claude/hooks/control-char-guard-hook.py"),
+            ("PreToolUse", "$HOME/.claude/hooks/task-nudge.sh"),
+            ("PreCompact", "$HOME/.claude/hooks/precompact-handoff.sh"),
+        }
     assert len(wired) == 14
     assert set(wired) == expected
 
@@ -107,46 +110,52 @@ def test_identical_rerun_adds_no_backup(home: Path) -> None:
     assert len(backups(claude_md)) == before
 
 
-def test_settings_change_makes_exactly_one_private_backup(home: Path) -> None:
-    run_install(home)
-    settings = home / ".claude" / "settings.json"
+def test_existing_settings_change_keeps_distinct_private_backups(home: Path) -> None:
+    claude = home / ".claude"
+    claude.mkdir()
+    settings = claude / "settings.json"
     settings.write_text(json.dumps({"hooks": {}}) + "\n", encoding="utf-8")
     settings.chmod(0o744)                                   # 이슈 #50 이 보고한 실제 조건
 
-    run_install(home)                                       # 배선 추가 → 변경 발생
+    result = run_install(home)                              # 두 installer-owned merge 발생
+    assert result.returncode == 0, result.stderr
 
     saved = backups(settings)
-    assert len(saved) == 1
-    assert mode_of(saved[0]) == 0o600
+    assert len(saved) == 2
+    assert all(mode_of(path) == 0o600 for path in saved)
     assert mode_of(settings) == 0o600
 
-    run_install(home)                                       # 이제 변경 없음
-    assert len(backups(settings)) == 1
+    result = run_install(home)                              # 이제 변경 없음
+    assert result.returncode == 0, result.stderr
+    assert len(backups(settings)) == 2
 
 
 def test_hook_wiring_stays_idempotent(home: Path) -> None:
-    run_install(home)
+    result = run_install(home)
+    assert result.returncode == 0, result.stderr
     settings = home / ".claude" / "settings.json"
-    settings.write_text(json.dumps({"hooks": {}}) + "\n", encoding="utf-8")
-    run_install(home)
 
     def entry_count() -> int:
         data = json.loads(settings.read_text(encoding="utf-8"))
         return sum(len(g.get("hooks", [])) for gs in data["hooks"].values() for g in gs)
 
     first = entry_count()
-    run_install(home)
+    result = run_install(home)
+    assert result.returncode == 0, result.stderr
 
     assert entry_count() == first
     assert first > 0
 
 
-def test_links_are_still_created(home: Path) -> None:
+def test_links_are_still_created_except_task_nudge_shim(home: Path) -> None:
     run_install(home)
     claude = home / ".claude"
     launcher = home / ".local" / "bin" / "jhw-control-host"
 
-    assert (claude / "hooks" / "task-nudge.sh").is_symlink()
+    shim = claude / "hooks" / "task-nudge.sh"
+    assert shim.is_file() and not shim.is_symlink()
+    assert shim.read_bytes() == (REPO / "hooks" / "task-nudge.sh").read_bytes()
+    assert mode_of(shim) == 0o700
     assert (claude / "scripts" / "hook-selfcheck.py").is_symlink()
     assert (claude / "skills" / "task-observer").is_symlink()
     assert launcher.is_symlink()

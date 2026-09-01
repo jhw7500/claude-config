@@ -100,6 +100,9 @@ private_dir ~/.claude/hooks
 HOOK_LINKS=0
 for f in "$REPO_DIR"/hooks/*.py "$REPO_DIR"/hooks/*.sh; do
   [ -f "$f" ] || continue
+  case "$(basename "$f")" in
+    task_nudge.py|task-nudge-claude.py|task-nudge-codex.py|task-nudge.sh) continue ;;
+  esac
   link_safely "$f" ~/.claude/hooks/"$(basename "$f")" && HOOK_LINKS=$((HOOK_LINKS + 1))
 done
 # set -e 아래에서 link_safely 가 && 목록의 마지막 명령이면 실패 시 스크립트가
@@ -208,11 +211,26 @@ f = sys.argv[1]
 notion = (len(sys.argv) > 2 and sys.argv[2] == "있음")
 sys.path.insert(0, sys.argv[3])
 from private_config import write_private
+
+class DuplicateKeyError(ValueError):
+    pass
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateKeyError
+        value[key] = item
+    return value
+
 try:
     with open(f) as fh:
-        d = json.load(fh)
+        d = json.load(fh, object_pairs_hook=unique_object)
 except FileNotFoundError:
     d = {}
+except DuplicateKeyError:
+    print("[install] settings.json 오류: duplicate JSON key", file=sys.stderr)
+    raise SystemExit(1)
 hooks = d.setdefault("hooks", {})
 
 import os
@@ -254,15 +272,12 @@ an = "python3 %s/agent-name-delivery-hook.py" % H
 nr = "python3 %s/notion-recall-trigger-hook.py" % H
 hc = "python3 %s/handoff-checkpoint-hook.py" % H
 cg = "python3 %s/control-char-guard-hook.py" % H
-# shell 훅은 기존 배선이 bash 접두어 없는 경로 표기라 같은 형태로 등록한다 (norm() 중복 방지)
-tn = "%s/task-nudge.sh" % H
 ph = "%s/precompact-handoff.sh" % H
 PI_MATCH = ("ToolSearch|WebSearch|WebFetch|mcp__notion__notion-search|mcp__notion__notion-fetch|"
             "mcp__notion__notion-get-comments|mcp__jhw-notion__jhw_search|mcp__jhw-notion__jhw_context|"
             "mcp__jhw-notion__jhw_history|mcp__jhw-notion__jhw_status|mcp__jhw-notion__jhw_retrieve|"
             "mcp__plugin_context7_context7__query-docs|mcp__plugin_context7_context7__resolve-library-id")
 CG_MATCH = "Edit|Write|MultiEdit|NotebookEdit"
-TN_MATCH = "Edit|Write|NotebookEdit"
 PA_MATCH = ("mcp__jhw-notion__jhw_(record|note|delete|start|close|report_export)|"
             "mcp__notion__notion-(create-pages|update-page|create-database|update-data-source|"
             "create-comment|duplicate-page|move-pages)")
@@ -282,7 +297,6 @@ if ensure("PostToolUse", pi, PI_MATCH): added.append("Post<-post-info")
 if ensure("PreToolUse", an, "Agent"): added.append("Pre<-agent-name-delivery")
 if ensure("UserPromptSubmit", hc): added.append("UPS<-handoff-checkpoint")
 if ensure("PostToolUse", cg, CG_MATCH): added.append("Post<-ctrl-char-guard")
-if ensure("PreToolUse", tn, TN_MATCH): added.append("Pre<-task-nudge")
 if ensure("PreCompact", ph, "*"): added.append("PreCompact<-handoff-gate")
 # 흡수 — notion 환경만
 if notion:
@@ -299,6 +313,12 @@ elif state == "unchanged":
 if changed:
     print("[install] 훅 matcher 갱신:", ", ".join(changed))
 PY
+
+/usr/bin/python3 "$REPO_DIR/scripts/install-task-nudge.py" \
+  --repo "$REPO_DIR" \
+  --home "$HOME"
+echo "[install] Task nudge: Claude/Codex hook + active AGENTS block"
+echo "[주의] Codex에서 /hooks를 열어 새 hook 또는 변경된 hash를 직접 검토·신뢰하세요."
 
 echo ""
 echo "완료. 적용: source ~/.bashrc  +  새 Claude 세션"

@@ -55,16 +55,29 @@ fi
 | `general-continuation-hook.py` | UserPromptSubmit | "한번에/끝까지/연속으로" 등 사용자의 연속 실행 의도 감지 시 reminder 주입 |
 | `bg-task-progress-hook.py` | PreToolUse + PostToolUse | Agent / Bash `run_in_background=true` 시작·완료 알림 강제 + statusLine 카운터 관리 |
 | `control-char-guard-hook.py` | PostToolUse | Edit/Write/MultiEdit/NotebookEdit 로 **기록한 내용**에 raw 제어문자(C0/DEL)가 섞이면 위치와 함께 경고 |
-| `task-nudge.sh` | PreToolUse | 세션 첫 프로젝트 파일 수정 직전 Task 등록 권유 리마인더를 세션당 1회 주입 |
+| `task_nudge.py` | Claude/Codex 공통 core | GitHub slug와 secure launcher의 등록 상태를 분류하고, 경계가 있는 정책 메시지와 세션당 1회 state를 관리 |
+| `task-nudge-claude.py` | Claude PreToolUse: `Edit\|Write\|NotebookEdit` | 공통 core 결과를 Claude 평문 `[TASK-NUDGE]`로 어댑트 |
+| `task-nudge-codex.py` | Codex PreToolUse: `apply_patch\|Edit\|Write` | 공통 core 결과를 Codex `systemMessage`로 어댑트; `--manual-check`는 state를 만들지 않는 fallback 확인 |
+| `task-nudge.sh` | Claude PreToolUse compatibility shim | 설치된 neutral Claude adapter를 호출 |
 | `delegate-nudge-hook.py` | UserPromptSubmit | 직전 턴 메인 스레드 탐색성 호출·tool_result 바이트가 임계(기본 10회/100KB) 초과 시 위임 넛지 주입 — 세션당 최대 3회, 발화마다 임계 2배, 발화/억제를 `state/delegate-nudge/log.jsonl`에 기록 |
 | `precompact-handoff.sh` | PreCompact | HANDOFF 파일이 없거나 낡았으면 auto compaction 을 막고 /handoff 를 요구 (manual 은 경고만) |
 
 ## 동작 원칙
 
-1. **조용히 실패**: 모든 훅은 예외 발생 시 `return 0`으로 조용히 종료. Claude Code 본 동작을 절대 차단하지 않는다.
+1. **exit 0, permission deny 없음**: 모든 훅은 예외가 나도 exit 0이며 Claude/Codex의 도구 실행을 permission-deny하지 않는다. `task-nudge`만은 bounded `unknown`을 출력해 에이전트가 분류 복구 전 후속 실질 변경을 멈추게 하는 명시적 예외이고, 훅 자체는 여전히 차단하지 않는다.
 2. **선택적 주입**: 트리거 조건이 맞지 않으면 stdout에 아무것도 쓰지 않는다 (훅이 없는 것과 동일).
 3. **Escape hatch**: 사용자 메시지 시작에 `#noreminder`, `#nr`, `#raw`, `#silent`, `#조용히` 중 하나가 있으면 UserPromptSubmit 훅들이 주입을 스킵한다.
 4. **전역 규칙 참조**: 훅 reminder는 행동 트리거만 담고, 세부 규칙은 `~/.claude/CLAUDE.md`를 참조하도록 설계.
+
+## Task nudge 운영
+
+설치된 Codex fallback의 stateless 수동 확인은 정확히 다음 명령이다. 이는 hook marker를 만들지 않으므로 native hook이 아직 trust되지 않았거나 matcher 밖의 변경을 검토할 때만 사용한다.
+
+```bash
+/usr/bin/python3 $HOME/.local/share/claude-config/hooks/task-nudge-codex.py --manual-check --cwd "$PWD"
+```
+
+정상 `registered`/`unregistered` 안내는 runtime+session별 atomic marker로 **최대 한 번**만 출력한다. `unknown`과 결정적 제외는 marker를 소비하지 않으므로, unknown은 다음 변경 후보에서 재조회·재안내할 수 있다. 두 adapter의 matcher 범위는 표의 exact scope뿐이며, 이 안내는 Task/Claim이나 Project Control mutation을 실행하지 않는다.
 
 ## 디버그 로깅
 

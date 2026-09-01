@@ -578,7 +578,14 @@ def run_bounded(
     process: subprocess.Popen[bytes] | None = None
     tty_stream = None
     tty_state = None
+    previous_signal_handlers: dict[int, object] = {}
+
+    def cancel_on_signal(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
     try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_signal_handlers[signum] = signal.signal(signum, cancel_on_signal)
         try:
             if tty_input:
                 tty_stream = open("/dev/tty", "r+b", buffering=0)
@@ -640,6 +647,8 @@ def run_bounded(
                 pass
         raise
     finally:
+        for signum, previous_handler in previous_signal_handlers.items():
+            signal.signal(signum, previous_handler)
         if selector is not None:
             selector.close()
         if process is not None:
