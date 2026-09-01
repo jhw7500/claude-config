@@ -319,6 +319,13 @@ PY
 /usr/bin/python3 "$REPO_DIR/scripts/install-task-nudge.py" \
   --repo "$REPO_DIR" \
   --home "$HOME"
+
+/usr/bin/python3 "$REPO_DIR/scripts/install-pre-pr-tribunal.py" \
+  --repo "$REPO_DIR" \
+  --home "$HOME"
+echo "[install] Pre-PR tribunal: Claude/Codex blocking hook"
+echo "[주의] Codex에서 /hooks를 열어 새 tribunal hook hash를 직접 검토·신뢰하세요."
+
 echo "[install] Task nudge: Claude/Codex hook + active AGENTS block"
 echo "[주의] Codex에서 /hooks를 열어 새 hook 또는 변경된 hash를 직접 검토·신뢰하세요."
 

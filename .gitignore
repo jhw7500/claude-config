@@ -10,3 +10,6 @@ __pycache__/
 # 실체는 여기 있고(스케줄 리뷰가 .claude/** 쓰기 게이트를 못 넘어 이 경로를 쓴다),
 # ~/.claude/projects/<id>/skill-observations 가 심링크로 가리킨다.
 skill-observations/
+
+# pre-PR tribunal verdict와 reviewer evidence는 local state다.
+.review/

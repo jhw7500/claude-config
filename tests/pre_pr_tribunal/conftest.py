@@ -9,8 +9,38 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 HOOKS = REPO / "hooks"
+INSTALLER_PATH = REPO / "scripts" / "install-pre-pr-tribunal.py"
+_COLLIDING_TEST_MODULES = {"test_installer", "test_install_integration"}
 if str(HOOKS) not in sys.path:
     sys.path.insert(0, str(HOOKS))
+
+
+def pytest_collectreport(report):
+    """Release planned duplicate basenames after their tribunal collection."""
+    if report.failed or not report.nodeid.startswith("tests/pre_pr_tribunal/"):
+        return
+    module_name = Path(report.nodeid).stem
+    if module_name in _COLLIDING_TEST_MODULES:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.fixture(scope="session")
+def installer():
+    spec = importlib.util.spec_from_file_location(
+        "install_pre_pr_tribunal", INSTALLER_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def home(tmp_path):
+    value = tmp_path / "home"
+    value.mkdir(mode=0o700)
+    return value
 
 
 @pytest.fixture
