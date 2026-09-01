@@ -1,2 +1,4 @@
 #!/usr/bin/env bash
-exec /usr/bin/python3 "$HOME/.local/share/claude-config/hooks/task-nudge-claude.py"
+adapter="$HOME/.local/share/claude-config/hooks/task-nudge-claude.py"
+[ -f "$adapter" ] || exit 0
+/usr/bin/python3 "$adapter" || exit 0

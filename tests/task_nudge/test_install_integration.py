@@ -63,6 +63,24 @@ def _task_artifact_snapshot(home):
     return artifacts
 
 
+def test_legacy_symlinked_shim_fails_open_before_neutral_adapter_install(home):
+    hooks = home / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    shim = hooks / "task-nudge.sh"
+    shim.symlink_to(REPO / "hooks" / "task-nudge.sh")
+
+    result = subprocess.run(
+        [str(shim)],
+        input="{}",
+        text=True,
+        capture_output=True,
+        check=False,
+        env=dict(os.environ, HOME=str(home)),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_fresh_install_adds_neutral_hooks_codex_config_and_agents(home, run_install):
     result = run_install(home)
     assert result.returncode == 0, result.stderr
