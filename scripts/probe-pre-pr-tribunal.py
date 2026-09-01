@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import argparse
 import errno
@@ -33,6 +34,9 @@ CAPTURE_LIMIT_BYTES = 64 * 1024
 MAX_CREDENTIAL_BYTES = 256 * 1024
 MAX_CREDENTIAL_JSON_ITEMS = 8192
 MAX_CREDENTIAL_JSON_DEPTH = 64
+MAX_CAPTURE_JSON_ITEMS = 8192
+MAX_CAPTURE_JSON_DEPTH = 64
+MAX_CAPTURE_JSON_DECODED_BYTES = CAPTURE_LIMIT_BYTES * 2
 RUNTIME_CHILD_DEADLINE_COUNT = 3
 VERDICT_CHILD_DEADLINE_COUNT = 2
 AUTH_SCHEDULING_CUSHION_SECONDS = 30
@@ -94,9 +98,17 @@ class ProbeFailure(Exception):
 
 
 class _TerminationSignal(BaseException):
-    def __init__(self, signum: int):
+    def __init__(self, signum: int, previous_mask: set[signal.Signals]):
         super().__init__(signum)
         self.signum = signum
+        self.previous_mask = previous_mask
+
+
+@dataclass
+class _TerminationState:
+    cleanup_active: bool = False
+    deferred_signum: int | None = None
+    restore_mask: set[signal.Signals] | None = None
 
 
 class _Parser(argparse.ArgumentParser):
@@ -172,20 +184,30 @@ class CodexSubscriptionAuth:
 class _EvidenceRecorder:
     def __init__(self) -> None:
         self.address = "\x00pre-pr-tribunal-" + secrets.token_hex(16)
-        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._socket.bind(self.address)
-        self._socket.listen(8)
-        self._socket.settimeout(0.1)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._valid = 0
         self._invalid = 0
         self._valid_limit = 1
         self._closed = False
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
+        self._socket: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        try:
+            with _blocked_termination_signals():
+                self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._socket.bind(self.address)
+                self._socket.listen(8)
+                self._socket.settimeout(0.1)
+                self._thread = threading.Thread(target=self._serve, daemon=True)
+                self._thread.start()
+        except BaseException:
+            with _blocked_termination_signals():
+                self.close()
+            raise
 
     def _serve(self) -> None:
+        if self._socket is None:
+            return
         while not self._stop.is_set():
             try:
                 connection, _address = self._socket.accept()
@@ -222,18 +244,20 @@ class _EvidenceRecorder:
             return
         self._closed = True
         self._stop.set()
-        try:
-            wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            with wake:
-                wake.settimeout(0.2)
-                wake.connect(self.address)
-        except OSError:
-            pass
-        self._thread.join(timeout=1.0)
-        try:
-            self._socket.close()
-        except OSError:
-            pass
+        if self._thread is not None and self._thread.is_alive():
+            try:
+                wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                with wake:
+                    wake.settimeout(0.2)
+                    wake.connect(self.address)
+            except OSError:
+                pass
+            self._thread.join(timeout=1.0)
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except OSError:
+                pass
 
     def __enter__(self) -> "_EvidenceRecorder":
         return self
@@ -397,17 +421,7 @@ def _credential_secret_values(value: str) -> tuple[bytes, ...]:
         raise ProbeFailure("CREDENTIAL_MALFORMED")
     if b"\x00" in encoded:
         raise ProbeFailure("CREDENTIAL_MALFORMED")
-    representations = {encoded}
-    for ensure_ascii in (False, True):
-        try:
-            literal = json.dumps(value, ensure_ascii=ensure_ascii).encode(
-                "utf-8"
-            )
-        except UnicodeEncodeError:
-            raise ProbeFailure("CREDENTIAL_MALFORMED") from None
-        representations.add(literal)
-        representations.add(literal[1:-1])
-    return tuple(sorted(representations))
+    return (encoded,)
 
 
 def _codex_token_values(value: object) -> tuple[bytes, ...]:
@@ -728,11 +742,14 @@ def _run_bounded(
             exit_class,
         )
     finally:
-        if process.returncode is None:
-            _stop_process_group(process)
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
+        with _blocked_termination_signals():
+            try:
+                if process.returncode is None:
+                    _stop_process_group(process)
+            finally:
+                selector.close()
+                process.stdout.close()
+                process.stderr.close()
 
 
 def _internal_env(home: Path) -> dict[str, str]:
@@ -811,30 +828,43 @@ def _prepare_work_dir(
     repo_source: Path,
     caller_home: Path | None,
 ) -> tuple[Path, tuple[int, int]]:
-    if supplied is None:
-        path = Path(tempfile.mkdtemp(prefix="pre-pr-tribunal-probe-"))
-    else:
-        requested = Path(supplied)
-        if not requested.is_absolute() or requested.exists():
+    path: Path | None = None
+    created = False
+    try:
+        if supplied is None:
+            with _blocked_termination_signals():
+                allocated = tempfile.mkdtemp(prefix="pre-pr-tribunal-probe-")
+                path = Path(allocated)
+                created = True
+        else:
+            requested = Path(supplied)
+            if not requested.is_absolute() or requested.exists():
+                raise ProbeFailure("INVALID_WORK_DIR")
+            try:
+                parent = requested.parent.resolve(strict=True)
+            except OSError:
+                raise ProbeFailure("INVALID_WORK_DIR") from None
+            path = parent / requested.name
+            forbidden = {Path("/"), repo_source}
+            if caller_home is not None:
+                forbidden.add(caller_home)
+            if path in forbidden:
+                raise ProbeFailure("INVALID_WORK_DIR")
+            try:
+                with _blocked_termination_signals():
+                    path.mkdir(mode=0o700)
+                    created = True
+            except OSError:
+                raise ProbeFailure("INVALID_WORK_DIR") from None
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
             raise ProbeFailure("INVALID_WORK_DIR")
-        try:
-            parent = requested.parent.resolve(strict=True)
-        except OSError:
-            raise ProbeFailure("INVALID_WORK_DIR") from None
-        path = parent / requested.name
-        forbidden = {Path("/"), repo_source}
-        if caller_home is not None:
-            forbidden.add(caller_home)
-        if path in forbidden:
-            raise ProbeFailure("INVALID_WORK_DIR")
-        try:
-            path.mkdir(mode=0o700)
-        except OSError:
-            raise ProbeFailure("INVALID_WORK_DIR") from None
-    metadata = path.lstat()
-    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise ProbeFailure("INVALID_WORK_DIR")
-    return path, (metadata.st_dev, metadata.st_ino)
+        return path, (metadata.st_dev, metadata.st_ino)
+    except BaseException:
+        if created and path is not None:
+            with _blocked_termination_signals():
+                _cleanup_unpublished_directory(path)
+        raise
 
 
 def _prepare_control_root(
@@ -843,34 +873,49 @@ def _prepare_control_root(
     repo_source: Path,
     caller_home: Path | None,
 ) -> tuple[Path, tuple[int, int]]:
+    path: Path | None = None
+    created = False
     try:
-        path = Path(tempfile.mkdtemp(prefix="pre-pr-tribunal-controls-")).resolve(
-            strict=True
-        )
+        with _blocked_termination_signals():
+            allocated = tempfile.mkdtemp(prefix="pre-pr-tribunal-controls-")
+            path = Path(allocated)
+            created = True
+        path = path.resolve(strict=True)
         metadata = path.lstat()
         work_dir = work_dir.resolve(strict=True)
-    except OSError:
-        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-    forbidden = (work_dir, repo_source)
-    if caller_home is not None:
-        forbidden += (caller_home,)
-    invalid = (
-        not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or stat.S_IMODE(metadata.st_mode) & 0o077 != 0
-        or any(
-            path == target
-            or path.is_relative_to(target)
-            or target.is_relative_to(path)
-            for target in forbidden
+        forbidden = (work_dir, repo_source)
+        if caller_home is not None:
+            forbidden += (caller_home,)
+        invalid = (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077 != 0
+            or any(
+                path == target
+                or path.is_relative_to(target)
+                or target.is_relative_to(path)
+                for target in forbidden
+            )
         )
-    )
-    identity = (metadata.st_dev, metadata.st_ino)
-    if invalid:
-        _cleanup_work_dir(path, identity)
-        raise ProbeFailure("ISOLATION_UNAVAILABLE")
-    return path, identity
+        if invalid:
+            raise ProbeFailure("ISOLATION_UNAVAILABLE")
+        return path, (metadata.st_dev, metadata.st_ino)
+    except BaseException as error:
+        if created and path is not None:
+            with _blocked_termination_signals():
+                _cleanup_unpublished_directory(path)
+        if isinstance(error, OSError):
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+        raise
+
+
+def _cleanup_unpublished_directory(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return
+    _cleanup_work_dir(path, (metadata.st_dev, metadata.st_ino))
 
 
 def _cleanup_work_dir(path: Path, identity: tuple[int, int]) -> bool:
@@ -1787,6 +1832,57 @@ def _parse_runtime_output(raw: bytes) -> tuple[bool, bool]:
     return True, denied
 
 
+def _decoded_json_strings(
+    raw: bytes,
+    budget: list[int],
+) -> tuple[tuple[bytes, ...], bool]:
+    decoded: list[bytes] = []
+    structure: list[int] = []
+    index = 0
+    while index < len(raw):
+        byte = raw[index]
+        if byte == 0x22:
+            start = index
+            index += 1
+            while index < len(raw):
+                byte = raw[index]
+                if byte == 0x22:
+                    break
+                if byte == 0x5C:
+                    index += 2
+                    continue
+                if byte < 0x20:
+                    return tuple(decoded), True
+                index += 1
+            if index >= len(raw):
+                return tuple(decoded), True
+            budget[0] -= 1
+            if budget[0] < 0:
+                return tuple(decoded), True
+            try:
+                value = json.loads(raw[start:index + 1].decode("utf-8", "strict"))
+                encoded = value.encode("utf-8", "strict")
+            except (UnicodeError, ValueError, RecursionError):
+                return tuple(decoded), True
+            budget[1] -= len(encoded)
+            if budget[1] < 0:
+                return tuple(decoded), True
+            decoded.append(encoded)
+        elif byte in (0x5B, 0x7B):
+            structure.append(byte)
+            budget[0] -= 1
+            if len(structure) > MAX_CAPTURE_JSON_DEPTH or budget[0] < 0:
+                return tuple(decoded), True
+        elif byte in (0x5D, 0x7D):
+            budget[0] -= 1
+            expected = 0x5B if byte == 0x5D else 0x7B
+            if not structure or structure[-1] != expected or budget[0] < 0:
+                return tuple(decoded), True
+            structure.pop()
+        index += 1
+    return tuple(decoded), bool(structure)
+
+
 def _sensitivity(
     capture: Capture,
     *,
@@ -1798,15 +1894,29 @@ def _sensitivity(
     credential_documents: Sequence[bytes] = (),
 ) -> Sensitivity:
     raw = capture.stdout + b"\x00" + capture.stderr
+    json_budget = [MAX_CAPTURE_JSON_ITEMS, MAX_CAPTURE_JSON_DECODED_BYTES]
+    stdout_strings, stdout_suspicious = _decoded_json_strings(
+        capture.stdout, json_budget
+    )
+    stderr_strings, stderr_suspicious = _decoded_json_strings(
+        capture.stderr, json_budget
+    )
+    decoded_strings = stdout_strings + stderr_strings
+    surfaces = (raw, *decoded_strings)
+    suspicious_json = stdout_suspicious or stderr_suspicious
     reasons: set[str] = set()
-    if b"TOKEN_CANARY" in raw:
+    if any(b"TOKEN_CANARY" in surface for surface in surfaces):
         reasons.add("TOKEN_LITERAL")
 
     def includes(path: Path | None) -> bool:
         if path is None:
             return False
         encoded = os.fsencode(path)
-        return bool(encoded and encoded != b"/" and encoded in raw)
+        return bool(
+            encoded
+            and encoded != b"/"
+            and any(encoded in surface for surface in surfaces)
+        )
 
     if includes(caller_home):
         reasons.add("CALLER_HOME")
@@ -1814,7 +1924,10 @@ def _sensitivity(
         reasons.add("REPO_SOURCE")
     for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
         value = caller_env.get(key)
-        if value and len(value) >= 4 and value.encode("utf-8", "ignore") in raw:
+        encoded = value.encode("utf-8", "ignore") if value else b""
+        if value and len(value) >= 4 and any(
+            encoded in surface for surface in surfaces
+        ):
             reasons.add("API_KEY")
     credential_matches: set[bytes] = set()
     for value in credential_values:
@@ -1826,11 +1939,23 @@ def _sensitivity(
         if len(value) >= 8:
             credential_matches.add(value[:8])
     document_matches = {value for value in credential_documents if value}
-    if any(value in raw for value in credential_matches | document_matches):
+    if any(
+        value in surface
+        for value in credential_matches | document_matches
+        for surface in surfaces
+    ):
         reasons.add("CREDENTIAL")
+    if suspicious_json:
+        if credential_matches or document_matches:
+            reasons.add("CREDENTIAL")
+        elif any(
+            caller_env.get(key)
+            for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+        ):
+            reasons.add("API_KEY")
     if any(includes(path) for path in disposable_paths):
         reasons.add("DISPOSABLE_PATH")
-    if HOME_PATH.search(raw):
+    if any(HOME_PATH.search(surface) for surface in surfaces):
         reasons.add("GENERIC_HOME")
     high_risk = bool(
         reasons
@@ -1855,7 +1980,6 @@ def _classify_capture(
     credential_values: Sequence[bytes] = (),
     credential_documents: Sequence[bytes] = (),
 ) -> Classification:
-    valid, denied = _parse_runtime_output(capture.stdout)
     sensitivity = _sensitivity(
         capture,
         repo_source=repo_source,
@@ -1866,7 +1990,8 @@ def _classify_capture(
         credential_documents=credential_documents,
     )
     if sensitivity.high_risk:
-        return Classification("SENSITIVE_OUTPUT", valid, denied, sensitivity)
+        return Classification("SENSITIVE_OUTPUT", False, False, sensitivity)
+    valid, denied = _parse_runtime_output(capture.stdout)
     if capture.exit_class == "TIMEOUT":
         return Classification("TIMEOUT", valid, denied, sensitivity)
     if capture.exit_class == "OUTPUT_LIMIT":
@@ -2231,34 +2356,86 @@ def _emit(report: Mapping[str, object]) -> None:
     sys.stdout.write(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n")
 
 
-def _install_termination_handlers() -> dict[int, object]:
+_TERMINATION_SIGNALS = frozenset((signal.SIGINT, signal.SIGTERM))
+
+
+def _block_termination_signals() -> set[signal.Signals]:
+    try:
+        return signal.pthread_sigmask(signal.SIG_BLOCK, _TERMINATION_SIGNALS)
+    except (AttributeError, OSError, ValueError):
+        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+
+
+def _restore_termination_mask(mask: set[signal.Signals]) -> None:
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    except (AttributeError, OSError, ValueError):
+        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+
+
+@contextmanager
+def _blocked_termination_signals():
+    previous_mask = _block_termination_signals()
+    try:
+        yield
+    finally:
+        _restore_termination_mask(previous_mask)
+
+
+def _install_termination_handlers(
+    state: _TerminationState,
+) -> dict[int, object]:
     previous: dict[int, object] = {}
 
     def terminate(signum: int, _frame: object) -> None:
-        raise _TerminationSignal(signum)
+        previous_mask = _block_termination_signals()
+        if state.restore_mask is None:
+            state.restore_mask = previous_mask
+        if state.cleanup_active:
+            if state.deferred_signum is None:
+                state.deferred_signum = signum
+            return
+        raise _TerminationSignal(signum, previous_mask)
 
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous[signum] = signal.getsignal(signum)
             signal.signal(signum, terminate)
     except (OSError, ValueError):
-        for signum, handler in previous.items():
-            try:
-                signal.signal(signum, handler)
-            except (OSError, ValueError):
-                pass
-        return {}
+        _set_termination_handlers(previous)
+        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
     return previous
 
 
 def _set_termination_handlers(
     handlers: Mapping[int, object],
-) -> None:
+) -> bool:
+    restored = True
     for signum, handler in handlers.items():
         try:
             signal.signal(signum, handler)
         except (OSError, ValueError):
-            pass
+            restored = False
+    return restored
+
+
+def _begin_termination_cleanup(
+    state: _TerminationState,
+) -> set[signal.Signals]:
+    state.cleanup_active = True
+    return _block_termination_signals()
+
+
+def _cleanup_owned_directory(
+    path: Path | None,
+    identity: tuple[int, int] | None,
+) -> bool:
+    if path is None or identity is None:
+        return True
+    try:
+        return _cleanup_work_dir(path, identity)
+    except BaseException:
+        return False
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2270,7 +2447,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     control_root: Path | None = None
     control_identity: tuple[int, int] | None = None
     cleanup_ok = True
-    previous_handlers = _install_termination_handlers()
+    cleanup_previous_mask: set[signal.Signals] | None = None
+    termination_restore_mask: set[signal.Signals] | None = None
+    termination_state = _TerminationState()
+    try:
+        with _blocked_termination_signals():
+            pass
+        previous_handlers = _install_termination_handlers(termination_state)
+    except ProbeFailure:
+        _emit({"schema": SCHEMA_VERSION, "status": "ISOLATION_UNAVAILABLE"})
+        return 1
     try:
         arguments = _parser().parse_args(argv)
         repo_raw = Path(arguments.repo_source)
@@ -2290,16 +2476,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 caller_home = Path(home_raw).resolve(strict=False)
             except (OSError, RuntimeError):
                 caller_home = None
-        work_dir, identity = _prepare_work_dir(
-            arguments.work_dir,
-            repo_source=repo_source,
-            caller_home=caller_home,
-        )
-        control_root, control_identity = _prepare_control_root(
-            work_dir,
-            repo_source=repo_source,
-            caller_home=caller_home,
-        )
+        with _blocked_termination_signals():
+            work_dir, identity = _prepare_work_dir(
+                arguments.work_dir,
+                repo_source=repo_source,
+                caller_home=caller_home,
+            )
+        with _blocked_termination_signals():
+            control_root, control_identity = _prepare_control_root(
+                work_dir,
+                repo_source=repo_source,
+                caller_home=caller_home,
+            )
         probe_home = work_dir / "home"
         probe_repo = work_dir / "repo"
         control_home = control_root / "home"
@@ -2316,7 +2504,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         (work_dir / "gh-config").mkdir(mode=0o700)
         _create_probe_repo(probe_repo, probe_home)
         try:
-            evidence = _EvidenceRecorder()
+            with _blocked_termination_signals():
+                evidence = _EvidenceRecorder()
         except OSError:
             raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
         _make_fake_gh(fake_bin, evidence.address, probe_repo)
@@ -2400,12 +2589,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             success = success and runtime_report.get("status") == "PASS"
         report["status"] = "PASS" if success else "BLOCKED"
         exit_code = 0 if success else 1
+        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
     except _TerminationSignal as error:
+        termination_restore_mask = error.previous_mask
         report = {"schema": SCHEMA_VERSION, "status": "INTERRUPTED"}
         exit_code = 128 + error.signum
+        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
     except KeyboardInterrupt:
         report = {"schema": SCHEMA_VERSION, "status": "INTERRUPTED"}
         exit_code = 130
+        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
     except ProbeFailure as error:
         report = {"schema": SCHEMA_VERSION, "status": error.code}
         if error.capture is not None:
@@ -2416,31 +2609,43 @@ def main(argv: Sequence[str] | None = None) -> int:
             in {"USAGE", "INVALID_REPO_SOURCE", "INVALID_WORK_DIR"}
             else 1
         )
+        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
     except Exception:
         report = {"schema": SCHEMA_VERSION, "status": "SETUP_FAILED"}
         exit_code = 1
+        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
+    except BaseException:
+        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
+        raise
     finally:
-        _set_termination_handlers(
-            {signum: signal.SIG_IGN for signum in previous_handlers}
-        )
+        if cleanup_previous_mask is None:
+            cleanup_previous_mask = _block_termination_signals()
         evidence_cleanup_ok = True
         if evidence is not None:
             try:
                 evidence.close()
-            except Exception:
+            except BaseException:
                 evidence_cleanup_ok = False
-        control_cleanup_ok = True
-        if control_root is not None and control_identity is not None:
-            control_cleanup_ok = _cleanup_work_dir(
-                control_root, control_identity
-            )
-        work_cleanup_ok = True
-        if work_dir is not None and identity is not None:
-            work_cleanup_ok = _cleanup_work_dir(work_dir, identity)
-        cleanup_ok = (
-            evidence_cleanup_ok and control_cleanup_ok and work_cleanup_ok
+        control_cleanup_ok = _cleanup_owned_directory(
+            control_root, control_identity
         )
-        _set_termination_handlers(previous_handlers)
+        work_cleanup_ok = _cleanup_owned_directory(work_dir, identity)
+        handlers_restored = _set_termination_handlers(previous_handlers)
+        cleanup_ok = (
+            evidence_cleanup_ok
+            and control_cleanup_ok
+            and work_cleanup_ok
+            and handlers_restored
+        )
+        if termination_restore_mask is not None:
+            restore_mask = termination_restore_mask
+        elif termination_state.restore_mask is not None:
+            restore_mask = termination_state.restore_mask
+        else:
+            restore_mask = cleanup_previous_mask
+        _restore_termination_mask(restore_mask)
+        if termination_state.deferred_signum is not None:
+            os.kill(os.getpid(), termination_state.deferred_signum)
     if not cleanup_ok:
         report = {"schema": SCHEMA_VERSION, "status": "CLEANUP_FAILED"}
         exit_code = 1

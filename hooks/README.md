@@ -136,9 +136,15 @@ credential만 bounded exception으로 다룬다. Claude source는 secure descrip
 OAuth/expiry validation 뒤 `CLAUDE_CODE_OAUTH_TOKEN`으로만 전달한다. Codex source는 exact bytes를
 disposable `0600` stage에 복사하고 immutable `CODEX_HOME`의 `auth.json` leaf에만 bind한다. 그 leaf는
 필요한 in-place refresh만 허용하며 parent/hook config는 immutable하다. Refresh 전후 token-like value를
-raw auth document 및 JSON-escaped representation과 함께 memory에서만 leak matcher로 유지한다.
-8-byte 미만 또는 structured token-like value는 malformed로 거부한다. Live source bytes/metadata 불변과
-stage cleanup은 정상/실패/timeout/setup exception 및 catchable SIGINT/SIGTERM에서 확인한다. Caller의
+raw auth document와 함께 memory에서만 leak matcher로 유지한다. Bounded capture는 JSON string token을
+linear scan으로 lex/decode하여 key, nested/list value, raw-document string, 대소문자가 섞인 `\uXXXX`, surrogate
+pair를 동일한 decoded inventory와 대조한다. Malformed 또는 8,192-item/64-depth/128-KiB decoded bound를 넘은
+의심 JSON은 credential-backed 실행에서 fail closed한다. 8-byte 미만 또는 structured token-like value는
+malformed로 거부한다. Live source bytes/metadata 불변과 stage cleanup은 정상/실패/timeout/setup exception 및
+catchable SIGINT/SIGTERM에서 확인한다. Work/control allocator와 evidence constructor는 생성 뒤 publication 전
+`BaseException`도 내부 cleanup하고, SIGINT/SIGTERM을 생성→caller assignment와 child/resource cleanup→기존
+handler/mask 복원 구간에서 원자적으로 함께 block한다. Cleanup 중 pending signal은 복원 뒤 원래 semantics로
+전달되며 handler 안에서는 cleanup하지 않는다. Caller의
 live `.claude`/`.codex` directory는 sandbox 안에서 empty immutable mask다. Claude expiry margin은 세
 runtime child deadline 360초, 두 verdict child deadline 60초와 30초 cushion을 합친 450초다.
 

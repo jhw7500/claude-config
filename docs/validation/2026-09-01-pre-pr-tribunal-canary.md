@@ -3,9 +3,10 @@
 ## Status
 
 **BLOCKED — no real-runtime success is claimed.** Real Claude and Codex PASS evidence is still
-required before Task 8 can be considered complete. Fix Round 5 closes the final local
-subscription-auth/security review findings, but controller review is required before either real runtime is run.
-No real runtime or GitHub endpoint was invoked in this implementation round.
+required before Task 8 can be considered complete. The one-time authorized Fix Round 6 closes two
+additional local subscription-auth/security review findings, but controller review is required before
+either real runtime is run. No real runtime, provider, or GitHub endpoint was invoked in this
+implementation round.
 
 Fix Round 1 strengthened the isolation code and fake-runtime evidence, but it was deliberately not
 revalidated against either real runtime because both allowlisted API keys remain absent. The code
@@ -175,6 +176,44 @@ disposable fixture credentials; no live credential was inspected during implemen
 - All Round 5 tests use disposable synthetic credentials. No live credential/config was opened,
   no real Claude/Codex process or GitHub/provider endpoint was invoked, and no Step 9/JHW action ran.
   This remains a controller-review checkpoint, not real-runtime PASS evidence.
+
+## Fix Round 6 passing local evidence
+
+- The first strict RED was `6 failed, 107 deselected`: three upper/lower/mixed `\uXXXX` ASCII
+  credential cases bypassed sensitivity, work/control allocator `BaseException` left roots, and an
+  evidence-recorder constructor failure left its socket open. The expanded signal run contained six
+  additional security reproductions for SIGINT/SIGTERM allocation handoff, recorder handoff, and
+  mixed cleanup signals; two unrelated over-strict test-only version assertions in that run were
+  corrected without changing production policy. Follow-up bounds REDs reproduced three unbalanced or
+  cross-stream complexity gaps, and a final RED reproduced mismatched JSON structure handling.
+- Final focused Round 6 selector: `33 passed, 107 deselected in 4.60s`. Complete fake-runtime probe
+  harness: `140 passed in 51.28s`. Direct Claude/Codex adapters: `71 passed in 5.41s`. Complete
+  related `tests/pre_pr_tribunal`: `603 passed in 69.72s`.
+- Fresh full repository regression: `2662 passed in 186.82s`, exit 0. Changed-Python compilation,
+  Git whitespace validation, and the relevant shared Skill validator exited 0; the validator returned
+  `Skill is valid!`. No shell file changed, so Bash/ShellCheck changed-shell gates were not applicable.
+- Count-only scanning of added lines found zero reusable credential-shaped literals and zero
+  non-fixture credential JSON values. It printed no matched value. No newly added live-auth path
+  reference was present.
+- SIGINT/SIGTERM are blocked as a pair across work/control/evidence allocation through caller
+  ownership publication and across child kill/reap plus final evidence/control/work cleanup. Prior
+  handlers and the exact caller mask are restored only afterward; a signal consumed at the cleanup
+  transition is replayed, while already-pending signals resume under the restored semantics. Allocator
+  and recorder construction also clean locally on `KeyboardInterrupt`/`SystemExit` before publication.
+- Credential values and raw auth documents remain the bounded inventory rather than an enumeration of
+  JSON spellings. A single lexical pass over both bounded streams decodes every JSON string token,
+  including keys, nested/list leaves, outer-encoded raw documents, mixed-case Unicode escapes, and
+  valid surrogate pairs. The shared scan stops at 8,192 string/structure items, depth 64, or 128 KiB
+  decoded text; malformed, mismatched, or over-bound suspicious JSON fails closed before verdict,
+  version/hash, or control-breach precedence.
+- Subscription-default/no-fallback, provider-env separation, 450-second Claude validity margin,
+  source preservation, immutable controls/fake `gh`/guard, and `OUTPUT_LIMIT` hash withholding remain
+  unchanged. `SIGKILL`, `os._exit`, kernel/power loss, and equivalent uncatchable termination remain
+  explicit residuals.
+- All Round 6 tests use disposable synthetic credentials and roots. No live credential/config was
+  opened or mutated; no real Claude/Codex/`gh`, GitHub/provider endpoint, Step 9, JHW command,
+  push/merge/PR action, or network probe ran. This remains a controller-review checkpoint, not
+  real-runtime PASS evidence.
 
 ## Original Claude canary result
 

@@ -70,9 +70,13 @@ credential source만 no-follow/close-on-exec, current-UID owner-only regular-fil
 leaf에 exact-copy하여 immutable `CODEX_HOME/auth.json`에만 mount한다. Live `.claude`/`.codex`는
 sandbox에서 empty immutable mask로 가려 fallback을 막고 source bytes/metadata는 실행 전후 동일해야
 한다. Staging은 control digest에 포함되지 않으며 정상/실패/timeout/setup exception과 catchable
-SIGINT/SIGTERM에서 outer lifecycle cleanup으로 삭제된다. Initial/refreshed raw auth document와
-JSON-escaped token representation도 bounded memory inventory에 포함하며, 8-byte 미만 또는 structured
-token-like value는 malformed로 거부한다. 7-byte prefix를 포함한 credential 출력은
+SIGINT/SIGTERM에서 outer lifecycle cleanup으로 삭제된다. 두 termination signal은 disposable root와
+evidence recorder의 생성부터 caller ownership publication까지, child kill/reap과 최종 cleanup부터 기존
+handler/mask 복원까지 쌍으로 block된다. Pending signal은 cleanup 뒤 원래 semantics로 전달된다. Initial/refreshed
+raw auth document와 token value는 bounded memory inventory에만 둔다. Capture의 JSON string token은 key/value와
+nested/NDJSON 위치를 구분하지 않고 한 번 lex/decode하여 Unicode escape와 surrogate pair를 정규화한 뒤 inventory와
+대조한다. Malformed 또는 token/depth/decoded-size bound를 넘은 의심 JSON은 fail closed한다. 8-byte 미만 또는
+structured token-like value는 malformed로 거부한다. 7-byte prefix를 포함한 credential 출력은
 `SENSITIVE_OUTPUT`으로 중단한다. 더 짧은 prefix의 안전한 분류가 불가능하므로 credential material이
 child 범위에 있으면 모든 capture hash는 `WITHHELD`이고, `OUTPUT_LIMIT`도 양쪽 hash를 항상 보류한다.
 

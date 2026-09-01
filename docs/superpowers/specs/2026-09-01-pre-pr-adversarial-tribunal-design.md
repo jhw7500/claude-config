@@ -534,10 +534,17 @@ mount한다. Refresh가 필요하면 disposable leaf만 쓸 수 있고 live sour
 두 live source는 probe 전후 bytes와 metadata가 같아야 하며 staged data는 control digest/evidence/output에
 들어가지 않고 모든 종료 경로에서 제거된다. Outermost lifecycle `finally`가 evidence/control/work root를
 소유하며 정상/실패/timeout/setup exception과 catchable SIGINT/SIGTERM에서 identity-confined,
-idempotent cleanup한다. Process stop과 evidence-thread join은 각각 deadline을 갖는다. Signal handler는
-termination만 전달하고 cleanup 작업은 수행하지 않는다. Claude OAuth와 Codex auth의
-token-like value(실행 중 staged refresh로 생긴 값 포함), bounded raw auth document, JSON-escaped
-representation은 high-risk `CREDENTIAL` inventory다. Token-like field가 8-byte 미만 string이거나
+idempotent cleanup한다. Work/control allocator와 evidence recorder는 publication 전 `BaseException`을 내부
+cleanup한다. SIGINT/SIGTERM은 allocator 생성부터 caller assignment까지 중첩 mask로 함께 block하며, handler는
+두 신호를 원자적으로 block하고 termination만 전달할 뿐 cleanup하지 않는다. Child kill/reap과 최종
+evidence/control/work cleanup은 handler 및 정확한 caller mask 복원 전에 끝난다. 그 구간의 pending signal은
+복원 뒤 caller의 원래 semantics로 전달된다. Process stop과 evidence-thread join은 각각 deadline을 갖는다.
+Claude OAuth와 Codex auth의 token-like value(실행 중 staged refresh로 생긴 값 포함)와 bounded raw auth
+document는 high-risk `CREDENTIAL` inventory다. Stdout/stderr의 JSON string token은 arbitrary surrounding text와
+NDJSON 안에서 한 번 lex/decode한다. Key/value, nested/list leaf, JSON string으로 감싼 raw document,
+대소문자 혼합 Unicode escape와 valid surrogate pair를 decoded inventory에 대조한다. 전체 item 8,192개,
+depth 64, decoded 128 KiB를 넘거나 JSON string/structure가 malformed이면 credential-backed capture를 fail
+closed하며 stable secret-derived field를 공개하지 않는다. Token-like field가 8-byte 미만 string이거나
 structured/list value이면 malformed로 fail closed하고, 긴 token의 7-byte prefix도 leak으로 분류한다.
 그런 값이 capture에 나타나면 raw value, prefix, raw auth JSON을 기록하지 않고
 `SENSITIVE_OUTPUT`으로 실패한다. 더 짧은 prefix의 모호성 때문에 credential material이 child 범위에

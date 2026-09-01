@@ -196,6 +196,26 @@ def _fake_runtime_source(
                 auth_path.chmod(0o600)
                 print(REFRESHED_CODEX_TOKEN)
                 raise SystemExit(3)
+            if MODE in {{
+                "version_unicode_escape_stdout",
+                "version_unicode_escape_stderr",
+            }}:
+                secret = (
+                    os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+                    if RUNTIME == "claude"
+                    else json.loads(
+                        (Path(os.environ["CODEX_HOME"]) / "auth.json").read_text()
+                    )["tokens"]["access_token"]
+                )
+                escaped = "".join(f"\\\\u{{ord(character):04X}}" for character in secret)
+                target = (
+                    sys.stdout
+                    if MODE == "version_unicode_escape_stdout"
+                    else sys.stderr
+                )
+                target.write('{{"version":"' + escaped + '"}}\\n')
+                print(f"{{RUNTIME}} 9.9.9")
+                raise SystemExit(0)
             print(f"{{RUNTIME}} 9.9.9")
             raise SystemExit(0)
 
@@ -368,6 +388,22 @@ def _fake_runtime_source(
                     (config_root / "auth.json").read_text()
                 )["tokens"]["access_token"]
             print(secret[:7])
+            raise SystemExit(3)
+        if MODE in {{
+            "credential_unicode_escape_fail",
+            "credential_unicode_escape_pass",
+        }} and (
+            MODE == "credential_unicode_escape_fail"
+            or (Path.cwd() / ".review").is_dir()
+        ):
+            if RUNTIME == "claude":
+                secret = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+            else:
+                secret = json.loads(
+                    (config_root / "auth.json").read_text()
+                )["tokens"]["access_token"]
+            escaped = "".join(f"\\\\u{{ord(character):04x}}" for character in secret)
+            print('{{"outer":[{{"leaf":"' + escaped + '"}}]}}')
             raise SystemExit(3)
         if MODE == "output_limit_stdout_credential_tail":
             if RUNTIME == "claude":
@@ -575,6 +611,33 @@ def _load_probe_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _json_unicode_escapes(value: str, casing: str = "upper") -> bytes:
+    units = value.encode("utf-16-be")
+    escapes = []
+    for index in range(0, len(units), 2):
+        digits = f"{int.from_bytes(units[index:index + 2], 'big'):04x}"
+        if casing == "upper":
+            digits = digits.upper()
+        elif casing == "mixed":
+            digits = "".join(
+                character.upper() if offset % 2 else character
+                for offset, character in enumerate(digits)
+            )
+        escapes.append("\\u" + digits)
+    return "".join(escapes).encode("ascii")
+
+
+def _synthetic_capture(module, *, stdout=b"", stderr=b"", exit_class="ZERO"):
+    return module.Capture(
+        0 if exit_class == "ZERO" else 3,
+        stdout,
+        stderr,
+        "1" * 64,
+        "2" * 64,
+        exit_class,
+    )
 
 
 def _assert_phase_counts(
@@ -2001,3 +2064,611 @@ def test_high_risk_leak_precedes_auth_classification(fake_runtimes, tmp_path, mo
     assert sensitivity["detected"] is True
     assert sensitivity["high_risk"] is True
     assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("casing", "stream", "exit_class"),
+    [
+        ("upper", "stdout", "ZERO"),
+        ("lower", "stderr", "ZERO"),
+        ("mixed", "stdout", "NONZERO"),
+    ],
+)
+def test_round6_json_unicode_escaped_ascii_credentials_fail_closed(
+    tmp_path, casing, stream, exit_class
+):
+    module = _load_probe_module()
+    secret = "fixture-codex-access-token"
+    encoded = _json_unicode_escapes(secret, casing)
+    stdout = b'{"type":"metadata"}\n'
+    stderr = b""
+    payload = b'{"outer":[{"leaf":"' + encoded + b'"}]}\n'
+    if stream == "stdout":
+        stdout = payload
+    else:
+        stderr = payload
+    capture = _synthetic_capture(
+        module,
+        stdout=stdout,
+        stderr=stderr,
+        exit_class=exit_class,
+    )
+
+    classification = module._classify_capture(
+        capture,
+        repo_source=tmp_path / "repo-source",
+        caller_home=tmp_path / "caller-home",
+        disposable_paths=(),
+        caller_env={},
+        credential_values=(secret.encode("ascii"),),
+    )
+
+    assert classification.failure == "SENSITIVE_OUTPUT"
+    assert classification.sensitivity == module.Sensitivity(
+        ("CREDENTIAL",), True
+    )
+
+
+@pytest.mark.parametrize("target", ["work", "control"])
+def test_round6_allocator_cleans_baseexception_before_publication(
+    tmp_path, monkeypatch, target
+):
+    module = _load_probe_module()
+    allocated = tmp_path / f"allocated-{target}"
+    interrupted = False
+    prefix = (
+        "pre-pr-tribunal-probe-"
+        if target == "work"
+        else "pre-pr-tribunal-controls-"
+    )
+
+    def allocate(*, prefix):
+        assert prefix == expected_prefix
+        allocated.mkdir(mode=0o700)
+        return str(allocated)
+
+    expected_prefix = prefix
+    monkeypatch.setattr(module.tempfile, "mkdtemp", allocate)
+    if target == "work":
+        original = Path.lstat
+
+        def interrupt(path, *args, **kwargs):
+            nonlocal interrupted
+            if path == allocated and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "lstat", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            module._prepare_work_dir(
+                None,
+                repo_source=tmp_path / "repo-source",
+                caller_home=tmp_path / "caller-home",
+            )
+    else:
+        work_dir = tmp_path / "work"
+        work_dir.mkdir(mode=0o700)
+        original = Path.resolve
+
+        def interrupt(path, *args, **kwargs):
+            nonlocal interrupted
+            if path == allocated and not interrupted:
+                interrupted = True
+                raise SystemExit(75)
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", interrupt)
+        with pytest.raises(SystemExit, match="75"):
+            module._prepare_control_root(
+                work_dir,
+                repo_source=tmp_path / "repo-source",
+                caller_home=tmp_path / "caller-home",
+            )
+
+    assert not allocated.exists()
+
+
+def test_round6_evidence_constructor_closes_socket_on_baseexception(monkeypatch):
+    module = _load_probe_module()
+    real_socket = module.socket.socket
+    created = []
+
+    def record_socket(*args, **kwargs):
+        result = real_socket(*args, **kwargs)
+        created.append(result)
+        return result
+
+    def interrupt_start(_thread):
+        raise SystemExit(76)
+
+    monkeypatch.setattr(module.socket, "socket", record_socket)
+    monkeypatch.setattr(module.threading.Thread, "start", interrupt_start)
+
+    with pytest.raises(SystemExit, match="76"):
+        module._EvidenceRecorder()
+
+    assert len(created) == 1
+    assert created[0].fileno() == -1
+
+
+@pytest.mark.parametrize("location", ["key", "nested-list"])
+def test_round6_decodes_json_keys_and_nested_list_leaves(tmp_path, location):
+    module = _load_probe_module()
+    secret = "fixture-codex-access-token"
+    encoded = _json_unicode_escapes(secret, "mixed")
+    if location == "key":
+        payload = b'{"' + encoded + b'":"metadata"}\n'
+    else:
+        payload = b'{"outer":[{"leaf":"' + encoded + b'"}]}\n'
+
+    sensitivity = module._sensitivity(
+        _synthetic_capture(module, stdout=payload),
+        repo_source=tmp_path / "repo-source",
+        caller_home=None,
+        disposable_paths=(),
+        caller_env={},
+        credential_values=(secret.encode("ascii"),),
+    )
+
+    assert sensitivity == module.Sensitivity(("CREDENTIAL",), True)
+
+
+def test_round6_decodes_json_string_wrapped_raw_auth_document(tmp_path):
+    module = _load_probe_module()
+    document = (
+        b'{"tokens":{"access_token":"fixture-codex-access-token"}}\n'
+    )
+    wrapped = b'{"document":"' + _json_unicode_escapes(
+        document.decode("utf-8"), "upper"
+    ) + b'"}\n'
+
+    sensitivity = module._sensitivity(
+        _synthetic_capture(module, stdout=wrapped),
+        repo_source=tmp_path / "repo-source",
+        caller_home=None,
+        disposable_paths=(),
+        caller_env={},
+        credential_documents=(document,),
+    )
+
+    assert sensitivity == module.Sensitivity(("CREDENTIAL",), True)
+
+
+def test_round6_normalizes_surrogate_pair_for_non_bmp_credential(tmp_path):
+    module = _load_probe_module()
+    secret = "fixture-rocket-\N{ROCKET}-access-token"
+    payload = b'{"value":"' + _json_unicode_escapes(
+        secret, "mixed"
+    ) + b'"}\n'
+
+    sensitivity = module._sensitivity(
+        _synthetic_capture(module, stderr=payload),
+        repo_source=tmp_path / "repo-source",
+        caller_home=None,
+        disposable_paths=(),
+        caller_env={},
+        credential_values=(secret.encode("utf-8"),),
+    )
+
+    assert sensitivity == module.Sensitivity(("CREDENTIAL",), True)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"value":"\\u00GG"}\n',
+        b'{"value":"metadata"\n',
+        b'{"value":"metadata"}}\n',
+        b'{"value":"metadata"]\n',
+        (b"[" * 65) + b'"metadata"' + (b"]" * 65) + b"\n",
+        b"[" + b",".join([b'""'] * 8193) + b"]\n",
+    ],
+)
+def test_round6_malformed_or_overcomplex_json_fails_closed(tmp_path, payload):
+    module = _load_probe_module()
+
+    sensitivity = module._sensitivity(
+        _synthetic_capture(module, stdout=payload),
+        repo_source=tmp_path / "repo-source",
+        caller_home=None,
+        disposable_paths=(),
+        caller_env={},
+        credential_values=(b"fixture-codex-access-token",),
+    )
+
+    assert sensitivity == module.Sensitivity(("CREDENTIAL",), True)
+
+
+def test_round6_json_complexity_budget_is_shared_across_streams(tmp_path):
+    module = _load_probe_module()
+    payload = b"[" + b",".join([b'""'] * 5000) + b"]\n"
+
+    sensitivity = module._sensitivity(
+        _synthetic_capture(module, stdout=payload, stderr=payload),
+        repo_source=tmp_path / "repo-source",
+        caller_home=None,
+        disposable_paths=(),
+        caller_env={},
+        credential_values=(b"fixture-codex-access-token",),
+    )
+
+    assert sensitivity == module.Sensitivity(("CREDENTIAL",), True)
+
+
+def test_round6_benign_json_metadata_remains_non_sensitive(tmp_path):
+    module = _load_probe_module()
+    payload = b'{"type":"metadata","items":["alpha","beta"]}\n'
+
+    sensitivity = module._sensitivity(
+        _synthetic_capture(module, stdout=payload),
+        repo_source=tmp_path / "repo-source",
+        caller_home=None,
+        disposable_paths=(),
+        caller_env={},
+        credential_values=(b"fixture-codex-access-token",),
+    )
+
+    assert sensitivity == module.Sensitivity((), False)
+
+
+@pytest.mark.parametrize(
+    ("runtime", "mode", "expected_phase"),
+    [
+        ("claude", "version_unicode_escape_stdout", "version"),
+        ("codex", "version_unicode_escape_stderr", "version"),
+        ("claude", "credential_unicode_escape_fail", "missing_verdict"),
+        ("codex", "credential_unicode_escape_pass", "pass_verdict"),
+    ],
+)
+def test_round6_unicode_escaped_credentials_are_blocked_in_every_phase(
+    fake_runtimes, tmp_path, runtime, mode, expected_phase
+):
+    fake = fake_runtimes(**{runtime: mode})
+
+    result, work_dir = _run_probe(fake, tmp_path, runtime=runtime)
+
+    runtime_report = json.loads(result.stdout)[runtime]
+    assert result.returncode != 0
+    assert runtime_report["status"] == "SENSITIVE_OUTPUT"
+    assert runtime_report["phase"] == expected_phase
+    if expected_phase == "version":
+        assert runtime_report["version"] == "WITHHELD"
+        sensitive = runtime_report
+    else:
+        assert runtime_report["version"] == f"{runtime}/9.9.9"
+        sensitive = runtime_report[expected_phase]
+    assert sensitive["sensitivity"] == {
+        "detected": True,
+        "high_risk": True,
+        "reasons": ["CREDENTIAL"],
+    }
+    assert sensitive["capture"]["stdout_sha256"] == "WITHHELD"
+    assert sensitive["capture"]["stderr_sha256"] == "WITHHELD"
+    assert not work_dir.exists()
+
+
+def _wait_for_round6_marker(path: Path, process, description: str) -> None:
+    deadline = time.monotonic() + 20
+    while not path.exists() and process.poll() is None:
+        if time.monotonic() >= deadline:
+            process.kill()
+            process.communicate(timeout=5)
+            pytest.fail(f"probe did not reach {description}")
+        time.sleep(0.02)
+    assert path.exists(), f"probe exited before {description}"
+
+
+def _round6_signal_driver(tmp_path: Path, fake: FakeRuntimes, scenario: str):
+    driver = tmp_path / f"round6-{scenario}-driver.py"
+    marker = tmp_path / f"round6-{scenario}-ready"
+    release = tmp_path / f"round6-{scenario}-release"
+    work_dir = tmp_path / f"round6-{scenario}-work"
+    controller_tmp = tmp_path / f"round6-{scenario}-tmp"
+    controller_tmp.mkdir(mode=0o700)
+    driver.write_text(
+        textwrap.dedent(
+            f"""\
+            import importlib.util
+            import os
+            from pathlib import Path
+            import sys
+            import time
+
+            probe_script = Path(os.environ["ROUND6_PROBE_SCRIPT"])
+            spec = importlib.util.spec_from_file_location(
+                "round6_probe_pre_pr_tribunal", probe_script
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            marker = Path(os.environ["ROUND6_MARKER"])
+            release = Path(os.environ["ROUND6_RELEASE"])
+            work_dir = Path(os.environ["ROUND6_WORK_DIR"])
+            scenario = {scenario!r}
+
+            def wait_for_release():
+                deadline = time.monotonic() + 20
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("round6 release timeout")
+                    time.sleep(0.01)
+
+            if scenario in {{"work-allocation", "control-allocation"}}:
+                original_mkdtemp = module.tempfile.mkdtemp
+                target_prefix = {{
+                    "work-allocation": "pre-pr-tribunal-probe-",
+                    "control-allocation": "pre-pr-tribunal-controls-",
+                }}[scenario]
+
+                def pause_mkdtemp(*, prefix):
+                    path = original_mkdtemp(prefix=prefix)
+                    if prefix == target_prefix:
+                        marker.write_text(path, encoding="utf-8")
+                        wait_for_release()
+                    return path
+
+                module.tempfile.mkdtemp = pause_mkdtemp
+            elif scenario == "recorder-handoff":
+                original_recorder = module._EvidenceRecorder
+
+                class PausingRecorder(original_recorder):
+                    def __init__(self):
+                        super().__init__()
+                        marker.write_text("owned", encoding="ascii")
+                        wait_for_release()
+
+                    def close(self):
+                        try:
+                            super().close()
+                        finally:
+                            marker.unlink(missing_ok=True)
+
+                module._EvidenceRecorder = PausingRecorder
+            elif scenario in {{"cleanup-mixed", "cleanup-transition"}}:
+                original_recorder = module._EvidenceRecorder
+
+                class PausingRecorder(original_recorder):
+                    def close(self):
+                        if scenario == "cleanup-mixed" and not marker.exists():
+                            stage = work_dir / "auth-stage/codex-auth.json"
+                            if not stage.is_file():
+                                raise RuntimeError("staged auth missing at cleanup")
+                            marker.write_text(str(stage), encoding="utf-8")
+                            wait_for_release()
+                        super().close()
+
+                module._EvidenceRecorder = PausingRecorder
+                module._verify_isolation = lambda **_kwargs: None
+                module._resolve_runtime = lambda *_args, **_kwargs: "/synthetic/codex"
+                module._probe_runtime = lambda *_args, **_kwargs: {{"status": "PASS"}}
+                if scenario == "cleanup-transition":
+                    original_block = module._block_termination_signals
+
+                    def pause_cleanup_transition():
+                        stage = work_dir / "auth-stage/codex-auth.json"
+                        if stage.is_file() and not marker.exists():
+                            marker.write_text(str(stage), encoding="utf-8")
+                            wait_for_release()
+                        return original_block()
+
+                    module._block_termination_signals = pause_cleanup_transition
+            elif scenario == "child-reap":
+                original_stop = module._stop_process_group
+
+                def pause_stop(process):
+                    if not marker.exists():
+                        marker.write_text(str(process.pid), encoding="ascii")
+                        wait_for_release()
+                    original_stop(process)
+
+                module._stop_process_group = pause_stop
+
+            arguments = [
+                "--runtime", "codex", "--repo-source",
+                os.environ["ROUND6_REPO_SOURCE"],
+            ]
+            if scenario in {{"cleanup-mixed", "cleanup-transition", "child-reap"}}:
+                arguments.extend(["--work-dir", str(work_dir)])
+            raise SystemExit(module.main(arguments))
+            """
+        ),
+        encoding="utf-8",
+    )
+    environment = dict(
+        fake.env,
+        TMPDIR=str(controller_tmp),
+        ROUND6_PROBE_SCRIPT=str(PROBE_SCRIPT),
+        ROUND6_REPO_SOURCE=str(REPO),
+        ROUND6_MARKER=str(marker),
+        ROUND6_RELEASE=str(release),
+        ROUND6_WORK_DIR=str(work_dir),
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(driver)],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return process, marker, release, work_dir, controller_tmp
+
+
+@pytest.mark.parametrize("scenario", ["work-allocation", "control-allocation"])
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_round6_signal_after_mkdtemp_waits_for_ownership_then_cleans(
+    fake_runtimes, tmp_path, scenario, signum
+):
+    fake = fake_runtimes()
+    process, marker, release, _work_dir, controller_tmp = _round6_signal_driver(
+        tmp_path, fake, scenario
+    )
+    _wait_for_round6_marker(marker, process, scenario)
+    allocated = Path(marker.read_text(encoding="utf-8"))
+
+    os.kill(process.pid, signum)
+    release.write_text("continue", encoding="ascii")
+    stdout, stderr = process.communicate(timeout=15)
+
+    assert process.returncode != 0
+    assert stderr == ""
+    assert json.loads(stdout)["status"] == "INTERRUPTED"
+    assert not allocated.exists()
+    assert not list(controller_tmp.glob("pre-pr-tribunal-probe-*"))
+    assert not list(controller_tmp.glob("pre-pr-tribunal-controls-*"))
+
+
+def test_round6_signal_during_recorder_handoff_closes_published_owner(
+    fake_runtimes, tmp_path
+):
+    fake = fake_runtimes()
+    process, marker, release, _work_dir, controller_tmp = _round6_signal_driver(
+        tmp_path, fake, "recorder-handoff"
+    )
+    _wait_for_round6_marker(marker, process, "recorder handoff")
+
+    os.kill(process.pid, signal.SIGTERM)
+    release.write_text("continue", encoding="ascii")
+    stdout, stderr = process.communicate(timeout=15)
+
+    assert process.returncode != 0
+    assert stderr == ""
+    assert json.loads(stdout)["status"] == "INTERRUPTED"
+    assert not marker.exists()
+    assert not list(controller_tmp.glob("pre-pr-tribunal-probe-*"))
+    assert not list(controller_tmp.glob("pre-pr-tribunal-controls-*"))
+
+
+def test_round6_mixed_signals_during_cleanup_are_deferred_until_roots_are_gone(
+    fake_runtimes, tmp_path
+):
+    fake = fake_runtimes()
+    process, marker, release, work_dir, controller_tmp = _round6_signal_driver(
+        tmp_path, fake, "cleanup-mixed"
+    )
+    _wait_for_round6_marker(marker, process, "cleanup pause")
+    assert Path(marker.read_text(encoding="utf-8")).is_file()
+
+    os.kill(process.pid, signal.SIGINT)
+    os.kill(process.pid, signal.SIGTERM)
+    release.write_text("continue", encoding="ascii")
+    process.communicate(timeout=15)
+
+    assert process.returncode not in (0, 1)
+    assert not work_dir.exists()
+    assert not list(controller_tmp.glob("pre-pr-tribunal-controls-*"))
+
+
+def test_round6_mixed_signals_at_cleanup_mask_transition_are_not_swallowed(
+    fake_runtimes, tmp_path
+):
+    fake = fake_runtimes()
+    process, marker, release, work_dir, controller_tmp = _round6_signal_driver(
+        tmp_path, fake, "cleanup-transition"
+    )
+    _wait_for_round6_marker(marker, process, "cleanup mask transition")
+    assert Path(marker.read_text(encoding="utf-8")).is_file()
+
+    os.kill(process.pid, signal.SIGINT)
+    os.kill(process.pid, signal.SIGTERM)
+    release.write_text("continue", encoding="ascii")
+    process.communicate(timeout=15)
+
+    assert process.returncode not in (0, 1)
+    assert not work_dir.exists()
+    assert not list(controller_tmp.glob("pre-pr-tribunal-controls-*"))
+
+
+@pytest.mark.parametrize(
+    ("mode", "ready_name"),
+    [
+        ("signal_wait_version", "signal-version-ready"),
+        ("signal_wait_phase", "signal-phase-ready"),
+    ],
+)
+def test_round6_mixed_signals_cannot_interrupt_child_kill_and_reap(
+    fake_runtimes, tmp_path, mode, ready_name
+):
+    fake = fake_runtimes(codex=mode)
+    process, marker, release, work_dir, controller_tmp = _round6_signal_driver(
+        tmp_path, fake, "child-reap"
+    )
+    _wait_for_round6_marker(work_dir / "tmp" / ready_name, process, ready_name)
+    os.kill(process.pid, signal.SIGINT)
+    _wait_for_round6_marker(marker, process, "child cleanup")
+    child_pid = int(marker.read_text(encoding="ascii"))
+
+    os.kill(process.pid, signal.SIGTERM)
+    release.write_text("continue", encoding="ascii")
+    process.communicate(timeout=15)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            child_alive = False
+            break
+        child_alive = True
+        time.sleep(0.02)
+    if child_alive:
+        try:
+            os.killpg(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    assert child_alive is False
+    assert not work_dir.exists()
+    assert not list(controller_tmp.glob("pre-pr-tribunal-controls-*"))
+
+
+def test_round6_cleanup_and_evidence_close_are_idempotent(tmp_path):
+    module = _load_probe_module()
+    root = tmp_path / "owned-root"
+    root.mkdir(mode=0o700)
+    metadata = root.lstat()
+    identity = (metadata.st_dev, metadata.st_ino)
+    evidence = module._EvidenceRecorder()
+
+    evidence.close()
+    evidence.close()
+
+    assert module._cleanup_work_dir(root, identity) is True
+    assert module._cleanup_work_dir(root, identity) is True
+
+
+def test_round6_main_restores_exact_signal_handlers_and_mask(tmp_path):
+    module = _load_probe_module()
+    original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    before_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    previous_int = signal.getsignal(signal.SIGINT)
+    previous_term = signal.getsignal(signal.SIGTERM)
+
+    def custom_int(_signum, _frame):
+        return None
+
+    def custom_term(_signum, _frame):
+        return None
+
+    try:
+        signal.signal(signal.SIGINT, custom_int)
+        signal.signal(signal.SIGTERM, custom_term)
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            exit_code = module.main(
+                [
+                    "--runtime",
+                    "claude",
+                    "--repo-source",
+                    str(tmp_path / "absent-repo"),
+                ]
+            )
+
+        assert exit_code == 2
+        assert json.loads(stdout.getvalue())["status"] == "INVALID_REPO_SOURCE"
+        assert signal.getsignal(signal.SIGINT) is custom_int
+        assert signal.getsignal(signal.SIGTERM) is custom_term
+        assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == before_mask
+    finally:
+        signal.signal(signal.SIGINT, previous_int)
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
