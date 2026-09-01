@@ -361,28 +361,27 @@ def apply_transaction(
             ):
                 raise InstallError("managed Skill source file is empty")
             raise InstallError("managed Skill source metadata required")
-    if managed:
-        if len(managed) != 2:
-            raise InstallError("managed Skill exact runtime pair required")
-        homes = {home for _entry, home, _runtime in managed}
-        runtimes = {runtime for _entry, _home, runtime in managed}
-        home = managed[0][1]
-        expected_targets = {
-            home / ".claude/skills/pre-pr-tribunal",
-            home / ".codex/skills/pre-pr-tribunal",
-        }
-        if (
-            len(homes) != 1
-            or runtimes != {".claude", ".codex"}
-            or {entry.path for entry, _home, _runtime in managed} != expected_targets
-        ):
-            raise InstallError("managed Skill exact runtime pair required")
-        first, second = (entry for entry, _home, _runtime in managed)
-        if (
-            first.target != second.target
-            or first.source_preconditions != second.source_preconditions
-        ):
-            raise InstallError("managed Skill links require the same guarded source")
+    if len(managed) != 2:
+        raise InstallError("managed Skill exact runtime pair required")
+    homes = {home for _entry, home, _runtime in managed}
+    runtimes = {runtime for _entry, _home, runtime in managed}
+    home = managed[0][1]
+    expected_targets = {
+        home / ".claude/skills/pre-pr-tribunal",
+        home / ".codex/skills/pre-pr-tribunal",
+    }
+    if (
+        len(homes) != 1
+        or runtimes != {".claude", ".codex"}
+        or {entry.path for entry, _home, _runtime in managed} != expected_targets
+    ):
+        raise InstallError("managed Skill exact runtime pair required")
+    first, second = (entry for entry, _home, _runtime in managed)
+    if (
+        first.target != second.target
+        or first.source_preconditions != second.source_preconditions
+    ):
+        raise InstallError("managed Skill links require the same guarded source")
     return _apply_transaction(entries, **kwargs)
 
 

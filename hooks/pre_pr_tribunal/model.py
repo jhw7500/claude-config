@@ -31,10 +31,8 @@ _SECRET = re.compile(
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8}|AKIA[A-Z0-9]{12}"
 )
 _HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>]+")
-_HTTP_URL_TOKEN = re.compile(
-    r"(?:^|[=\s'\"(<\[])(https?://[^\s'\"<>]+)",
-    re.IGNORECASE,
-)
+_HTTP_URL_START = re.compile(r"https?://", re.IGNORECASE)
+_SHELL_CONTROL = frozenset(";|&()<>`")
 
 
 class TribunalError(Exception):
@@ -379,10 +377,110 @@ def _text(value: object, maximum: int, *, allow_empty: bool = False) -> str:
     return value
 
 
+def _shell_quote_context(
+    text: str, end: int
+) -> tuple[str | None, bool, int, bool]:
+    quote: str | None = None
+    interpolated = False
+    substitutions = 0
+    backtick = False
+    index = 0
+    while index < end:
+        character = text[index]
+        if quote == "'":
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character == "\\":
+            index += 2
+            continue
+        if quote == '"':
+            if character == '"':
+                quote = None
+                interpolated = False
+            elif character == "`":
+                interpolated = True
+                backtick = not backtick
+            elif character == "$":
+                interpolated = True
+                if index + 1 < end and text[index + 1] == "(":
+                    substitutions += 1
+                    index += 1
+            elif substitutions and character == "(":
+                substitutions += 1
+            elif substitutions and character == ")":
+                substitutions -= 1
+            index += 1
+            continue
+        if character == "`":
+            backtick = not backtick
+            index += 1
+            continue
+        if character == "$" and index + 1 < end and text[index + 1] == "(":
+            substitutions += 1
+            index += 2
+            continue
+        if substitutions and character == "(":
+            substitutions += 1
+            index += 1
+            continue
+        if substitutions and character == ")":
+            substitutions -= 1
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            interpolated = False
+        index += 1
+    return quote, interpolated, substitutions, backtick
+
+
+def _http_url_candidate(text: str, start: int) -> tuple[str, int] | None:
+    quote, interpolated, substitutions, backtick = _shell_quote_context(text, start)
+    if interpolated or substitutions or backtick:
+        return None
+    if start:
+        previous = text[start - 1]
+        if not (
+            previous.isspace()
+            or previous in {"=", "'", '"'}
+            or previous in _SHELL_CONTROL
+        ):
+            return None
+    index = start
+    if quote is None:
+        while index < len(text):
+            character = text[index]
+            if (
+                character.isspace()
+                or character in _SHELL_CONTROL
+                or character in {"'", '"', "$", "\\"}
+            ):
+                break
+            index += 1
+    else:
+        while index < len(text):
+            character = text[index]
+            if quote == '"' and character in {"$", "`"}:
+                return None
+            if character == quote:
+                break
+            if quote == '"' and character == "\\":
+                index += 2
+                continue
+            index += 1
+    return text[start:index], index
+
+
 def _http_url_path_spans(text: str) -> tuple[tuple[int, int], ...]:
     spans: list[tuple[int, int]] = []
-    for match in _HTTP_URL_TOKEN.finditer(text):
-        token = match.group(1)
+    for match in _HTTP_URL_START.finditer(text):
+        start = match.start()
+        candidate = _http_url_candidate(text, start)
+        if candidate is None:
+            continue
+        token, _end = candidate
         try:
             parsed = urlsplit(token)
             hostname = parsed.hostname
@@ -391,7 +489,7 @@ def _http_url_path_spans(text: str) -> tuple[tuple[int, int], ...]:
             continue
         if parsed.scheme.lower() not in {"http", "https"} or not hostname:
             continue
-        path_start = match.start(1) + len(parsed.scheme) + 3 + len(parsed.netloc)
+        path_start = start + len(parsed.scheme) + 3 + len(parsed.netloc)
         spans.append((path_start, path_start + len(parsed.path)))
     return tuple(spans)
 

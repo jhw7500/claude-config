@@ -385,6 +385,57 @@ def test_tribunal_boundary_accepts_exact_matching_managed_skill_pair(
     assert all(entry.path.resolve() == source for entry in links)
 
 
+def test_tribunal_boundary_rejects_full_plan_with_both_skill_links_filtered(
+    installer, home, monkeypatch
+):
+    plans = [
+        entry
+        for entry in installer.build_plan(REPO, home)
+        if not isinstance(entry, installer.PlannedSymlink)
+    ]
+    before = _snapshot(_targets(home))
+    shared_calls = []
+    real_apply = installer._apply_transaction
+
+    def observe_apply(entries, **kwargs):
+        shared_calls.append(tuple(entries))
+        return real_apply(entries, **kwargs)
+
+    monkeypatch.setattr(installer, "_apply_transaction", observe_apply)
+
+    with pytest.raises(installer.InstallError, match="exact runtime pair required"):
+        installer.apply_transaction(
+            plans,
+            namespace="pre-pr-tribunal",
+            stamp="20260901161616",
+        )
+
+    assert shared_calls == []
+    assert _snapshot(_targets(home)) == before
+    assert _artifacts(home) == {}
+
+
+def test_tribunal_boundary_rejects_empty_direct_plan_without_shared_writer(
+    installer, monkeypatch
+):
+    shared_calls = []
+
+    def observe_apply(entries, **kwargs):
+        shared_calls.append((entries, kwargs))
+        return []
+
+    monkeypatch.setattr(installer, "_apply_transaction", observe_apply)
+
+    with pytest.raises(installer.InstallError, match="exact runtime pair required"):
+        installer.apply_transaction(
+            [],
+            namespace="pre-pr-tribunal",
+            stamp="20260901171717",
+        )
+
+    assert shared_calls == []
+
+
 def test_main_cli_path_applies_both_managed_links_with_source_guards(
     installer, home, monkeypatch
 ):

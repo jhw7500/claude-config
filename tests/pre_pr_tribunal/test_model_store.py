@@ -360,6 +360,58 @@ def test_valid_http_url_path_in_shell_assignment_is_allowed(snapshot):
     assert parsed.executions[0].command == command
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl https://example.com;/home/alice/private",
+        "curl https://example.com|/home/alice/private",
+        "curl https://example.com&/home/alice/private",
+        "curl https://example.com(/home/alice/private)",
+        "curl https://example.com)/home/alice/private",
+        "curl https://example.com>/home/alice/private",
+        "curl https://example.com</home/alice/private",
+        "curl https://example.com 2>/home/alice/private",
+        "curl https://example.com`id`/home/alice/private",
+        'curl "https://example.com$(id)/home/alice/private"',
+        'curl "https://example.com/${HOST}/home/alice/private"',
+        r"curl https://example.com/a\;/home/alice/private",
+        "echo $(curl https://example.com/home/alice/private)",
+        "echo `curl https://example.com/home/alice/private`",
+    ],
+)
+def test_shell_control_or_interpolation_ends_http_url_path_exemption(
+    snapshot, command
+):
+    item = execution(command=command)
+    with pytest.raises(SchemaError, match="EVIDENCE_SECRET_DETECTED"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "curl 'https://example.com/a;/home/alice/private'",
+        'curl "https://example.com/a|/home/alice/private"',
+        "curl 'https://example.com/a&(/home/alice/private)'",
+        r'curl "https://example.com/a\$/home/alice/private"',
+    ],
+)
+def test_quoted_literal_shell_operators_remain_valid_http_url_path(snapshot, command):
+    item = execution(command=command)
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+    assert parsed.executions[0].command == command
+
+
 def test_report_and_evidence_byte_limits_are_enforced(snapshot):
     with pytest.raises(SchemaError, match="REPORT_TOO_LARGE"):
         parse_reviewer_report(
