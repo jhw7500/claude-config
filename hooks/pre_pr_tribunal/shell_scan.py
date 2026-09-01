@@ -831,9 +831,11 @@ class _StreamingHint:
             following = self._peek(1)
             if following:
                 if following != "\n":
+                    frame.quoted = True
                     self._append(frame, following)
                 self.index += 2
             else:
+                frame.quoted = True
                 self.index += 1
             return False
         if char == "'":
@@ -1046,6 +1048,7 @@ class _StreamingHint:
         frame = self.overflow
         needs_restore = (
             frame.kind != "COMMAND"
+            or frame.terminator != ")"
             or frame.quote is not None
             or frame.phase != "EXEC"
             or frame.assignment

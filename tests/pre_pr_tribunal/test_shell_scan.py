@@ -5,6 +5,7 @@ from pre_pr_tribunal.shell_scan import (
     MAX_RECURSION,
     MAX_TOKENS,
     ScanKind,
+    ScanResult,
     scan_pr_create,
 )
 
@@ -265,6 +266,26 @@ def test_token_limited_hint_skips_numeric_fd_redirection(redirection):
     result = scan_pr_create(argument_data)
     assert result.kind is ScanKind.NO_MATCH
     assert result.reason == "TOKEN_LIMIT"
+
+
+def test_deep_backtick_child_preserves_outer_argument_context():
+    command = (
+        "echo "
+        + "$(" * (MAX_RECURSION + 1)
+        + "`$(printf x)`"
+        + ")" * (MAX_RECURSION + 1)
+        + " gh pr create"
+    )
+
+    assert scan_pr_create(command) == ScanResult(
+        ScanKind.NO_MATCH, "RECURSION_LIMIT"
+    )
+
+
+def test_escaped_digit_is_not_a_numeric_fd_hint():
+    command = ("x;" * MAX_TOKENS) + r"\2>/tmp/x gh pr create"
+
+    assert scan_pr_create(command) == ScanResult(ScanKind.NO_MATCH, "TOKEN_LIMIT")
 
 
 @pytest.mark.parametrize(
