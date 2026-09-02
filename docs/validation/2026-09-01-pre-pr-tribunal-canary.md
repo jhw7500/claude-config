@@ -277,3 +277,22 @@ run, and this checkpoint does not satisfy the required real-runtime PASS gate.
   retained in this checkpoint.
 - GitHub endpoints remained sinkholed; no real GitHub endpoint, JHW readiness action, push, merge or
   PR was used.
+
+## Schema-v2 final ordered live runtime PASS — 2026-09-02
+
+- Timestamp: `2026-09-02T14:36:26+09:00`.
+- Reviewed implementation commit: `73a06166f416ffd037a053c105af2b45083d66c4`.
+- Independent scoped review: PASS — Critical 0, Important 0, Minor 0; spec compliant and quality
+  approved.
+- Claude ran first and passed:
+  `{"claude":{"missing":{"gh_calls":0,"hook":"DENY","runtime_exit":"ZERO"},"pass":{"gh_calls":1,"hook":"ALLOW","runtime_exit":"ZERO"},"status":"PASS"},"schema":2,"status":"PASS"}`.
+- Codex ran only after Claude PASS and passed:
+  `{"codex":{"missing":{"gh_calls":0,"hook":"DENY","runtime_exit":"ZERO"},"pass":{"gh_calls":1,"hook":"ALLOW","runtime_exit":"ZERO"},"status":"PASS"},"schema":2,"status":"PASS"}`.
+- The Codex standalone executable and its present `codex-code-mode-host` sibling were exposed only
+  through validated read-only control targets; caller `.codex` remained masked. Companion-free
+  distributions retain the single-executable path.
+- Runtime stdout/stderr, prompts, credentials, paths, versions and hashes were discarded and are not
+  retained in this evidence. Only the sanitized schema-v2 marker objects above were recorded.
+- All discovered fixed `gh` paths remained replaced by the fake client and GitHub hostnames remained
+  loopback-sinkholed. No real GitHub endpoint, push, merge, PR creation, or readiness action occurred
+  during these canaries.
