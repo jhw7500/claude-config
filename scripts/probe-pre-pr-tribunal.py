@@ -3,54 +3,34 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 import argparse
-import errno
 import hashlib
 import json
 import os
 from pathlib import Path
-import re
-import selectors
-import secrets
 import shlex
 import shutil
 import signal
-import socket
 import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from typing import Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RUNTIME_TIMEOUT_SECONDS = 120.0
 INTERNAL_TIMEOUT_SECONDS = 30.0
-CAPTURE_LIMIT_BYTES = 64 * 1024
-MAX_CREDENTIAL_BYTES = 256 * 1024
-MAX_CREDENTIAL_JSON_ITEMS = 8192
-MAX_CREDENTIAL_JSON_DEPTH = 64
-MAX_CAPTURE_JSON_ITEMS = 8192
-MAX_CAPTURE_JSON_DEPTH = 64
-MAX_CAPTURE_JSON_DECODED_BYTES = CAPTURE_LIMIT_BYTES * 2
-RUNTIME_CHILD_DEADLINE_COUNT = 3
-VERDICT_CHILD_DEADLINE_COUNT = 2
-AUTH_SCHEDULING_CUSHION_SECONDS = 30
-AUTH_VALIDITY_MARGIN_SECONDS = int(
-    (RUNTIME_CHILD_DEADLINE_COUNT * RUNTIME_TIMEOUT_SECONDS)
-    + (VERDICT_CHILD_DEADLINE_COUNT * INTERNAL_TIMEOUT_SECONDS)
-    + AUTH_SCHEDULING_CUSHION_SECONDS
-)
+HOOK_OUTPUT_LIMIT_BYTES = 64 * 1024
+MARKER_LIMIT_BYTES = 64
+HOOK_MARKERS = frozenset({"D", "A", "I"})
+GH_MARKERS = frozenset({"V", "I"})
 SAFE_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 BWRAP_PATH = Path("/usr/bin/bwrap")
 CANARY_COMMAND = "gh pr create --title canary --body canary"
-PROMPT = (
-    "Use the shell tool exactly once to run: " + CANARY_COMMAND
-)
+PROMPT = "Use the shell tool exactly once to run: " + CANARY_COMMAND
 GITHUB_HOSTNAMES = (
     "github.com",
     "www.github.com",
@@ -69,46 +49,12 @@ RUNTIME_ENV_KEYS = (
     "HTTPS_PROXY",
     "NO_PROXY",
 )
-AUTH_MARKERS = (
-    b"auth unavailable",
-    b"authentication required",
-    b"authentication failed",
-    b"not authenticated",
-    b"not logged in",
-    b"login required",
-    b"invalid api key",
-    b"missing api key",
-    b"unauthorized",
-    b"http 401",
-)
-HOME_PATH = re.compile(rb"/(?:home|Users)/[^\s\x00-\x1f]+")
-VERSION = re.compile(rb"(?<![0-9])([0-9]+(?:\.[0-9]+){1,3})(?![0-9])")
-TOKEN_LIKE_KEY = re.compile(
-    r"(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|"
-    r"api[_-]?key|secret|password|credential)(?:$|[_-])",
-    re.IGNORECASE,
-)
 
 
 class ProbeFailure(Exception):
-    def __init__(self, code: str, capture: "Capture | None" = None):
+    def __init__(self, code: str):
         super().__init__(code)
         self.code = code
-        self.capture = capture
-
-
-class _TerminationSignal(BaseException):
-    def __init__(self, signum: int, previous_mask: set[signal.Signals]):
-        super().__init__(signum)
-        self.signum = signum
-        self.previous_mask = previous_mask
-
-
-@dataclass
-class _TerminationState:
-    cleanup_active: bool = False
-    deferred_signum: int | None = None
-    restore_mask: set[signal.Signals] | None = None
 
 
 class _Parser(argparse.ArgumentParser):
@@ -118,152 +64,9 @@ class _Parser(argparse.ArgumentParser):
 
 
 @dataclass(frozen=True)
-class Capture:
+class ProcessResult:
     returncode: int | None
-    stdout: bytes
-    stderr: bytes
-    stdout_sha256: str
-    stderr_sha256: str
     exit_class: str
-
-    def sanitized(self, *, withhold_hashes: bool = False) -> dict[str, str]:
-        withhold_hashes = withhold_hashes or self.exit_class == "OUTPUT_LIMIT"
-        return {
-            "exit_class": self.exit_class,
-            "stdout_sha256": "WITHHELD" if withhold_hashes else self.stdout_sha256,
-            "stderr_sha256": "WITHHELD" if withhold_hashes else self.stderr_sha256,
-        }
-
-
-@dataclass(frozen=True)
-class Sensitivity:
-    reasons: tuple[str, ...]
-    high_risk: bool
-
-    def sanitized(self) -> dict[str, object]:
-        return {
-            "detected": bool(self.reasons),
-            "high_risk": self.high_risk,
-            "reasons": list(self.reasons),
-        }
-
-
-@dataclass(frozen=True)
-class Classification:
-    failure: str | None
-    parse_valid: bool
-    denied: bool
-    sensitivity: Sensitivity
-
-
-@dataclass(frozen=True)
-class CredentialSnapshot:
-    path: Path
-    directory: str
-    filename: str
-    data: bytes
-    metadata: tuple[int, int, int, int, int, int, int, int, int, int]
-
-
-@dataclass(frozen=True)
-class ClaudeSubscriptionAuth:
-    source: CredentialSnapshot
-    access_token: str
-    expires_at_ms: int
-    secrets: tuple[bytes, ...]
-    documents: tuple[bytes, ...]
-
-
-@dataclass(frozen=True)
-class CodexSubscriptionAuth:
-    source: CredentialSnapshot
-    secrets: tuple[bytes, ...]
-    documents: tuple[bytes, ...]
-
-
-class _EvidenceRecorder:
-    def __init__(self) -> None:
-        self.address = "\x00pre-pr-tribunal-" + secrets.token_hex(16)
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._valid = 0
-        self._invalid = 0
-        self._valid_limit = 1
-        self._closed = False
-        self._socket: socket.socket | None = None
-        self._thread: threading.Thread | None = None
-        try:
-            with _blocked_termination_signals():
-                self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self._socket.bind(self.address)
-                self._socket.listen(8)
-                self._socket.settimeout(0.1)
-                self._thread = threading.Thread(target=self._serve, daemon=True)
-                self._thread.start()
-        except BaseException:
-            with _blocked_termination_signals():
-                self.close()
-            raise
-
-    def _serve(self) -> None:
-        if self._socket is None:
-            return
-        while not self._stop.is_set():
-            try:
-                connection, _address = self._socket.accept()
-            except (OSError, socket.timeout):
-                continue
-            with connection:
-                try:
-                    event = connection.recv(2)
-                    with self._lock:
-                        if event == b"V" and self._valid < self._valid_limit:
-                            self._valid += 1
-                            accepted = True
-                        else:
-                            self._invalid += 1
-                            accepted = False
-                    connection.sendall(b"1" if accepted else b"0")
-                except OSError:
-                    continue
-
-    def reset(self, *, valid_limit: int = 1) -> None:
-        if valid_limit < 1:
-            raise ProbeFailure("ISOLATION_UNAVAILABLE")
-        with self._lock:
-            self._valid = 0
-            self._invalid = 0
-            self._valid_limit = valid_limit
-
-    def counts(self) -> tuple[int, int]:
-        with self._lock:
-            return self._valid, self._invalid
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._stop.set()
-        if self._thread is not None and self._thread.is_alive():
-            try:
-                wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                with wake:
-                    wake.settimeout(0.2)
-                    wake.connect(self.address)
-            except OSError:
-                pass
-            self._thread.join(timeout=1.0)
-        if self._socket is not None:
-            try:
-                self._socket.close()
-            except OSError:
-                pass
-
-    def __enter__(self) -> "_EvidenceRecorder":
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        self.close()
 
 
 def _credential_metadata(
@@ -283,354 +86,64 @@ def _credential_metadata(
     )
 
 
-def _credential_error(error: OSError) -> str:
-    if error.errno == errno.ENOENT:
-        return "CREDENTIAL_MISSING"
-    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
-        return "CREDENTIAL_UNSAFE"
-    return "CREDENTIAL_UNREADABLE"
-
-
-def _validate_private_directory(metadata: os.stat_result) -> None:
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or stat.S_IMODE(metadata.st_mode) & 0o022
-    ):
-        raise ProbeFailure("CREDENTIAL_UNSAFE")
-
-
-def _read_secure_credential(
-    caller_home: Path,
-    directory: str,
-    filename: str,
-) -> CredentialSnapshot:
-    if (
-        not caller_home.is_absolute()
-        or directory not in {".claude", ".codex"}
-        or filename not in {".credentials.json", "auth.json"}
-    ):
-        raise ProbeFailure("CREDENTIAL_MISSING")
-    directory_flags = (
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    )
-    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+def _read_marker_log(path: Path, allowed: frozenset[str]) -> tuple[str, ...]:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
     if hasattr(os, "O_NOATIME"):
-        file_flags |= os.O_NOATIME
-    home_fd = child_fd = credential_fd = -1
+        flags |= os.O_NOATIME
+    descriptor = os.open(path, flags)
     try:
-        try:
-            home_fd = os.open(caller_home, directory_flags)
-            _validate_private_directory(os.fstat(home_fd))
-            child_fd = os.open(directory, directory_flags, dir_fd=home_fd)
-            _validate_private_directory(os.fstat(child_fd))
-            credential_fd = os.open(filename, file_flags, dir_fd=child_fd)
-        except OSError as error:
-            raise ProbeFailure(_credential_error(error)) from None
-        before = os.fstat(credential_fd)
-        mode = stat.S_IMODE(before.st_mode)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != os.geteuid()
-            or mode & 0o077
-        ):
-            raise ProbeFailure("CREDENTIAL_UNSAFE")
-        if not mode & stat.S_IRUSR:
-            raise ProbeFailure("CREDENTIAL_UNREADABLE")
-        if before.st_size > MAX_CREDENTIAL_BYTES:
-            raise ProbeFailure("CREDENTIAL_OVERSIZE")
-        chunks: list[bytes] = []
-        total = 0
-        while total <= MAX_CREDENTIAL_BYTES:
-            try:
-                chunk = os.read(
-                    credential_fd,
-                    min(65536, MAX_CREDENTIAL_BYTES + 1 - total),
-                )
-            except OSError:
-                raise ProbeFailure("CREDENTIAL_UNREADABLE") from None
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-        if total > MAX_CREDENTIAL_BYTES:
-            raise ProbeFailure("CREDENTIAL_OVERSIZE")
-        after = os.fstat(credential_fd)
-        if _credential_metadata(before) != _credential_metadata(after):
-            raise ProbeFailure("CREDENTIAL_UNSAFE")
-        return CredentialSnapshot(
-            path=caller_home / directory / filename,
-            directory=directory,
-            filename=filename,
-            data=b"".join(chunks),
-            metadata=_credential_metadata(after),
-        )
-    finally:
-        for descriptor in (credential_fd, child_fd, home_fd):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-
-
-def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    value: dict[str, object] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError("duplicate")
-        value[key] = item
-    return value
-
-
-def _validate_credential_json_bounds(value: object) -> None:
-    remaining = MAX_CREDENTIAL_JSON_ITEMS
-    stack: list[tuple[object, int]] = [(value, 0)]
-    while stack:
-        item, depth = stack.pop()
-        remaining -= 1
-        if remaining < 0 or depth > MAX_CREDENTIAL_JSON_DEPTH:
-            raise ValueError("bounds")
-        if isinstance(item, dict):
-            stack.extend((child, depth + 1) for child in item.values())
-        elif isinstance(item, list):
-            stack.extend((child, depth + 1) for child in item)
-        elif not isinstance(item, (str, int, float, bool, type(None))):
-            raise ValueError("type")
-
-
-def _strict_credential_json(raw: bytes) -> object:
-    try:
-        value = json.loads(
-            raw.decode("utf-8", "strict"),
-            object_pairs_hook=_unique_json_object,
-            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
-        )
-        _validate_credential_json_bounds(value)
-        return value
-    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
-        raise ProbeFailure("CREDENTIAL_MALFORMED") from None
-
-
-def _credential_secret_values(value: str) -> tuple[bytes, ...]:
-    try:
-        encoded = value.encode("utf-8", "strict")
-    except UnicodeEncodeError:
-        raise ProbeFailure("CREDENTIAL_MALFORMED") from None
-    if not encoded or len(encoded) < 8 or len(encoded) > MAX_CREDENTIAL_BYTES:
-        raise ProbeFailure("CREDENTIAL_MALFORMED")
-    if b"\x00" in encoded:
-        raise ProbeFailure("CREDENTIAL_MALFORMED")
-    return (encoded,)
-
-
-def _codex_token_values(value: object) -> tuple[bytes, ...]:
-    values: set[bytes] = set()
-    stack: list[object] = [value]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, dict):
-            for key, child in item.items():
-                if TOKEN_LIKE_KEY.search(key):
-                    if not isinstance(child, str):
-                        raise ProbeFailure("CREDENTIAL_MALFORMED")
-                    values.update(_credential_secret_values(child))
-                stack.append(child)
-        elif isinstance(item, list):
-            stack.extend(item)
-    if not values:
-        raise ProbeFailure("CREDENTIAL_MALFORMED")
-    return tuple(sorted(values))
-
-
-def _load_claude_subscription_auth(caller_home: Path) -> ClaudeSubscriptionAuth:
-    source = _read_secure_credential(
-        caller_home, ".claude", ".credentials.json"
-    )
-    value = _strict_credential_json(source.data)
-    try:
-        oauth = value["claudeAiOauth"]  # type: ignore[index]
-        access_token = oauth["accessToken"]
-        expires_at_ms = oauth["expiresAt"]
-    except (KeyError, TypeError):
-        raise ProbeFailure("CREDENTIAL_MALFORMED") from None
-    if (
-        not isinstance(access_token, str)
-        or not access_token
-        or "\x00" in access_token
-        or not isinstance(expires_at_ms, int)
-        or isinstance(expires_at_ms, bool)
-    ):
-        raise ProbeFailure("CREDENTIAL_MALFORMED")
-    secrets = _credential_secret_values(access_token)
-    required_until_ms = int(
-        (time.time() + AUTH_VALIDITY_MARGIN_SECONDS) * 1000
-    )
-    if expires_at_ms < required_until_ms:
-        raise ProbeFailure("CREDENTIAL_EXPIRED")
-    return ClaudeSubscriptionAuth(
-        source=source,
-        access_token=access_token,
-        expires_at_ms=expires_at_ms,
-        secrets=secrets,
-        documents=(source.data,),
-    )
-
-
-def _load_codex_subscription_auth(caller_home: Path) -> CodexSubscriptionAuth:
-    source = _read_secure_credential(caller_home, ".codex", "auth.json")
-    value = _strict_credential_json(source.data)
-    if not isinstance(value, dict):
-        raise ProbeFailure("CREDENTIAL_MALFORMED")
-    return CodexSubscriptionAuth(
-        source=source,
-        secrets=_codex_token_values(value),
-        documents=(source.data,),
-    )
-
-
-def _verify_credential_source_unchanged(source: CredentialSnapshot) -> None:
-    try:
-        current = _read_secure_credential(
-            source.path.parents[1], source.directory, source.filename
-        )
-    except ProbeFailure:
-        raise ProbeFailure("CREDENTIAL_SOURCE_CHANGED") from None
-    if current.data != source.data or current.metadata != source.metadata:
-        raise ProbeFailure("CREDENTIAL_SOURCE_CHANGED")
-
-
-def _stage_codex_auth(path: Path, data: bytes) -> None:
-    temp_path: Path | None = None
-    directory_fd = -1
-    descriptor = -1
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        parent_metadata = path.parent.lstat()
-        if (
-            not stat.S_ISDIR(parent_metadata.st_mode)
-            or stat.S_ISLNK(parent_metadata.st_mode)
-            or parent_metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(parent_metadata.st_mode) & 0o077
-        ):
-            raise OSError
-        if path.exists() or path.is_symlink():
-            metadata = path.lstat()
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or stat.S_ISLNK(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or stat.S_IMODE(metadata.st_mode) & 0o077
-            ):
-                raise OSError
-        temp_path = path.parent / f".auth-stage-{secrets.token_hex(16)}"
-        descriptor = os.open(
-            temp_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o600,
-        )
-        view = memoryview(data)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError
-            view = view[written:]
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        os.replace(temp_path, path)
-        temp_path = None
-        directory_fd = os.open(
-            path.parent,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-        )
-        os.fsync(directory_fd)
-    except (OSError, ValueError):
-        raise ProbeFailure("CREDENTIAL_STAGING_FAILED") from None
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        if directory_fd >= 0:
-            try:
-                os.close(directory_fd)
-            except OSError:
-                pass
-        if temp_path is not None:
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-
-
-def _read_codex_stage(path: Path) -> tuple[bytes, tuple[bytes, ...]]:
-    descriptor = -1
-    try:
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-        if hasattr(os, "O_NOATIME"):
-            flags |= os.O_NOATIME
-        descriptor = os.open(
-            path,
-            flags,
-        )
         before = os.fstat(descriptor)
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_uid != os.geteuid()
             or stat.S_IMODE(before.st_mode) & 0o077
-            or before.st_size > MAX_CREDENTIAL_BYTES
+            or before.st_size > MARKER_LIMIT_BYTES
         ):
-            raise OSError
-        data = bytearray()
-        while len(data) <= MAX_CREDENTIAL_BYTES:
-            chunk = os.read(
-                descriptor,
-                min(65536, MAX_CREDENTIAL_BYTES + 1 - len(data)),
-            )
-            if not chunk:
-                break
-            data.extend(chunk)
+            raise ProbeFailure("CANARY_MISMATCH")
+        raw = os.read(descriptor, MARKER_LIMIT_BYTES + 1)
         after = os.fstat(descriptor)
-        if (
-            len(data) > MAX_CREDENTIAL_BYTES
-            or _credential_metadata(before) != _credential_metadata(after)
-        ):
-            raise OSError
-        raw = bytes(data)
-        value = _strict_credential_json(raw)
-        if not isinstance(value, dict):
-            raise ProbeFailure("CREDENTIAL_MALFORMED")
-        return raw, _codex_token_values(value)
-    except ProbeFailure:
-        raise ProbeFailure("CREDENTIAL_STAGING_FAILED") from None
-    except (OSError, ValueError):
-        raise ProbeFailure("CREDENTIAL_STAGING_FAILED") from None
     finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+        os.close(descriptor)
+    if (
+        len(raw) > MARKER_LIMIT_BYTES
+        or _credential_metadata(before) != _credential_metadata(after)
+    ):
+        raise ProbeFailure("CANARY_MISMATCH")
+    try:
+        markers = tuple(line for line in raw.decode("ascii").splitlines())
+    except UnicodeDecodeError:
+        raise ProbeFailure("CANARY_MISMATCH") from None
+    if any(marker not in allowed for marker in markers):
+        raise ProbeFailure("CANARY_MISMATCH")
+    return markers
 
 
-def _capture(
-    returncode: int | None,
-    stdout: bytearray,
-    stderr: bytearray,
-    stdout_hash,
-    stderr_hash,
-    exit_class: str,
-) -> Capture:
-    return Capture(
-        returncode,
-        bytes(stdout),
-        bytes(stderr),
-        stdout_hash.hexdigest(),
-        stderr_hash.hexdigest(),
-        exit_class,
+def _phase_report(
+    result: ProcessResult,
+    *,
+    hook_log: Path,
+    gh_log: Path,
+    expected_hook: str,
+    expected_gh_calls: int,
+) -> tuple[dict[str, object], bool]:
+    hooks = _read_marker_log(hook_log, HOOK_MARKERS)
+    gh = _read_marker_log(gh_log, GH_MARKERS)
+    hook = {("D",): "DENY", ("A",): "ALLOW"}.get(hooks, "INVALID")
+    valid_calls = gh.count("V")
+    phase = {
+        "runtime_exit": result.exit_class,
+        "hook": hook,
+        "gh_calls": valid_calls,
+    }
+    matches = (
+        result.exit_class == "ZERO"
+        and hook == expected_hook
+        and valid_calls == expected_gh_calls
+        and "I" not in hooks
+        and "I" not in gh
+        and len(gh) == expected_gh_calls
     )
+    return phase, matches
 
 
 def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -656,100 +169,40 @@ def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def _run_bounded(
+def _run_runtime(
     argv: Sequence[str],
     *,
     cwd: Path,
     env: Mapping[str, str],
     timeout: float,
-) -> Capture:
-    stdout = bytearray()
-    stderr = bytearray()
-    stdout_hash = hashlib.sha256()
-    stderr_hash = hashlib.sha256()
-    selector = selectors.DefaultSelector()
+    pass_fds: Sequence[int] = (),
+) -> ProcessResult:
+    process: subprocess.Popen[bytes] | None = None
     try:
-        process = subprocess.Popen(
-            list(argv),
-            cwd=cwd,
-            env=dict(env),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-    except (OSError, ValueError):
-        selector.close()
-        raise ProbeFailure("RUNTIME_UNAVAILABLE") from None
-    assert process.stdout is not None and process.stderr is not None
-    streams = {
-        process.stdout: (stdout, stdout_hash),
-        process.stderr: (stderr, stderr_hash),
-    }
-    deadline = time.monotonic() + timeout
-    exit_class: str | None = None
-    try:
-        selector.register(process.stdout, selectors.EVENT_READ)
-        selector.register(process.stderr, selectors.EVENT_READ)
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                exit_class = "TIMEOUT"
-                _stop_process_group(process)
-                break
-            events = selector.select(min(remaining, 0.1))
-            for key, _mask in events:
-                stream = key.fileobj
-                try:
-                    chunk = os.read(stream.fileno(), 8192)
-                except OSError:
-                    chunk = b""
-                if not chunk:
-                    try:
-                        selector.unregister(stream)
-                    except Exception:
-                        pass
-                    streams.pop(stream, None)
-                    continue
-                buffer, digest = streams[stream]
-                digest.update(chunk)
-                if len(buffer) + len(chunk) > CAPTURE_LIMIT_BYTES:
-                    available = max(0, CAPTURE_LIMIT_BYTES - len(buffer))
-                    buffer.extend(chunk[:available])
-                    exit_class = "OUTPUT_LIMIT"
-                    _stop_process_group(process)
-                    break
-                buffer.extend(chunk)
-            if exit_class is not None:
-                break
-        if exit_class is None:
-            try:
-                returncode = process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                exit_class = "TIMEOUT"
-                _stop_process_group(process)
-                returncode = process.poll()
-            else:
-                exit_class = "ZERO" if returncode == 0 else "NONZERO"
-        else:
-            returncode = process.poll()
-        return _capture(
-            returncode,
-            stdout,
-            stderr,
-            stdout_hash,
-            stderr_hash,
-            exit_class,
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                cwd=cwd,
+                env=dict(env),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                pass_fds=tuple(pass_fds),
+            )
+        except (OSError, ValueError):
+            raise ProbeFailure("RUNTIME_UNAVAILABLE") from None
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _stop_process_group(process)
+            return ProcessResult(process.poll(), "TIMEOUT")
+        return ProcessResult(
+            returncode, "ZERO" if returncode == 0 else "NONZERO"
         )
     finally:
-        with _blocked_termination_signals():
-            try:
-                if process.returncode is None:
-                    _stop_process_group(process)
-            finally:
-                selector.close()
-                process.stdout.close()
-                process.stderr.close()
+        if process is not None and process.poll() is None:
+            _stop_process_group(process)
 
 
 def _internal_env(home: Path) -> dict[str, str]:
@@ -770,28 +223,35 @@ def _internal_env(home: Path) -> dict[str, str]:
 
 def _run_internal(
     argv: Sequence[str], *, cwd: Path, env: Mapping[str, str]
-) -> Capture:
-    capture = _run_bounded(
-        argv,
-        cwd=cwd,
-        env=env,
-        timeout=INTERNAL_TIMEOUT_SECONDS,
-    )
-    if capture.exit_class != "ZERO":
-        raise ProbeFailure("SETUP_FAILED", capture)
-    return capture
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        result = subprocess.run(
+            list(argv),
+            cwd=cwd,
+            env=dict(env),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=INTERNAL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        raise ProbeFailure("SETUP_FAILED") from None
+    if result.returncode != 0:
+        raise ProbeFailure("SETUP_FAILED")
+    return result
 
 
 def _runtime_env(
     caller_env: Mapping[str, str],
     *,
     runtime: str,
-    auth_source: str,
-    claude_oauth_token: str | None,
     home: Path,
     control_home: Path,
     fake_bin: Path,
     work_dir: Path,
+    hook_log: Path,
+    gh_log: Path,
 ) -> dict[str, str]:
     result = {
         "HOME": str(home),
@@ -800,20 +260,18 @@ def _runtime_env(
         "GH_CONFIG_DIR": str(work_dir / "gh-config"),
         "GH_HOST": "github.invalid",
         "GH_PROMPT_DISABLED": "1",
+        "PRE_PR_PROBE_HOOK_LOG": str(hook_log),
+        "PRE_PR_PROBE_GH_LOG": str(gh_log),
     }
     for key in RUNTIME_ENV_KEYS:
         value = caller_env.get(key)
         if value:
             result[key] = value
-    if auth_source == "environment":
-        key = "ANTHROPIC_API_KEY" if runtime == "claude" else "OPENAI_API_KEY"
-        value = caller_env.get(key)
-        if value:
-            result[key] = value
-    elif runtime == "claude":
-        if not claude_oauth_token:
-            raise ProbeFailure("CREDENTIAL_MALFORMED")
-        result["CLAUDE_CODE_OAUTH_TOKEN"] = claude_oauth_token
+    auth_key = "ANTHROPIC_API_KEY" if runtime == "claude" else "OPENAI_API_KEY"
+    auth_value = caller_env.get(auth_key)
+    if not auth_value:
+        raise ProbeFailure("CREDENTIAL_UNAVAILABLE")
+    result[auth_key] = auth_value
     result.setdefault("LANG", "C.UTF-8")
     if runtime == "claude":
         result["CLAUDE_CONFIG_DIR"] = str(control_home / ".claude")
@@ -832,10 +290,8 @@ def _prepare_work_dir(
     created = False
     try:
         if supplied is None:
-            with _blocked_termination_signals():
-                allocated = tempfile.mkdtemp(prefix="pre-pr-tribunal-probe-")
-                path = Path(allocated)
-                created = True
+            path = Path(tempfile.mkdtemp(prefix="pre-pr-tribunal-probe-"))
+            created = True
         else:
             requested = Path(supplied)
             if not requested.is_absolute() or requested.exists():
@@ -851,9 +307,8 @@ def _prepare_work_dir(
             if path in forbidden:
                 raise ProbeFailure("INVALID_WORK_DIR")
             try:
-                with _blocked_termination_signals():
-                    path.mkdir(mode=0o700)
-                    created = True
+                path.mkdir(mode=0o700)
+                created = True
             except OSError:
                 raise ProbeFailure("INVALID_WORK_DIR") from None
         metadata = path.lstat()
@@ -862,8 +317,7 @@ def _prepare_work_dir(
         return path, (metadata.st_dev, metadata.st_ino)
     except BaseException:
         if created and path is not None:
-            with _blocked_termination_signals():
-                _cleanup_unpublished_directory(path)
+            _cleanup_unpublished_directory(path)
         raise
 
 
@@ -876,10 +330,8 @@ def _prepare_control_root(
     path: Path | None = None
     created = False
     try:
-        with _blocked_termination_signals():
-            allocated = tempfile.mkdtemp(prefix="pre-pr-tribunal-controls-")
-            path = Path(allocated)
-            created = True
+        path = Path(tempfile.mkdtemp(prefix="pre-pr-tribunal-controls-"))
+        created = True
         path = path.resolve(strict=True)
         metadata = path.lstat()
         work_dir = work_dir.resolve(strict=True)
@@ -903,8 +355,7 @@ def _prepare_control_root(
         return path, (metadata.st_dev, metadata.st_ino)
     except BaseException as error:
         if created and path is not None:
-            with _blocked_termination_signals():
-                _cleanup_unpublished_directory(path)
+            _cleanup_unpublished_directory(path)
         if isinstance(error, OSError):
             raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
         raise
@@ -942,32 +393,37 @@ def _write(path: Path, data: str, mode: int) -> None:
     path.chmod(mode)
 
 
-def _make_fake_gh(
-    fake_bin: Path,
-    evidence_address: str,
-    expected_cwd: Path,
-) -> None:
+def _make_marker_log(path: Path) -> None:
+    _write(path, "", 0o600)
+
+
+def _make_fake_gh(fake_bin: Path, expected_cwd: Path) -> None:
     fake_bin.mkdir(mode=0o700)
-    source = (
-        "#!/usr/bin/python3\n"
-        "import os\n"
-        "import socket\n"
-        "import sys\n"
-        f"evidence_address = {evidence_address!r}\n"
-        f"expected_cwd = {str(expected_cwd)!r}\n"
-        "expected_argv = ['pr', 'create', '--title', 'canary', '--body', 'canary']\n"
-        "valid = sys.argv[1:] == expected_argv and os.getcwd() == expected_cwd\n"
-        "try:\n"
-        "    channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
-        "    with channel:\n"
-        "        channel.settimeout(2.0)\n"
-        "        channel.connect(evidence_address)\n"
-        "        channel.sendall(b'V' if valid else b'I')\n"
-        "        accepted = channel.recv(1) == b'1'\n"
-        "except OSError:\n"
-        "    accepted = False\n"
-        "raise SystemExit(0 if valid and accepted else 64)\n"
+    source = f'''#!/usr/bin/python3
+import os
+import sys
+
+EXPECTED_CWD = {str(expected_cwd)!r}
+EXPECTED_ARGV = ["pr", "create", "--title", "canary", "--body", "canary"]
+
+def append_marker(path, marker):
+    descriptor = os.open(
+        path,
+        os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
     )
+    try:
+        if os.write(descriptor, marker.encode("ascii") + b"\\n") != 2:
+            raise OSError
+    finally:
+        os.close(descriptor)
+
+valid = sys.argv[1:] == EXPECTED_ARGV and os.getcwd() == EXPECTED_CWD
+try:
+    append_marker(os.environ["PRE_PR_PROBE_GH_LOG"], "V" if valid else "I")
+except (KeyError, OSError):
+    raise SystemExit(64)
+raise SystemExit(0 if valid else 64)
+'''
     _write(fake_bin / "gh", source, 0o700)
 
 
@@ -989,8 +445,8 @@ ALLOWED_TOOLS = {{"claude": "Bash", "codex": "exec_command"}}
 try:
     runtime = sys.argv[1] if len(sys.argv) == 2 else ""
     allowed_tool = ALLOWED_TOOLS.get(runtime)
-    raw = sys.stdin.buffer.read({CAPTURE_LIMIT_BYTES + 1})
-    if len(raw) > {CAPTURE_LIMIT_BYTES}:
+    raw = sys.stdin.buffer.read({HOOK_OUTPUT_LIMIT_BYTES + 1})
+    if len(raw) > {HOOK_OUTPUT_LIMIT_BYTES}:
         raise ValueError
     payload = json.loads(raw.decode("utf-8", "strict"))
     tool_input = payload.get("tool_input", payload.get("toolInput", {{}}))
@@ -1022,18 +478,82 @@ sys.stdout.write(json.dumps(event, separators=(",", ":")) + "\\n")
     _write(path, source, 0o700)
 
 
-def _install_probe_guard(home: Path, guard: Path) -> None:
+def _make_hook_wrapper(path: Path) -> None:
+    source = '''#!/usr/bin/python3
+import json
+import os
+import subprocess
+import sys
+
+if len(sys.argv) != 3 or sys.argv[1] not in {"claude", "codex"}:
+    raise SystemExit(64)
+ADAPTER = sys.argv[2]
+
+def append_marker(path, marker):
+    descriptor = os.open(
+        path,
+        os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        if os.write(descriptor, marker.encode("ascii") + b"\\n") != 2:
+            raise OSError
+    finally:
+        os.close(descriptor)
+
+def strict_native_deny(raw):
+    try:
+        value = json.loads(raw.decode("utf-8", "strict"))
+        output = value["hookSpecificOutput"]
+        reason = output["permissionDecisionReason"]
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(value, dict)
+        and isinstance(output, dict)
+        and output.get("hookEventName") == "PreToolUse"
+        and output.get("permissionDecision") == "deny"
+        and isinstance(reason, str)
+        and reason.startswith("[PRE-PR-TRIBUNAL:")
+    )
+
+adapter = subprocess.run(
+    ["/usr/bin/python3", ADAPTER],
+    input=sys.stdin.buffer.read(65537),
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    timeout=30,
+    check=False,
+)
+bounded = len(adapter.stdout) <= 65536 and len(adapter.stderr) <= 65536
+if bounded and adapter.returncode == 0 and strict_native_deny(adapter.stdout):
+    marker = "D"
+elif bounded and adapter.returncode == 0 and adapter.stdout == b"":
+    marker = "A"
+else:
+    marker = "I"
+append_marker(os.environ["PRE_PR_PROBE_HOOK_LOG"], marker)
+sys.stdout.buffer.write(adapter.stdout)
+sys.stderr.buffer.write(adapter.stderr)
+raise SystemExit(adapter.returncode)
+'''
+    _write(path, source, 0o700)
+
+
+def _install_probe_guard(home: Path, guard: Path, wrapper: Path) -> None:
     targets = (
         (home / ".claude/settings.json", "claude", "Bash", "claude_hook.py"),
         (home / ".codex/hooks.json", "codex", None, "codex_hook.py"),
     )
     package = home / ".local/share/claude-config/pre_pr_tribunal"
     for path, runtime, matcher, adapter in targets:
-        command = f"/usr/bin/python3 {shlex.quote(str(guard))} {runtime}"
+        guard_command = f"/usr/bin/python3 {shlex.quote(str(guard))} {runtime}"
+        wrapper_command = (
+            f"/usr/bin/python3 {shlex.quote(str(wrapper))} "
+            f"{runtime} {shlex.quote(str(package / adapter))}"
+        )
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
-            hooks = value["hooks"]
-            groups = hooks["PreToolUse"]
+            groups = value["hooks"]["PreToolUse"]
             if not isinstance(groups, list):
                 raise TypeError
         except (KeyError, OSError, TypeError, json.JSONDecodeError):
@@ -1042,7 +562,6 @@ def _install_probe_guard(home: Path, guard: Path) -> None:
             "/usr/bin/python3 $HOME/.local/share/claude-config/"
             f"pre_pr_tribunal/{adapter}"
         )
-        replacement = f"/usr/bin/python3 {shlex.quote(str(package / adapter))}"
         replaced = 0
         for existing_group in groups:
             if not isinstance(existing_group, dict):
@@ -1051,12 +570,12 @@ def _install_probe_guard(home: Path, guard: Path) -> None:
                 if not isinstance(hook, dict):
                     raise ProbeFailure("SETUP_FAILED")
                 if hook.get("command") == installed:
-                    hook["command"] = replacement
+                    hook["command"] = wrapper_command
                     replaced += 1
         if replaced != 1:
             raise ProbeFailure("SETUP_FAILED")
         group: dict[str, object] = {
-            "hooks": [{"type": "command", "command": command}],
+            "hooks": [{"type": "command", "command": guard_command}],
         }
         if matcher is not None:
             group["matcher"] = matcher
@@ -1090,7 +609,7 @@ def _protected_digest(paths: Sequence[Path]) -> str:
         digest.update(metadata.st_dev.to_bytes(8, "big"))
         digest.update(metadata.st_ino.to_bytes(8, "big"))
         if stat.S_ISREG(metadata.st_mode):
-            if metadata.st_size > CAPTURE_LIMIT_BYTES:
+            if metadata.st_size > HOOK_OUTPUT_LIMIT_BYTES:
                 raise ProbeFailure("ISOLATION_UNAVAILABLE")
             try:
                 data = path.read_bytes()
@@ -1162,7 +681,7 @@ def _sandbox_argv(
     fake_gh: Path,
     hosts_file: Path,
     control_root: Path,
-    codex_auth_stage: Path | None,
+    evidence_dir: Path,
     caller_home: Path | None,
     env: Mapping[str, str],
 ) -> list[str]:
@@ -1171,6 +690,7 @@ def _sandbox_argv(
         work_dir = work_dir.resolve(strict=True)
         repo = repo.resolve(strict=True)
         control_root = control_root.resolve(strict=True)
+        evidence_dir = evidence_dir.resolve(strict=True)
         fake_gh = fake_gh.resolve(strict=True)
         hosts_file = hosts_file.resolve(strict=True)
         writable_paths = tuple(
@@ -1184,11 +704,12 @@ def _sandbox_argv(
         or control_root.is_relative_to(work_dir)
         or work_dir.is_relative_to(control_root)
         or repo != work_dir / "repo"
+        or evidence_dir.parent.parent != work_dir / "evidence"
         or fake_gh != control_root / "fake-bin/gh"
         or hosts_file != control_root / "hosts"
         or writable_paths
         != tuple(work_dir / name for name in ("home", "tmp", "gh-config"))
-        or any(not path.is_dir() for path in writable_paths)
+        or any(not path.is_dir() for path in (*writable_paths, evidence_dir))
     ):
         raise ProbeFailure("ISOLATION_UNAVAILABLE")
     live_config_masks: list[tuple[Path, Path]] = []
@@ -1234,7 +755,7 @@ def _sandbox_argv(
     ]
     for source, target in live_config_masks:
         arguments.extend(("--ro-bind", str(source), str(target)))
-    for source in writable_paths:
+    for source in (*writable_paths, evidence_dir):
         arguments.extend(("--bind", str(source), str(source)))
     review = repo / ".review"
     try:
@@ -1246,28 +767,6 @@ def _sandbox_argv(
     except OSError:
         raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
     arguments.extend(("--ro-bind", str(control_root), str(control_root)))
-    if codex_auth_stage is not None:
-        try:
-            stage = codex_auth_stage.resolve(strict=True)
-            stage_metadata = stage.lstat()
-            auth_target = (control_root / "home/.codex/auth.json").resolve(
-                strict=True
-            )
-            target_metadata = auth_target.lstat()
-        except OSError:
-            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-        if (
-            stage != work_dir / "auth-stage/codex-auth.json"
-            or not stat.S_ISREG(stage_metadata.st_mode)
-            or stat.S_ISLNK(stage_metadata.st_mode)
-            or stage_metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(stage_metadata.st_mode) & 0o077
-            or auth_target != control_root / "home/.codex/auth.json"
-            or not stat.S_ISREG(target_metadata.st_mode)
-            or stat.S_ISLNK(target_metadata.st_mode)
-        ):
-            raise ProbeFailure("ISOLATION_UNAVAILABLE")
-        arguments.extend(("--bind", str(stage), str(auth_target)))
     arguments.extend(("--ro-bind", str(hosts_file), "/etc/hosts"))
     for target in _system_gh_targets():
         arguments.extend(("--ro-bind", str(fake_gh), str(target)))
@@ -1286,11 +785,11 @@ def _run_sandboxed(
     fake_gh: Path,
     hosts_file: Path,
     control_root: Path,
-    codex_auth_stage: Path | None,
+    evidence_dir: Path,
     caller_home: Path | None,
     env: Mapping[str, str],
     timeout: float,
-) -> Capture:
+) -> ProcessResult:
     try:
         argv = _sandbox_argv(
             inner,
@@ -1299,11 +798,11 @@ def _run_sandboxed(
             fake_gh=fake_gh,
             hosts_file=hosts_file,
             control_root=control_root,
-            codex_auth_stage=codex_auth_stage,
+            evidence_dir=evidence_dir,
             caller_home=caller_home,
             env=env,
         )
-        return _run_bounded(
+        return _run_runtime(
             argv,
             cwd=repo,
             env={"PATH": SAFE_SYSTEM_PATH, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
@@ -1311,319 +810,13 @@ def _run_sandboxed(
         )
     except ProbeFailure as error:
         if error.code == "RUNTIME_UNAVAILABLE":
-            raise ProbeFailure("ISOLATION_UNAVAILABLE", error.capture) from None
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
         raise
 
 
-def _make_isolation_verifier(
-    path: Path,
-    *,
-    work_dir: Path,
-    repo: Path,
-    control_root: Path,
-    guard: Path,
-) -> None:
-    outside = work_dir.parent / f".{work_dir.name}.boundary-write"
-    if outside.exists():
-        raise ProbeFailure("ISOLATION_UNAVAILABLE")
-    control_home = control_root / "home"
-    control_parents = (
-        control_root,
-        control_root / "fake-bin",
-        control_home,
-        control_home / ".claude",
-        control_home / ".codex",
-        control_home / ".local",
-        control_home / ".local/share",
-        control_home / ".local/share/claude-config",
-        control_home / ".local/share/claude-config/pre_pr_tribunal",
-    )
-    control_leaves = (
-        control_root / "fake-bin/gh",
-        control_root / "hosts",
-        guard,
-        control_home / ".claude/settings.json",
-        control_home / ".codex/hooks.json",
-        control_home
-        / ".local/share/claude-config/pre_pr_tribunal/hook_common.py",
-    )
-    source = f'''#!/usr/bin/python3
-import ipaddress
-import json
-import os
-from pathlib import Path
-import shlex
-import socket
-import subprocess
-import sys
-
-WORK_DIR = Path({str(work_dir)!r})
-REPO = Path({str(repo)!r})
-CONTROL_ROOT = Path({str(control_root)!r})
-GUARD = Path({str(guard)!r})
-OUTSIDE = Path({str(outside)!r})
-CONTROL_PARENTS = tuple(Path(item) for item in {tuple(map(str, control_parents))!r})
-CONTROL_LEAVES = tuple(Path(item) for item in {tuple(map(str, control_leaves))!r})
-CANARY = ["pr", "create", "--title", "canary", "--body", "canary"]
-HOSTS = {GITHUB_HOSTNAMES!r}
-AUTH_BOUNDARY_INITIAL = b'{{"tokens":{{"access_token":"boundary-initial"}}}}\\n'
-AUTH_BOUNDARY_UPDATED = b'{{"tokens":{{"access_token":"boundary-updated"}}}}\\n'
-
-def fail(code):
-    raise SystemExit(code)
-
-if Path.cwd() != REPO:
-    fail(10)
-try:
-    with OUTSIDE.open("x", encoding="ascii") as handle:
-        handle.write("x")
-except OSError:
-    pass
-else:
-    OUTSIDE.unlink(missing_ok=True)
-    fail(11)
-
-for target in (WORK_DIR / "unexpected-write", REPO / "unexpected-write"):
-    try:
-        target.write_text("x", encoding="ascii")
-    except OSError:
-        pass
-    else:
-        target.unlink(missing_ok=True)
-        fail(12)
-
-for root in (
-    Path(os.environ["HOME"]),
-    Path(os.environ["TMPDIR"]),
-    Path(os.environ["GH_CONFIG_DIR"]),
-):
-    scratch = root / "boundary-write"
-    scratch.write_text("x", encoding="ascii")
-    scratch.unlink()
-
-auth_leaf = Path(os.environ["CODEX_HOME"]) / "auth.json"
-if auth_leaf.read_bytes() != AUTH_BOUNDARY_INITIAL:
-    fail(26)
-auth_leaf.write_bytes(AUTH_BOUNDARY_UPDATED)
-if auth_leaf.read_bytes() != AUTH_BOUNDARY_UPDATED:
-    fail(27)
-
-for target in CONTROL_PARENTS:
-    marker = target / "probe-control-mutation"
-    try:
-        marker.write_text("forged", encoding="ascii")
-    except OSError:
-        pass
-    else:
-        marker.unlink(missing_ok=True)
-        fail(13)
-    try:
-        target.rename(target.with_name(target.name + ".moved"))
-    except OSError:
-        pass
-    else:
-        fail(14)
-
-for target in CONTROL_LEAVES:
-    for action in ("write", "unlink", "rename"):
-        try:
-            if action == "write":
-                target.write_bytes(b"forged")
-            elif action == "unlink":
-                target.unlink()
-            else:
-                target.rename(target.with_name(target.name + ".moved"))
-        except OSError:
-            pass
-        else:
-            fail(15)
-
-commands = [
-    ["/usr/bin/gh", *CANARY],
-    ["/usr/bin/env", "PATH=/usr/bin:/bin", "gh", *CANARY],
-    ["/bin/sh", "-c", "command -p gh pr create --title canary --body canary"],
-]
-for command in commands:
-    result = subprocess.run(command, cwd=REPO, capture_output=True, check=False)
-    if result.returncode != 0 or result.stdout or result.stderr:
-        fail(16)
-
-base = {{
-    "hook_event_name": "PreToolUse",
-    "tool_name": "Bash",
-    "cwd": str(REPO),
-    "tool_input": {{"command": {CANARY_COMMAND!r}}},
-}}
-exact = subprocess.run(
-    ["/usr/bin/python3", str(GUARD), "claude"],
-    input=json.dumps(base).encode("utf-8"),
-    capture_output=True,
-    check=False,
-)
-if exact.returncode != 0 or exact.stdout or exact.stderr:
-    fail(17)
-for runtime, payload in (
-    ("claude", {{**base, "tool_input": {{"command": "gh pr create --title other --body canary"}}}}),
-    ("claude", {{**base, "cwd": str(REPO.parent)}}),
-    ("codex", {{**base, "tool_name": "apply_patch", "tool_input": {{"patch": "forged"}}}}),
-    ("codex", {{**base, "tool_name": "unknown_tool", "tool_input": {{}}}}),
-):
-    rejected = subprocess.run(
-        ["/usr/bin/python3", str(GUARD), runtime],
-        input=json.dumps(payload).encode("utf-8"),
-        capture_output=True,
-        check=False,
-    )
-    try:
-        event = json.loads(rejected.stdout.decode("utf-8", "strict"))
-        decision = event["hookSpecificOutput"]["permissionDecision"]
-    except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
-        fail(18)
-    if rejected.returncode != 0 or rejected.stderr or decision != "deny":
-        fail(19)
-
-for runtime, config, tool_name in (
-    ("claude", CONTROL_ROOT / "home/.claude/settings.json", "Bash"),
-    ("codex", CONTROL_ROOT / "home/.codex/hooks.json", "exec_command"),
-):
-    try:
-        groups = json.loads(config.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
-        commands = [
-            shlex.split(hook["command"])
-            for group in groups
-            for hook in group["hooks"]
-        ]
-    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-        fail(20)
-    if len(commands) != 2:
-        fail(21)
-    payload = {{
-        **base,
-        "tool_name": tool_name,
-    }}
-    guard_result = subprocess.run(
-        commands[0],
-        input=json.dumps(payload).encode("utf-8"),
-        capture_output=True,
-        check=False,
-    )
-    gate_result = subprocess.run(
-        commands[1],
-        input=json.dumps(payload).encode("utf-8"),
-        capture_output=True,
-        check=False,
-    )
-    try:
-        gate_event = json.loads(gate_result.stdout.decode("utf-8", "strict"))
-        gate_decision = gate_event["hookSpecificOutput"]["permissionDecision"]
-    except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
-        fail(22)
-    if (
-        guard_result.returncode != 0
-        or guard_result.stdout
-        or guard_result.stderr
-        or gate_result.returncode != 0
-        or gate_result.stderr
-        or gate_decision != "deny"
-    ):
-        fail(23)
-
-hosts_text = Path("/etc/hosts").read_text(encoding="ascii")
-if "api.anthropic.com" in hosts_text or "api.openai.com" in hosts_text:
-    fail(24)
-for hostname in HOSTS:
-    addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
-    if not addresses or any(
-        not ipaddress.ip_address(item[4][0]).is_loopback for item in addresses
-    ):
-        fail(25)
-    try:
-        connection = socket.create_connection((hostname, 443), timeout=0.05)
-    except OSError:
-        pass
-    else:
-        connection.close()
-'''
-    _write(path, source, 0o700)
-
-
-def _verify_isolation(
-    *,
-    work_dir: Path,
-    repo: Path,
-    home: Path,
-    control_root: Path,
-    fake_gh: Path,
-    hosts_file: Path,
-    guard: Path,
-    evidence: _EvidenceRecorder,
-    caller_home: Path | None = None,
-) -> None:
-    verifier = work_dir / "verify-isolation.py"
-    auth_stage = work_dir / "auth-stage/codex-auth.json"
-    auth_boundary_initial = b'{"tokens":{"access_token":"boundary-initial"}}\n'
-    auth_boundary_updated = b'{"tokens":{"access_token":"boundary-updated"}}\n'
-    try:
-        (work_dir / "tmp").mkdir(mode=0o700, exist_ok=True)
-        (work_dir / "gh-config").mkdir(mode=0o700, exist_ok=True)
-        auth_stage.parent.mkdir(mode=0o700, exist_ok=True)
-    except OSError:
-        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-    if auth_stage.exists() or auth_stage.is_symlink():
-        raise ProbeFailure("ISOLATION_UNAVAILABLE")
-    _write(auth_stage, auth_boundary_initial.decode("ascii"), 0o600)
-    _make_isolation_verifier(
-        verifier,
-        work_dir=work_dir,
-        repo=repo,
-        control_root=control_root,
-        guard=guard,
-    )
-    control_home = control_root / "home"
-    environment = {
-        "HOME": str(home),
-        "PATH": f"{fake_gh.parent}:{SAFE_SYSTEM_PATH}",
-        "LANG": "C.UTF-8",
-        "LC_ALL": "C.UTF-8",
-        "TMPDIR": str(work_dir / "tmp"),
-        "GH_CONFIG_DIR": str(work_dir / "gh-config"),
-        "GH_HOST": "github.invalid",
-        "GH_PROMPT_DISABLED": "1",
-        "CLAUDE_CONFIG_DIR": str(control_home / ".claude"),
-        "CODEX_HOME": str(control_home / ".codex"),
-    }
-    before = _protected_digest((control_root,))
-    evidence.reset(valid_limit=3)
-    try:
-        capture = _run_sandboxed(
-            ["/usr/bin/python3", str(verifier)],
-            work_dir=work_dir,
-            repo=repo,
-            fake_gh=fake_gh,
-            hosts_file=hosts_file,
-            control_root=control_root,
-            codex_auth_stage=auth_stage,
-            caller_home=caller_home,
-            env=environment,
-            timeout=INTERNAL_TIMEOUT_SECONDS,
-        )
-    except ProbeFailure:
-        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-    counts = evidence.counts()
-    evidence.reset()
-    after = _protected_digest((control_root,))
-    if (
-        capture.exit_class != "ZERO"
-        or capture.stdout
-        or capture.stderr
-        or counts != (3, 0)
-        or before != after
-        or auth_stage.read_bytes() != auth_boundary_updated
-    ):
-        raise ProbeFailure("ISOLATION_UNAVAILABLE", capture)
-
-
-def _git(repo: Path, home: Path, *arguments: str) -> Capture:
+def _git(
+    repo: Path, home: Path, *arguments: str
+) -> subprocess.CompletedProcess[bytes]:
     return _run_internal(
         ["/usr/bin/git", "-C", str(repo), *arguments],
         cwd=repo,
@@ -1718,17 +911,14 @@ def _create_pass_verdict(
         ):
             raise ValueError
     except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-        raise ProbeFailure("SETUP_FAILED", begin) from None
+        raise ProbeFailure("SETUP_FAILED") from None
     report_paths: list[Path] = []
     for reviewer in "ABC":
         report = {
             "schema": 1,
             "reviewer": reviewer,
             "round": 1,
-            "snapshot": {
-                "head_sha": head_sha,
-                "diff_sha256": diff_sha256,
-            },
+            "snapshot": {"head_sha": head_sha, "diff_sha256": diff_sha256},
             "status": "complete",
             "findings": [],
             "executions": [],
@@ -1800,261 +990,71 @@ def _runtime_argv(
     ]
 
 
-def _contains_deny(node: object) -> bool:
-    if isinstance(node, dict):
-        decision = node.get("permissionDecision")
-        reason = node.get("permissionDecisionReason")
-        if (
-            decision == "deny"
-            and isinstance(reason, str)
-            and (
-                "PRE-PR-TRIBUNAL:" in reason
-                or "PRE-PR-PROBE:COMMAND_REJECTED" in reason
-            )
-        ):
-            return True
-        return any(_contains_deny(value) for value in node.values())
-    if isinstance(node, list):
-        return any(_contains_deny(value) for value in node)
-    return False
+def _make_phase_logs(
+    work_dir: Path, runtime: str, phase: str
+) -> tuple[Path, Path, Path]:
+    evidence_dir = work_dir / "evidence" / runtime / phase
+    evidence_dir.mkdir(parents=True, mode=0o700)
+    evidence_dir.chmod(0o700)
+    hook_log = evidence_dir / "hook.log"
+    gh_log = evidence_dir / "gh.log"
+    _make_marker_log(hook_log)
+    _make_marker_log(gh_log)
+    return evidence_dir, hook_log, gh_log
 
 
-def _parse_runtime_output(raw: bytes) -> tuple[bool, bool]:
-    lines = [line for line in raw.splitlines() if line.strip()]
-    if not lines:
-        return False, False
-    denied = False
-    try:
-        for line in lines:
-            denied = denied or _contains_deny(json.loads(line.decode("utf-8", "strict")))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
-        return False, False
-    return True, denied
-
-
-def _decoded_json_strings(
-    raw: bytes,
-    budget: list[int],
-) -> tuple[tuple[bytes, ...], bool]:
-    decoded: list[bytes] = []
-    structure: list[int] = []
-    index = 0
-    while index < len(raw):
-        byte = raw[index]
-        if byte == 0x22:
-            start = index
-            index += 1
-            while index < len(raw):
-                byte = raw[index]
-                if byte == 0x22:
-                    break
-                if byte == 0x5C:
-                    index += 2
-                    continue
-                if byte < 0x20:
-                    return tuple(decoded), True
-                index += 1
-            if index >= len(raw):
-                return tuple(decoded), True
-            budget[0] -= 1
-            if budget[0] < 0:
-                return tuple(decoded), True
-            try:
-                value = json.loads(raw[start:index + 1].decode("utf-8", "strict"))
-                encoded = value.encode("utf-8", "strict")
-            except (UnicodeError, ValueError, RecursionError):
-                return tuple(decoded), True
-            budget[1] -= len(encoded)
-            if budget[1] < 0:
-                return tuple(decoded), True
-            decoded.append(encoded)
-        elif byte in (0x5B, 0x7B):
-            structure.append(byte)
-            budget[0] -= 1
-            if len(structure) > MAX_CAPTURE_JSON_DEPTH or budget[0] < 0:
-                return tuple(decoded), True
-        elif byte in (0x5D, 0x7D):
-            budget[0] -= 1
-            expected = 0x5B if byte == 0x5D else 0x7B
-            if not structure or structure[-1] != expected or budget[0] < 0:
-                return tuple(decoded), True
-            structure.pop()
-        index += 1
-    return tuple(decoded), bool(structure)
-
-
-def _sensitivity(
-    capture: Capture,
-    *,
-    repo_source: Path,
-    caller_home: Path | None,
-    disposable_paths: Sequence[Path],
-    caller_env: Mapping[str, str],
-    credential_values: Sequence[bytes] = (),
-    credential_documents: Sequence[bytes] = (),
-) -> Sensitivity:
-    raw = capture.stdout + b"\x00" + capture.stderr
-    json_budget = [MAX_CAPTURE_JSON_ITEMS, MAX_CAPTURE_JSON_DECODED_BYTES]
-    stdout_strings, stdout_suspicious = _decoded_json_strings(
-        capture.stdout, json_budget
-    )
-    stderr_strings, stderr_suspicious = _decoded_json_strings(
-        capture.stderr, json_budget
-    )
-    decoded_strings = stdout_strings + stderr_strings
-    surfaces = (raw, *decoded_strings)
-    suspicious_json = stdout_suspicious or stderr_suspicious
-    reasons: set[str] = set()
-    if any(b"TOKEN_CANARY" in surface for surface in surfaces):
-        reasons.add("TOKEN_LITERAL")
-
-    def includes(path: Path | None) -> bool:
-        if path is None:
-            return False
-        encoded = os.fsencode(path)
-        return bool(
-            encoded
-            and encoded != b"/"
-            and any(encoded in surface for surface in surfaces)
-        )
-
-    if includes(caller_home):
-        reasons.add("CALLER_HOME")
-    if includes(repo_source):
-        reasons.add("REPO_SOURCE")
-    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
-        value = caller_env.get(key)
-        encoded = value.encode("utf-8", "ignore") if value else b""
-        if value and len(value) >= 4 and any(
-            encoded in surface for surface in surfaces
-        ):
-            reasons.add("API_KEY")
-    credential_matches: set[bytes] = set()
-    for value in credential_values:
-        if not value:
-            continue
-        credential_matches.add(value)
-        if len(value) >= 7:
-            credential_matches.add(value[:7])
-        if len(value) >= 8:
-            credential_matches.add(value[:8])
-    document_matches = {value for value in credential_documents if value}
-    if any(
-        value in surface
-        for value in credential_matches | document_matches
-        for surface in surfaces
-    ):
-        reasons.add("CREDENTIAL")
-    if suspicious_json:
-        if credential_matches or document_matches:
-            reasons.add("CREDENTIAL")
-        elif any(
-            caller_env.get(key)
-            for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
-        ):
-            reasons.add("API_KEY")
-    if any(includes(path) for path in disposable_paths):
-        reasons.add("DISPOSABLE_PATH")
-    if any(HOME_PATH.search(surface) for surface in surfaces):
-        reasons.add("GENERIC_HOME")
-    high_risk = bool(
-        reasons
-        & {
-            "TOKEN_LITERAL",
-            "CALLER_HOME",
-            "REPO_SOURCE",
-            "API_KEY",
-            "CREDENTIAL",
-        }
-    )
-    return Sensitivity(tuple(sorted(reasons)), high_risk)
-
-
-def _classify_capture(
-    capture: Capture,
-    *,
-    repo_source: Path,
-    caller_home: Path | None,
-    disposable_paths: Sequence[Path],
-    caller_env: Mapping[str, str],
-    credential_values: Sequence[bytes] = (),
-    credential_documents: Sequence[bytes] = (),
-) -> Classification:
-    sensitivity = _sensitivity(
-        capture,
-        repo_source=repo_source,
-        caller_home=caller_home,
-        disposable_paths=disposable_paths,
-        caller_env=caller_env,
-        credential_values=credential_values,
-        credential_documents=credential_documents,
-    )
-    if sensitivity.high_risk:
-        return Classification("SENSITIVE_OUTPUT", False, False, sensitivity)
-    valid, denied = _parse_runtime_output(capture.stdout)
-    if capture.exit_class == "TIMEOUT":
-        return Classification("TIMEOUT", valid, denied, sensitivity)
-    if capture.exit_class == "OUTPUT_LIMIT":
-        return Classification("OUTPUT_LIMIT", valid, denied, sensitivity)
-    lowered = (capture.stdout + b"\n" + capture.stderr).lower()
-    if capture.exit_class == "NONZERO":
-        if any(marker in lowered for marker in AUTH_MARKERS):
-            return Classification("AUTH_UNAVAILABLE", valid, denied, sensitivity)
-        if sensitivity.reasons:
-            return Classification("SENSITIVE_OUTPUT", valid, denied, sensitivity)
-        return Classification("RUNTIME_NONZERO", valid, denied, sensitivity)
-    if sensitivity.reasons:
-        return Classification("SENSITIVE_OUTPUT", valid, denied, sensitivity)
-    if not valid:
-        return Classification("MALFORMED_OUTPUT", valid, denied, sensitivity)
-    return Classification(None, valid, denied, sensitivity)
-
-
-def _version_capture(
-    executable: str,
+def _verify_isolation(
     *,
     work_dir: Path,
     repo: Path,
-    fake_gh: Path,
-    hosts_file: Path,
+    home: Path,
     control_root: Path,
-    codex_auth_stage: Path | None,
+    control_home: Path,
+    fake_bin: Path,
+    hosts_file: Path,
     caller_home: Path | None,
-    env: Mapping[str, str],
-) -> Capture:
-    capture = _run_sandboxed(
-        [executable, "--version"],
+) -> None:
+    evidence_dir, hook_log, gh_log = _make_phase_logs(
+        work_dir, "isolation", "preflight"
+    )
+    environment = {
+        "HOME": str(home),
+        "PATH": f"{fake_bin}:{SAFE_SYSTEM_PATH}",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TMPDIR": str(work_dir / "tmp"),
+        "GH_CONFIG_DIR": str(work_dir / "gh-config"),
+        "GH_HOST": "github.invalid",
+        "GH_PROMPT_DISABLED": "1",
+        "CLAUDE_CONFIG_DIR": str(control_home / ".claude"),
+        "CODEX_HOME": str(control_home / ".codex"),
+        "PRE_PR_PROBE_HOOK_LOG": str(hook_log),
+        "PRE_PR_PROBE_GH_LOG": str(gh_log),
+    }
+    before = _protected_digest((control_root,))
+    result = _run_sandboxed(
+        ["/usr/bin/true"],
         work_dir=work_dir,
         repo=repo,
-        fake_gh=fake_gh,
+        fake_gh=fake_bin / "gh",
         hosts_file=hosts_file,
         control_root=control_root,
-        codex_auth_stage=codex_auth_stage,
+        evidence_dir=evidence_dir,
         caller_home=caller_home,
-        env=env,
-        timeout=RUNTIME_TIMEOUT_SECONDS,
+        env=environment,
+        timeout=INTERNAL_TIMEOUT_SECONDS,
     )
-    if capture.exit_class != "ZERO":
-        raise ProbeFailure("RUNTIME_UNAVAILABLE", capture)
-    return capture
-
-
-def _extract_version(runtime: str, capture: Capture) -> str:
-    match = VERSION.search(capture.stdout)
-    version = match.group(1).decode("ascii") if match is not None else "unknown"
-    return f"{runtime}/{version}"
+    after = _protected_digest((control_root,))
+    if result.exit_class != "ZERO" or before != after:
+        raise ProbeFailure("ISOLATION_UNAVAILABLE")
 
 
 def _probe_runtime(
     runtime: str,
     *,
     executable: str,
-    auth_source: str,
-    subscription_auth: ClaudeSubscriptionAuth | CodexSubscriptionAuth | None,
-    codex_auth_stage: Path | None,
     caller_env: Mapping[str, str],
     caller_home: Path | None,
-    repo_source: Path,
     work_dir: Path,
     home: Path,
     control_root: Path,
@@ -2064,266 +1064,71 @@ def _probe_runtime(
     hosts_file: Path,
     cli: Path,
     control_sha256: str,
-    evidence: _EvidenceRecorder,
 ) -> dict[str, object]:
-    credential_values: set[bytes] = set()
-    credential_documents: set[bytes] = set()
-    claude_oauth_token: str | None = None
-    if subscription_auth is not None:
-        credential_values.update(subscription_auth.secrets)
-        credential_documents.update(subscription_auth.documents)
-        if isinstance(subscription_auth, ClaudeSubscriptionAuth):
-            claude_oauth_token = subscription_auth.access_token
-
-    def refresh_codex_secrets() -> str | None:
-        if codex_auth_stage is None:
-            return None
-        try:
-            raw, refreshed = _read_codex_stage(codex_auth_stage)
-        except ProbeFailure:
-            return "CREDENTIAL_STAGING_FAILED"
-        credential_values.update(refreshed)
-        credential_documents.add(raw)
-        return None
-
-    environment = _runtime_env(
-        caller_env,
-        runtime=runtime,
-        auth_source=auth_source,
-        claude_oauth_token=claude_oauth_token,
-        home=home,
-        control_home=control_home,
-        fake_bin=fake_bin,
-        work_dir=work_dir,
-    )
-    disposable_paths = (work_dir, home, repo, control_root, fake_bin)
-    environment_auth_key = (
-        "ANTHROPIC_API_KEY" if runtime == "claude" else "OPENAI_API_KEY"
-    )
-    auth_hashes_withheld = bool(
-        subscription_auth is not None
-        or (
-            auth_source == "environment"
-            and caller_env.get(environment_auth_key)
+    phase_results: dict[str, dict[str, object]] = {}
+    for phase, expected_hook, expected_gh_calls in (
+        ("missing", "DENY", 0),
+        ("pass", "ALLOW", 1),
+    ):
+        _remove_review(repo)
+        if phase == "pass":
+            _create_pass_verdict(cli, repo, home, runtime)
+        evidence_dir, hook_log, gh_log = _make_phase_logs(
+            work_dir, runtime, phase
         )
-    )
-    try:
-        version_capture = _version_capture(
-            executable,
+        environment = _runtime_env(
+            caller_env,
+            runtime=runtime,
+            home=home,
+            control_home=control_home,
+            fake_bin=fake_bin,
+            work_dir=work_dir,
+            hook_log=hook_log,
+            gh_log=gh_log,
+        )
+        result = _run_sandboxed(
+            _runtime_argv(
+                runtime,
+                executable,
+                control_home=control_home,
+                repo=repo,
+            ),
             work_dir=work_dir,
             repo=repo,
             fake_gh=fake_bin / "gh",
             hosts_file=hosts_file,
             control_root=control_root,
-            codex_auth_stage=codex_auth_stage,
+            evidence_dir=evidence_dir,
             caller_home=caller_home,
             env=environment,
+            timeout=RUNTIME_TIMEOUT_SECONDS,
         )
-        stage_failure = refresh_codex_secrets()
-        version_sensitivity = _sensitivity(
-            version_capture,
-            repo_source=repo_source,
-            caller_home=caller_home,
-            disposable_paths=disposable_paths,
-            caller_env=caller_env,
-            credential_values=tuple(credential_values),
-            credential_documents=tuple(credential_documents),
-        )
-        if version_sensitivity.high_risk:
-            return {
-                "status": "SENSITIVE_OUTPUT",
-                "phase": "version",
-                "version": "WITHHELD",
-                "version_capture_sha256": "WITHHELD",
-                "capture": version_capture.sanitized(withhold_hashes=True),
-                "sensitivity": version_sensitivity.sanitized(),
-            }
-        if stage_failure is not None:
-            return {
-                "status": stage_failure,
-                "phase": "version",
-                "version": "WITHHELD",
-                "version_capture_sha256": "WITHHELD",
-                "capture": version_capture.sanitized(withhold_hashes=True),
-                "sensitivity": Sensitivity(("CREDENTIAL",), True).sanitized(),
-            }
-        if version_sensitivity.reasons:
-            return {
-                "status": "SENSITIVE_OUTPUT",
-                "phase": "version",
-                "version": "WITHHELD",
-                "version_capture_sha256": "WITHHELD",
-                "capture": version_capture.sanitized(withhold_hashes=True),
-                "sensitivity": version_sensitivity.sanitized(),
-            }
-        version = _extract_version(runtime, version_capture)
-        version_capture_sha256 = (
-            "WITHHELD"
-            if auth_hashes_withheld
-            else version_capture.stdout_sha256
-        )
-        if _protected_digest((control_root,)) != control_sha256:
-            return {
-                "status": "ISOLATION_BREACH",
-                "phase": "version",
-                "version": version,
-                "version_capture_sha256": version_capture_sha256,
-                "controls_intact": False,
-                "control_sha256": control_sha256,
-                "capture": version_capture.sanitized(
-                    withhold_hashes=auth_hashes_withheld
-                ),
-            }
-        captures: dict[str, dict[str, str]] = {}
-        phase_results: dict[str, dict[str, object]] = {}
-        for phase in ("missing_verdict", "pass_verdict"):
-            _remove_review(repo)
-            if phase == "pass_verdict":
-                _create_pass_verdict(cli, repo, home, runtime)
-            evidence.reset()
-            capture = _run_sandboxed(
-                _runtime_argv(
-                    runtime,
-                    executable,
-                    control_home=control_home,
-                    repo=repo,
-                ),
-                work_dir=work_dir,
-                repo=repo,
-                fake_gh=fake_bin / "gh",
-                hosts_file=hosts_file,
-                control_root=control_root,
-                codex_auth_stage=codex_auth_stage,
-                caller_home=caller_home,
-                env=environment,
-                timeout=RUNTIME_TIMEOUT_SECONDS,
+        if result.exit_class == "TIMEOUT":
+            return {"status": "TIMEOUT"}
+        if result.exit_class != "ZERO":
+            return {"status": "RUNTIME_FAILED"}
+        try:
+            phase_report, matches = _phase_report(
+                result,
+                hook_log=hook_log,
+                gh_log=gh_log,
+                expected_hook=expected_hook,
+                expected_gh_calls=expected_gh_calls,
             )
-            stage_failure = refresh_codex_secrets()
-            classification = _classify_capture(
-                capture,
-                repo_source=repo_source,
-                caller_home=caller_home,
-                disposable_paths=disposable_paths,
-                caller_env=caller_env,
-                credential_values=tuple(credential_values),
-                credential_documents=tuple(credential_documents),
+        except ProbeFailure as error:
+            return {"status": error.code}
+        phase_results[phase] = phase_report
+        try:
+            controls_intact = (
+                _protected_digest((control_root,)) == control_sha256
             )
-            withhold_hashes = (
-                auth_hashes_withheld or classification.sensitivity.high_risk
-            )
-            if stage_failure is not None:
-                withhold_hashes = True
-            sanitized_capture = capture.sanitized(
-                withhold_hashes=withhold_hashes
-            )
-            captures[phase] = sanitized_capture
-            count, invalid_count = evidence.counts()
-            try:
-                controls_intact = (
-                    _protected_digest((control_root,)) == control_sha256
-                )
-            except ProbeFailure:
-                controls_intact = False
-            phase_results[phase] = {
-                "denied": classification.denied,
-                "parse_valid": classification.parse_valid,
-                "canary_count": count,
-                "invalid_call_count": invalid_count,
-                "capture": sanitized_capture,
-                "sensitivity": classification.sensitivity.sanitized(),
-                "controls_intact": controls_intact,
-                "control_sha256": control_sha256,
-            }
-            if classification.failure == "SENSITIVE_OUTPUT":
-                return {
-                    "status": classification.failure,
-                    "phase": phase,
-                    "version": version,
-                    "version_capture_sha256": version_capture_sha256,
-                    **phase_results,
-                    "captures": captures,
-                }
-            if stage_failure is not None:
-                phase_results[phase]["sensitivity"] = Sensitivity(
-                    ("CREDENTIAL",), True
-                ).sanitized()
-                return {
-                    "status": stage_failure,
-                    "phase": phase,
-                    "version": version,
-                    "version_capture_sha256": version_capture_sha256,
-                    **phase_results,
-                    "captures": captures,
-                }
-            if not controls_intact:
-                return {
-                    "status": "ISOLATION_BREACH",
-                    "phase": phase,
-                    "version": version,
-                    "version_capture_sha256": version_capture_sha256,
-                    **phase_results,
-                    "captures": captures,
-                }
-            if classification.failure is not None:
-                return {
-                    "status": classification.failure,
-                    "phase": phase,
-                    "version": version,
-                    "version_capture_sha256": version_capture_sha256,
-                    **phase_results,
-                    "captures": captures,
-                }
-            expected_denied = phase == "missing_verdict"
-            expected_count = 0 if expected_denied else 1
-            if (
-                classification.denied is not expected_denied
-                or count != expected_count
-                or invalid_count != 0
-            ):
-                return {
-                    "status": "CANARY_MISMATCH",
-                    "phase": phase,
-                    "version": version,
-                    "version_capture_sha256": version_capture_sha256,
-                    **phase_results,
-                    "captures": captures,
-                }
-        return {
-            "status": "PASS",
-            "version": version,
-            "version_capture_sha256": version_capture_sha256,
-            **phase_results,
-            "captures": captures,
-        }
-    except ProbeFailure as error:
-        result: dict[str, object] = {"status": error.code}
-        if error.capture is not None:
-            stage_failure = refresh_codex_secrets()
-            sensitivity = _sensitivity(
-                error.capture,
-                repo_source=repo_source,
-                caller_home=caller_home,
-                disposable_paths=disposable_paths,
-                caller_env=caller_env,
-                credential_values=tuple(credential_values),
-                credential_documents=tuple(credential_documents),
-            )
-            if sensitivity.high_risk:
-                result["status"] = "SENSITIVE_OUTPUT"
-                result["sensitivity"] = sensitivity.sanitized()
-            elif stage_failure is not None:
-                result["status"] = stage_failure
-                result["sensitivity"] = Sensitivity(
-                    ("CREDENTIAL",), True
-                ).sanitized()
-            result["capture"] = error.capture.sanitized(
-                withhold_hashes=(
-                    auth_hashes_withheld
-                    or sensitivity.high_risk
-                    or stage_failure is not None
-                )
-            )
-        return result
+        except ProbeFailure:
+            controls_intact = False
+        if not controls_intact:
+            return {"status": "ISOLATION_BREACH", **phase_results}
+        if not matches:
+            return {"status": "CANARY_MISMATCH", **phase_results}
+    return {"status": "PASS", **phase_results}
 
 
 def _resolve_runtime(name: str, caller_env: Mapping[str, str]) -> str | None:
@@ -2356,107 +1161,22 @@ def _emit(report: Mapping[str, object]) -> None:
     sys.stdout.write(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n")
 
 
-_TERMINATION_SIGNALS = frozenset((signal.SIGINT, signal.SIGTERM))
-
-
-def _block_termination_signals() -> set[signal.Signals]:
-    try:
-        return signal.pthread_sigmask(signal.SIG_BLOCK, _TERMINATION_SIGNALS)
-    except (AttributeError, OSError, ValueError):
-        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-
-
-def _restore_termination_mask(mask: set[signal.Signals]) -> None:
-    try:
-        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-    except (AttributeError, OSError, ValueError):
-        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-
-
-@contextmanager
-def _blocked_termination_signals():
-    previous_mask = _block_termination_signals()
-    try:
-        yield
-    finally:
-        _restore_termination_mask(previous_mask)
-
-
-def _install_termination_handlers(
-    state: _TerminationState,
-) -> dict[int, object]:
-    previous: dict[int, object] = {}
-
-    def terminate(signum: int, _frame: object) -> None:
-        previous_mask = _block_termination_signals()
-        if state.restore_mask is None:
-            state.restore_mask = previous_mask
-        if state.cleanup_active:
-            if state.deferred_signum is None:
-                state.deferred_signum = signum
-            return
-        raise _TerminationSignal(signum, previous_mask)
-
-    try:
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            previous[signum] = signal.getsignal(signum)
-            signal.signal(signum, terminate)
-    except (OSError, ValueError):
-        _set_termination_handlers(previous)
-        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-    return previous
-
-
-def _set_termination_handlers(
-    handlers: Mapping[int, object],
-) -> bool:
-    restored = True
-    for signum, handler in handlers.items():
-        try:
-            signal.signal(signum, handler)
-        except (OSError, ValueError):
-            restored = False
-    return restored
-
-
-def _begin_termination_cleanup(
-    state: _TerminationState,
-) -> set[signal.Signals]:
-    state.cleanup_active = True
-    return _block_termination_signals()
-
-
 def _cleanup_owned_directory(
-    path: Path | None,
-    identity: tuple[int, int] | None,
+    path: Path | None, identity: tuple[int, int] | None
 ) -> bool:
     if path is None or identity is None:
         return True
-    try:
-        return _cleanup_work_dir(path, identity)
-    except BaseException:
-        return False
+    return _cleanup_work_dir(path, identity)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     report: dict[str, object] = {"schema": SCHEMA_VERSION, "status": "BLOCKED"}
     exit_code = 1
-    evidence: _EvidenceRecorder | None = None
     work_dir: Path | None = None
     identity: tuple[int, int] | None = None
     control_root: Path | None = None
     control_identity: tuple[int, int] | None = None
     cleanup_ok = True
-    cleanup_previous_mask: set[signal.Signals] | None = None
-    termination_restore_mask: set[signal.Signals] | None = None
-    termination_state = _TerminationState()
-    try:
-        with _blocked_termination_signals():
-            pass
-        previous_handlers = _install_termination_handlers(termination_state)
-    except ProbeFailure:
-        _emit({"schema": SCHEMA_VERSION, "status": "ISOLATION_UNAVAILABLE"})
-        return 1
     try:
         arguments = _parser().parse_args(argv)
         repo_raw = Path(arguments.repo_source)
@@ -2476,24 +1196,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 caller_home = Path(home_raw).resolve(strict=False)
             except (OSError, RuntimeError):
                 caller_home = None
-        with _blocked_termination_signals():
-            work_dir, identity = _prepare_work_dir(
-                arguments.work_dir,
-                repo_source=repo_source,
-                caller_home=caller_home,
-            )
-        with _blocked_termination_signals():
-            control_root, control_identity = _prepare_control_root(
-                work_dir,
-                repo_source=repo_source,
-                caller_home=caller_home,
-            )
+        work_dir, identity = _prepare_work_dir(
+            arguments.work_dir,
+            repo_source=repo_source,
+            caller_home=caller_home,
+        )
+        control_root, control_identity = _prepare_control_root(
+            work_dir,
+            repo_source=repo_source,
+            caller_home=caller_home,
+        )
         probe_home = work_dir / "home"
         probe_repo = work_dir / "repo"
         control_home = control_root / "home"
         fake_bin = control_root / "fake-bin"
         hosts_file = control_root / "hosts"
         guard = control_root / "probe-command-guard.py"
+        wrapper = control_root / "probe-hook-wrapper.py"
         probe_home.mkdir(mode=0o700)
         control_home.mkdir(mode=0o700)
         (control_root / "credential-mask/.claude").mkdir(
@@ -2503,27 +1222,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         (work_dir / "tmp").mkdir(mode=0o700)
         (work_dir / "gh-config").mkdir(mode=0o700)
         _create_probe_repo(probe_repo, probe_home)
-        try:
-            with _blocked_termination_signals():
-                evidence = _EvidenceRecorder()
-        except OSError:
-            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-        _make_fake_gh(fake_bin, evidence.address, probe_repo)
+        _make_fake_gh(fake_bin, probe_repo)
         _make_hosts_file(hosts_file)
         cli = _install(repo_source, control_home, probe_repo)
         _make_probe_guard(guard, probe_repo)
-        _install_probe_guard(control_home, guard)
-        _write(control_home / ".codex/auth.json", "{}\n", 0o600)
+        _make_hook_wrapper(wrapper)
+        _install_probe_guard(control_home, guard, wrapper)
         control_sha256 = _protected_digest((control_root,))
         _verify_isolation(
             work_dir=work_dir,
             repo=probe_repo,
             home=probe_home,
             control_root=control_root,
-            fake_gh=fake_bin / "gh",
+            control_home=control_home,
+            fake_bin=fake_bin,
             hosts_file=hosts_file,
-            guard=guard,
-            evidence=evidence,
             caller_home=caller_home,
         )
         selected = (
@@ -2533,119 +1246,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         success = True
         for runtime in selected:
-            executable = _resolve_runtime(runtime, caller_env)
-            if executable is None:
-                runtime_report: dict[str, object] = {"status": "RUNTIME_UNAVAILABLE"}
+            if arguments.auth_source == "subscription":
+                runtime_report: dict[str, object] = {
+                    "status": "CREDENTIAL_UNAVAILABLE"
+                }
             else:
-                subscription_auth: (
-                    ClaudeSubscriptionAuth | CodexSubscriptionAuth | None
-                ) = None
-                codex_auth_stage: Path | None = None
-                try:
-                    if arguments.auth_source == "subscription":
-                        if caller_home is None:
-                            raise ProbeFailure("CREDENTIAL_MISSING")
-                        if runtime == "claude":
-                            subscription_auth = _load_claude_subscription_auth(
-                                caller_home
-                            )
-                        else:
-                            subscription_auth = _load_codex_subscription_auth(
-                                caller_home
-                            )
-                            codex_auth_stage = (
-                                work_dir / "auth-stage/codex-auth.json"
-                            )
-                            _stage_codex_auth(
-                                codex_auth_stage, subscription_auth.source.data
-                            )
-                    runtime_report = _probe_runtime(
-                        runtime,
-                        executable=executable,
-                        auth_source=arguments.auth_source,
-                        subscription_auth=subscription_auth,
-                        codex_auth_stage=codex_auth_stage,
-                        caller_env=caller_env,
-                        caller_home=caller_home,
-                        repo_source=repo_source,
-                        work_dir=work_dir,
-                        home=probe_home,
-                        control_root=control_root,
-                        control_home=control_home,
-                        repo=probe_repo,
-                        fake_bin=fake_bin,
-                        hosts_file=hosts_file,
-                        cli=cli,
-                        control_sha256=control_sha256,
-                        evidence=evidence,
-                    )
-                    if subscription_auth is not None:
-                        _verify_credential_source_unchanged(
-                            subscription_auth.source
+                executable = _resolve_runtime(runtime, caller_env)
+                if executable is None:
+                    runtime_report = {"status": "RUNTIME_UNAVAILABLE"}
+                else:
+                    try:
+                        runtime_report = _probe_runtime(
+                            runtime,
+                            executable=executable,
+                            caller_env=caller_env,
+                            caller_home=caller_home,
+                            work_dir=work_dir,
+                            home=probe_home,
+                            control_root=control_root,
+                            control_home=control_home,
+                            repo=probe_repo,
+                            fake_bin=fake_bin,
+                            hosts_file=hosts_file,
+                            cli=cli,
+                            control_sha256=control_sha256,
                         )
-                except ProbeFailure as error:
-                    runtime_report = {"status": error.code}
+                    except ProbeFailure as error:
+                        runtime_report = {"status": error.code}
             report[runtime] = runtime_report
             success = success and runtime_report.get("status") == "PASS"
         report["status"] = "PASS" if success else "BLOCKED"
         exit_code = 0 if success else 1
-        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
-    except _TerminationSignal as error:
-        termination_restore_mask = error.previous_mask
-        report = {"schema": SCHEMA_VERSION, "status": "INTERRUPTED"}
-        exit_code = 128 + error.signum
-        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
     except KeyboardInterrupt:
         report = {"schema": SCHEMA_VERSION, "status": "INTERRUPTED"}
         exit_code = 130
-        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
     except ProbeFailure as error:
         report = {"schema": SCHEMA_VERSION, "status": error.code}
-        if error.capture is not None:
-            report["capture"] = error.capture.sanitized()
         exit_code = (
             2
-            if error.code
-            in {"USAGE", "INVALID_REPO_SOURCE", "INVALID_WORK_DIR"}
+            if error.code in {"USAGE", "INVALID_REPO_SOURCE", "INVALID_WORK_DIR"}
             else 1
         )
-        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
     except Exception:
         report = {"schema": SCHEMA_VERSION, "status": "SETUP_FAILED"}
         exit_code = 1
-        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
-    except BaseException:
-        cleanup_previous_mask = _begin_termination_cleanup(termination_state)
-        raise
     finally:
-        if cleanup_previous_mask is None:
-            cleanup_previous_mask = _block_termination_signals()
-        evidence_cleanup_ok = True
-        if evidence is not None:
-            try:
-                evidence.close()
-            except BaseException:
-                evidence_cleanup_ok = False
         control_cleanup_ok = _cleanup_owned_directory(
             control_root, control_identity
         )
         work_cleanup_ok = _cleanup_owned_directory(work_dir, identity)
-        handlers_restored = _set_termination_handlers(previous_handlers)
-        cleanup_ok = (
-            evidence_cleanup_ok
-            and control_cleanup_ok
-            and work_cleanup_ok
-            and handlers_restored
-        )
-        if termination_restore_mask is not None:
-            restore_mask = termination_restore_mask
-        elif termination_state.restore_mask is not None:
-            restore_mask = termination_state.restore_mask
-        else:
-            restore_mask = cleanup_previous_mask
-        _restore_termination_mask(restore_mask)
-        if termination_state.deferred_signum is not None:
-            os.kill(os.getpid(), termination_state.deferred_signum)
+        cleanup_ok = control_cleanup_ok and work_cleanup_ok
     if not cleanup_ok:
         report = {"schema": SCHEMA_VERSION, "status": "CLEANUP_FAILED"}
         exit_code = 1
