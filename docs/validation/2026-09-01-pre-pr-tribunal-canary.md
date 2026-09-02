@@ -264,3 +264,16 @@ run, and this checkpoint does not satisfy the required real-runtime PASS gate.
 - No live credential or config was read; no real Claude/Codex/`gh`, GitHub/provider endpoint,
   network probe, JHW readiness action, push, merge or PR was used. This is synthetic evidence only,
   not a live canary or final whole-branch review.
+
+## Schema-v2 live runtime checkpoint — 2026-09-02
+
+- Timestamp: `2026-09-02T12:53:31+09:00`.
+- Independent scoped review: PASS — Critical 0, Important 0.
+- Commit: `9b02e6d8d2f31d418c6cca8948a34a01e84ac7fc`.
+- Overall status: `BLOCKED`.
+- Claude: `{"status":"CANARY_MISMATCH","missing":{"runtime_exit":"ZERO","hook":"INVALID","gh_calls":0}}`.
+- Codex: not run; the ordered gate stopped immediately after the non-PASS Claude result.
+- The spec remains incomplete. No runtime output, credential, prompt, path, version or hash was
+  retained in this checkpoint.
+- GitHub endpoints remained sinkholed; no real GitHub endpoint, JHW readiness action, push, merge or
+  PR was used.
