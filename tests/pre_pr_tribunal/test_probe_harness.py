@@ -798,6 +798,31 @@ def test_marker_reader_rejects_oversized_non_ascii_or_unknown_content(
     assert raised.value.code == "CANARY_MISMATCH"
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"D",
+        b"D\r\n",
+        b"D\r",
+        b"D\v",
+        b"D\f",
+        b"D\x1c",
+        b"D\x1d",
+        b"D\x1e",
+    ],
+)
+def test_marker_reader_rejects_noncanonical_record_delimiters(tmp_path, raw):
+    module = _load_probe_module()
+    marker = tmp_path / "hook.log"
+    marker.write_bytes(raw)
+    marker.chmod(0o600)
+
+    with pytest.raises(module.ProbeFailure) as raised:
+        module._read_marker_log(marker, module.HOOK_MARKERS)
+
+    assert raised.value.code == "CANARY_MISMATCH"
+
+
 def test_marker_log_rejects_exactly_65_bytes(tmp_path):
     module = _load_probe_module()
     marker = tmp_path / "hook.log"
@@ -903,6 +928,74 @@ def test_environment_canary_requires_missing_deny_then_pass_allow(
             hook="ALLOW",
             gh_calls=1,
         )
+    assert not work_dir.exists()
+
+
+def test_all_runtime_stops_before_any_codex_path_after_claude_failure(
+    fake_runtimes, tmp_path, monkeypatch
+):
+    module = _load_probe_module()
+    codex_auth = b'{"auth_mode":"chatgpt","tokens":{"access_token":"synthetic"}}\n'
+    fake = fake_runtimes(codex_auth_document=codex_auth)
+    _write_claude_subscription(
+        fake,
+        expires_at_ms=int((time.time() + 3600) * 1000),
+    )
+    for key, value in fake.env.items():
+        monkeypatch.setenv(key, value)
+
+    codex_events: list[str] = []
+    original_resolve_runtime = module._resolve_runtime
+    original_load_codex_auth = module._load_codex_subscription_auth
+    original_read_credential = module._read_secure_credential
+
+    def track_resolver(name, caller_env):
+        if name == "codex":
+            codex_events.append("resolver")
+        return original_resolve_runtime(name, caller_env)
+
+    def track_codex_loader(caller_home):
+        codex_events.append("credential-loader")
+        return original_load_codex_auth(caller_home)
+
+    def track_credential_source(caller_home, directory_name, filename):
+        if directory_name == ".codex":
+            codex_events.append("credential-source")
+        return original_read_credential(caller_home, directory_name, filename)
+
+    def synthetic_probe(runtime, **_kwargs):
+        if runtime == "codex":
+            codex_events.append("runtime")
+            return {"status": "PASS"}
+        return {"status": "RUNTIME_FAILED"}
+
+    monkeypatch.setattr(module, "_resolve_runtime", track_resolver)
+    monkeypatch.setattr(module, "_load_codex_subscription_auth", track_codex_loader)
+    monkeypatch.setattr(module, "_read_secure_credential", track_credential_source)
+    monkeypatch.setattr(module, "_verify_isolation", lambda **_kwargs: None)
+    monkeypatch.setattr(module, "_probe_runtime", synthetic_probe)
+    stdout = io.StringIO()
+    work_dir = tmp_path / "probe"
+
+    with redirect_stdout(stdout):
+        exit_code = module.main(
+            [
+                "--runtime",
+                "all",
+                "--repo-source",
+                str(REPO),
+                "--work-dir",
+                str(work_dir),
+            ]
+        )
+
+    assert exit_code == 1
+    assert codex_events == []
+    assert json.loads(stdout.getvalue()) == {
+        "schema": 2,
+        "status": "BLOCKED",
+        "claude": {"status": "RUNTIME_FAILED"},
+    }
     assert not work_dir.exists()
 
 
@@ -1119,6 +1212,30 @@ def test_claude_subscription_expiry_margin_is_exactly_330_seconds(
         with pytest.raises(module.ProbeFailure) as raised:
             module._load_claude_subscription_auth(fake.caller_home)
         assert raised.value.code == "CREDENTIAL_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("synthetic\0token", id="nul"),
+        pytest.param("synthetic\ud800token", id="posix-unencodable"),
+    ],
+)
+def test_claude_subscription_rejects_tokens_unsafe_for_process_environment(
+    fake_runtimes, token
+):
+    module = _load_probe_module()
+    fake = fake_runtimes()
+    _write_claude_subscription(
+        fake,
+        expires_at_ms=int((time.time() + 3600) * 1000),
+        token=token,
+    )
+
+    with pytest.raises(module.ProbeFailure) as raised:
+        module._load_claude_subscription_auth(fake.caller_home)
+
+    assert raised.value.code == "CREDENTIAL_UNAVAILABLE"
 
 
 def test_claude_subscription_injects_token_only_in_child_environment(

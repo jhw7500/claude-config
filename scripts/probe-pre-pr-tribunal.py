@@ -236,6 +236,11 @@ def _load_claude_subscription_auth(
             < (time.time() + AUTH_VALIDITY_MARGIN_SECONDS) * 1000
         ):
             raise ProbeFailure("CREDENTIAL_UNAVAILABLE")
+        try:
+            if b"\0" in os.fsencode(access_token):
+                raise ProbeFailure("CREDENTIAL_UNAVAILABLE")
+        except UnicodeEncodeError:
+            raise ProbeFailure("CREDENTIAL_UNAVAILABLE") from None
         return ClaudeSubscriptionAuth(
             source=source,
             access_token=access_token,
@@ -339,11 +344,13 @@ def _read_marker_log(path: Path, allowed: frozenset[str]) -> tuple[str, ...]:
         or _credential_metadata(before) != _credential_metadata(after)
     ):
         raise ProbeFailure("CANARY_MISMATCH")
-    try:
-        markers = tuple(line for line in raw.decode("ascii").splitlines())
-    except UnicodeDecodeError:
-        raise ProbeFailure("CANARY_MISMATCH") from None
-    if any(marker not in allowed for marker in markers):
+    if len(raw) % 2:
+        raise ProbeFailure("CANARY_MISMATCH")
+    markers = tuple(chr(raw[offset]) for offset in range(0, len(raw), 2))
+    if any(
+        raw[offset + 1] != ord("\n") or marker not in allowed
+        for offset, marker in zip(range(0, len(raw), 2), markers)
+    ):
         raise ProbeFailure("CANARY_MISMATCH")
     return markers
 
@@ -1864,7 +1871,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     except ProbeFailure as error:
                         runtime_report = {"status": error.code}
                 report[runtime] = runtime_report
-                success = success and runtime_report.get("status") == "PASS"
+                runtime_passed = runtime_report.get("status") == "PASS"
+                success = success and runtime_passed
+                if (
+                    arguments.runtime == "all"
+                    and runtime == "claude"
+                    and not runtime_passed
+                ):
+                    break
             report["status"] = "PASS" if success else "BLOCKED"
             exit_code = 0 if success else 1
     except KeyboardInterrupt:

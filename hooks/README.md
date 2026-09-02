@@ -134,7 +134,7 @@ Report는 schema v2의 bounded JSON이며 성공 예시는 다음과 같다.
 }
 ```
 
-Stable public failure status는 정확히 다음 8개다.
+Runtime/execution 단계의 stable public failure status는 정확히 다음 8개다.
 
 - `CREDENTIAL_UNAVAILABLE`
 - `RUNTIME_UNAVAILABLE`
@@ -144,6 +144,9 @@ Stable public failure status는 정확히 다음 8개다.
 - `CANARY_MISMATCH`
 - `SETUP_FAILED`
 - `CLEANUP_FAILED`
+
+CLI 입력 검증 단계의 public failure status는 별도로 `USAGE`,
+`INVALID_REPO_SOURCE`, `INVALID_WORK_DIR`를 사용한다.
 
 기본 `--auth-source subscription`은 caller의 기존 subscription login만 사용하며 API key로
 fallback하지 않는다. API-key billing을 의도적으로 승인한 경우에만
