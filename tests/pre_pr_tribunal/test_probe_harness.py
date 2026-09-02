@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import subprocess
@@ -43,6 +44,12 @@ class IsolationFixture:
     hosts_file: Path
     guard: Path
     wrapper: Path
+
+
+@dataclass(frozen=True)
+class ProcessHandle:
+    pid: int
+    pidfd: int
 
 
 @pytest.fixture
@@ -431,25 +438,31 @@ def _wait_for(
     assert path.exists()
 
 
-def _wait_until_process_absent(pid: int, *, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.02)
-    pytest.fail(f"process {pid} survived")
+def _pidfd_ready(handle: ProcessHandle, timeout: float) -> bool:
+    poller = select.poll()
+    poller.register(handle.pidfd, select.POLLIN)
+    return bool(poller.poll(max(0, int(timeout * 1000))))
 
 
-def _process_descendants(root_pid: int) -> list[int]:
+def _wait_until_process_absent(
+    handle: ProcessHandle, *, timeout: float
+) -> None:
+    if not _pidfd_ready(handle, timeout):
+        pytest.fail(f"process {handle.pid} survived")
+
+
+def _process_descendants(root_pid: int) -> dict[int, int]:
     parents: dict[int, int] = {}
+    start_times: dict[int, int] = {}
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
             suffix = (entry / "stat").read_text(encoding="ascii").rsplit(")", 1)[1]
-            parents[int(entry.name)] = int(suffix.split()[1])
+            fields = suffix.split()
+            pid = int(entry.name)
+            parents[pid] = int(fields[1])
+            start_times[pid] = int(fields[19])
         except (IndexError, OSError, ValueError):
             continue
     descendants: set[int] = set()
@@ -462,7 +475,111 @@ def _process_descendants(root_pid: int) -> list[int]:
         }
         descendants.update(children)
         frontier = children
-    return sorted(descendants)
+    return {pid: start_times[pid] for pid in sorted(descendants)}
+
+
+def _open_descendant_pidfds(root_pid: int) -> list[ProcessHandle]:
+    descendants = _process_descendants(root_pid)
+    handles: list[ProcessHandle] = []
+    try:
+        for pid, start_time in descendants.items():
+            try:
+                pidfd = os.pidfd_open(pid, 0)
+            except ProcessLookupError:
+                continue
+            try:
+                verified = (
+                    _process_descendants(root_pid).get(pid) == start_time
+                )
+            except BaseException:
+                os.close(pidfd)
+                raise
+            if not verified:
+                os.close(pidfd)
+                continue
+            handles.append(ProcessHandle(pid=pid, pidfd=pidfd))
+        return handles
+    except BaseException:
+        for handle in handles:
+            os.close(handle.pidfd)
+        raise
+
+
+def _cleanup_process_handles(handles: list[ProcessHandle]) -> None:
+    for handle in handles:
+        try:
+            if not _pidfd_ready(handle, 0):
+                try:
+                    signal.pidfd_send_signal(
+                        handle.pidfd, signal.SIGKILL, None, 0
+                    )
+                except ProcessLookupError:
+                    pass
+                _pidfd_ready(handle, 1.0)
+        finally:
+            os.close(handle.pidfd)
+
+
+def test_pidfd_lifecycle_never_signals_numeric_descendant(monkeypatch):
+    absent = type("Handle", (), {"pid": 101, "pidfd": 10})()
+    alive = type("Handle", (), {"pid": 202, "pidfd": 20})()
+    numeric_signals: list[tuple[int, int]] = []
+    pidfd_signals: list[tuple[int, int, object, int]] = []
+    closed: list[int] = []
+
+    def reject_numeric_signal(pid, signum):
+        numeric_signals.append((pid, signum))
+        raise AssertionError("numeric descendant PID was signaled")
+
+    monkeypatch.setattr(os, "kill", reject_numeric_signal)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_pidfd_ready",
+        lambda handle, _timeout: handle.pidfd == absent.pidfd,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        signal,
+        "pidfd_send_signal",
+        lambda pidfd, signum, siginfo, flags: pidfd_signals.append(
+            (pidfd, signum, siginfo, flags)
+        ),
+    )
+    monkeypatch.setattr(os, "close", closed.append)
+
+    _wait_until_process_absent(absent, timeout=5.0)
+    _cleanup_process_handles([absent, alive])
+
+    assert numeric_signals == []
+    assert pidfd_signals == [(20, signal.SIGKILL, None, 0)]
+    assert closed == [10, 20]
+
+
+def test_descendant_pidfd_partial_open_failure_closes_prior_handle(monkeypatch):
+    opened: list[int] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_process_descendants",
+        lambda _root_pid: {101: 1, 202: 2},
+    )
+
+    def open_pidfd(pid, flags):
+        assert flags == 0
+        opened.append(pid)
+        if pid == 202:
+            raise OSError("synthetic pidfd failure")
+        return 10
+
+    monkeypatch.setattr(os, "pidfd_open", open_pidfd)
+    monkeypatch.setattr(os, "close", closed.append)
+
+    with pytest.raises(OSError, match="synthetic pidfd failure"):
+        _open_descendant_pidfds(99)
+
+    assert opened == [101, 202]
+    assert closed == [10]
 
 
 def _regular_files(root: Path) -> Iterator[Path]:
@@ -1402,9 +1519,7 @@ def test_runtime_timeout_reaps_its_own_process_group(tmp_path):
     )
 
     assert result.exit_class == "TIMEOUT"
-    pids = [int(value) for value in pid_file.read_text().splitlines()]
-    for pid in pids:
-        _wait_until_process_absent(pid, timeout=5.0)
+    assert len(pid_file.read_text().splitlines()) == 2
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
@@ -1423,12 +1538,12 @@ def test_default_signal_semantics_leave_no_runtime_or_credential_copy(
     )
     process, work_dir, _release = _start_probe(fake, tmp_path, runtime="codex")
     pid_file = work_dir / "tmp/runtime-pids"
-    pids: list[int] = []
+    handles: list[ProcessHandle] = []
     try:
         _wait_for(pid_file, process)
         assert len(pid_file.read_text().splitlines()) == 2
-        pids = _process_descendants(process.pid)
-        assert len(pids) >= 2
+        handles = _open_descendant_pidfds(process.pid)
+        assert len(handles) >= 2
 
         os.kill(process.pid, signum)
         stdout, stderr = process.communicate(timeout=15)
@@ -1440,18 +1555,14 @@ def test_default_signal_semantics_leave_no_runtime_or_credential_copy(
             assert not work_dir.exists()
         else:
             assert stdout == ""
-        for pid in pids:
-            _wait_until_process_absent(pid, timeout=5.0)
+        for handle in handles:
+            _wait_until_process_absent(handle, timeout=5.0)
         assert not _tree_contains(work_dir, sentinel)
     finally:
         if process.poll() is None:
             os.kill(process.pid, signal.SIGKILL)
             process.communicate(timeout=5)
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        _cleanup_process_handles(handles)
         shutil.rmtree(work_dir, ignore_errors=True)
         shutil.rmtree(tmp_path / "controller-tmp", ignore_errors=True)
 
@@ -1476,12 +1587,12 @@ def test_timeout_leaves_no_runtime_or_credential_copy(
         runtime_timeout=1.0,
     )
     pid_file = work_dir / "tmp/runtime-pids"
-    pids: list[int] = []
+    handles: list[ProcessHandle] = []
     try:
         _wait_for(pid_file, process)
         assert len(pid_file.read_text().splitlines()) == 2
-        pids = _process_descendants(process.pid)
-        assert len(pids) >= 2
+        handles = _open_descendant_pidfds(process.pid)
+        assert len(handles) >= 2
         stdout, stderr = process.communicate(timeout=15)
 
         assert process.returncode != 0
@@ -1489,19 +1600,15 @@ def test_timeout_leaves_no_runtime_or_credential_copy(
         report = json.loads(stdout)
         assert report["status"] == "BLOCKED"
         assert report["codex"] == {"status": "TIMEOUT"}
-        for pid in pids:
-            _wait_until_process_absent(pid, timeout=5.0)
+        for handle in handles:
+            _wait_until_process_absent(handle, timeout=5.0)
         assert not _tree_contains(work_dir, sentinel)
         assert not work_dir.exists()
     finally:
         if process.poll() is None:
             os.kill(process.pid, signal.SIGKILL)
             process.communicate(timeout=5)
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        _cleanup_process_handles(handles)
         shutil.rmtree(work_dir, ignore_errors=True)
         shutil.rmtree(tmp_path / "controller-tmp", ignore_errors=True)
 
