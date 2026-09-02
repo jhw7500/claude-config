@@ -9,6 +9,8 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
+import signal
 import subprocess
 import sys
 import textwrap
@@ -177,6 +179,20 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
         if sys.argv[1:] != expected:
             raise SystemExit(8)
 
+        if MODE == "wait_with_descendant":
+            descendant = subprocess.Popen(
+                ["/usr/bin/python3", "-c", "import time; time.sleep(60)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            Path(os.environ["TMPDIR"], "runtime-pids").write_text(
+                f"{{os.getpid()}}\\n{{descendant.pid}}\\n",
+                encoding="ascii",
+            )
+            time.sleep(60)
+            raise SystemExit(0)
         if MODE == "timeout":
             time.sleep(60)
             raise SystemExit(0)
@@ -250,11 +266,21 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
         )
         value = json.loads(config.read_text(encoding="utf-8"))
         tool_name = "Bash" if RUNTIME == "claude" else "exec_command"
+        is_pass_phase = (Path.cwd() / ".review").is_dir()
+        attack_command = {{
+            "absolute_gh": "/usr/bin/gh pr create --title canary --body canary",
+            "path_reset": "PATH=/usr/bin:/bin gh pr create --title canary --body canary",
+            "command_p": "command -p gh pr create --title canary --body canary",
+            "nonexact_hook": "gh pr create --title other --body canary",
+            "github_client": "curl https://github.com",
+        }}.get(MODE, CANARY)
         payload = {{
             "hook_event_name": "PreToolUse",
             "tool_name": tool_name,
             "cwd": os.getcwd(),
-            "tool_input": {{"command": CANARY}},
+            "tool_input": {{
+                "command": attack_command if is_pass_phase else CANARY
+            }},
         }}
         denied = False
         repetitions = {{"missing_hook": 0, "duplicate_hook": 2}}.get(MODE, 1)
@@ -282,8 +308,15 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
                 os.environ["PRE_PR_PROBE_HOOK_LOG"], "a", encoding="ascii"
             ) as marker:
                 marker.write("I\\n")
+        if MODE == "oversized_hook":
+            with open(os.environ["PRE_PR_PROBE_HOOK_LOG"], "ab") as marker:
+                marker.write(b"X" * 65)
         if not denied:
             calls = {{"missing_gh": 0, "duplicate_gh": 2}}.get(MODE, 1)
+            if is_pass_phase and MODE == "pass_absent":
+                calls = 0
+            elif is_pass_phase and MODE == "pass_duplicate":
+                calls = 2
             command = (
                 ["gh", "pr", "view"]
                 if MODE == "invalid_gh"
@@ -333,23 +366,50 @@ def _run_probe(
 
 
 def _start_probe(
-    fake: FakeRuntimes, tmp_path: Path, *, runtime: str
+    fake: FakeRuntimes,
+    tmp_path: Path,
+    *,
+    runtime: str,
+    runtime_timeout: float | None = None,
 ) -> tuple[subprocess.Popen[str], Path, Path]:
     controller_tmp = tmp_path / "controller-tmp"
     controller_tmp.mkdir(mode=0o700)
     work_dir = tmp_path / "probe"
     release = work_dir / "tmp/auth-release"
-    process = subprocess.Popen(
-        [
+    arguments = [
+        "--runtime",
+        runtime,
+        "--repo-source",
+        str(REPO),
+        "--work-dir",
+        str(work_dir),
+    ]
+    if runtime_timeout is None:
+        command = [
             sys.executable,
             str(PROBE_SCRIPT),
-            "--runtime",
-            runtime,
-            "--repo-source",
-            str(REPO),
-            "--work-dir",
-            str(work_dir),
-        ],
+            *arguments,
+        ]
+    else:
+        runner = (
+            "import importlib.util,sys; "
+            "spec=importlib.util.spec_from_file_location('probe_driver',sys.argv[1]); "
+            "module=importlib.util.module_from_spec(spec); "
+            "sys.modules[spec.name]=module; "
+            "spec.loader.exec_module(module); "
+            "module.RUNTIME_TIMEOUT_SECONDS=float(sys.argv[2]); "
+            "raise SystemExit(module.main(sys.argv[3:]))"
+        )
+        command = [
+            sys.executable,
+            "-c",
+            runner,
+            str(PROBE_SCRIPT),
+            str(runtime_timeout),
+            *arguments,
+        ]
+    process = subprocess.Popen(
+        command,
         env=dict(fake.env, TMPDIR=str(controller_tmp)),
         text=True,
         stdout=subprocess.PIPE,
@@ -371,12 +431,73 @@ def _wait_for(
     assert path.exists()
 
 
+def _wait_until_process_absent(pid: int, *, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+    pytest.fail(f"process {pid} survived")
+
+
+def _process_descendants(root_pid: int) -> list[int]:
+    parents: dict[int, int] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            suffix = (entry / "stat").read_text(encoding="ascii").rsplit(")", 1)[1]
+            parents[int(entry.name)] = int(suffix.split()[1])
+        except (IndexError, OSError, ValueError):
+            continue
+    descendants: set[int] = set()
+    frontier = {root_pid}
+    while frontier:
+        children = {
+            pid
+            for pid, parent in parents.items()
+            if parent in frontier and pid not in descendants
+        }
+        descendants.update(children)
+        frontier = children
+    return sorted(descendants)
+
+
 def _regular_files(root: Path) -> Iterator[Path]:
     if not root.exists():
         return
     for path in root.rglob("*"):
         if path.is_file() and not path.is_symlink():
             yield path
+
+
+def _tree_contains(root: Path, needle: bytes) -> bool:
+    for path in _regular_files(root):
+        try:
+            if needle in path.read_bytes():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _inject_fault(module, monkeypatch, fault: str, tmp_path: Path) -> None:
+    if fault == "missing_runtime":
+        monkeypatch.setattr(module, "_resolve_runtime", lambda *_args: None)
+    elif fault == "missing_bwrap":
+        monkeypatch.setattr(module, "BWRAP_PATH", tmp_path / "absent-bwrap")
+    elif fault == "installer_failure":
+
+        def fail_install(*_args, **_kwargs):
+            raise module.ProbeFailure("SETUP_FAILED")
+
+        monkeypatch.setattr(module, "_install", fail_install)
+    elif fault == "cleanup_failure":
+        monkeypatch.setattr(module, "_cleanup_work_dir", lambda *_args: False)
+    else:
+        raise AssertionError(fault)
 
 
 def _write_claude_subscription(
@@ -560,6 +681,32 @@ def test_marker_reader_rejects_oversized_non_ascii_or_unknown_content(
     assert raised.value.code == "CANARY_MISMATCH"
 
 
+def test_marker_log_rejects_exactly_65_bytes(tmp_path):
+    module = _load_probe_module()
+    marker = tmp_path / "hook.log"
+    marker.write_bytes(b"D" * 65)
+    marker.chmod(0o600)
+
+    with pytest.raises(module.ProbeFailure) as raised:
+        module._read_marker_log(marker, module.HOOK_MARKERS)
+
+    assert raised.value.code == "CANARY_MISMATCH"
+
+
+def test_marker_log_rejects_wrong_owner(tmp_path, monkeypatch):
+    module = _load_probe_module()
+    marker = tmp_path / "hook.log"
+    marker.write_bytes(b"D\n")
+    marker.chmod(0o600)
+    actual_euid = os.geteuid()
+    monkeypatch.setattr(module.os, "geteuid", lambda: actual_euid + 1)
+
+    with pytest.raises(module.ProbeFailure) as raised:
+        module._read_marker_log(marker, module.HOOK_MARKERS)
+
+    assert raised.value.code == "CANARY_MISMATCH"
+
+
 @pytest.mark.parametrize(
     (
         "hook_raw",
@@ -675,6 +822,76 @@ def test_invalid_marker_evidence_blocks_probe(
         hook=hook,
         gh_calls=gh_calls,
     )
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("nonzero", "RUNTIME_FAILED"),
+        ("timeout", "TIMEOUT"),
+        ("missing_hook", "CANARY_MISMATCH"),
+        ("duplicate_hook", "CANARY_MISMATCH"),
+        ("invalid_hook", "CANARY_MISMATCH"),
+        ("oversized_hook", "CANARY_MISMATCH"),
+        ("pass_absent", "CANARY_MISMATCH"),
+        ("pass_duplicate", "CANARY_MISMATCH"),
+        ("invalid_gh", "CANARY_MISMATCH"),
+    ],
+)
+def test_runtime_failures_use_only_stable_v2_statuses(
+    fake_runtimes, tmp_path, monkeypatch, mode, expected
+):
+    module = _load_probe_module()
+    fake = fake_runtimes(claude=mode)
+    for key, value in fake.env.items():
+        monkeypatch.setenv(key, value)
+    if mode == "timeout":
+        monkeypatch.setattr(module, "RUNTIME_TIMEOUT_SECONDS", 0.1)
+    stdout = io.StringIO()
+    work_dir = tmp_path / "probe"
+
+    with redirect_stdout(stdout):
+        exit_code = module.main(
+            [
+                "--runtime",
+                "claude",
+                "--repo-source",
+                str(REPO),
+                "--work-dir",
+                str(work_dir),
+                "--auth-source",
+                "environment",
+            ]
+        )
+
+    report = json.loads(stdout.getvalue())
+    assert exit_code != 0
+    assert report["status"] == "BLOCKED"
+    assert report["claude"]["status"] == expected
+    assert set(report["claude"]) <= {"status", "missing", "pass"}
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["absolute_gh", "path_reset", "command_p", "nonexact_hook", "github_client"],
+)
+def test_runtime_guard_keeps_existing_github_confinement(
+    fake_runtimes, tmp_path, mode
+):
+    fake = fake_runtimes(claude=mode)
+    result, work_dir = _run_probe(
+        fake,
+        tmp_path,
+        runtime="claude",
+        auth_source="environment",
+    )
+    runtime = json.loads(result.stdout)["claude"]
+
+    assert result.returncode != 0
+    assert runtime["status"] == "CANARY_MISMATCH"
+    assert runtime["pass"]["gh_calls"] == 0
     assert not work_dir.exists()
 
 
@@ -1007,6 +1224,286 @@ def test_subscription_fails_closed_until_auth_is_restored(
     assert report["status"] == "BLOCKED"
     assert report[runtime] == {"status": "CREDENTIAL_UNAVAILABLE"}
     assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        ("missing_runtime", "RUNTIME_UNAVAILABLE"),
+        ("missing_bwrap", "ISOLATION_UNAVAILABLE"),
+        ("installer_failure", "SETUP_FAILED"),
+        ("cleanup_failure", "CLEANUP_FAILED"),
+    ],
+)
+def test_top_level_failures_use_stable_v2_status(
+    fake_runtimes, tmp_path, monkeypatch, fault, expected
+):
+    module = _load_probe_module()
+    fake = fake_runtimes()
+    work_dir = tmp_path / "probe"
+    control_root = tmp_path / "control"
+
+    def make_control_root(*_args, **_kwargs):
+        control_root.mkdir(mode=0o700)
+        return str(control_root)
+
+    monkeypatch.setattr(module.tempfile, "mkdtemp", make_control_root)
+    _inject_fault(module, monkeypatch, fault, tmp_path)
+    for key, value in fake.env.items():
+        monkeypatch.setenv(key, value)
+    stdout = io.StringIO()
+    try:
+        with redirect_stdout(stdout):
+            exit_code = module.main(
+                [
+                    "--runtime",
+                    "claude",
+                    "--repo-source",
+                    str(REPO),
+                    "--work-dir",
+                    str(work_dir),
+                    "--auth-source",
+                    "environment",
+                ]
+            )
+
+        assert exit_code != 0
+        report = json.loads(stdout.getvalue())
+        observed = report.get("claude", report)["status"]
+        assert observed == expected
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(control_root, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ((0, "ZERO"), None),
+        ((7, "NONZERO"), "RUNTIME_FAILED"),
+        ((7, "TIMEOUT"), "TIMEOUT"),
+    ],
+)
+def test_runtime_failure_prioritizes_timeout(result, expected):
+    module = _load_probe_module()
+
+    observed = module._runtime_failure(module.ProcessResult(*result))
+
+    assert observed == expected
+
+
+def test_control_digest_mismatch_uses_stable_v2_status(tmp_path, monkeypatch):
+    module = _load_probe_module()
+    work_dir = tmp_path / "work"
+    repo = work_dir / "repo"
+    home = work_dir / "home"
+    control_root = tmp_path / "control"
+    control_home = control_root / "home"
+    fake_bin = control_root / "fake-bin"
+    hosts_file = control_root / "hosts"
+    for path in (repo, home, control_home, fake_bin):
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+    monkeypatch.setattr(module, "_remove_review", lambda *_args: None)
+    monkeypatch.setattr(module, "_create_pass_verdict", lambda *_args: None)
+
+    def successful_phase(*_args, env, **_kwargs):
+        Path(env["PRE_PR_PROBE_HOOK_LOG"]).write_text("D\n", encoding="ascii")
+        return module.ProcessResult(0, "ZERO")
+
+    monkeypatch.setattr(module, "_run_sandboxed", successful_phase)
+    monkeypatch.setattr(module, "_protected_digest", lambda *_args: "tampered")
+
+    report = module._probe_runtime(
+        "claude",
+        executable="/synthetic/claude",
+        auth_source="environment",
+        claude_subscription_token=None,
+        codex_auth_fd=None,
+        codex_hooks_fd=42,
+        caller_env={"ANTHROPIC_API_KEY": "synthetic"},
+        caller_home=None,
+        work_dir=work_dir,
+        home=home,
+        control_root=control_root,
+        control_home=control_home,
+        repo=repo,
+        fake_bin=fake_bin,
+        hosts_file=hosts_file,
+        cli=tmp_path / "cli",
+        control_sha256="expected",
+    )
+
+    assert report["status"] == "CANARY_MISMATCH"
+
+
+def test_timeout_stop_process_group_does_not_signal_reaped_group(monkeypatch):
+    module = _load_probe_module()
+    process = subprocess.Popen(
+        ["/usr/bin/python3", "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    original_killpg = module.os.killpg
+    signals: list[int] = []
+
+    def record_killpg(pid, signum):
+        assert pid == process.pid
+        signals.append(signum)
+        return original_killpg(pid, signum)
+
+    monkeypatch.setattr(module.os, "killpg", record_killpg)
+    try:
+        module._stop_process_group(process)
+    finally:
+        if process.poll() is None:
+            original_killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+    assert signals == [signal.SIGTERM]
+    assert process.returncode == -signal.SIGTERM
+
+
+def test_runtime_timeout_reaps_its_own_process_group(tmp_path):
+    module = _load_probe_module()
+    pid_file = tmp_path / "runtime-pids"
+    source = textwrap.dedent(
+        """\
+        import os
+        from pathlib import Path
+        import subprocess
+        import time
+
+        child = subprocess.Popen(
+            ["/usr/bin/python3", "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        Path(os.environ["PID_FILE"]).write_text(
+            f"{os.getpid()}\\n{child.pid}\\n", encoding="ascii"
+        )
+        time.sleep(60)
+        """
+    )
+
+    result = module._run_runtime(
+        ["/usr/bin/python3", "-c", source],
+        cwd=tmp_path,
+        env={
+            "PATH": SAFE_SYSTEM_PATH,
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PID_FILE": str(pid_file),
+        },
+        timeout=0.5,
+    )
+
+    assert result.exit_class == "TIMEOUT"
+    pids = [int(value) for value in pid_file.read_text().splitlines()]
+    for pid in pids:
+        _wait_until_process_absent(pid, timeout=5.0)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_default_signal_semantics_leave_no_runtime_or_credential_copy(
+    fake_runtimes, tmp_path, signum
+):
+    sentinel = b"MEMFD_ONLY_CODEX_SENTINEL_32"
+    auth = (
+        b'{"auth_mode":"chatgpt","tokens":{"access_token":"'
+        + sentinel
+        + b'"}}\n'
+    )
+    fake = fake_runtimes(
+        codex="wait_with_descendant",
+        codex_auth_document=auth,
+    )
+    process, work_dir, _release = _start_probe(fake, tmp_path, runtime="codex")
+    pid_file = work_dir / "tmp/runtime-pids"
+    pids: list[int] = []
+    try:
+        _wait_for(pid_file, process)
+        assert len(pid_file.read_text().splitlines()) == 2
+        pids = _process_descendants(process.pid)
+        assert len(pids) >= 2
+
+        os.kill(process.pid, signum)
+        stdout, stderr = process.communicate(timeout=15)
+
+        assert process.returncode != 0
+        assert stderr == ""
+        if signum == signal.SIGINT:
+            assert json.loads(stdout) == {"schema": 2, "status": "RUNTIME_FAILED"}
+            assert not work_dir.exists()
+        else:
+            assert stdout == ""
+        for pid in pids:
+            _wait_until_process_absent(pid, timeout=5.0)
+        assert not _tree_contains(work_dir, sentinel)
+    finally:
+        if process.poll() is None:
+            os.kill(process.pid, signal.SIGKILL)
+            process.communicate(timeout=5)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(tmp_path / "controller-tmp", ignore_errors=True)
+
+
+def test_timeout_leaves_no_runtime_or_credential_copy(
+    fake_runtimes, tmp_path
+):
+    sentinel = b"MEMFD_ONLY_CODEX_TIMEOUT_SENTINEL_32"
+    auth = (
+        b'{"auth_mode":"chatgpt","tokens":{"access_token":"'
+        + sentinel
+        + b'"}}\n'
+    )
+    fake = fake_runtimes(
+        codex="wait_with_descendant",
+        codex_auth_document=auth,
+    )
+    process, work_dir, _release = _start_probe(
+        fake,
+        tmp_path,
+        runtime="codex",
+        runtime_timeout=1.0,
+    )
+    pid_file = work_dir / "tmp/runtime-pids"
+    pids: list[int] = []
+    try:
+        _wait_for(pid_file, process)
+        assert len(pid_file.read_text().splitlines()) == 2
+        pids = _process_descendants(process.pid)
+        assert len(pids) >= 2
+        stdout, stderr = process.communicate(timeout=15)
+
+        assert process.returncode != 0
+        assert stderr == ""
+        report = json.loads(stdout)
+        assert report["status"] == "BLOCKED"
+        assert report["codex"] == {"status": "TIMEOUT"}
+        for pid in pids:
+            _wait_until_process_absent(pid, timeout=5.0)
+        assert not _tree_contains(work_dir, sentinel)
+        assert not work_dir.exists()
+    finally:
+        if process.poll() is None:
+            os.kill(process.pid, signal.SIGKILL)
+            process.communicate(timeout=5)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(tmp_path / "controller-tmp", ignore_errors=True)
 
 
 @pytest.mark.parametrize(

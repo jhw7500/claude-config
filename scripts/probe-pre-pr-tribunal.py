@@ -376,14 +376,23 @@ def _phase_report(
     return phase, matches
 
 
+def _runtime_failure(result: ProcessResult) -> str | None:
+    if result.exit_class == "TIMEOUT":
+        return "TIMEOUT"
+    if result.exit_class != "ZERO":
+        return "RUNTIME_FAILED"
+    return None
+
+
 def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except OSError:
         pass
     try:
-        time.sleep(0.25)
-    except Exception:
+        process.wait(timeout=0.25)
+        return
+    except subprocess.TimeoutExpired:
         pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -392,11 +401,8 @@ def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         process.wait(timeout=1.0)
     except subprocess.TimeoutExpired:
-        try:
-            process.kill()
-            process.wait(timeout=1.0)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        process.kill()
+        process.wait(timeout=1.0)
 
 
 def _run_runtime(
@@ -1654,10 +1660,9 @@ def _probe_runtime(
             codex_auth_fd=codex_auth_fd,
             codex_hooks_fd=codex_hooks_fd,
         )
-        if result.exit_class == "TIMEOUT":
-            return {"status": "TIMEOUT"}
-        if result.exit_class != "ZERO":
-            return {"status": "RUNTIME_FAILED"}
+        runtime_failure = _runtime_failure(result)
+        if runtime_failure is not None:
+            return {"status": runtime_failure}
         try:
             phase_report, matches = _phase_report(
                 result,
@@ -1676,7 +1681,7 @@ def _probe_runtime(
         except ProbeFailure:
             controls_intact = False
         if not controls_intact:
-            return {"status": "ISOLATION_BREACH", **phase_results}
+            return {"status": "CANARY_MISMATCH", **phase_results}
         if not matches:
             return {"status": "CANARY_MISMATCH", **phase_results}
     return {"status": "PASS", **phase_results}
@@ -1863,7 +1868,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             report["status"] = "PASS" if success else "BLOCKED"
             exit_code = 0 if success else 1
     except KeyboardInterrupt:
-        report = {"schema": SCHEMA_VERSION, "status": "INTERRUPTED"}
+        report = {"schema": SCHEMA_VERSION, "status": "RUNTIME_FAILED"}
         exit_code = 130
     except ProbeFailure as error:
         report = {"schema": SCHEMA_VERSION, "status": error.code}
