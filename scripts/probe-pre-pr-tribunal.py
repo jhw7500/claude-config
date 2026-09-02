@@ -662,6 +662,11 @@ def _make_marker_log(path: Path) -> None:
     _write(path, "", 0o600)
 
 
+def _make_runtime_targets(control_root: Path) -> None:
+    for runtime in ("claude", "codex"):
+        _write(control_root / "runtime-bin" / runtime, "", 0o700)
+
+
 def _make_fake_gh(fake_bin: Path, expected_cwd: Path) -> None:
     fake_bin.mkdir(mode=0o700)
     source = f'''#!/usr/bin/python3
@@ -942,6 +947,7 @@ def _sandbox_argv(
     inner: Sequence[str],
     *,
     runtime: str | None,
+    runtime_executable: Path | None,
     work_dir: Path,
     repo: Path,
     fake_gh: Path,
@@ -967,6 +973,31 @@ def _sandbox_argv(
         )
     except OSError:
         raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+    runtime_target: Path | None = None
+    if runtime not in {None, "claude", "codex"}:
+        raise ProbeFailure("ISOLATION_UNAVAILABLE")
+    if (runtime is None) != (runtime_executable is None):
+        raise ProbeFailure("ISOLATION_UNAVAILABLE")
+    if runtime is not None and runtime_executable is not None:
+        runtime_target = control_root / "runtime-bin" / runtime
+        try:
+            runtime_executable = runtime_executable.resolve(strict=True)
+            source_metadata = runtime_executable.lstat()
+            target_metadata = runtime_target.lstat()
+            if (
+                not stat.S_ISREG(source_metadata.st_mode)
+                or stat.S_ISLNK(source_metadata.st_mode)
+                or not os.access(runtime_executable, os.X_OK)
+                or not stat.S_ISREG(target_metadata.st_mode)
+                or stat.S_ISLNK(target_metadata.st_mode)
+                or target_metadata.st_uid != os.geteuid()
+                or target_metadata.st_nlink != 1
+                or target_metadata.st_size != 0
+                or stat.S_IMODE(target_metadata.st_mode) != 0o700
+            ):
+                raise OSError
+        except (OSError, RuntimeError):
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
     if (
         control_root == work_dir
         or control_root.is_relative_to(work_dir)
@@ -1020,7 +1051,14 @@ def _sandbox_argv(
         "/proc",
         "--dev",
         "/dev",
+        "--ro-bind",
+        str(control_root),
+        str(control_root),
     ]
+    if runtime_target is not None and runtime_executable is not None:
+        arguments.extend(
+            ("--ro-bind", str(runtime_executable), str(runtime_target))
+        )
     for source, target in live_config_masks:
         arguments.extend(("--ro-bind", str(source), str(target)))
     for source in (*writable_paths, evidence_dir):
@@ -1034,7 +1072,6 @@ def _sandbox_argv(
             arguments.extend(("--bind", str(review), str(review)))
     except OSError:
         raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-    arguments.extend(("--ro-bind", str(control_root), str(control_root)))
     if runtime == "codex":
         if codex_hooks_fd is None:
             raise ProbeFailure("ISOLATION_UNAVAILABLE")
@@ -1078,6 +1115,7 @@ def _run_sandboxed(
     inner: Sequence[str],
     *,
     runtime: str | None = None,
+    runtime_executable: Path | None = None,
     work_dir: Path,
     repo: Path,
     fake_gh: Path,
@@ -1094,6 +1132,7 @@ def _run_sandboxed(
         argv = _sandbox_argv(
             inner,
             runtime=runtime,
+            runtime_executable=runtime_executable,
             work_dir=work_dir,
             repo=repo,
             fake_gh=fake_gh,
@@ -1337,6 +1376,7 @@ def _make_isolation_verifier(
     wrapper = control_root / "probe-hook-wrapper.py"
     control_parents = (
         control_root,
+        control_root / "runtime-bin",
         control_root / "fake-bin",
         control_home,
         control_home / ".claude",
@@ -1348,6 +1388,8 @@ def _make_isolation_verifier(
     )
     package = control_home / ".local/share/claude-config/pre_pr_tribunal"
     control_leaves = (
+        control_root / "runtime-bin/claude",
+        control_root / "runtime-bin/codex",
         control_root / "fake-bin/gh",
         control_root / "hosts",
         guard,
@@ -1665,11 +1707,12 @@ def _probe_runtime(
         result = _run_sandboxed(
             _runtime_argv(
                 runtime,
-                executable,
+                str(control_root / "runtime-bin" / runtime),
                 control_home=control_home,
                 repo=repo,
             ),
             runtime=runtime,
+            runtime_executable=Path(executable),
             work_dir=work_dir,
             repo=repo,
             fake_gh=fake_bin / "gh",
@@ -1714,10 +1757,10 @@ def _resolve_runtime(name: str, caller_env: Mapping[str, str]) -> str | None:
     if executable is None:
         return None
     try:
-        path = Path(executable)
+        path = Path(executable).resolve(strict=True)
         if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
             return None
-    except OSError:
+    except (OSError, RuntimeError):
         return None
     return str(path)
 
@@ -1800,6 +1843,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         (work_dir / "tmp").mkdir(mode=0o700)
         (work_dir / "gh-config").mkdir(mode=0o700)
         _create_probe_repo(probe_repo, probe_home)
+        _make_runtime_targets(control_root)
         _make_fake_gh(fake_bin, probe_repo)
         _make_hosts_file(hosts_file)
         cli = _install(repo_source, control_home, probe_repo)

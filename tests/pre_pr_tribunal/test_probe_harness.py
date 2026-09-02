@@ -709,6 +709,50 @@ def test_claude_runtime_uses_disposable_canary_system_prompt(tmp_path):
     assert "--system-prompt" not in codex_argv
 
 
+def test_runtime_resolution_returns_canonical_executable(tmp_path):
+    module = _load_probe_module()
+    bin_dir = tmp_path / "bin"
+    release_dir = tmp_path / "masked-config/releases/current"
+    bin_dir.mkdir()
+    release_dir.mkdir(parents=True)
+    target = release_dir / "runtime"
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    target.chmod(0o700)
+    (bin_dir / "runtime").symlink_to(target)
+
+    resolved = module._resolve_runtime(
+        "runtime",
+        {"PATH": str(bin_dir)},
+    )
+
+    assert resolved == str(target.resolve(strict=True))
+
+
+def test_runtime_binary_inside_masked_config_is_rebound(
+    fake_runtimes, tmp_path
+):
+    fake = fake_runtimes()
+    fake_bin = Path(fake.env["PATH"].split(os.pathsep, 1)[0])
+    launcher = fake_bin / "codex"
+    target = fake.caller_home / ".codex/packages/standalone/current/bin/codex"
+    target.parent.mkdir(parents=True, mode=0o700)
+    target.write_bytes(launcher.read_bytes())
+    target.chmod(0o700)
+    launcher.unlink()
+    launcher.symlink_to(target)
+
+    result, work_dir = _run_probe(
+        fake,
+        tmp_path,
+        runtime="codex",
+        auth_source="environment",
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["codex"]["status"] == "PASS"
+    assert not work_dir.exists()
+
+
 def _isolation_fixture(module, tmp_path: Path) -> IsolationFixture:
     work_dir = tmp_path / "work"
     control_root = tmp_path / "control"
@@ -724,6 +768,7 @@ def _isolation_fixture(module, tmp_path: Path) -> IsolationFixture:
     (work_dir / "tmp").mkdir(mode=0o700)
     (work_dir / "gh-config").mkdir(mode=0o700)
     module._create_probe_repo(repo, home)
+    module._make_runtime_targets(control_root)
     module._make_fake_gh(fake_bin, repo)
     module._make_hosts_file(hosts_file)
     module._install(REPO, control_home, repo)
@@ -1440,6 +1485,7 @@ def test_run_sandboxed_rewinds_and_passes_only_live_memfds(
             result = module._run_sandboxed(
                 ["runtime"],
                 runtime="codex",
+                runtime_executable=Path("/usr/bin/true"),
                 work_dir=tmp_path,
                 repo=tmp_path,
                 fake_gh=tmp_path,
@@ -1482,8 +1528,9 @@ def test_claude_subscription_token_is_child_environment_only(
 
     monkeypatch.setattr(module, "_run_runtime", fake_run_runtime)
     result = module._run_sandboxed(
-        ["claude"],
+        [str(fixture.control_root / "runtime-bin/claude")],
         runtime="claude",
+        runtime_executable=Path("/usr/bin/true"),
         work_dir=fixture.work_dir,
         repo=fixture.repo,
         fake_gh=fixture.fake_bin / "gh",
