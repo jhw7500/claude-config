@@ -113,61 +113,55 @@ verdict는 exact clean repository root, GitHub origin, remote base SHA, HEAD, me
 rtk python3 -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py tests/pre_pr_tribunal/test_gate_adapters.py
 ```
 
-실제 runtime canary도 격리 harness와 harness가 만든 fake `gh`를 통해서만 실행한다. 출력은 version,
-exit class, deny/count와 안전하다고 분류된 capture hash만 포함하며 raw model output, prompt,
-credential, 절대 경로를 기록하지 않는다. Credential 가능성이 있으면 hash도 `WITHHELD`다.
+실제 runtime canary는 verified `/usr/bin/bwrap` 안에서 GitHub hostname을 sinkhole하고,
+발견된 모든 fixed `gh` 경로를 exact fake executable로 덮는다. Runtime
+stdout/stderr는 `/dev/null`로 폐기하고 canary wrapper와 fake `gh`가 남긴 marker만
+판정한다. Missing phase는 hook `D`, fake-`gh` 0회여야 하고 pass phase는 hook `A`,
+fake-`gh` 1회여야 한다. 그 경계를 준비할 수 없으면 fail closed하며 live config나
+real `gh`로 fallback하지 않는다.
 
-canary는 root-owned, non-writable `/usr/bin/bwrap`을 검증한 뒤 read-only root를 구성한다. Runtime
-work tree 밖의 별도 controller-owned control root에 hosts, fake `gh`, guard, 양쪽 hook config와 installed
-package를 완성하고 그 root 전체를 read-only로 mount한다. PATH/config/hook command에는 이 root 밖의
-writable ancestor alias가 없다. Runtime HOME, TMPDIR, neutral `GH_CONFIG_DIR`, pass verdict의 existing
-`.review` lock state만 별도 writable submount이고, repository 나머지와 work-root parent는 read-only다.
+Report는 schema v2의 bounded JSON이며 성공 예시는 다음과 같다.
 
-Control root/fake-bin/config/package parent의 rename·recreate, control leaf replace, whole-root inode/content
-hash 불변을 runtime dispatch 전에 검사한다. `/usr/bin/gh`, PATH reset, `command -p gh`, direct GitHub
-hostname client, 그리고 exact command/cwd/tool에서 벗어난 payload도 같은 경계에서 검증한다. Codex의
-matcherless guard는 command-less, non-shell, unknown tool을 모두 deny한다. Valid/invalid call evidence는
-writable ledger가 아닌 harness-owned memory channel에만 누적한다. `GH_HOST`와
-`GH_PROMPT_DISABLED`도 harness-owned neutral 값만 사용한다. 이 중 하나라도 실패하면
-`ISOLATION_UNAVAILABLE`이며 live config나 real `gh`로 fallback하지 않는다.
+```json
+{
+  "schema": 2,
+  "status": "PASS",
+  "claude": {
+    "status": "PASS",
+    "missing": {"runtime_exit": "ZERO", "hook": "DENY", "gh_calls": 0},
+    "pass": {"runtime_exit": "ZERO", "hook": "ALLOW", "gh_calls": 1}
+  }
+}
+```
 
-기본 `--auth-source subscription`은 caller의 기존 subscription login 중 canary에 필요한 exact
-credential만 bounded exception으로 다룬다. Claude source는 secure descriptor read와 strict
-OAuth/expiry validation 뒤 `CLAUDE_CODE_OAUTH_TOKEN`으로만 전달한다. Codex source는 exact bytes를
-disposable `0600` stage에 복사하고 immutable `CODEX_HOME`의 `auth.json` leaf에만 bind한다. 그 leaf는
-필요한 in-place refresh만 허용하며 parent/hook config는 immutable하다. Refresh 전후 token-like value를
-raw auth document와 함께 memory에서만 leak matcher로 유지한다. Bounded capture는 JSON string token을
-linear scan으로 lex/decode하여 key, nested/list value, raw-document string, 대소문자가 섞인 `\uXXXX`, surrogate
-pair를 동일한 decoded inventory와 대조한다. Malformed 또는 8,192-item/64-depth/128-KiB decoded bound를 넘은
-의심 JSON은 credential-backed 실행에서 fail closed한다. 8-byte 미만 또는 structured token-like value는
-malformed로 거부한다. Live source bytes/metadata 불변과 stage cleanup은 정상/실패/timeout/setup exception 및
-catchable SIGINT/SIGTERM에서 확인한다. Work/control allocator와 evidence constructor는 생성 뒤 publication 전
-`BaseException`도 내부 cleanup하고, SIGINT/SIGTERM을 생성→caller assignment와 child/resource cleanup→기존
-handler/mask 복원 구간에서 원자적으로 함께 block한다. Cleanup 중 pending signal은 복원 뒤 원래 semantics로
-전달되며 handler 안에서는 cleanup하지 않는다. Caller의
-live `.claude`/`.codex` directory는 sandbox 안에서 empty immutable mask다. Claude expiry margin은 세
-runtime child deadline 360초, 두 verdict child deadline 60초와 30초 cushion을 합친 450초다.
+Stable public failure status는 정확히 다음 8개다.
 
-Default mode는 API key를 child에 넘기지 않는다. `--auth-source environment`는 API-key billing을
-명시적으로 opt-in하는 compatibility mode이며 subscription failure에서 자동 선택되지 않는다.
-그 mode에서도 Claude version/phase child는 `ANTHROPIC_API_KEY`만, Codex child는 `OPENAI_API_KEY`만
-받는다. Credential literal/raw JSON 또는 7-byte prefix가 capture에 섞이면 raw data와 derived field를
-보류하고 `SENSITIVE_OUTPUT`으로 차단한다. 더 짧은 prefix는 안전하게 분류할 수 없으므로 credential
-material이 child 범위에 있는 모든 capture hash는 `WITHHELD`다. `OUTPUT_LIMIT`도 classifier가 보지 못한
-tail과 무관하게 stdout/stderr hash를 항상 둘 다 보류한다. Source/stage validation 실패도 stable
-credential status로 fail closed한다. Version capture는 staged Codex auth를 다시 읽고 sensitivity를
-판정한 뒤에만 version/hash를 파생하며, sensitivity는 control-digest breach보다 우선한다.
+- `CREDENTIAL_UNAVAILABLE`
+- `RUNTIME_UNAVAILABLE`
+- `ISOLATION_UNAVAILABLE`
+- `RUNTIME_FAILED`
+- `TIMEOUT`
+- `CANARY_MISMATCH`
+- `SETUP_FAILED`
+- `CLEANUP_FAILED`
 
-Provider API 연결을 보존하려고 network namespace는 공유한다. 따라서 GitHub sinkhole/fake executable
-경계 밖의 일반 egress 차단이나 provider connectivity 보장은 이 harness의 계약이 아니다. Runtime
-실패 결과는 phase, parse/deny 상태, valid/invalid fake-call count, exit class, capture hash와 coarse
-sensitivity category만 남긴다. High-risk literal은 `SENSITIVE_OUTPUT`이 우선하고, auth-marked nonzero에
-disposable/generic path metadata만 함께 있으면 `AUTH_UNAVAILABLE`과 별도 sensitivity fact로 기록한다.
+기본 `--auth-source subscription`은 caller의 기존 subscription login만 사용하며 API key로
+fallback하지 않는다. API-key billing을 의도적으로 승인한 경우에만
+`--auth-source environment`를 명시해 opt-in한다. Claude OAuth는 두 120초 runtime
+phase, 두 30초 begin/finalize deadline과 30초 scheduling cushion을 합친 behavioral
+330초 validity margin을 요구하고 child environment에만 전달한다. Codex auth는
+sealed memfd에 보관하고 bubblewrap 내 private writable tmpfs
+`CODEX_HOME/auth.json`을 초기화해 atomic refresh를 허용하며, hooks overlay는
+read-only로 유지한다. 따라서 host filesystem에 credential copy를 만들지 않는다.
+
+SIGTERM이나 SIGKILL로 probe가 비정상 종료되면 credential이 없는 임시
+repository/config residue는 남을 수 있다. Provider network는 Claude와 Codex별로
+분리하지 않고 connectivity를 공유한다. 따라서 GitHub sinkhole/fake executable
+경계 밖의 일반 egress 차단이나 provider connectivity 보장은 이 harness의 계약이 아니다.
 
 ```bash
 rtk python3 scripts/probe-pre-pr-tribunal.py --runtime claude --repo-source "$PWD"
 rtk python3 scripts/probe-pre-pr-tribunal.py --runtime codex --repo-source "$PWD"
-# API-key billing을 의도적으로 승인한 경우에만:
 rtk python3 scripts/probe-pre-pr-tribunal.py --runtime claude --auth-source environment --repo-source "$PWD"
 ```
 

@@ -241,3 +241,26 @@ of those categories.
 The diagnostic instrumentation was removed immediately. The original fake harness/direct-adapter
 suite passed again afterward. The path/auth/sensitivity contract was not weakened, Codex was not
 run, and this checkpoint does not satisfy the required real-runtime PASS gate.
+
+## Schema-v2 simplification synthetic checkpoint — 2026-09-02
+
+- Status: synthetic PASS; live runtime not yet authorized at this checkpoint. Task 5 live work
+  remains pending.
+- Probe contract: missing `D/0`, pass `A/1`; runtime stdout/stderr discarded.
+- Codex auth: sealed memfd → tmpfs auth, writable atomic refresh, read-only hooks overlay.
+- Focused harness command:
+  `rtk env PYTHONPATH=/tmp/claude-config-issue32-test-deps.YXp69B python3 -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py`.
+  Complete pytest summary: `89 passed in 36.91s`; exit 0.
+- Related tribunal regression command:
+  `rtk env PYTHONPATH=/tmp/claude-config-issue32-test-deps.YXp69B python3 -m pytest -q tests/pre_pr_tribunal`.
+  Complete pytest summary: `552 passed in 83.56s (0:01:23)`; exit 0.
+- Full repository regression command:
+  `rtk env PYTHONPATH=/tmp/claude-config-issue32-test-deps.YXp69B python3 -m pytest -q`.
+  Complete pytest summary: `2611 passed in 177.72s (0:02:57)`; exit 0.
+- Implementation commit range:
+  `6e1e7547053c8d1a60bed4e4d21943034096184e..dc74766b1ff39913919941fd02829551dfcb234a`.
+- `rtk python3 -m py_compile scripts/probe-pre-pr-tribunal.py tests/pre_pr_tribunal/test_probe_harness.py`
+  and `rtk git diff --check` both exited 0.
+- No live credential or config was read; no real Claude/Codex/`gh`, GitHub/provider endpoint,
+  network probe, JHW readiness action, push, merge or PR was used. This is synthetic evidence only,
+  not a live canary or final whole-branch review.

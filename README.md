@@ -52,42 +52,12 @@ review 상태는 현재 저장소의 ignored `.review/`에만 남고 HOME이나 
 생성, `gh api`, alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가
 필요하다. 설치·복구와 검증 절차는 [hook 운영 문서](hooks/README.md#pre-pr-tribunal-운영)를 따른다.
 
-실제 runtime canary harness는 verified `/usr/bin/bwrap`을 필수로 사용한다. root filesystem은
-read-only로 두고 writable work tree 밖에 별도의 controller-owned control root를 만든 뒤, 그 전체를
-하나의 read-only mount로 고정한다. Fake `gh`, hosts sinkhole, exact command/cwd/tool guard, 양쪽 hook
-config와 installed hook package는 모두 이 immutable root 아래에 있고 PATH/config/hook command도 그
-경로만 참조한다. Runtime HOME, TMPDIR, neutral GH config와 pass-phase의 기존 `.review` lock state만
-각각 명시적인 writable submount다. Repository 나머지와 work-root parent는 read-only이므로 control
-parent를 rename/recreate할 writable alias가 없다. Whole-root inode/content hash도 dispatch 전후에
-확인한다. Fake-call evidence는 harness process가 소유한 memory channel에 기록되어 runtime tool이
-file로 forge하거나 reset할 수 없다. 이 경계가 준비되지 않으면 `ISOLATION_UNAVAILABLE`로 중단한다.
-
-Canary 인증 기본값은 기존 Claude/Codex subscription login이다. Harness는 caller HOME의 두 exact
-credential source만 no-follow/close-on-exec, current-UID owner-only regular-file, bounded stable-read
-조건으로 연다. Claude OAuth는 version probe 120초, 두 phase 240초, pass-verdict 준비 child
-60초와 30초 scheduling cushion을 합친 450초 expiry margin을 확인한 뒤
-`CLAUDE_CODE_OAUTH_TOKEN`으로만 child에 전달하고, Codex `auth.json`은 disposable `0600` staging
-leaf에 exact-copy하여 immutable `CODEX_HOME/auth.json`에만 mount한다. Live `.claude`/`.codex`는
-sandbox에서 empty immutable mask로 가려 fallback을 막고 source bytes/metadata는 실행 전후 동일해야
-한다. Staging은 control digest에 포함되지 않으며 정상/실패/timeout/setup exception과 catchable
-SIGINT/SIGTERM에서 outer lifecycle cleanup으로 삭제된다. 두 termination signal은 disposable root와
-evidence recorder의 생성부터 caller ownership publication까지, child kill/reap과 최종 cleanup부터 기존
-handler/mask 복원까지 쌍으로 block된다. Pending signal은 cleanup 뒤 원래 semantics로 전달된다. Initial/refreshed
-raw auth document와 token value는 bounded memory inventory에만 둔다. Capture의 JSON string token은 key/value와
-nested/NDJSON 위치를 구분하지 않고 한 번 lex/decode하여 Unicode escape와 surrogate pair를 정규화한 뒤 inventory와
-대조한다. Malformed 또는 token/depth/decoded-size bound를 넘은 의심 JSON은 fail closed한다. 8-byte 미만 또는
-structured token-like value는 malformed로 거부한다. 7-byte prefix를 포함한 credential 출력은
-`SENSITIVE_OUTPUT`으로 중단한다. 더 짧은 prefix의 안전한 분류가 불가능하므로 credential material이
-child 범위에 있으면 모든 capture hash는 `WITHHELD`이고, `OUTPUT_LIMIT`도 양쪽 hash를 항상 보류한다.
-
-API-key billing을 의도적으로 사용할 때만 `--auth-source environment`를 명시한다. 기본 subscription
-mode는 `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`를 전달하거나 fallback하지 않는다. Missing, unsafe,
-unreadable, oversized, malformed/duplicate, expired 또는 staging failure는 stable credential status로
-fail closed하며 live config나 real `gh`로 우회하지 않는다. Explicit environment mode도 Claude child에는
-`ANTHROPIC_API_KEY`만, Codex child에는 `OPENAI_API_KEY`만 전달하고 반대 provider key는 전달하지 않는다.
-
-Provider API 연결을 유지하기 위해 network namespace는 공유하므로, 이 harness는 일반적인
-outbound-network 차단을 제공하거나 provider 장애를 보호한다고 주장하지 않는다.
+실제 runtime canary는 `/usr/bin/bwrap` 안에서 GitHub hostname을 sinkhole하고 발견된
+모든 fixed `gh` 경로를 exact fake executable로 덮는다. Runtime stdout/stderr는
+`/dev/null`로 폐기하며 missing phase의 `D/0`, pass phase의 `A/1` marker만 schema-v2
+report로 판정한다. Claude OAuth는 child environment에만 전달하고 Codex auth는 sealed
+memfd에서 tmpfs `CODEX_HOME/auth.json`으로만 초기화하므로 host filesystem에 credential
+copy를 만들지 않는다. 이 경계를 준비할 수 없으면 fail closed한다.
 
 ## 토글 메커니즘 — 2종류 (대체 불가, 병행)
 
