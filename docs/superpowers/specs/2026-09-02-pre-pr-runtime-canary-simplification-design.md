@@ -2,7 +2,7 @@
 
 - 날짜: 2026-09-02
 - 대상: GitHub Issue #32, Task 8 실제 Claude/Codex canary
-- 상태: synthetic 구현 완료, 독립 scoped review 대기
+- 상태: Task 5 live runtime 호환성 수정 검증 중
 - 기준 커밋: `841a5e26b3315ed57bf65dcbcb948a6165022afa`
 - 대체 범위: `2026-09-01-pre-pr-adversarial-tribunal-design.md`의 16.5절
 
@@ -145,12 +145,16 @@ API key로 fallback하지 않는다.
 - Runtime HOME, tmpfs Codex auth와 phase evidence만 최소 writable mount한다. Codex
   hook config는 tmpfs 안에서도 read-only overlay다.
 - Caller `.claude`와 `.codex`는 empty immutable directory로 가린다.
-- Host runtime launcher는 sandbox 진입 전에 canonical executable로 해석하고, 그 파일만
-  immutable control root의 빈 target 위에 read-only bind한 뒤 live config directory를
-  가린다. Runtime package가 `.claude`나 `.codex` 아래에 있어도 config 전체를 노출하지 않는다.
+- Host runtime launcher는 sandbox 진입 전에 canonical executable로 해석하고 immutable
+  control root의 빈 target 위에 read-only bind한 뒤 live config directory를 가린다.
+  Codex executable 옆에 별도 `codex-code-mode-host`가 있으면 그 canonical executable도
+  전용 sibling target에 함께 bind한다. Companion이 없는 배포는 기존 단일 target을
+  유지하며, 어느 경우에도 runtime package나 `.codex` config 전체를 노출하지 않는다.
 - PATH 첫 항목과 발견된 모든 고정 system `gh` 경로를 fake executable로 덮는다.
 - GitHub hostname은 isolated hosts file로 loopback/sinkhole 처리한다.
-- Claude/Codex hook guard는 exact shell tool, exact command와 exact cwd만 허용한다.
+- Hook guard는 Claude의 exact `Bash` tool을 요구한다. Codex는 matcherless adapter와
+  동일하게 non-empty tool name과 string command를 요구한 뒤 exact command와 exact cwd만
+  허용해 code-mode 또는 이후 command-tool 이름 변경을 수용한다.
 - Fake `gh`는 exact argv와 cwd를 검증한다.
 - Runtime process에는 `--die-with-parent` bubblewrap boundary를 적용한다.
 

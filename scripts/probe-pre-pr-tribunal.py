@@ -87,6 +87,14 @@ class ProcessResult:
 
 
 @dataclass(frozen=True)
+class RuntimeMount:
+    executable: Path
+    target: Path
+    companion: Path | None = None
+    companion_target: Path | None = None
+
+
+@dataclass(frozen=True)
 class CredentialSnapshot:
     caller_home: Path
     directory_name: str
@@ -663,8 +671,13 @@ def _make_marker_log(path: Path) -> None:
 
 
 def _make_runtime_targets(control_root: Path) -> None:
-    for runtime in ("claude", "codex"):
-        _write(control_root / "runtime-bin" / runtime, "", 0o700)
+    for relative in (
+        "runtime-bin/claude",
+        "runtime-bin/codex",
+        "runtime-bin/codex-bundle/codex",
+        "runtime-bin/codex-bundle/codex-code-mode-host",
+    ):
+        _write(control_root / relative, "", 0o700)
 
 
 def _make_fake_gh(fake_bin: Path, expected_cwd: Path) -> None:
@@ -710,11 +723,8 @@ import sys
 
 EXPECTED_COMMAND = {CANARY_COMMAND!r}
 EXPECTED_CWD = {str(expected_cwd)!r}
-ALLOWED_TOOLS = {{"claude": "Bash", "codex": "exec_command"}}
-
 try:
     runtime = sys.argv[1] if len(sys.argv) == 2 else ""
-    allowed_tool = ALLOWED_TOOLS.get(runtime)
     raw = sys.stdin.buffer.read({HOOK_OUTPUT_LIMIT_BYTES + 1})
     if len(raw) > {HOOK_OUTPUT_LIMIT_BYTES}:
         raise ValueError
@@ -727,11 +737,14 @@ except (AttributeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
     command = ""
     cwd = None
     tool_name = None
-    allowed_tool = None
+
+tool_allowed = (
+    (runtime == "claude" and tool_name == "Bash")
+    or (runtime == "codex" and isinstance(tool_name, str) and bool(tool_name))
+)
 
 if (
-    allowed_tool is not None
-    and tool_name == allowed_tool
+    tool_allowed
     and command == EXPECTED_COMMAND
     and cwd == EXPECTED_CWD
 ):
@@ -922,6 +935,70 @@ def _verified_bwrap() -> Path:
     return BWRAP_PATH
 
 
+def _runtime_mount(
+    control_root: Path,
+    runtime: str,
+    runtime_executable: Path,
+) -> RuntimeMount:
+    if runtime not in {"claude", "codex"}:
+        raise ProbeFailure("ISOLATION_UNAVAILABLE")
+
+    def source(path: Path) -> Path:
+        try:
+            resolved = path.resolve(strict=True)
+            metadata = resolved.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or not os.access(resolved, os.X_OK)
+            ):
+                raise OSError
+            return resolved
+        except (OSError, RuntimeError):
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+
+    executable = source(runtime_executable)
+    companion: Path | None = None
+    if runtime == "codex":
+        candidate = executable.with_name("codex-code-mode-host")
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+        else:
+            companion = source(candidate)
+
+    if companion is None:
+        target = control_root / "runtime-bin" / runtime
+        companion_target = None
+    else:
+        target = control_root / "runtime-bin/codex-bundle/codex"
+        companion_target = (
+            control_root / "runtime-bin/codex-bundle/codex-code-mode-host"
+        )
+
+    for bind_target in (target, companion_target):
+        if bind_target is None:
+            continue
+        try:
+            metadata = bind_target.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or metadata.st_size != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise OSError
+        except OSError:
+            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+
+    return RuntimeMount(executable, target, companion, companion_target)
+
+
 def _system_gh_targets() -> tuple[Path, ...]:
     targets: set[Path] = set()
     for directory in SAFE_SYSTEM_PATH.split(os.pathsep):
@@ -973,31 +1050,17 @@ def _sandbox_argv(
         )
     except OSError:
         raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
-    runtime_target: Path | None = None
+    runtime_mount: RuntimeMount | None = None
     if runtime not in {None, "claude", "codex"}:
         raise ProbeFailure("ISOLATION_UNAVAILABLE")
     if (runtime is None) != (runtime_executable is None):
         raise ProbeFailure("ISOLATION_UNAVAILABLE")
     if runtime is not None and runtime_executable is not None:
-        runtime_target = control_root / "runtime-bin" / runtime
-        try:
-            runtime_executable = runtime_executable.resolve(strict=True)
-            source_metadata = runtime_executable.lstat()
-            target_metadata = runtime_target.lstat()
-            if (
-                not stat.S_ISREG(source_metadata.st_mode)
-                or stat.S_ISLNK(source_metadata.st_mode)
-                or not os.access(runtime_executable, os.X_OK)
-                or not stat.S_ISREG(target_metadata.st_mode)
-                or stat.S_ISLNK(target_metadata.st_mode)
-                or target_metadata.st_uid != os.geteuid()
-                or target_metadata.st_nlink != 1
-                or target_metadata.st_size != 0
-                or stat.S_IMODE(target_metadata.st_mode) != 0o700
-            ):
-                raise OSError
-        except (OSError, RuntimeError):
-            raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+        runtime_mount = _runtime_mount(
+            control_root,
+            runtime,
+            runtime_executable,
+        )
     if (
         control_root == work_dir
         or control_root.is_relative_to(work_dir)
@@ -1055,10 +1118,25 @@ def _sandbox_argv(
         str(control_root),
         str(control_root),
     ]
-    if runtime_target is not None and runtime_executable is not None:
+    if runtime_mount is not None:
         arguments.extend(
-            ("--ro-bind", str(runtime_executable), str(runtime_target))
+            (
+                "--ro-bind",
+                str(runtime_mount.executable),
+                str(runtime_mount.target),
+            )
         )
+        if (
+            runtime_mount.companion is not None
+            and runtime_mount.companion_target is not None
+        ):
+            arguments.extend(
+                (
+                    "--ro-bind",
+                    str(runtime_mount.companion),
+                    str(runtime_mount.companion_target),
+                )
+            )
     for source, target in live_config_masks:
         arguments.extend(("--ro-bind", str(source), str(target)))
     for source in (*writable_paths, evidence_dir):
@@ -1377,6 +1455,7 @@ def _make_isolation_verifier(
     control_parents = (
         control_root,
         control_root / "runtime-bin",
+        control_root / "runtime-bin/codex-bundle",
         control_root / "fake-bin",
         control_home,
         control_home / ".claude",
@@ -1390,6 +1469,8 @@ def _make_isolation_verifier(
     control_leaves = (
         control_root / "runtime-bin/claude",
         control_root / "runtime-bin/codex",
+        control_root / "runtime-bin/codex-bundle/codex",
+        control_root / "runtime-bin/codex-bundle/codex-code-mode-host",
         control_root / "fake-bin/gh",
         control_root / "hosts",
         guard,
@@ -1682,6 +1763,7 @@ def _probe_runtime(
     control_sha256: str,
 ) -> dict[str, object]:
     phase_results: dict[str, dict[str, object]] = {}
+    runtime_mount = _runtime_mount(control_root, runtime, Path(executable))
     for phase, expected_hook, expected_gh_calls in (
         ("missing", "DENY", 0),
         ("pass", "ALLOW", 1),
@@ -1707,7 +1789,7 @@ def _probe_runtime(
         result = _run_sandboxed(
             _runtime_argv(
                 runtime,
-                str(control_root / "runtime-bin" / runtime),
+                str(runtime_mount.target),
                 control_home=control_home,
                 repo=repo,
             ),

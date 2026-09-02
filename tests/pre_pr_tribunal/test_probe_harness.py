@@ -146,6 +146,20 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
         unexpected = sorted(set(os.environ) - ALLOWED)
         if unexpected:
             raise SystemExit(9)
+        if RUNTIME == "codex" and MODE == "requires_code_mode_host":
+            companion = Path(__file__).with_name("codex-code-mode-host")
+            try:
+                companion_result = subprocess.run(
+                    [str(companion)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            except OSError:
+                raise SystemExit(9)
+            if companion_result.returncode != 0:
+                raise SystemExit(9)
         path_head = Path(os.environ["PATH"].split(os.pathsep, 1)[0]) / "gh"
         if shutil.which("gh") != str(path_head):
             raise SystemExit(9)
@@ -731,13 +745,16 @@ def test_runtime_resolution_returns_canonical_executable(tmp_path):
 def test_runtime_binary_inside_masked_config_is_rebound(
     fake_runtimes, tmp_path
 ):
-    fake = fake_runtimes()
+    fake = fake_runtimes(codex="requires_code_mode_host")
     fake_bin = Path(fake.env["PATH"].split(os.pathsep, 1)[0])
     launcher = fake_bin / "codex"
     target = fake.caller_home / ".codex/packages/standalone/current/bin/codex"
     target.parent.mkdir(parents=True, mode=0o700)
     target.write_bytes(launcher.read_bytes())
     target.chmod(0o700)
+    companion = target.with_name("codex-code-mode-host")
+    companion.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    companion.chmod(0o700)
     launcher.unlink()
     launcher.symlink_to(target)
 
@@ -751,6 +768,32 @@ def test_runtime_binary_inside_masked_config_is_rebound(
     assert result.returncode == 0
     assert json.loads(result.stdout)["codex"]["status"] == "PASS"
     assert not work_dir.exists()
+
+
+def test_probe_guard_accepts_unfamiliar_codex_command_tool(tmp_path):
+    module = _load_probe_module()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    guard = tmp_path / "guard.py"
+    module._make_probe_guard(guard, repo)
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "future_command_tool",
+        "cwd": str(repo),
+        "tool_input": {"command": module.CANARY_COMMAND},
+    }
+
+    result = subprocess.run(
+        [sys.executable, str(guard), "codex"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
 
 
 def _isolation_fixture(module, tmp_path: Path) -> IsolationFixture:
@@ -1643,6 +1686,7 @@ def test_control_digest_mismatch_uses_stable_v2_status(tmp_path, monkeypatch):
     hosts_file = control_root / "hosts"
     for path in (repo, home, control_home, fake_bin):
         path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    module._make_runtime_targets(control_root)
 
     monkeypatch.setattr(module, "_remove_review", lambda *_args: None)
     monkeypatch.setattr(module, "_create_pass_verdict", lambda *_args: None)
@@ -1656,7 +1700,7 @@ def test_control_digest_mismatch_uses_stable_v2_status(tmp_path, monkeypatch):
 
     report = module._probe_runtime(
         "claude",
-        executable="/synthetic/claude",
+        executable="/usr/bin/true",
         auth_source="environment",
         claude_subscription_token=None,
         codex_auth_fd=None,
