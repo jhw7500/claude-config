@@ -2,7 +2,7 @@
 
 - 날짜: 2026-09-02
 - 대상: GitHub Issue #32, Task 8 실제 Claude/Codex canary
-- 상태: 대화 설계 승인 완료, 작성된 spec 사용자 검토 대기
+- 상태: 사용자 승인 완료, 구현 계획 작성 완료
 - 기준 커밋: `841a5e26b3315ed57bf65dcbcb948a6165022afa`
 - 대체 범위: `2026-09-01-pre-pr-adversarial-tribunal-design.md`의 16.5절
 
