@@ -516,56 +516,12 @@ scanner corpus와 함께 기존 #19 전체 test suite도 실행해 동작 격리
 
 ### 16.5 실제 runtime canary probe
 
-Claude와 Codex 각각 격리된 temporary HOME/CODEX_HOME 및 temporary Git repository를
-사용한다. PATH 앞에는 실행 시 canary file을 만드는 fake `gh`를 둔다.
-
-기본 인증원은 caller의 기존 subscription login이다. 이는 live runtime 설정 전체를 상속한다는
-뜻이 아니라 canary에 필요한 credential 하나만 controller가 bounded exception으로 다룬다는 뜻이다.
-Claude는 caller HOME의 `.claude/.credentials.json`을 no-follow/close-on-exec로 열어 현재 UID 소유,
-owner-only regular file, stable metadata, bounded duplicate-free JSON, non-empty OAuth access token과
-version probe 120초, 두 phase 240초, pass-verdict의 begin/finalize 60초 및 scheduling cushion
-30초를 모두 덮는 450초 expiry margin을 확인한 뒤 child environment의
-`CLAUDE_CODE_OAUTH_TOKEN`으로만 전달한다. Codex는 같은 검증을 거친 `.codex/auth.json`의 exact bounded
-bytes를 disposable owner-only file에 복사하고, immutable `CODEX_HOME` parent 아래 `auth.json` leaf에만
-mount한다. Refresh가 필요하면 disposable leaf만 쓸 수 있고 live source와 hook config parent는 쓸 수
-없다. Caller의 `.claude`/`.codex`는 sandbox 안에서 empty immutable directory로 가려 live fallback을
-막는다.
-
-두 live source는 probe 전후 bytes와 metadata가 같아야 하며 staged data는 control digest/evidence/output에
-들어가지 않고 모든 종료 경로에서 제거된다. Outermost lifecycle `finally`가 evidence/control/work root를
-소유하며 정상/실패/timeout/setup exception과 catchable SIGINT/SIGTERM에서 identity-confined,
-idempotent cleanup한다. Work/control allocator와 evidence recorder는 publication 전 `BaseException`을 내부
-cleanup한다. SIGINT/SIGTERM은 allocator 생성부터 caller assignment까지 중첩 mask로 함께 block하며, handler는
-두 신호를 원자적으로 block하고 termination만 전달할 뿐 cleanup하지 않는다. Child kill/reap과 최종
-evidence/control/work cleanup은 handler 및 정확한 caller mask 복원 전에 끝난다. 그 구간의 pending signal은
-복원 뒤 caller의 원래 semantics로 전달된다. Process stop과 evidence-thread join은 각각 deadline을 갖는다.
-Claude OAuth와 Codex auth의 token-like value(실행 중 staged refresh로 생긴 값 포함)와 bounded raw auth
-document는 high-risk `CREDENTIAL` inventory다. Stdout/stderr의 JSON string token은 arbitrary surrounding text와
-NDJSON 안에서 한 번 lex/decode한다. Key/value, nested/list leaf, JSON string으로 감싼 raw document,
-대소문자 혼합 Unicode escape와 valid surrogate pair를 decoded inventory에 대조한다. 전체 item 8,192개,
-depth 64, decoded 128 KiB를 넘거나 JSON string/structure가 malformed이면 credential-backed capture를 fail
-closed하며 stable secret-derived field를 공개하지 않는다. Token-like field가 8-byte 미만 string이거나
-structured/list value이면 malformed로 fail closed하고, 긴 token의 7-byte prefix도 leak으로 분류한다.
-그런 값이 capture에 나타나면 raw value, prefix, raw auth JSON을 기록하지 않고
-`SENSITIVE_OUTPUT`으로 실패한다. 더 짧은 prefix의 모호성 때문에 credential material이 child 범위에
-있으면 capture/version hash는 항상 `WITHHELD`다. `OUTPUT_LIMIT`도 classifier가 보지 못한 tail을 digest에
-결속하지 않도록 두 hash를 무조건 보류한다. Version output은 refreshed Codex stage를 다시 읽은 뒤
-sensitivity를 먼저 판정하고, 안전할 때만 version/hash를 파생한다. Sensitivity는 control-digest breach보다
-우선한다.
-Missing, unsafe/symlink, unreadable, oversized, malformed/duplicate, expired 또는 staging 실패는 stable
-status로 fail closed한다. API-key 인증은 명시적인 `--auth-source environment`에서만 가능하며 default는
-`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`를 전달하거나 fallback하지 않는다. Explicit mode에서도 Claude
-version/two-phase child에는 `ANTHROPIC_API_KEY`만, Codex child에는 `OPENAI_API_KEY`만 전달한다.
-
-각 runtime에서 두 번 검증한다.
-
-1. verdict가 없을 때 모델이 `gh pr create`를 시도해도 hook이 deny하고 canary가 없음
-2. 현재 snapshot의 valid pass verdict가 있을 때 fake `gh`가 실행되어 canary가 생김
-
-실제 GitHub API와 network는 사용하지 않는다. Codex trust bypass flag가 필요하면
-검토된 temporary test source에만 사용하고 production 설치 검증으로 표현하지 않는다.
-Probe command, runtime version, exit/result와 canary 상태를 validation evidence로
-보존한다.
+2026-09-02에 승인된
+[`2026-09-02-pre-pr-runtime-canary-simplification-design.md`](./2026-09-02-pre-pr-runtime-canary-simplification-design.md)가
+이 절의 authoritative 설계다. 실제 runtime canary는 기존 bubblewrap, fake `gh`,
+GitHub sinkhole과 exact-command guard를 유지하되 runtime raw output, version, hash와
+credential classifier를 증거에서 제거한다. Hook/fake-`gh` marker만 판정하고 Codex
+auth는 sealed memfd에서 sandbox tmpfs로 초기화해 host disk staging을 만들지 않는다.
 
 ## 17. 성능과 운영 한계
 
