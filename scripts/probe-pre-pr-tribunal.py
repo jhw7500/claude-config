@@ -90,12 +90,16 @@ def _read_marker_log(path: Path, allowed: frozenset[str]) -> tuple[str, ...]:
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
     if hasattr(os, "O_NOATIME"):
         flags |= os.O_NOATIME
-    descriptor = os.open(path, flags)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise ProbeFailure("CANARY_MISMATCH") from None
     try:
         before = os.fstat(descriptor)
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
             or stat.S_IMODE(before.st_mode) & 0o077
             or before.st_size > MARKER_LIMIT_BYTES
         ):
@@ -1003,6 +1007,240 @@ def _make_phase_logs(
     return evidence_dir, hook_log, gh_log
 
 
+def _make_isolation_verifier(
+    path: Path,
+    *,
+    work_dir: Path,
+    repo: Path,
+    control_root: Path,
+) -> None:
+    outside = work_dir.parent / f".{work_dir.name}.boundary-write"
+    if outside.exists():
+        raise ProbeFailure("ISOLATION_UNAVAILABLE")
+    control_home = control_root / "home"
+    guard = control_root / "probe-command-guard.py"
+    wrapper = control_root / "probe-hook-wrapper.py"
+    control_parents = (
+        control_root,
+        control_root / "fake-bin",
+        control_home,
+        control_home / ".claude",
+        control_home / ".codex",
+        control_home / ".local",
+        control_home / ".local/share",
+        control_home / ".local/share/claude-config",
+        control_home / ".local/share/claude-config/pre_pr_tribunal",
+    )
+    package = control_home / ".local/share/claude-config/pre_pr_tribunal"
+    control_leaves = (
+        control_root / "fake-bin/gh",
+        control_root / "hosts",
+        guard,
+        wrapper,
+        control_home / ".claude/settings.json",
+        control_home / ".codex/hooks.json",
+        package / "hook_common.py",
+        package / "claude_hook.py",
+        package / "codex_hook.py",
+    )
+    source = f'''#!/usr/bin/python3
+import ipaddress
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+
+WORK_DIR = Path({str(work_dir)!r})
+REPO = Path({str(repo)!r})
+CONTROL_ROOT = Path({str(control_root)!r})
+OUTSIDE = Path({str(outside)!r})
+CONTROL_PARENTS = tuple(Path(item) for item in {tuple(map(str, control_parents))!r})
+CONTROL_LEAVES = tuple(Path(item) for item in {tuple(map(str, control_leaves))!r})
+CANARY = ["pr", "create", "--title", "canary", "--body", "canary"]
+HOSTS = {GITHUB_HOSTNAMES!r}
+LIMIT = {HOOK_OUTPUT_LIMIT_BYTES}
+
+def fail(code):
+    raise SystemExit(code)
+
+def run_control(command, payload):
+    result = subprocess.run(
+        command,
+        input=json.dumps(payload).encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if len(result.stdout) > LIMIT or len(result.stderr) > LIMIT:
+        fail(40)
+    return result
+
+if Path.cwd() != REPO:
+    fail(10)
+try:
+    with OUTSIDE.open("x", encoding="ascii") as handle:
+        handle.write("x")
+except OSError:
+    pass
+else:
+    OUTSIDE.unlink(missing_ok=True)
+    fail(11)
+
+for target in (WORK_DIR / "unexpected-write", REPO / "unexpected-write"):
+    try:
+        target.write_text("x", encoding="ascii")
+    except OSError:
+        pass
+    else:
+        target.unlink(missing_ok=True)
+        fail(12)
+
+for root in (
+    Path(os.environ["HOME"]),
+    Path(os.environ["TMPDIR"]),
+    Path(os.environ["GH_CONFIG_DIR"]),
+    Path(os.environ["PRE_PR_PROBE_HOOK_LOG"]).parent,
+):
+    scratch = root / "boundary-write"
+    scratch.write_text("x", encoding="ascii")
+    scratch.unlink()
+
+for target in CONTROL_PARENTS:
+    marker = target / "probe-control-mutation"
+    try:
+        marker.write_text("forged", encoding="ascii")
+    except OSError:
+        pass
+    else:
+        marker.unlink(missing_ok=True)
+        fail(13)
+    try:
+        target.rename(target.with_name(target.name + ".moved"))
+    except OSError:
+        pass
+    else:
+        fail(14)
+
+for target in CONTROL_LEAVES:
+    for action in ("write", "unlink", "rename"):
+        try:
+            if action == "write":
+                target.write_bytes(b"forged")
+            elif action == "unlink":
+                target.unlink()
+            else:
+                target.rename(target.with_name(target.name + ".moved"))
+        except OSError:
+            pass
+        else:
+            fail(15)
+
+commands = [
+    ["/usr/bin/gh", *CANARY],
+    ["/usr/bin/env", "PATH=/usr/bin:/bin", "gh", *CANARY],
+    ["/bin/sh", "-c", "command -p gh pr create --title canary --body canary"],
+]
+for command in commands:
+    result = subprocess.run(
+        command,
+        cwd=REPO,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        fail(16)
+
+base = {{
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "cwd": str(REPO),
+    "tool_input": {{"command": {CANARY_COMMAND!r}}},
+}}
+exact = run_control(
+    ["/usr/bin/python3", str(CONTROL_ROOT / "probe-command-guard.py"), "claude"],
+    base,
+)
+if exact.returncode != 0 or exact.stdout or exact.stderr:
+    fail(17)
+
+for runtime, payload in (
+    ("claude", {{**base, "tool_input": {{"command": "gh pr create --title other --body canary"}}}}),
+    ("claude", {{**base, "cwd": str(REPO.parent)}}),
+    ("codex", {{**base, "tool_name": "apply_patch", "tool_input": {{"patch": "forged"}}}}),
+    ("codex", {{**base, "tool_name": "unknown_tool", "tool_input": {{}}}}),
+):
+    rejected = run_control(
+        ["/usr/bin/python3", str(CONTROL_ROOT / "probe-command-guard.py"), runtime],
+        payload,
+    )
+    try:
+        event = json.loads(rejected.stdout.decode("utf-8", "strict"))
+        decision = event["hookSpecificOutput"]["permissionDecision"]
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        fail(18)
+    if rejected.returncode != 0 or rejected.stderr or decision != "deny":
+        fail(19)
+
+for runtime, config, tool_name in (
+    ("claude", CONTROL_ROOT / "home/.claude/settings.json", "Bash"),
+    ("codex", CONTROL_ROOT / "home/.codex/hooks.json", "exec_command"),
+):
+    try:
+        groups = json.loads(config.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
+        commands = [
+            shlex.split(hook["command"])
+            for group in groups
+            for hook in group["hooks"]
+        ]
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        fail(20)
+    if len(commands) != 2:
+        fail(21)
+    payload = {{**base, "tool_name": tool_name}}
+    guard_result = run_control(commands[0], payload)
+    adapter_result = run_control(commands[1], payload)
+    try:
+        event = json.loads(adapter_result.stdout.decode("utf-8", "strict"))
+        decision = event["hookSpecificOutput"]["permissionDecision"]
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        fail(22)
+    if (
+        guard_result.returncode != 0
+        or guard_result.stdout
+        or guard_result.stderr
+        or adapter_result.returncode != 0
+        or adapter_result.stderr
+        or decision != "deny"
+    ):
+        fail(23)
+
+mappings = {{hostname: set() for hostname in HOSTS}}
+try:
+    lines = Path("/etc/hosts").read_text(encoding="ascii").splitlines()
+    for line in lines:
+        fields = line.split("#", 1)[0].split()
+        if len(fields) < 2:
+            continue
+        address = ipaddress.ip_address(fields[0])
+        for hostname in fields[1:]:
+            if hostname in mappings:
+                mappings[hostname].add(address)
+except (OSError, UnicodeError, ValueError):
+    fail(24)
+if any(
+    len(addresses) != 2
+    or not all(address.is_loopback for address in addresses)
+    or {{address.version for address in addresses}} != {{4, 6}}
+    for addresses in mappings.values()
+):
+    fail(25)
+'''
+    _write(path, source, 0o700)
+
+
 def _verify_isolation(
     *,
     work_dir: Path,
@@ -1016,6 +1254,13 @@ def _verify_isolation(
 ) -> None:
     evidence_dir, hook_log, gh_log = _make_phase_logs(
         work_dir, "isolation", "preflight"
+    )
+    verifier = work_dir / "verify-isolation.py"
+    _make_isolation_verifier(
+        verifier,
+        work_dir=work_dir,
+        repo=repo,
+        control_root=control_root,
     )
     environment = {
         "HOME": str(home),
@@ -1032,20 +1277,30 @@ def _verify_isolation(
         "PRE_PR_PROBE_GH_LOG": str(gh_log),
     }
     before = _protected_digest((control_root,))
-    result = _run_sandboxed(
-        ["/usr/bin/true"],
-        work_dir=work_dir,
-        repo=repo,
-        fake_gh=fake_bin / "gh",
-        hosts_file=hosts_file,
-        control_root=control_root,
-        evidence_dir=evidence_dir,
-        caller_home=caller_home,
-        env=environment,
-        timeout=INTERNAL_TIMEOUT_SECONDS,
-    )
-    after = _protected_digest((control_root,))
-    if result.exit_class != "ZERO" or before != after:
+    try:
+        result = _run_sandboxed(
+            ["/usr/bin/python3", str(verifier)],
+            work_dir=work_dir,
+            repo=repo,
+            fake_gh=fake_bin / "gh",
+            hosts_file=hosts_file,
+            control_root=control_root,
+            evidence_dir=evidence_dir,
+            caller_home=caller_home,
+            env=environment,
+            timeout=INTERNAL_TIMEOUT_SECONDS,
+        )
+        hooks = _read_marker_log(hook_log, HOOK_MARKERS)
+        gh = _read_marker_log(gh_log, GH_MARKERS)
+        after = _protected_digest((control_root,))
+    except ProbeFailure:
+        raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
+    if (
+        result.exit_class != "ZERO"
+        or hooks != ("D", "D")
+        or gh != ("V", "V", "V")
+        or before != after
+    ):
         raise ProbeFailure("ISOLATION_UNAVAILABLE")
 
 

@@ -24,6 +24,19 @@ class FakeRuntimes:
     env: dict[str, str]
 
 
+@dataclass(frozen=True)
+class IsolationFixture:
+    work_dir: Path
+    repo: Path
+    home: Path
+    control_root: Path
+    control_home: Path
+    fake_bin: Path
+    hosts_file: Path
+    guard: Path
+    wrapper: Path
+
+
 @pytest.fixture
 def fake_runtimes(tmp_path):
     def make(
@@ -159,30 +172,44 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
             "tool_input": {{"command": CANARY}},
         }}
         denied = False
-        for group in value.get("hooks", {{}}).get("PreToolUse", []):
-            matcher = group.get("matcher")
-            if matcher is not None and matcher != tool_name:
-                continue
-            for hook_spec in group.get("hooks", []):
-                hook = subprocess.run(
-                    shlex.split(os.path.expandvars(hook_spec["command"])),
-                    input=json.dumps(payload),
-                    text=True,
-                    capture_output=True,
+        repetitions = {{"missing_hook": 0, "duplicate_hook": 2}}.get(MODE, 1)
+        for _ in range(repetitions):
+            for group in value.get("hooks", {{}}).get("PreToolUse", []):
+                matcher = group.get("matcher")
+                if matcher is not None and matcher != tool_name:
+                    continue
+                for hook_spec in group.get("hooks", []):
+                    hook = subprocess.run(
+                        shlex.split(os.path.expandvars(hook_spec["command"])),
+                        input=json.dumps(payload),
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        env=dict(os.environ),
+                    )
+                    if hook.stdout:
+                        event = json.loads(hook.stdout)
+                        denied = denied or event.get("hookSpecificOutput", {{}}).get(
+                            "permissionDecision"
+                        ) == "deny"
+        if MODE == "invalid_hook":
+            with open(
+                os.environ["PRE_PR_PROBE_HOOK_LOG"], "a", encoding="ascii"
+            ) as marker:
+                marker.write("I\\n")
+        if not denied:
+            calls = {{"missing_gh": 0, "duplicate_gh": 2}}.get(MODE, 1)
+            command = (
+                ["gh", "pr", "view"]
+                if MODE == "invalid_gh"
+                else ["gh", "pr", "create", "--title", "canary", "--body", "canary"]
+            )
+            for _ in range(calls):
+                subprocess.run(
+                    command,
                     check=False,
                     env=dict(os.environ),
                 )
-                if hook.stdout:
-                    event = json.loads(hook.stdout)
-                    denied = denied or event.get("hookSpecificOutput", {{}}).get(
-                        "permissionDecision"
-                    ) == "deny"
-        if not denied:
-            subprocess.run(
-                ["gh", "pr", "create", "--title", "canary", "--body", "canary"],
-                check=False,
-                env=dict(os.environ),
-            )
         raise SystemExit(0)
         """
     )
@@ -232,6 +259,92 @@ def _load_probe_module():
     return module
 
 
+def _isolation_fixture(module, tmp_path: Path) -> IsolationFixture:
+    work_dir = tmp_path / "work"
+    control_root = tmp_path / "control"
+    home = work_dir / "home"
+    repo = work_dir / "repo"
+    control_home = control_root / "home"
+    fake_bin = control_root / "fake-bin"
+    hosts_file = control_root / "hosts"
+    guard = control_root / "probe-command-guard.py"
+    wrapper = control_root / "probe-hook-wrapper.py"
+    for path in (work_dir, control_root, home, control_home):
+        path.mkdir(mode=0o700)
+    (work_dir / "tmp").mkdir(mode=0o700)
+    (work_dir / "gh-config").mkdir(mode=0o700)
+    module._create_probe_repo(repo, home)
+    module._make_fake_gh(fake_bin, repo)
+    module._make_hosts_file(hosts_file)
+    module._install(REPO, control_home, repo)
+    module._make_probe_guard(guard, repo)
+    module._make_hook_wrapper(wrapper)
+    module._install_probe_guard(control_home, guard, wrapper)
+    return IsolationFixture(
+        work_dir=work_dir,
+        repo=repo,
+        home=home,
+        control_root=control_root,
+        control_home=control_home,
+        fake_bin=fake_bin,
+        hosts_file=hosts_file,
+        guard=guard,
+        wrapper=wrapper,
+    )
+
+
+def _run_isolation_preflight(module, fixture: IsolationFixture) -> None:
+    module._verify_isolation(
+        work_dir=fixture.work_dir,
+        repo=fixture.repo,
+        home=fixture.home,
+        control_root=fixture.control_root,
+        control_home=fixture.control_home,
+        fake_bin=fixture.fake_bin,
+        hosts_file=fixture.hosts_file,
+        caller_home=None,
+    )
+
+
+def test_isolation_preflight_exercises_guards_mounts_and_gh_interception(tmp_path):
+    module = _load_probe_module()
+    fixture = _isolation_fixture(module, tmp_path)
+
+    _run_isolation_preflight(module, fixture)
+
+    evidence = fixture.work_dir / "evidence/isolation/preflight"
+    assert module._read_marker_log(
+        evidence / "hook.log", module.HOOK_MARKERS
+    ) == ("D", "D")
+    assert module._read_marker_log(
+        evidence / "gh.log", module.GH_MARKERS
+    ) == ("V", "V", "V")
+
+
+@pytest.mark.parametrize("tamper", ["guard", "wrapper", "hosts"])
+def test_isolation_preflight_rejects_broken_controls(tmp_path, tamper):
+    module = _load_probe_module()
+    fixture = _isolation_fixture(module, tmp_path)
+    if tamper == "guard":
+        fixture.guard.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+        fixture.guard.chmod(0o700)
+    elif tamper == "wrapper":
+        fixture.wrapper.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+        fixture.wrapper.chmod(0o700)
+    else:
+        names = " ".join(module.GITHUB_HOSTNAMES)
+        fixture.hosts_file.write_text(
+            f"192.0.2.1 {names}\n2001:db8::1 {names}\n",
+            encoding="ascii",
+        )
+        fixture.hosts_file.chmod(0o600)
+
+    with pytest.raises(module.ProbeFailure) as raised:
+        _run_isolation_preflight(module, fixture)
+
+    assert raised.value.code == "ISOLATION_UNAVAILABLE"
+
+
 def _assert_phase(
     phase: dict[str, object],
     *,
@@ -244,6 +357,105 @@ def _assert_phase(
         "hook": hook,
         "gh_calls": gh_calls,
     }
+
+
+@pytest.mark.parametrize("case", ["directory", "public_mode", "symlink", "hardlink"])
+def test_marker_reader_rejects_unsafe_metadata(tmp_path, case):
+    module = _load_probe_module()
+    marker = tmp_path / "hook.log"
+    if case == "directory":
+        marker.mkdir(mode=0o700)
+    elif case == "symlink":
+        target = tmp_path / "target.log"
+        target.write_bytes(b"D\n")
+        target.chmod(0o600)
+        marker.symlink_to(target)
+    elif case == "hardlink":
+        target = tmp_path / "target.log"
+        target.write_bytes(b"D\n")
+        target.chmod(0o600)
+        os.link(target, marker)
+    else:
+        marker.write_bytes(b"D\n")
+        marker.chmod(0o640)
+
+    with pytest.raises(module.ProbeFailure) as raised:
+        module._read_marker_log(marker, module.HOOK_MARKERS)
+
+    assert raised.value.code == "CANARY_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"D\n" * 33,
+        b"\xff\n",
+        b"X\n",
+    ],
+)
+def test_marker_reader_rejects_oversized_non_ascii_or_unknown_content(
+    tmp_path, raw
+):
+    module = _load_probe_module()
+    marker = tmp_path / "hook.log"
+    marker.write_bytes(raw)
+    marker.chmod(0o600)
+
+    with pytest.raises(module.ProbeFailure) as raised:
+        module._read_marker_log(marker, module.HOOK_MARKERS)
+
+    assert raised.value.code == "CANARY_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    (
+        "hook_raw",
+        "gh_raw",
+        "expected_hook",
+        "expected_gh_calls",
+        "phase_hook",
+        "phase_gh_calls",
+    ),
+    [
+        (b"", b"", "DENY", 0, "INVALID", 0),
+        (b"D\nD\n", b"", "DENY", 0, "INVALID", 0),
+        (b"I\n", b"", "DENY", 0, "INVALID", 0),
+        (b"D\n", b"V\n", "DENY", 0, "DENY", 1),
+        (b"A\n", b"", "ALLOW", 1, "ALLOW", 0),
+        (b"A\n", b"V\nV\n", "ALLOW", 1, "ALLOW", 2),
+        (b"A\n", b"I\n", "ALLOW", 1, "ALLOW", 0),
+    ],
+)
+def test_phase_report_rejects_inexact_marker_sequences(
+    tmp_path,
+    hook_raw,
+    gh_raw,
+    expected_hook,
+    expected_gh_calls,
+    phase_hook,
+    phase_gh_calls,
+):
+    module = _load_probe_module()
+    hook_log = tmp_path / "hook.log"
+    gh_log = tmp_path / "gh.log"
+    for path, raw in ((hook_log, hook_raw), (gh_log, gh_raw)):
+        path.write_bytes(raw)
+        path.chmod(0o600)
+
+    phase, matches = module._phase_report(
+        module.ProcessResult(0, "ZERO"),
+        hook_log=hook_log,
+        gh_log=gh_log,
+        expected_hook=expected_hook,
+        expected_gh_calls=expected_gh_calls,
+    )
+
+    assert phase == {
+        "runtime_exit": "ZERO",
+        "hook": phase_hook,
+        "gh_calls": phase_gh_calls,
+    }
+    assert matches is False
 
 
 def test_environment_canary_requires_missing_deny_then_pass_allow(
@@ -274,6 +486,42 @@ def test_environment_canary_requires_missing_deny_then_pass_allow(
             hook="ALLOW",
             gh_calls=1,
         )
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("mode", "phase", "hook", "gh_calls"),
+    [
+        ("missing_hook", "missing", "INVALID", 1),
+        ("duplicate_hook", "missing", "INVALID", 0),
+        ("invalid_hook", "missing", "INVALID", 0),
+        ("missing_gh", "pass", "ALLOW", 0),
+        ("duplicate_gh", "pass", "ALLOW", 2),
+        ("invalid_gh", "pass", "ALLOW", 0),
+    ],
+)
+def test_invalid_marker_evidence_blocks_probe(
+    fake_runtimes, tmp_path, mode, phase, hook, gh_calls
+):
+    fake = fake_runtimes(claude=mode)
+
+    result, work_dir = _run_probe(
+        fake,
+        tmp_path,
+        runtime="claude",
+        auth_source="environment",
+    )
+
+    report = json.loads(result.stdout)
+    assert result.returncode != 0
+    assert report["status"] == "BLOCKED"
+    assert report["claude"]["status"] == "CANARY_MISMATCH"
+    _assert_phase(
+        report["claude"][phase],
+        runtime_exit="ZERO",
+        hook=hook,
+        gh_calls=gh_calls,
+    )
     assert not work_dir.exists()
 
 
