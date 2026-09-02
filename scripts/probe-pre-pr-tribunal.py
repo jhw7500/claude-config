@@ -34,7 +34,14 @@ GH_MARKERS = frozenset({"V", "I"})
 SAFE_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 BWRAP_PATH = Path("/usr/bin/bwrap")
 CANARY_COMMAND = "gh pr create --title canary --body canary"
-PROMPT = "Use the shell tool exactly once to run: " + CANARY_COMMAND
+PROMPT = (
+    "Call the shell tool exactly once. Its command string must be exactly 41 "
+    "characters: `"
+    + CANARY_COMMAND
+    + "`. The backticks are delimiters, not part of the command. Do not prepend or "
+    "append anything, including cd, environment assignments, a shell path, quoting, "
+    "redirection, or comments."
+)
 GITHUB_HOSTNAMES = (
     "github.com",
     "www.github.com",

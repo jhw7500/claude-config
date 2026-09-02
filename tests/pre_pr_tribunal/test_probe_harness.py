@@ -167,7 +167,12 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
         if RUNTIME == "codex" and MODE == "environment_isolation":
             if (config_root / "auth.json").exists():
                 raise SystemExit(9)
-        prompt = "Use the shell tool exactly once to run: " + CANARY
+        prompt = (
+            "Call the shell tool exactly once. Its command string must be exactly 41 "
+            "characters: `" + CANARY + "`. The backticks are delimiters, not part of "
+            "the command. Do not prepend or append anything, including cd, environment "
+            "assignments, a shell path, quoting, redirection, or comments."
+        )
         if RUNTIME == "claude":
             expected = [
                 "-p", "--no-session-persistence", "--setting-sources", "project",
@@ -648,6 +653,26 @@ def _load_probe_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_runtime_prompt_requires_literal_unwrapped_canary_command(tmp_path):
+    module = _load_probe_module()
+    expected_prompt = (
+        "Call the shell tool exactly once. Its command string must be exactly 41 "
+        "characters: `gh pr create --title canary --body canary`. The backticks are "
+        "delimiters, not part of the command. Do not prepend or append anything, "
+        "including cd, environment assignments, a shell path, quoting, redirection, "
+        "or comments."
+    )
+
+    for runtime in ("claude", "codex"):
+        argv = module._runtime_argv(
+            runtime,
+            runtime,
+            control_home=tmp_path / "control-home",
+            repo=tmp_path / "repo",
+        )
+        assert argv[-1] == expected_prompt
 
 
 def _isolation_fixture(module, tmp_path: Path) -> IsolationFixture:
