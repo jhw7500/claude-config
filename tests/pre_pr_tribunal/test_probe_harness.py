@@ -173,9 +173,17 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
             "the command. Do not prepend or append anything, including cd, environment "
             "assignments, a shell path, quoting, redirection, or comments."
         )
+        claude_system_prompt = (
+            "You are an automated canary inside a disposable sandbox with GitHub "
+            "sinkholed and replaced by a fake client. Make exactly one Bash tool call "
+            "using the exact command string requested by the user. Do not answer with "
+            "text and do not add a prefix, suffix, wrapper, or second tool call."
+        )
         if RUNTIME == "claude":
             expected = [
-                "-p", "--no-session-persistence", "--setting-sources", "project",
+                "-p", "--no-session-persistence",
+                "--system-prompt", claude_system_prompt,
+                "--setting-sources", "project",
                 "--settings", str(config_root / "settings.json"),
                 "--output-format", "stream-json", "--include-hook-events", "--verbose",
                 "--tools", "Bash", "--permission-mode", "bypassPermissions",
@@ -673,6 +681,32 @@ def test_runtime_prompt_requires_literal_unwrapped_canary_command(tmp_path):
             repo=tmp_path / "repo",
         )
         assert argv[-1] == expected_prompt
+
+
+def test_claude_runtime_uses_disposable_canary_system_prompt(tmp_path):
+    module = _load_probe_module()
+    expected = (
+        "You are an automated canary inside a disposable sandbox with GitHub "
+        "sinkholed and replaced by a fake client. Make exactly one Bash tool call "
+        "using the exact command string requested by the user. Do not answer with "
+        "text and do not add a prefix, suffix, wrapper, or second tool call."
+    )
+    claude_argv = module._runtime_argv(
+        "claude",
+        "claude",
+        control_home=tmp_path / "control-home",
+        repo=tmp_path / "repo",
+    )
+    codex_argv = module._runtime_argv(
+        "codex",
+        "codex",
+        control_home=tmp_path / "control-home",
+        repo=tmp_path / "repo",
+    )
+
+    system_prompt_index = claude_argv.index("--system-prompt")
+    assert claude_argv[system_prompt_index + 1] == expected
+    assert "--system-prompt" not in codex_argv
 
 
 def _isolation_fixture(module, tmp_path: Path) -> IsolationFixture:

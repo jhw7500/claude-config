@@ -188,6 +188,9 @@ Runtime은 bubblewrap child process group으로 시작한다.
 
 - stdin은 `/dev/null`이다.
 - stdout과 stderr도 `/dev/null`이다.
+- Claude는 disposable sandbox와 fake `gh`만 설명하는 고정 canary system prompt를 사용하고,
+  user prompt는 41자 exact command 외의 prefix, suffix와 wrapper를 금지한다. 기본 agent
+  planning의 비결정성은 canary wiring 판정에 포함하지 않는다.
 - Runtime output byte, hash, version, auth marker 또는 sensitivity를 읽지 않는다.
 - 120초 timeout을 넘으면 process group에 TERM, bounded grace 뒤 KILL을 보내고 reap한다.
 - Nonzero는 내용을 해석하지 않고 `RUNTIME_FAILED`다.

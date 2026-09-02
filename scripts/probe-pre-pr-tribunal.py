@@ -42,6 +42,12 @@ PROMPT = (
     "append anything, including cd, environment assignments, a shell path, quoting, "
     "redirection, or comments."
 )
+CLAUDE_CANARY_SYSTEM_PROMPT = (
+    "You are an automated canary inside a disposable sandbox with GitHub sinkholed "
+    "and replaced by a fake client. Make exactly one Bash tool call using the exact "
+    "command string requested by the user. Do not answer with text and do not add a "
+    "prefix, suffix, wrapper, or second tool call."
+)
 GITHUB_HOSTNAMES = (
     "github.com",
     "www.github.com",
@@ -1270,6 +1276,8 @@ def _runtime_argv(
             executable,
             "-p",
             "--no-session-persistence",
+            "--system-prompt",
+            CLAUDE_CANARY_SYSTEM_PROMPT,
             "--setting-sources",
             "project",
             "--settings",
