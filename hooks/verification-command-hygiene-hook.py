@@ -9,7 +9,9 @@ would make most candidates noise.
 Quoted documentation/search literals, comments, heredoc data, later commands,
 and redirection targets are not echo output and are ignored. Executable command
 substitutions are checked recursively. The hook never denies a tool call and
-returns zero on malformed input.
+returns zero on malformed input. The warning is emitted as a PreToolUse
+``hookSpecificOutput.additionalContext`` envelope; raw stdout is discarded
+by the harness on this event.
 Kill switch: CLAUDE_SKIP_VERIFICATION_COMMAND_HYGIENE=1.
 """
 
@@ -21,12 +23,10 @@ import sys
 import time
 
 
-REMINDER = """<system-reminder>
-[VERIFICATION-COMMAND-HYGIENE] `|| echo` fallback에 실행 전 작성된 결론이 들어 있다.
+REMINDER = """[VERIFICATION-COMMAND-HYGIENE] `|| echo` fallback에 실행 전 작성된 결론이 들어 있다.
 
 검증 명령의 fallback은 `(no match)`처럼 중립적으로 바꾸고, 원인·유일성 판단은
-명령 결과와 별도의 반증 확인을 마친 뒤 작성하라.
-</system-reminder>"""
+명령 결과와 별도의 반증 확인을 마친 뒤 작성하라."""
 
 CONTROL_OPERATORS = frozenset(
     {"||", "&&", "|", "|&", ";", ";;", ";&", ";;&", "&"}
@@ -704,7 +704,18 @@ def main() -> int:
         return 0
 
     if has_conclusion_fallback(command):
-        sys.stdout.write(REMINDER)
+        # PreToolUse는 raw stdout을 컨텍스트로 주입하지 않는다. 이 envelope 로만
+        # 전달되므로 형식을 바꾸면 훅이 조용히 무동작이 된다.
+        json.dump(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": REMINDER,
+                }
+            },
+            sys.stdout,
+            ensure_ascii=False,
+        )
         sys.stdout.flush()
     return 0
 

@@ -53,6 +53,16 @@ def run_hook(
     )
 
 
+def test_warning_uses_pretooluse_additional_context_envelope() -> None:
+    """PreToolUse discards raw stdout; only this envelope reaches the model."""
+    result = run_hook('rg "CONFIG_BT" . || echo "없음 → CONFIG_X 뿐"')
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    specific = payload["hookSpecificOutput"]
+    assert specific["hookEventName"] == "PreToolUse"
+    assert "[VERIFICATION-COMMAND-HYGIENE]" in specific["additionalContext"]
+
+
 def test_warns_when_fallback_injects_arrow_conclusion() -> None:
     result = run_hook('rg "CONFIG_BT" . || echo "없음 → CONFIG_X 뿐"')
 
