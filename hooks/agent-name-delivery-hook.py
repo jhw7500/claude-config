@@ -24,6 +24,27 @@ REMINDER = """[AGENT-NAME-DELIVERY] `name`을 붙인 Agent는 메일박스 모�
 결과를 받아야 하는 리뷰·검증·조사 에이전트에 `name`을 붙이지 마라."""
 
 
+
+def emit_context(text: str, hook_event: str) -> None:
+    """Deliver ``text`` to the model.
+
+    PreToolUse/PostToolUse/SubagentStop discard raw stdout; the only channel
+    that reaches the model is the ``hookSpecificOutput.additionalContext``
+    envelope. Writing plain text here makes the hook silently inert.
+    """
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": hook_event,
+                "additionalContext": text,
+            }
+        },
+        sys.stdout,
+        ensure_ascii=False,
+    )
+    sys.stdout.flush()
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -48,8 +69,7 @@ def main() -> int:
     if "sendmessage" in prompt.lower():
         return 0
 
-    sys.stdout.write(REMINDER)
-    sys.stdout.flush()
+    emit_context(REMINDER, "PreToolUse")
     return 0
 
 

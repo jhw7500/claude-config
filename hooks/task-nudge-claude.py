@@ -51,7 +51,18 @@ def main() -> int:
         result = core.RegistrationResult(core.RegistrationStatus.UNKNOWN, None, error.reason)
     except Exception:
         result = core.RegistrationResult(core.RegistrationStatus.UNKNOWN, None, "PORTFOLIO_UNAVAILABLE")
-    sys.stdout.write(core.render_nudge_message(result) + "\n")
+    # PreToolUse는 raw stdout을 모델에 주입하지 않는다. 평문 계약은 훅을
+    # 조용히 무동작으로 만든다 — additionalContext envelope 로만 전달된다.
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": core.render_nudge_message(result),
+            }
+        },
+        sys.stdout,
+        ensure_ascii=False,
+    )
     return 0
 
 
