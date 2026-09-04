@@ -593,7 +593,7 @@ def _audit_rss_observation(
         or not isinstance(rss_kib, int)
         or rss_kib < 0
         or observation.kind != "live"
-        or observation.identity != identity
+        or not identity.same_process(observation.identity)
     ):
         return False, 0
     return True, rss_kib

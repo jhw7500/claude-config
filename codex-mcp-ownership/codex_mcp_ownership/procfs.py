@@ -252,7 +252,7 @@ class LinuxProcfs:
     def rss_kib(self, identity: ProcessIdentity) -> int | None:
         if not isinstance(identity, ProcessIdentity):
             return None
-        if self.identity(identity.pid) != identity:
+        if not identity.same_process(self.identity(identity.pid)):
             return None
         try:
             status = self._read_text(self.proc_root / str(identity.pid) / "status")
@@ -261,7 +261,7 @@ class LinuxProcfs:
         match = re.search(r"^VmRSS:\s*(\d+)\s+kB\s*$", status, re.MULTILINE)
         if match is None:
             return None
-        if self.identity(identity.pid) != identity:
+        if not identity.same_process(self.identity(identity.pid)):
             return None
         return int(match.group(1))
 

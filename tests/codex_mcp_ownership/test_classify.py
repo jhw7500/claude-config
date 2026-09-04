@@ -1084,3 +1084,17 @@ def test_audit_classification_order_is_stable_by_process_identity(tmp_path, scen
 
     keys = [item.process.wrapper.stable_key() for item in snapshot.classifications]
     assert keys == sorted(keys)
+
+
+def test_audit_rss_observation_counts_a_reparented_process(fake_proc) -> None:
+    """A live orphan must still be audited, not silently dropped."""
+    from codex_mcp_ownership import procfs as procfs_module
+
+    fake_proc.write_ppid(321, 999)
+    identity = fake_proc.identity(321)
+    assert identity is not None
+    live = procfs_module.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+
+    fake_proc.write_ppid(321, 1)
+
+    assert classify._audit_rss_observation(live, identity) == (True, 128)

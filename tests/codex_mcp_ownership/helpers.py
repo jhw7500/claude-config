@@ -132,5 +132,16 @@ class FakeProcTree:
             raw[: right + 1] + " " + " ".join(fields) + "\n", encoding="utf-8"
         )
 
+    def write_ppid(self, pid: int, value: int) -> None:
+        """Reparent the fake process — what the kernel does when a parent exits."""
+        stat_path = self.root / str(pid) / "stat"
+        raw = stat_path.read_text(encoding="utf-8")
+        right = raw.rfind(")")
+        fields = raw[right + 1 :].strip().split()
+        fields[1] = str(value)
+        stat_path.write_text(
+            raw[: right + 1] + " " + " ".join(fields) + "\n", encoding="utf-8"
+        )
+
     def rss_kib(self, identity):
         return procfs.LinuxProcfs(self.root, self.boot_id_path).rss_kib(identity)

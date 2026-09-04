@@ -1701,7 +1701,7 @@ def _fresh_identity_metrics(
         _deadline_check(deadline, monotonic)
         before = _observe_identity(procfs, identity.pid)
         _deadline_check(deadline, monotonic)
-        if before.kind != "live" or before.identity != identity:
+        if before.kind != "live" or not identity.same_process(before.identity):
             continue
         try:
             _deadline_check(deadline, monotonic)
@@ -1717,7 +1717,7 @@ def _fresh_identity_metrics(
             or not isinstance(rss_kib, int)
             or rss_kib < 0
             or after.kind != "live"
-            or after.identity != identity
+            or not identity.same_process(after.identity)
         ):
             continue
         count += 1

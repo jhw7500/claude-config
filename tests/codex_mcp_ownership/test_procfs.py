@@ -566,3 +566,14 @@ def test_same_process_still_rejects_a_reused_pid(fake_proc) -> None:
     assert not identity.same_process(recycled)
     assert not identity.same_process(None)
     assert identity.same_process(replace(identity, ppid=1))
+
+
+def test_rss_survives_reparenting(fake_proc) -> None:
+    """RSS accounting must not lose a process when its parent exits."""
+    fake_proc.write_ppid(321, 999)
+    identity = fake_proc.identity(321)
+    assert identity is not None and identity.ppid == 999
+
+    fake_proc.write_ppid(321, 1)
+
+    assert fake_proc.rss_kib(identity) == 128
