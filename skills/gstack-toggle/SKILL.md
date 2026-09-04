@@ -24,9 +24,13 @@ holding directory while **never** touching:
 3. Report the count and remind: changes take effect in a **new Claude Code session**
    (the current session's skill list is already loaded in memory).
 
+> If a host also moved the repo body into the hold directory, the first `on`
+> restores `gstack` to `~/.claude/skills/gstack` along with the skills. From then
+> on `off` leaves the repo in place, as described above.
+
 ### off — disable gstack skills
 ```bash
-SKILLS="$HOME/.claude/skills"; REPO="$SKILLS/gstack"; HOLD="$HOME/.claude/skills-disabled"
+SKILLS="$HOME/.claude/skills"; REPO="$SKILLS/gstack"; HOLD="$HOME/.claude/_disabled/gstack-set"
 mkdir -p "$HOLD"; n=0
 for path in "$SKILLS"/*/; do
   name="$(basename "$path")"
@@ -42,7 +46,7 @@ echo "gstack OFF: moved $n skill(s) -> $HOLD (repo & CLI kept)."
 
 ### on — re-enable gstack skills
 ```bash
-SKILLS="$HOME/.claude/skills"; HOLD="$HOME/.claude/skills-disabled"; n=0
+SKILLS="$HOME/.claude/skills"; HOLD="$HOME/.claude/_disabled/gstack-set"; n=0
 shopt -s nullglob
 for path in "$HOLD"/*/; do
   name="$(basename "$path")"
@@ -53,6 +57,6 @@ echo "gstack ON: restored $n skill(s)."
 
 ### status — show counts
 ```bash
-SKILLS="$HOME/.claude/skills"; HOLD="$HOME/.claude/skills-disabled"
+SKILLS="$HOME/.claude/skills"; HOLD="$HOME/.claude/_disabled/gstack-set"
 echo "active skill dirs: $(find "$SKILLS" -maxdepth 1 -mindepth 1 -type d | wc -l) | held (disabled): $(find "$HOLD" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)"
 ```
