@@ -500,3 +500,69 @@ def test_open_pidfd_closes_once_when_post_open_parse_fails(fake_proc, monkeypatc
         tree.open_pidfd(identity)
 
     assert closed == [91]
+
+
+def test_open_pidfd_survives_the_parent_exiting() -> None:
+    """A reparented process is still the same process.
+
+    When a leader exits the kernel reparents its children to init, changing
+    only ``ppid``. Comparing whole identities called that live process gone —
+    and orphaned descendants are exactly what this supervisor exists to reap,
+    so the check failed precisely when it was needed.
+    """
+    import os
+    import subprocess
+    import sys
+    import time
+
+    descendant = "import sys,time;sys.stdout.write('x');sys.stdout.flush();time.sleep(30)"
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess,sys,time;"
+            f"c=subprocess.Popen([sys.executable,'-c',{descendant!r}],stdout=subprocess.PIPE);"
+            "sys.stdout.write(str(c.pid)+'\\n');sys.stdout.flush();time.sleep(0.2)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert leader.stdout is not None
+        descendant_pid = int(leader.stdout.readline().strip())
+        live = procfs.LinuxProcfs()
+        captured = live.identity(descendant_pid)
+        assert captured is not None
+
+        leader.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            current = live.identity(descendant_pid)
+            if current is not None and current.ppid != captured.ppid:
+                break
+            time.sleep(0.01)
+
+        reparented = live.identity(descendant_pid)
+        assert reparented is not None
+        assert reparented != captured, "parent never exited; test proves nothing"
+        assert reparented.start_ticks == captured.start_ticks
+
+        pidfd = live.open_pidfd(captured)
+        os.close(pidfd)
+    finally:
+        try:
+            os.kill(descendant_pid, 15)
+        except (OSError, NameError, UnboundLocalError):
+            pass
+        if leader.stdout is not None:
+            leader.stdout.close()
+
+
+def test_same_process_still_rejects_a_reused_pid(fake_proc) -> None:
+    """Loosening the comparison must not loosen pid-reuse protection."""
+    identity = fake_proc.identity(321)
+    assert identity is not None
+    recycled = replace(identity, start_ticks=identity.start_ticks + 1)
+    assert not identity.same_process(recycled)
+    assert not identity.same_process(None)
+    assert identity.same_process(replace(identity, ppid=1))

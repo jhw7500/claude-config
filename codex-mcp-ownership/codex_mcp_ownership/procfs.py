@@ -266,9 +266,8 @@ class LinuxProcfs:
         return int(match.group(1))
 
     def open_pidfd(self, identity: ProcessIdentity) -> int:
-        if (
-            not isinstance(identity, ProcessIdentity)
-            or self.identity(identity.pid) != identity
+        if not isinstance(identity, ProcessIdentity) or not identity.same_process(
+            self.identity(identity.pid)
         ):
             raise ProcessLookupError(errno.ESRCH, "process identity is no longer live")
         pidfd_open = getattr(os, "pidfd_open", None)
@@ -276,7 +275,7 @@ class LinuxProcfs:
             raise OSError(errno.ENOSYS, "pidfd_open is unavailable")
         descriptor = pidfd_open(identity.pid, 0)
         try:
-            if self.identity(identity.pid) == identity:
+            if identity.same_process(self.identity(identity.pid)):
                 return descriptor
             raise ProcessLookupError(
                 errno.ESRCH, "process identity changed while opening pidfd"

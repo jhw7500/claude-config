@@ -199,13 +199,13 @@ def _require_pidfd_signaling() -> None:
 
 def _open_exact_pidfd(identity: model.ProcessIdentity) -> int | None:
     live_procfs = procfs.LinuxProcfs()
-    if live_procfs.identity(identity.pid) != identity:
+    if not identity.same_process(live_procfs.identity(identity.pid)):
         return None
     try:
         pidfd = live_procfs.open_pidfd(identity)
     except OSError:
         return None
-    if live_procfs.identity(identity.pid) != identity:
+    if not identity.same_process(live_procfs.identity(identity.pid)):
         os.close(pidfd)
         return None
     return pidfd

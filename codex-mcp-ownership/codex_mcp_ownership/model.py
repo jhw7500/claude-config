@@ -99,6 +99,19 @@ class ProcessIdentity:
     exe_ino: int
     exe_name: str
 
+    def same_process(self, other: object) -> bool:
+        """Is ``other`` this very process, still running?
+
+        Not ``==``. A process keeps running when its parent exits, but the
+        kernel reparents it and ``ppid`` changes — full equality then reports a
+        live process as gone. ``stable_key`` is the identity that survives that
+        (and still defeats pid reuse, via start_ticks and boot_id).
+        """
+        return (
+            isinstance(other, ProcessIdentity)
+            and self.stable_key() == other.stable_key()
+        )
+
     def stable_key(self) -> str:
         canonical = json.dumps(
             {
