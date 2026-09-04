@@ -1598,6 +1598,8 @@ def test_post_reap_exact_forward_failure_becomes_sticky_and_cleans_descendant(
     )
     children = _capture_real_popen(monkeypatch)
     descendant_handles: list[tuple[model.ProcessIdentity, int]] = []
+    capture_failures: list[str] = []
+    capture_calls = [0, 0]  # group_members calls, calls that saw a ready descendant
     installed: dict[int, signal.Handlers] = {}
     injected = False
     fail_exact_send = False
@@ -1605,14 +1607,25 @@ def test_post_reap_exact_forward_failure_becomes_sticky_and_cleans_descendant(
     class CaptureDescendantProcfs(procfs.LinuxProcfs):
         def group_members(self, pgid: int):
             members = super().group_members(pgid)
+            capture_calls[0] += 1
             if descendant_ready.exists() and not descendant_handles:
-                identity = self.identity(
-                    int(descendant_pid.read_text(encoding="utf-8"))
-                )
-                assert identity is not None
-                pidfd = _open_exact_pidfd(identity)
-                assert pidfd is not None
-                descendant_handles.append((identity, pidfd))
+                capture_calls[1] += 1
+                # The supervisor wraps this call in `except BaseException`, so an
+                # assertion raised here is swallowed and the only symptom left is
+                # an empty handle list. Record why instead of raising into that void.
+                try:
+                    raw = descendant_pid.read_text(encoding="utf-8")
+                    identity = self.identity(int(raw))
+                    if identity is None:
+                        capture_failures.append(f"identity=None pid={raw!r}")
+                    else:
+                        pidfd = _open_exact_pidfd(identity)
+                        if pidfd is None:
+                            capture_failures.append(f"pidfd=None identity={identity!r}")
+                        else:
+                            descendant_handles.append((identity, pidfd))
+                except Exception as error:
+                    capture_failures.append(f"{type(error).__name__}: {error}")
             return members
 
     def capture_and_inject(signum, handler):
@@ -1656,7 +1669,14 @@ def test_post_reap_exact_forward_failure_becomes_sticky_and_cleans_descendant(
         )
         captured = capsys.readouterr()
         assert result == 70
-        assert len(descendant_handles) == 1
+        assert len(descendant_handles) == 1, (
+            "descendant capture failed: "
+            f"group_members_calls={capture_calls[0]} "
+            f"calls_with_ready={capture_calls[1]} "
+            f"ready_exists={descendant_ready.exists()} "
+            f"pid_exists={descendant_pid.exists()} "
+            f"failures={capture_failures}"
+        )
         assert descendant_term.read_text(encoding="utf-8") == "term"
         _wait_exact_identity_gone(descendant_handles[0][0])
         assert captured.err == (
