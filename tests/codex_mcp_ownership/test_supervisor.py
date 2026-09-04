@@ -1600,6 +1600,7 @@ def test_post_reap_exact_forward_failure_becomes_sticky_and_cleans_descendant(
     descendant_handles: list[tuple[model.ProcessIdentity, int]] = []
     capture_failures: list[str] = []
     capture_calls = [0, 0]  # group_members calls, calls that saw a ready descendant
+    capture_deadline = [time.monotonic() + 30.0]
     installed: dict[int, signal.Handlers] = {}
     injected = False
     fail_exact_send = False
@@ -1608,6 +1609,17 @@ def test_post_reap_exact_forward_failure_becomes_sticky_and_cleans_descendant(
         def group_members(self, pgid: int):
             members = super().group_members(pgid)
             capture_calls[0] += 1
+            if not descendant_handles:
+                # The supervisor can run its whole forward-and-reap pass before
+                # the descendant has written its ready file — on a loaded runner
+                # it usually does, and every call then sees nothing to capture.
+                # Wait for the process this test exists to observe rather than
+                # racing it. Bounded, and shared across calls so a descendant
+                # that never arrives still fails instead of hanging.
+                while not descendant_ready.exists():
+                    if time.monotonic() >= capture_deadline[0]:
+                        break
+                    time.sleep(0.01)
             if descendant_ready.exists() and not descendant_handles:
                 capture_calls[1] += 1
                 # The supervisor wraps this call in `except BaseException`, so an
@@ -1674,6 +1686,7 @@ def test_post_reap_exact_forward_failure_becomes_sticky_and_cleans_descendant(
             f"group_members_calls={capture_calls[0]} "
             f"calls_with_ready={capture_calls[1]} "
             f"ready_exists={descendant_ready.exists()} "
+            f"waited_out={time.monotonic() >= capture_deadline[0]} "
             f"pid_exists={descendant_pid.exists()} "
             f"failures={capture_failures}"
         )
