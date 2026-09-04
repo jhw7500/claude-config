@@ -28,7 +28,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: jhw7500/automation/.github/workflows/gemini-auto-review.yml@938c130f3adc4ef9a451e5991f100e1acca63fec
+    uses: jhw7500/automation/.github/workflows/gemini-auto-review.yml@06b0f77baa88e04001fe3f6259a994571dcf5408
     with:
       pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
       force_review: ${{ github.event_name == 'workflow_dispatch' && inputs.force_review }}
