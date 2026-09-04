@@ -3653,3 +3653,18 @@ def test_force_delivery_event_is_partial_only_for_strict_subsets(
     names = [event["event"] for event in events]
     assert names.count("cleanup_force_partial") == identity_count - 1
     assert names.count("cleanup_force_delivery_receipt") == 1
+
+
+def test_fresh_identity_metrics_counts_a_reparented_process(fake_proc) -> None:
+    """Orphaned descendants are the population this accounting is about."""
+    from codex_mcp_ownership import procfs as procfs_module
+
+    fake_proc.write_ppid(321, 999)
+    identity = fake_proc.identity(321)
+    assert identity is not None
+    live = procfs_module.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+
+    fake_proc.write_ppid(321, 1)
+
+    count, total_rss_kib = cleanup._fresh_identity_metrics((identity,), live)
+    assert (count, total_rss_kib) == (1, 128)
