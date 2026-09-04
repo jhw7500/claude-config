@@ -51,8 +51,7 @@ def debug_log(tag: str, info: "dict[str, object]") -> None:
 BG_DIR = Path.home() / ".claude" / "state" / "bg-tasks"
 
 
-PRE_REMINDER = """<system-reminder>
-[BG-TASK-START] 백그라운드 작업 시작 — {kind}: {what}
+PRE_REMINDER = """[BG-TASK-START] 백그라운드 작업 시작 — {kind}: {what}
 
 행동: (1) 지금 즉시 1문장으로 사용자에게 시작 알림
 (2) 다른 작업 병행 시 분기마다 "BG 진행 중" 언급
@@ -60,17 +59,15 @@ PRE_REMINDER = """<system-reminder>
 
 HUD 🔄 BG 카운트 증가.
 세부 규칙: `~/.claude/CLAUDE.md` > "진행상황 보고"
-</system-reminder>"""
+"""
 
 
-POST_REMINDER = """<system-reminder>
-[BG-TASK-DONE] 백그라운드 작업 완료 — {kind}
+POST_REMINDER = """[BG-TASK-DONE] 백그라운드 작업 완료 — {kind}
 
 행동: 이번 응답에서 1~2문장으로 완료 사실과 핵심 결과를 사용자에게 알림.
 긴 결과는 요약만 + 상세 위치(파일/URL) 언급. 다음 단계가 명확하면 재확인 없이 진행.
 
-HUD 🔄 BG 카운트 감소.
-</system-reminder>"""
+HUD 🔄 BG 카운트 감소."""
 
 
 def session_key(payload: "dict[str, object]") -> str:
@@ -254,6 +251,26 @@ def hud_complete_task(cwd: str, session_id: str, task_id: str | None, failed: bo
 # Main dispatch
 # ---------------------------------------------------------------------------
 
+
+def emit_context(text: str, hook_event: str) -> None:
+    """Deliver ``text`` to the model.
+
+    PreToolUse/PostToolUse/SubagentStop discard raw stdout; the only channel
+    that reaches the model is the ``hookSpecificOutput.additionalContext``
+    envelope. Writing plain text here makes the hook silently inert.
+    """
+    json.dump(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": hook_event,
+                "additionalContext": text,
+            }
+        },
+        sys.stdout,
+        ensure_ascii=False,
+    )
+    sys.stdout.flush()
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
@@ -294,8 +311,7 @@ def main() -> int:
                     existing.unlink(missing_ok=True)
                 except OSError:
                     pass
-            sys.stdout.write(POST_REMINDER.format(kind="Agent"))
-            sys.stdout.flush()
+            emit_context(POST_REMINDER.format(kind="Agent"), "SubagentStop")
         return 0
 
     # Pre/Post는 Agent/Bash에만 적용
@@ -326,8 +342,7 @@ def main() -> int:
                 # 레거시 .task 존재했는데 HUD state에는 없던 경우에도 알림
                 matched = True
         if matched:
-            sys.stdout.write(POST_REMINDER.format(kind="Agent"))
-            sys.stdout.flush()
+            emit_context(POST_REMINDER.format(kind="Agent"), "PostToolUse")
         return 0
 
     # Pre
@@ -341,8 +356,7 @@ def main() -> int:
     except OSError:
         pass
     hud_add_task(cwd, skey, task_id, desc, kind)
-    sys.stdout.write(PRE_REMINDER.format(kind=kind, what=desc))
-    sys.stdout.flush()
+    emit_context(PRE_REMINDER.format(kind=kind, what=desc), "PreToolUse")
     return 0
 
 

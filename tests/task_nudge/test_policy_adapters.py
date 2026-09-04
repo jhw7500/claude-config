@@ -70,6 +70,18 @@ def _payload(repo, *, runtime):
     return base
 
 
+def _message(name, stdout):
+    """Extract the nudge text from either adapter's structured output.
+
+    Both runtimes wrap the message now, so asserting on raw stdout would let a
+    JSON-escaped secret slip past a plain substring check.
+    """
+    decoded = json.loads(stdout)
+    if name.endswith("codex.py"):
+        return decoded["systemMessage"]
+    return decoded["hookSpecificOutput"]["additionalContext"]
+
+
 def test_codex_adapter_emits_only_system_message_once(repo, registered_home, run_adapter):
     payload = _payload(repo, runtime="codex")
     first = run_adapter("task-nudge-codex.py", payload, registered_home)
@@ -81,11 +93,13 @@ def test_codex_adapter_emits_only_system_message_once(repo, registered_home, run
     assert second.stdout == second.stderr == ""
 
 
-def test_claude_adapter_preserves_plaintext_contract(repo, registered_home, run_adapter):
+def test_claude_adapter_delivers_via_pretooluse_context_envelope(repo, registered_home, run_adapter):
+    """PreToolUse discards raw stdout, so the old plaintext contract was inert."""
     result = run_adapter("task-nudge-claude.py", _payload(repo, runtime="claude"), registered_home)
     assert result.returncode == 0
-    assert result.stdout.startswith("[TASK-NUDGE]")
-    assert not result.stdout.lstrip().startswith("{")
+    specific = json.loads(result.stdout)["hookSpecificOutput"]
+    assert specific["hookEventName"] == "PreToolUse"
+    assert specific["additionalContext"].startswith("[TASK-NUDGE]")
     assert result.stderr == ""
 
 
@@ -94,9 +108,7 @@ def test_adapters_emit_bounded_invalid_input_without_canaries(name, home, run_ad
     secret = "super-secret-/home/leak"
     result = run_adapter(name, {"secret": secret}, home)
     assert result.returncode == 0 and result.stderr == ""
-    output = result.stdout
-    if name.endswith("codex.py"):
-        output = json.loads(output)["systemMessage"]
+    output = _message(name, result.stdout)
     assert "HOOK_INPUT_INVALID" in output
     assert secret not in output and "/home/" not in output
 
@@ -105,7 +117,7 @@ def test_adapters_emit_bounded_invalid_input_without_canaries(name, home, run_ad
 def test_adapters_reject_oversized_stdin_with_bounded_output(name, home, run_adapter):
     result = run_adapter(name, {"padding": "x" * (1024 * 1024 + 1)}, home)
     assert result.returncode == 0 and result.stderr == ""
-    output = json.loads(result.stdout)["systemMessage"] if name.endswith("codex.py") else result.stdout
+    output = _message(name, result.stdout)
     assert "HOOK_INPUT_INVALID" in output
     assert "padding" not in output and "x" * 32 not in output
 
@@ -122,7 +134,7 @@ def test_adapters_reject_oversized_stdin_with_bounded_output(name, home, run_ada
 )
 def test_adapters_classify_invalid_json_without_creating_a_marker(name, raw_input, home, run_adapter):
     result = run_adapter(name, raw_input, home)
-    output = json.loads(result.stdout)["systemMessage"] if name.endswith("codex.py") else result.stdout
+    output = _message(name, result.stdout)
     assert result.returncode == 0 and result.stderr == ""
     assert "HOOK_INPUT_INVALID" in output
     assert not list((home / "runtime").rglob("*"))
