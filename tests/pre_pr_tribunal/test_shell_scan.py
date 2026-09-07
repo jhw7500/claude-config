@@ -20,6 +20,26 @@ from pre_pr_tribunal.shell_scan import (
         "FOO='two words' gh pr create",
         "command -- gh pr create",
         "env FOO=1 gh --repo owner/repo pr create",
+        "bash -c 'gh pr create --draft'",
+        'dash -c "gh pr create --draft"',
+        "/bin/sh -c 'gh pr create' shell-name",
+        "g\\\nh pr create",
+        "gh pr \\\ncreate",
+    ],
+)
+def test_detects_executable_pr_create(command):
+    assert scan_pr_create(command).kind is ScanKind.PR_CREATE
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd ../other && gh pr create --base master",
+        "git commit -am stale && gh pr create --base master",
+        "gh pr create --base master >result.txt",
+        'gh pr create --base master --title "$(git rev-parse HEAD)"',
+        "env -C ../other gh pr create --base master",
+        "time -o timing.txt gh pr create --base master",
         "env -i -u OLD -C /tmp FOO=1 gh pr create",
         "env --ignore-environment --unset=OLD --chdir=/tmp gh pr create",
         "tests && gh pr create",
@@ -36,17 +56,12 @@ from pre_pr_tribunal.shell_scan import (
         "echo `gh pr create`",
         'echo "`gh pr create`"',
         "echo >$(gh pr create) output",
-        "bash -c 'gh pr create --draft'",
-        'dash -c "gh pr create --draft"',
-        "/bin/sh -c 'gh pr create' shell-name",
-        "g\\\nh pr create",
-        "gh pr \\\ncreate",
         "<input gh pr create",
         "2>/tmp/pr-create.log gh pr create",
     ],
 )
-def test_detects_executable_pr_create(command):
-    assert scan_pr_create(command).kind is ScanKind.PR_CREATE
+def test_unsafe_context_cannot_run_before_bound_pr_create(command):
+    assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
 
 
 @pytest.mark.parametrize(
@@ -153,6 +168,43 @@ def test_skips_only_supported_gh_global_options(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "gh pr create",
+        "gh pr create --base other",
+        "gh pr create --base master --base master",
+        'gh pr create --base "$BASE"',
+        "GH_REPO=other/repo gh pr create --base master",
+        "GH_REPO=other/repo bash -c 'gh pr create --base master'",
+        "env GH_HOST=github.example gh pr create --base master",
+        "gh --repo other/repo pr create --base master",
+        "gh -Rother/repo pr create --base master",
+        "gh pr create --base master -Rother/repo",
+        "gh pr create --base master --head other:branch",
+        "gh pr create --base master -Hother:branch",
+        "time gh pr create --base other",
+    ],
+)
+def test_target_binding_rejects_unbound_pr_command(command):
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create --base master --fill",
+        "gh pr create --base=master --draft",
+        "gh pr create -B master --title title",
+        "gh pr create -Bmaster --body body",
+    ],
+)
+def test_target_binding_accepts_literal_matching_base(command):
+    assert scan_pr_create(command, expected_base="master").kind is ScanKind.PR_CREATE
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "env --future gh pr create",
         "env -Z gh pr create",
         "command -v gh pr create",
@@ -251,7 +303,9 @@ def test_recursion_depth_17_is_bounded_not_executed():
         MAX_RECURSION + 1
     )
 
-    assert scan_pr_create(at_limit).kind is ScanKind.PR_CREATE
+    assert scan_pr_create(at_limit) == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "UNSAFE_PR_CONTEXT"
+    )
     result = scan_pr_create(too_deep)
     assert result.kind is ScanKind.AMBIGUOUS_CANDIDATE
     assert result.reason == "RECURSION_LIMIT"
@@ -350,8 +404,10 @@ def test_bash_compound_redirection_operand_and_following_words_are_data(command)
     assert scan_pr_create(command).kind is ScanKind.NO_MATCH
 
 
-def test_command_boundary_after_bash_compound_redirection_is_still_executable():
-    assert scan_pr_create("echo &>out; gh pr create").kind is ScanKind.PR_CREATE
+def test_command_after_bash_compound_redirection_is_unsafe_context():
+    assert scan_pr_create("echo &>out; gh pr create") == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "UNSAFE_PR_CONTEXT"
+    )
 
 
 @pytest.mark.parametrize(
@@ -372,8 +428,10 @@ def test_arithmetic_text_is_not_an_executable_command_context(command):
         "(( $(gh pr create) ))",
     ],
 )
-def test_command_substitution_inside_arithmetic_is_executable(command):
-    assert scan_pr_create(command).kind is ScanKind.PR_CREATE
+def test_command_substitution_inside_arithmetic_is_unsafe_context(command):
+    assert scan_pr_create(command) == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "UNSAFE_PR_CONTEXT"
+    )
 
 
 def test_comment_cannot_supply_a_redirection_operand():

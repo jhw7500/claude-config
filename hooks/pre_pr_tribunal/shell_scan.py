@@ -8,6 +8,25 @@ import re
 MAX_COMMAND_BYTES = 256 * 1024
 MAX_TOKENS = 4096
 MAX_RECURSION = 16
+TARGET_ENV_NAMES = frozenset(
+    {
+        "GH_REPO",
+        "GH_HOST",
+        "GH_CONFIG_DIR",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+    }
+)
+
+_ALWAYS_AMBIGUOUS_FAILURES = {
+    "ANSI_C_QUOTE",
+    "BASE_OPTION",
+    "DYNAMIC_PR_ARGUMENT",
+    "TARGET_BINDING",
+    "TARGET_OVERRIDE",
+    "UNSAFE_PR_CONTEXT",
+}
 
 
 class ScanKind(str, Enum):
@@ -71,6 +90,20 @@ class _Context:
 
 _GH_VALUE_OPTIONS = {"--repo", "-R", "--hostname", "--config"}
 _GH_FLAG_OPTIONS = {"--help", "--version"}
+_PR_CONTENT_LONG_VALUE_OPTIONS = {
+    "--assignee",
+    "--body",
+    "--body-file",
+    "--label",
+    "--milestone",
+    "--project",
+    "--recover",
+    "--reviewer",
+    "--template",
+    "--title",
+}
+_PR_CONTENT_SHORT_VALUE_OPTIONS = set("abFlmprTt")
+_PR_BOOLEAN_SHORT_OPTIONS = set("defw")
 _ENV_FLAGS = {"-i", "--ignore-environment"}
 _ENV_VALUE_OPTIONS = {"-u", "-C"}
 _SHELLS = {"sh", "bash", "dash"}
@@ -115,18 +148,24 @@ _SHELL_REDIRECTIONS = (
 )
 
 
-def scan_pr_create(command: str) -> ScanResult:
+def scan_pr_create(
+    command: str, *, expected_base: str | None = None
+) -> ScanResult:
     if not isinstance(command, str) or "\x00" in command:
         return ScanResult(ScanKind.NO_MATCH)
+    if expected_base is not None and (
+        not isinstance(expected_base, str) or not expected_base
+    ):
+        return ScanResult(ScanKind.AMBIGUOUS_CANDIDATE, "TARGET_BINDING")
     if len(command.encode("utf-8", "surrogatepass")) > MAX_COMMAND_BYTES:
         candidate_hint = _has_unquoted_candidate_hint(command)
         kind = ScanKind.AMBIGUOUS_CANDIDATE if candidate_hint else ScanKind.NO_MATCH
         return ScanResult(kind, "COMMAND_LIMIT")
     try:
-        return _scan_context(command, depth=0)
+        return _scan_context(command, depth=0, expected_base=expected_base)
     except (RecursionError, ScanFailure) as error:
         code = "RECURSION_LIMIT" if isinstance(error, RecursionError) else error.code
-        if code == "ANSI_C_QUOTE":
+        if code in _ALWAYS_AMBIGUOUS_FAILURES:
             return ScanResult(ScanKind.AMBIGUOUS_CANDIDATE, code)
         candidate_hint = _has_unquoted_candidate_hint(command)
         kind = ScanKind.AMBIGUOUS_CANDIDATE if candidate_hint else ScanKind.NO_MATCH
@@ -503,36 +542,73 @@ class _Parser:
         context.tokens.append(token)
 
 
-def _scan_context(command: str, depth: int) -> ScanResult:
+def _scan_context(
+    command: str, depth: int, expected_base: str | None = None
+) -> ScanResult:
     budget = _Budget()
     context = _Parser(command, budget).parse(depth)
-    if _scan_parsed_context(context, budget):
+    if _scan_parsed_context(context, budget, expected_base):
         return ScanResult(ScanKind.PR_CREATE)
     return ScanResult(ScanKind.NO_MATCH)
 
 
-def _scan_parsed_context(context: _Context, budget: _Budget) -> bool:
+def _scan_parsed_context(
+    context: _Context, budget: _Budget, expected_base: str | None = None
+) -> bool:
+    has_nested_execution = False
     for token in context.tokens:
         if token.kind == "NESTED" and token.nested is not None:
-            if _scan_parsed_context(token.nested, budget):
-                return True
+            has_nested_execution = True
+            if _scan_parsed_context(token.nested, budget, expected_base):
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
         if token.kind == "WORD" and token.word is not None and token.role != "HEREDOC":
+            if token.word.nested:
+                has_nested_execution = True
             for nested in token.word.nested:
-                if _scan_parsed_context(nested, budget):
-                    return True
+                if _scan_parsed_context(nested, budget, expected_base):
+                    raise ScanFailure("UNSAFE_PR_CONTEXT")
 
+    segments: list[list[_Token]] = []
     segment: list[_Token] = []
     for token in context.tokens + [_Token("OP", -1, -1, ";")]:
         if token.kind in {"OP", "NESTED"}:
-            if _scan_simple_command(segment, context.depth, budget):
-                return True
+            if segment:
+                segments.append(segment)
             segment = []
         else:
             segment.append(token)
+
+    candidate: list[_Token] | None = None
+    for segment in segments:
+        if _scan_simple_command(
+            segment, context.depth, budget, expected_base
+        ):
+            if candidate is not None:
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
+            candidate = segment
+    if candidate is not None:
+        if (
+            has_nested_execution
+            or len(segments) != 1
+            or any(token.kind == "REDIR" for token in candidate)
+            or any(
+                token.kind == "WORD"
+                and token.word is not None
+                and bool(token.word.nested)
+                for token in candidate
+            )
+        ):
+            raise ScanFailure("UNSAFE_PR_CONTEXT")
+        return True
     return False
 
 
-def _scan_simple_command(tokens: list[_Token], depth: int, budget: _Budget) -> bool:
+def _scan_simple_command(
+    tokens: list[_Token],
+    depth: int,
+    budget: _Budget,
+    expected_base: str | None = None,
+) -> bool:
     words = [
         token.word
         for token in tokens
@@ -542,7 +618,9 @@ def _scan_simple_command(tokens: list[_Token], depth: int, budget: _Budget) -> b
         return False
 
     index = 0
+    target_assignment = False
     while index < len(words) and _is_assignment(words[index]):
+        target_assignment = target_assignment or _is_target_assignment(words[index])
         index += 1
     while index < len(words):
         executable = words[index]
@@ -570,7 +648,11 @@ def _scan_simple_command(tokens: list[_Token], depth: int, budget: _Budget) -> b
                 return False
             continue
         if name == "env":
-            index = _skip_env(words, index + 1)
+            index = _skip_env(
+                words,
+                index + 1,
+                enforce_target_binding=expected_base is not None,
+            )
             continue
         break
 
@@ -584,13 +666,19 @@ def _scan_simple_command(tokens: list[_Token], depth: int, budget: _Budget) -> b
         return False
     name = _basename(executable.text)
     if name == "gh":
-        return _scan_gh(arguments)
+        matched = _scan_gh(arguments, expected_base=expected_base)
+        if matched and expected_base is not None and target_assignment:
+            raise ScanFailure("TARGET_OVERRIDE")
+        return matched
     if name in _SHELLS and len(arguments) >= 2 and arguments[0].text == "-c":
         script = arguments[1]
         if not script.dynamic and not script.nested:
             parser = _Parser(script.text, budget)
             nested = parser.parse(depth + 1)
-            return _scan_parsed_context(nested, budget)
+            matched = _scan_parsed_context(nested, budget, expected_base)
+            if matched and expected_base is not None and target_assignment:
+                raise ScanFailure("TARGET_OVERRIDE")
+            return matched
     return False
 
 
@@ -639,6 +727,10 @@ def _skip_time(words: list[_Word], index: int) -> int:
         if value in _TIME_VALUE_OPTIONS:
             if index + 1 >= len(words):
                 raise ScanFailure("INCOMPLETE_TIME_OPTION")
+            if value in {"-o", "--output"} and _could_contain_gh_pr_create(
+                words[index + 2 :]
+            ):
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
             index += 2
             continue
         if (
@@ -646,6 +738,10 @@ def _skip_time(words: list[_Word], index: int) -> int:
             or value.startswith("--output=")
             or (len(value) > 2 and value[:2] in {"-f", "-o"})
         ):
+            if (
+                value.startswith("--output=") or value.startswith("-o")
+            ) and _could_contain_gh_pr_create(words[index + 1 :]):
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
             index += 1
             continue
         if value == "--":
@@ -658,13 +754,21 @@ def _skip_time(words: list[_Word], index: int) -> int:
     return index
 
 
-def _skip_env(words: list[_Word], index: int) -> int:
+def _skip_env(
+    words: list[_Word], index: int, *, enforce_target_binding: bool = False
+) -> int:
     while index < len(words):
         word = words[index]
         if word.dynamic:
             return len(words)
         value = word.text
         if _is_assignment(word):
+            if (
+                enforce_target_binding
+                and _is_target_assignment(word)
+                and _could_contain_gh_pr_create(words[index + 1 :])
+            ):
+                raise ScanFailure("TARGET_OVERRIDE")
             index += 1
             continue
         if value in _ENV_FLAGS:
@@ -673,9 +777,15 @@ def _skip_env(words: list[_Word], index: int) -> int:
         if value in _ENV_VALUE_OPTIONS:
             if index + 1 >= len(words):
                 raise ScanFailure("INCOMPLETE_ENV_OPTION")
+            if value == "-C" and _could_contain_gh_pr_create(words[index + 2 :]):
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
             index += 2
             continue
         if value.startswith("--unset=") or value.startswith("--chdir="):
+            if value.startswith("--chdir=") and _could_contain_gh_pr_create(
+                words[index + 1 :]
+            ):
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
             index += 1
             continue
         if value.startswith("-"):
@@ -686,8 +796,11 @@ def _skip_env(words: list[_Word], index: int) -> int:
     return index
 
 
-def _scan_gh(arguments: list[_Word]) -> bool:
+def _scan_gh(
+    arguments: list[_Word], expected_base: str | None = None
+) -> bool:
     index = 0
+    target_override = False
     while index < len(arguments):
         word = arguments[index]
         if word.dynamic:
@@ -698,6 +811,7 @@ def _scan_gh(arguments: list[_Word]) -> bool:
         if value in _GH_VALUE_OPTIONS:
             if index + 1 >= len(arguments):
                 raise ScanFailure("INCOMPLETE_GH_OPTION")
+            target_override = True
             index += 2
             continue
         if (
@@ -705,9 +819,11 @@ def _scan_gh(arguments: list[_Word]) -> bool:
             or value.startswith("--hostname=")
             or value.startswith("--config=")
         ):
+            target_override = True
             index += 1
             continue
         if value.startswith("-R") and value != "-R":
+            target_override = True
             index += 1
             continue
         if value in _GH_FLAG_OPTIONS:
@@ -722,7 +838,127 @@ def _scan_gh(arguments: list[_Word]) -> bool:
         return False
     if arguments[index].dynamic or arguments[index + 1].dynamic:
         raise ScanFailure("ANSI_C_QUOTE")
+    if expected_base is not None:
+        if target_override:
+            raise ScanFailure("TARGET_OVERRIDE")
+        _validate_pr_create_target(arguments[index + 2 :], expected_base)
     return True
+
+
+def _validate_pr_create_target(
+    arguments: list[_Word], expected_base: str
+) -> None:
+    bases: list[str] = []
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
+        value = word.text
+
+        if value in {"--repo", "-R", "--hostname", "--config"}:
+            raise ScanFailure("TARGET_OVERRIDE")
+        if (
+            value.startswith("--repo=")
+            or value.startswith("--hostname=")
+            or value.startswith("--config=")
+        ):
+            raise ScanFailure("TARGET_OVERRIDE")
+        if value in {"--head", "-H"} or value.startswith("--head="):
+            raise ScanFailure("TARGET_OVERRIDE")
+        if value == "--base":
+            base, index = _required_static_value(arguments, index, "BASE_OPTION")
+            bases.append(base)
+            continue
+        if value.startswith("--base="):
+            if word.dynamic:
+                raise ScanFailure("TARGET_BINDING")
+            bases.append(value.split("=", 1)[1])
+            index += 1
+            continue
+        if value in _PR_CONTENT_LONG_VALUE_OPTIONS:
+            _, index = _required_content_value(arguments, index)
+            continue
+        if any(
+            value.startswith(option + "=")
+            for option in _PR_CONTENT_LONG_VALUE_OPTIONS
+        ):
+            if word.dynamic and not word.quoted:
+                raise ScanFailure("DYNAMIC_PR_ARGUMENT")
+            index += 1
+            continue
+        if value.startswith("--"):
+            if word.dynamic:
+                raise ScanFailure("DYNAMIC_PR_ARGUMENT")
+            index += 1
+            continue
+        if value.startswith("-") and value != "-":
+            index = _scan_pr_short_options(arguments, index, bases)
+            continue
+        if word.dynamic:
+            raise ScanFailure("DYNAMIC_PR_ARGUMENT")
+        index += 1
+
+    if bases != [expected_base]:
+        raise ScanFailure("TARGET_BINDING")
+
+
+def _required_static_value(
+    arguments: list[_Word], index: int, code: str
+) -> tuple[str, int]:
+    if index + 1 >= len(arguments):
+        raise ScanFailure("INCOMPLETE_GH_OPTION")
+    value = arguments[index + 1]
+    if value.dynamic:
+        raise ScanFailure(code)
+    return value.text, index + 2
+
+
+def _required_content_value(
+    arguments: list[_Word], index: int
+) -> tuple[str, int]:
+    if index + 1 >= len(arguments):
+        raise ScanFailure("INCOMPLETE_GH_OPTION")
+    value = arguments[index + 1]
+    if value.dynamic and not value.quoted:
+        raise ScanFailure("DYNAMIC_PR_ARGUMENT")
+    return value.text, index + 2
+
+
+def _scan_pr_short_options(
+    arguments: list[_Word], index: int, bases: list[str]
+) -> int:
+    word = arguments[index]
+    options = word.text[1:]
+    position = 0
+    while position < len(options):
+        option = options[position]
+        remainder = options[position + 1 :]
+        if option in {"R", "H"}:
+            raise ScanFailure("TARGET_OVERRIDE")
+        if option == "B":
+            if remainder:
+                if word.dynamic:
+                    raise ScanFailure("TARGET_BINDING")
+                bases.append(remainder)
+                return index + 1
+            base, next_index = _required_static_value(
+                arguments, index, "BASE_OPTION"
+            )
+            bases.append(base)
+            return next_index
+        if option in _PR_CONTENT_SHORT_VALUE_OPTIONS:
+            if remainder:
+                if word.dynamic and not word.quoted:
+                    raise ScanFailure("DYNAMIC_PR_ARGUMENT")
+                return index + 1
+            _, next_index = _required_content_value(arguments, index)
+            return next_index
+        if option in _PR_BOOLEAN_SHORT_OPTIONS:
+            position += 1
+            continue
+        if word.dynamic:
+            raise ScanFailure("DYNAMIC_PR_ARGUMENT")
+        return index + 1
+    return index + 1
 
 
 def _could_form_pr_create(words: list[_Word]) -> bool:
@@ -769,6 +1005,10 @@ def _has_remaining_gh(words: list[_Word], index: int) -> bool:
 
 def _is_assignment(word: _Word) -> bool:
     return word.assignment
+
+
+def _is_target_assignment(word: _Word) -> bool:
+    return _is_assignment(word) and word.text.split("=", 1)[0] in TARGET_ENV_NAMES
 
 
 def _basename(value: str) -> str:

@@ -19,6 +19,7 @@ from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verd
 PACKAGE = Path(__file__).resolve().parents[2] / "hooks" / "pre_pr_tribunal"
 MAX_PAYLOAD_BYTES = 1024 * 1024
 COMMAND = "gh pr create"
+BOUND_COMMAND = "gh pr create --base master"
 
 
 def _git(repo: Path, *arguments: str) -> str:
@@ -273,7 +274,7 @@ def run_adapter(
 
 
 def assert_decision(repo: Path, expected: GateCode) -> None:
-    decision = evaluate_gate(repo, COMMAND)
+    decision = evaluate_gate(repo, BOUND_COMMAND)
     assert decision.code is expected
     assert decision.block is (expected is not GateCode.PASS)
 
@@ -515,8 +516,44 @@ def test_subdirectory_non_github_and_non_git_roots_are_unsupported(
 
 def test_exact_current_terminal_pass_allows_runtime_policy(git_repo: Path):
     _passing_verdict(git_repo)
-    assert evaluate_gate(git_repo, COMMAND).code is GateCode.PASS
-    assert evaluate_gate(git_repo, COMMAND).block is False
+    assert evaluate_gate(git_repo, BOUND_COMMAND).code is GateCode.PASS
+    assert evaluate_gate(git_repo, BOUND_COMMAND).block is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        COMMAND,
+        "GH_REPO=other/repo gh pr create --base master",
+        "env GH_HOST=github.example gh pr create --base master",
+        "gh --repo other/repo pr create --base master",
+        "gh pr create --base other",
+        "gh pr create --base master --head other:branch",
+    ),
+)
+def test_passing_verdict_rejects_unbound_target(git_repo: Path, command: str):
+    _passing_verdict(git_repo)
+
+    decision = evaluate_gate(git_repo, command)
+
+    assert decision.block is True
+    assert decision.code is GateCode.COMMAND_AMBIGUOUS
+
+
+@pytest.mark.parametrize(
+    "name",
+    ("GH_REPO", "GH_HOST", "GH_CONFIG_DIR", "GIT_DIR", "GIT_WORK_TREE"),
+)
+def test_passing_verdict_rejects_inherited_target_override(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, name: str
+):
+    _passing_verdict(git_repo)
+    monkeypatch.setenv(name, "other")
+
+    decision = evaluate_gate(git_repo, BOUND_COMMAND)
+
+    assert decision.block is True
+    assert decision.code is GateCode.COMMAND_AMBIGUOUS
 
 
 @pytest.mark.parametrize(
@@ -580,7 +617,7 @@ def test_unrelated_and_valid_pass_produce_no_output(
     allowed = run_adapter(
         installed_package,
         "claude_hook.py",
-        payload(git_repo, COMMAND),
+        payload(git_repo, BOUND_COMMAND),
         git_repo,
     )
     assert unrelated.returncode == allowed.returncode == 0

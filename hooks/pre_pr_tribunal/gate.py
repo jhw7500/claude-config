@@ -17,7 +17,7 @@ from .git_state import (
     capture_snapshot,
 )
 from .model import GateStatus, SchemaError, TribunalError
-from .shell_scan import ScanKind, scan_pr_create
+from .shell_scan import TARGET_ENV_NAMES, ScanKind, scan_pr_create
 from .verdict_store import read_verdict
 
 
@@ -156,7 +156,10 @@ def _snapshot_is_bound(verdict, snapshot) -> bool:
     )
 
 
-def _evaluate_direct_pr_create(cwd: Path) -> GateDecision:
+def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
+    if any(name in os.environ for name in TARGET_ENV_NAMES):
+        return _decision(True, GateCode.COMMAND_AMBIGUOUS)
+
     root, preflight_error = _exact_clean_root(cwd)
     if preflight_error is not None or root is None:
         return _decision(True, preflight_error or GateCode.REPOSITORY_UNSUPPORTED)
@@ -170,6 +173,10 @@ def _evaluate_direct_pr_create(cwd: Path) -> GateDecision:
         return _decision(True, snapshot_error or GateCode.VERDICT_INVALID)
     if not _snapshot_is_bound(verdict, snapshot):
         return _decision(True, GateCode.VERDICT_STALE)
+
+    bound_scan = scan_pr_create(command, expected_base=verdict.base_ref)
+    if bound_scan.kind is not ScanKind.PR_CREATE:
+        return _decision(True, GateCode.COMMAND_AMBIGUOUS)
 
     if set(verdict.reviewers) != set("ABC") or any(
         slot.status != "complete" or slot.report is None
@@ -203,6 +210,6 @@ def evaluate_gate(cwd: Path, command: str) -> GateDecision:
     if scan.kind is ScanKind.AMBIGUOUS_CANDIDATE:
         return _decision(True, GateCode.COMMAND_AMBIGUOUS)
     try:
-        return _evaluate_direct_pr_create(cwd)
+        return _evaluate_direct_pr_create(cwd, command)
     except Exception:
         return _decision(True, GateCode.VERDICT_INVALID)
