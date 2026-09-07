@@ -1612,6 +1612,55 @@ def test_claude_subscription_token_is_child_environment_only(
     assert observed["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == token
 
 
+@pytest.mark.parametrize(
+    ("runtime", "key"),
+    (("claude", "ANTHROPIC_API_KEY"), ("codex", "OPENAI_API_KEY")),
+)
+def test_environment_api_key_is_child_environment_only(
+    tmp_path, monkeypatch, runtime, key
+):
+    module = _load_probe_module()
+    fixture = _isolation_fixture(module, tmp_path)
+    evidence_dir, _, _ = module._make_phase_logs(
+        fixture.work_dir, runtime, "environment-key-boundary"
+    )
+    token = f"{runtime.upper()}_CHILD_ENV_ONLY_SENTINEL_32"
+    observed: dict[str, object] = {}
+
+    def fake_run_runtime(argv, *, cwd, env, timeout, pass_fds=()):
+        observed["argv"] = argv
+        observed["env"] = env
+        return module.ProcessResult(0, "ZERO")
+
+    monkeypatch.setattr(module, "_run_runtime", fake_run_runtime)
+    with module._sealed_memfd("hooks-test", b"hooks") as hooks_fd:
+        result = module._run_sandboxed(
+            [str(fixture.control_root / f"runtime-bin/{runtime}")],
+            runtime=runtime,
+            runtime_executable=Path("/usr/bin/true"),
+            work_dir=fixture.work_dir,
+            repo=fixture.repo,
+            fake_gh=fixture.fake_bin / "gh",
+            hosts_file=fixture.hosts_file,
+            control_root=fixture.control_root,
+            evidence_dir=evidence_dir,
+            caller_home=None,
+            env={
+                "HOME": str(fixture.home),
+                "PATH": SAFE_SYSTEM_PATH,
+                key: token,
+            },
+            timeout=1,
+            codex_hooks_fd=hooks_fd if runtime == "codex" else None,
+        )
+
+    assert result == module.ProcessResult(0, "ZERO")
+    assert all(token not in argument for argument in observed["argv"])
+    assert observed["env"][key] == token
+    assert not _tree_contains(fixture.control_root, token.encode())
+    assert not _tree_contains(fixture.work_dir, token.encode())
+
+
 @pytest.mark.parametrize("runtime", ["claude", "codex"])
 def test_subscription_fails_closed_until_auth_is_restored(
     fake_runtimes, tmp_path, runtime

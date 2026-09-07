@@ -323,6 +323,23 @@ def test_alternate_argv_cannot_bypass_state_preflight(tmp_path: Path, command: s
     assert decision.code is not GateCode.NOT_PR_CREATE
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        "gh pr new --base master",
+        "coproc gh pr create --base master",
+        "coproc { gh pr create --base master; }",
+        "coproc PR_JOB { gh pr create --base master; }",
+    ),
+)
+def test_alias_and_coproc_forms_are_command_ambiguous(
+    tmp_path: Path, command: str
+):
+    assert evaluate_gate(tmp_path, command) == gate.GateDecision(
+        True, GateCode.COMMAND_AMBIGUOUS
+    )
+
+
 def test_scanner_exception_on_unrelated_request_is_silent(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -544,6 +561,44 @@ def test_exact_current_terminal_pass_allows_runtime_policy(git_repo: Path):
     _passing_verdict(git_repo)
     assert evaluate_gate(git_repo, BOUND_COMMAND).code is GateCode.PASS
     assert evaluate_gate(git_repo, BOUND_COMMAND).block is False
+
+
+def test_non_origin_gh_default_repository_cannot_reuse_pass(git_repo: Path):
+    _passing_verdict(git_repo)
+    _git(
+        git_repo,
+        "remote",
+        "add",
+        "other",
+        "https://github.com/other/repository.git",
+    )
+    _git(git_repo, "config", "--local", "remote.other.gh-resolved", "base")
+
+    assert_decision(git_repo, GateCode.REPOSITORY_UNSUPPORTED)
+
+
+def test_origin_gh_default_repository_preserves_bound_pass(git_repo: Path):
+    _git(git_repo, "config", "--local", "remote.origin.gh-resolved", "base")
+    _passing_verdict(git_repo)
+
+    assert_decision(git_repo, GateCode.PASS)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        'FOO="${VALUE@P}" gh pr create --base master',
+        'env FOO="${VALUE@P}" gh pr create --base master',
+    ),
+)
+def test_dynamic_leading_assignment_cannot_reuse_pass(
+    git_repo: Path, command: str
+):
+    _passing_verdict(git_repo)
+
+    assert evaluate_gate(git_repo, command) == gate.GateDecision(
+        True, GateCode.COMMAND_AMBIGUOUS
+    )
 
 
 @pytest.mark.parametrize(

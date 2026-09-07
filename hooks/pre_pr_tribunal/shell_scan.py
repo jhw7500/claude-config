@@ -44,6 +44,7 @@ _ALWAYS_AMBIGUOUS_FAILURES = {
     "DYNAMIC_PR_ARGUMENT",
     "DYNAMIC_SHELL_SCRIPT",
     "ENV_SPLIT_STRING",
+    "PR_CREATE_ALIAS",
     "TARGET_BINDING",
     "TARGET_OVERRIDE",
     "UNSAFE_PR_CONTEXT",
@@ -715,8 +716,21 @@ def _scan_simple_command(
 
     index = 0
     target_assignment = False
+    coproc_context = False
     while index < len(words) and _is_assignment(words[index]):
-        target_assignment = target_assignment or _is_target_assignment(words[index])
+        assignment = words[index]
+        assignment_targets_repository = _is_target_assignment(assignment)
+        if expected_base is not None and (
+            assignment.dynamic or assignment.shell_expansion
+        ) and _could_contain_gh_pr_create(words[index + 1 :]):
+            if assignment_targets_repository:
+                code = "TARGET_OVERRIDE"
+            else:
+                code = (
+                    "ANSI_C_QUOTE" if assignment.ansi_c else "DYNAMIC_PR_ARGUMENT"
+                )
+            raise ScanFailure(code)
+        target_assignment = target_assignment or assignment_targets_repository
         index += 1
     while index < len(words):
         executable = words[index]
@@ -730,6 +744,19 @@ def _scan_simple_command(
         name = _basename(executable.text)
         if not executable.quoted and name in _SHELL_CONTROL_PREFIXES:
             index += 1
+            continue
+        if not executable.quoted and name == "coproc":
+            coproc_context = True
+            index += 1
+            if (
+                index + 1 < len(words)
+                and not words[index].quoted
+                and not words[index].dynamic
+                and not words[index].shell_expansion
+                and not words[index + 1].quoted
+                and words[index + 1].text == "{"
+            ):
+                index += 1
             continue
         if name == "exec":
             index = _skip_exec(words, index + 1)
@@ -764,6 +791,8 @@ def _scan_simple_command(
     name = _basename(executable.text)
     if name == "gh":
         matched = _scan_gh(arguments, expected_base=expected_base)
+        if matched and coproc_context:
+            raise ScanFailure("UNSAFE_PR_CONTEXT")
         if matched and expected_base is not None and target_assignment:
             raise ScanFailure("TARGET_OVERRIDE")
         return matched
@@ -781,6 +810,8 @@ def _scan_simple_command(
             parser = _Parser(script.text, budget)
             nested = parser.parse(depth + 1)
             matched = _scan_parsed_context(nested, budget, expected_base)
+            if matched and coproc_context:
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
             if matched and expected_base is not None:
                 raise ScanFailure("UNSAFE_PR_CONTEXT")
             if matched and expected_base is not None and target_assignment:
@@ -951,6 +982,14 @@ def _skip_env(
         value = word.text
         assignment_name = _env_assignment_name(word)
         if assignment_name is not None:
+            if enforce_target_binding and (
+                word.dynamic or word.shell_expansion
+            ) and _could_contain_gh_pr_create(words[index + 1 :]):
+                if is_target_environment_name(assignment_name):
+                    code = "TARGET_OVERRIDE"
+                else:
+                    code = "ANSI_C_QUOTE" if word.ansi_c else "DYNAMIC_PR_ARGUMENT"
+                raise ScanFailure(code)
             if (
                 enforce_target_binding
                 and is_target_environment_name(assignment_name)
@@ -1164,6 +1203,13 @@ def _scan_gh(arguments: list[_Word], expected_base: str | None = None) -> bool:
             return False
         break
 
+    if (
+        index < len(arguments)
+        and not arguments[index].dynamic
+        and not arguments[index].shell_expansion
+        and arguments[index].text == "new"
+    ):
+        raise ScanFailure("PR_CREATE_ALIAS")
     if index >= len(arguments) or not _could_equal(arguments[index], "create"):
         return False
     if arguments[index].dynamic or arguments[index].shell_expansion:
@@ -1854,6 +1900,8 @@ class _StreamingHint:
             frame.phase = "EXEC_OPTION"
         elif name == "time":
             frame.phase = "TIME_OPTION"
+        elif name == "coproc":
+            frame.phase = "UNKNOWN_WRAPPER"
         elif name in _SHELLS:
             frame.phase = "SHELL_OPTION"
         else:

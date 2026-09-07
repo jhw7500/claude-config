@@ -1,5 +1,4 @@
 import hashlib
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -14,6 +13,7 @@ from pre_pr_tribunal.git_state import (
     capture_snapshot,
     snapshot_matches,
 )
+from pre_pr_tribunal.verdict_store import begin_round
 
 
 GIT = "/usr/bin/git"
@@ -142,11 +142,26 @@ def test_dirty_detached_and_missing_remote_base_fail_closed(git_repo):
 
 @pytest.mark.parametrize(
     "base",
-    ["", "--upload-pack=x", "-master", "../master", "master^{commit}", "main..x"],
+    [
+        "",
+        "--upload-pack=x",
+        "-master",
+        "../master",
+        "master^{commit}",
+        "main..x",
+        "ma\u0301ster",
+    ],
 )
 def test_invalid_base_is_rejected_before_remote_ref_resolution(git_repo, base):
     with pytest.raises(GitStateError, match="^BASE_INVALID$"):
         capture_snapshot(git_repo, base)
+
+
+def test_non_nfc_symbolic_head_is_rejected_before_verdict_write(git_repo):
+    _git(git_repo, "branch", "-m", "fe\u0301ature")
+
+    with pytest.raises(GitStateError, match="^GIT_STATE_INVALID$"):
+        capture_snapshot(git_repo, "master")
 
 
 def test_non_git_cwd_and_bare_repository_are_rejected(tmp_path):
@@ -176,6 +191,35 @@ def test_supported_github_origin_shapes_are_canonicalized(git_repo, url):
     _git(git_repo, "remote", "set-url", "origin", url)
 
     assert capture_snapshot(git_repo, "master").repository == ("jhw7500/claude-config")
+
+
+def test_origin_gh_default_repository_is_accepted(git_repo):
+    _git(git_repo, "config", "--local", "remote.origin.gh-resolved", "base")
+
+    assert capture_snapshot(git_repo, "master").repository == (
+        "jhw7500/claude-config"
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("remote.other.gh-resolved", "base"),
+        ("remote.origin.gh-resolved", "other"),
+    ),
+)
+def test_non_origin_gh_default_repository_is_rejected(git_repo, key, value):
+    _git(
+        git_repo,
+        "remote",
+        "add",
+        "other",
+        "https://github.com/other/repository.git",
+    )
+    _git(git_repo, "config", "--local", key, value)
+
+    with pytest.raises(GitStateError, match="^REPOSITORY_UNSUPPORTED$"):
+        capture_snapshot(git_repo, "master")
 
 
 @pytest.mark.parametrize(
@@ -212,22 +256,38 @@ def test_ignored_review_state_is_clean_but_untracked_source_is_dirty(git_repo):
         capture_snapshot(git_repo, "master")
 
 
-def test_newline_filename_is_nul_parsed_and_json_escaped(git_repo):
+@pytest.mark.parametrize(
+    "path", ["line\nbreak.txt", "tab\tpath.txt", "cafe\u0301.txt"]
+)
+def test_verdict_incompatible_path_text_is_rejected(git_repo, path):
+    (git_repo / path).write_text("new\n", encoding="utf-8")
+    _git(git_repo, "add", "--", path)
+    _commit(git_repo, "add incompatible path")
+
+    with pytest.raises(GitStateError, match="^PATH_INVALID$"):
+        capture_snapshot(git_repo, "master")
+
+
+def test_initial_path_count_cannot_exceed_verdict_parser_limit(git_repo):
+    _make_current_head_the_base(git_repo)
+    for index in range(1025):
+        (git_repo / f"path-{index:04d}.txt").write_text("x\n", encoding="ascii")
+    _git(git_repo, "add", ".")
+    _commit(git_repo, "add too many paths")
+
+    with pytest.raises(GitStateError, match="^GIT_STATE_INVALID$"):
+        capture_snapshot(git_repo, "master")
+
+
+def test_begin_round_never_persists_a_parser_incompatible_snapshot(git_repo):
     path = "line\nbreak.txt"
     (git_repo / path).write_text("new\n", encoding="utf-8")
     _git(git_repo, "add", "--", path)
-    _commit(git_repo, "add newline path")
+    _commit(git_repo, "add incompatible path")
 
-    snapshot = capture_snapshot(git_repo, "master")
-    encoded = json.dumps(snapshot.to_json(), ensure_ascii=False)
-
-    assert [(item.status, item.path) for item in snapshot.paths] == [
-        ("A", path),
-        ("M", "tracked.txt"),
-    ]
-    assert snapshot.initial_paths == (path, "tracked.txt")
-    assert "line\\nbreak.txt" in encoded
-    assert json.loads(encoded)["initial_paths"][0] == path
+    with pytest.raises(GitStateError, match="^PATH_INVALID$"):
+        begin_round(git_repo, base="master", runtime="codex", round_number=1)
+    assert not (git_repo / ".review/verdict.json").exists()
 
 
 def test_rename_binds_old_and_new_paths_in_utf8_byte_order(git_repo):

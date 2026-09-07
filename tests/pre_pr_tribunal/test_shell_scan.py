@@ -183,6 +183,49 @@ def test_round_three_executable_candidates_are_not_ignored(command):
     }
 
 
+def test_builtin_pr_create_alias_is_never_treated_as_unrelated():
+    command = "gh pr new --base master"
+
+    assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "coproc gh pr create --base master",
+        "coproc { gh pr create --base master; }",
+        "coproc PR_JOB { gh pr create --base master; }",
+    ],
+)
+def test_bash_coproc_candidates_are_not_ignored(command):
+    assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
+def test_bash_coproc_argument_data_remains_unrelated():
+    assert scan_pr_create("coproc printf gh pr create --base master").kind is (
+        ScanKind.NO_MATCH
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'FOO="${VALUE@P}" gh pr create --base master',
+        'env FOO="${VALUE@P}" gh pr create --base master',
+    ],
+)
+def test_bound_candidate_rejects_dynamic_leading_assignments(command):
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
 def test_quote_removed_executable_survives_token_limit_fallback():
     command = "X=x " * (MAX_TOKENS - 2)
     command += r"\g\h pr create --base master"
@@ -202,6 +245,22 @@ def test_quote_removed_executable_survives_token_limit_fallback():
     ],
 )
 def test_wrapped_executable_survives_token_limit_fallback(tail):
+    command = "X=x " * MAX_TOKENS + tail
+
+    assert scan_pr_create(command) == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "TOKEN_LIMIT"
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "coproc gh pr create --base master",
+        "coproc { gh pr create --base master; }",
+        "coproc PR_JOB { gh pr create --base master; }",
+    ],
+)
+def test_bash_coproc_survives_token_limit_fallback(tail):
     command = "X=x " * MAX_TOKENS + tail
 
     assert scan_pr_create(command) == ScanResult(

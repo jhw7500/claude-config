@@ -52,10 +52,12 @@ command substitution, redirection, shell expansion, 동적 shell/env 또는 Git 
 형태는 `COMMAND_AMBIGUOUS`로 차단된다. GNU `env -S`의 option cluster/long-option 축약과
 split operand 뒤 argv, shell `-c` 앞의 operand option, `pr`과 `create` 사이의 `gh` global
 option도 같은 candidate 경계에서 검사한다. 실행 위치의 정적 quote/escape 제거 이름은 실제
-argv 이름으로 인식하며, GNU split-string의 `\c` 종료 문법은 안전하게 fail closed한다.
+argv 이름으로 인식하며, GNU split-string의 `\c` 종료 문법, official `gh pr new` alias와
+Bash `coproc` candidate도 안전하게 fail closed한다. GitHub CLI의 repository-local default는
+없거나 origin을 가리키는 exact marker 하나만 허용한다.
 
 이 gate는 Claude/Codex shell hook에 보이는 direct `gh pr create`만 다룬다. GitHub UI에서의 PR
-생성, `gh api`, alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가
+생성, `gh api`, shell alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가
 필요하다. 1 MiB를 넘는 hook payload는 command를 신뢰할 수 없으므로 bounded deny한다.
 설치·복구와 검증 절차는 [hook 운영 문서](hooks/README.md#pre-pr-tribunal-운영)를 따른다.
 
@@ -64,7 +66,8 @@ argv 이름으로 인식하며, GNU split-string의 `\c` 종료 문법은 안전
 `/dev/null`로 폐기하며 missing phase의 `D/0`, pass phase의 `A/1` marker만 schema-v2
 report로 판정한다. Claude OAuth는 child environment에만 전달하고 Codex auth는 sealed
 memfd에서 tmpfs `CODEX_HOME/auth.json`으로만 초기화하므로 host filesystem에 credential
-copy를 만들지 않는다. 이 경계를 준비할 수 없으면 fail closed한다.
+copy를 만들지 않는다. Environment-mode API key도 bubblewrap argv가 아닌 최소 child
+environment로만 전달한다. 이 경계를 준비할 수 없으면 fail closed한다.
 
 ## 토글 메커니즘 — 2종류 (대체 불가, 병행)
 

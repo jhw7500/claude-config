@@ -12,7 +12,14 @@ import subprocess
 import time
 import unicodedata
 
-from .model import ChangedPath, SCHEMA_VERSION, Snapshot, TribunalError
+from .model import (
+    ChangedPath,
+    MAX_COMMAND_TEXT_BYTES,
+    MAX_INITIAL_PATHS,
+    SCHEMA_VERSION,
+    Snapshot,
+    TribunalError,
+)
 
 
 GIT = "/usr/bin/git"
@@ -203,6 +210,23 @@ def _sha(raw: bytes, code: str = "GIT_STATE_INVALID") -> str:
     return value
 
 
+def _valid_schema_text(value: object, maximum: int) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        encoded = value.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return False
+    return (
+        len(encoded) <= maximum
+        and unicodedata.normalize("NFC", value) == value
+        and not any(
+            unicodedata.category(character) in {"Cc", "Cs"}
+            for character in value
+        )
+    )
+
+
 def _physical_root(cwd: Path) -> Path:
     output = _command_output(
         cwd,
@@ -241,16 +265,10 @@ def _validated_cwd(cwd: object) -> Path:
 
 def _validate_base(root: Path, base: str) -> None:
     if (
-        not isinstance(base, str)
-        or not base
+        not _valid_schema_text(base, 256)
         or base.startswith("-")
-        or any(unicodedata.category(character) == "Cc" for character in base)
     ):
         raise GitStateError("BASE_INVALID")
-    try:
-        base.encode("utf-8", "strict")
-    except UnicodeEncodeError:
-        raise GitStateError("BASE_INVALID") from None
     result = _run_git(root, "check-ref-format", "--branch", base)
     if result.returncode != 0:
         raise GitStateError("BASE_INVALID")
@@ -283,18 +301,30 @@ def _repository_from_origin(raw: bytes) -> str:
 
 
 def _valid_path_text(value: object) -> bool:
-    if not isinstance(value, str) or not value or value.startswith("/"):
-        return False
-    try:
-        value.encode("utf-8", "strict")
-    except UnicodeEncodeError:
-        return False
-    if any(
-        unicodedata.category(character) == "Cc" and character not in "\n\t"
-        for character in value
+    if (
+        not _valid_schema_text(value, MAX_COMMAND_TEXT_BYTES)
+        or value.startswith(("/", "\\"))
+        or "\\" in value
     ):
         return False
     return all(component not in {"", ".", ".."} for component in value.split("/"))
+
+
+def _validate_gh_default_repository(root: Path) -> None:
+    result = _run_git(
+        root,
+        "config",
+        "--local",
+        "--null",
+        "--get-regexp",
+        r"^remote\..*\.gh-resolved$",
+    )
+    if result.returncode == 1 and not result.stdout and not result.stderr:
+        return
+    if result.returncode != 0 or result.stderr:
+        raise GitStateError("REPOSITORY_UNSUPPORTED")
+    if result.stdout != b"remote.origin.gh-resolved\nbase\x00":
+        raise GitStateError("REPOSITORY_UNSUPPORTED")
 
 
 def _path(raw: bytes) -> str:
@@ -412,6 +442,7 @@ def _revalidate_snapshot_state(
             failure="SNAPSHOT_CHANGED",
         )
         final_repository = _repository_from_origin(final_origin)
+        _validate_gh_default_repository(root)
     except GitStateError:
         raise GitStateError("SNAPSHOT_CHANGED") from None
     if (
@@ -442,6 +473,8 @@ def capture_snapshot(
     if symbolic_head.returncode != 0:
         raise GitStateError("DETACHED_HEAD")
     symbolic_head_name = _one_line_utf8(symbolic_head.stdout, "GIT_STATE_INVALID")
+    if not _valid_schema_text(symbolic_head_name, 1024):
+        raise GitStateError("GIT_STATE_INVALID")
 
     head_sha = _sha(_command_output(root, ("rev-parse", "--verify", "HEAD^{commit}")))
     _validate_base(root, base)
@@ -468,6 +501,7 @@ def capture_snapshot(
         failure="REPOSITORY_UNSUPPORTED",
     )
     repository = _repository_from_origin(origin)
+    _validate_gh_default_repository(root)
 
     status = _command_output(
         root, ("status", "--porcelain=v2", "-z", "--untracked-files=all")
@@ -505,6 +539,8 @@ def capture_snapshot(
         for path in (item.path, item.old_path)
         if path is not None
     }
+    if len(initial_paths) > MAX_INITIAL_PATHS:
+        raise GitStateError("GIT_STATE_INVALID")
     ordered_initial_paths = tuple(
         sorted(initial_paths, key=lambda value: value.encode("utf-8"))
     )

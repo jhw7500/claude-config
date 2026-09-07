@@ -12,9 +12,13 @@ reviewed snapshot remain the values represented by that verdict.
 This amendment covers:
 
 - repository/base/head target binding for the PR command;
+- GitHub CLI default-repository selection and the `gh pr new` alias;
 - rejection of shell work that can run before the PR command;
+- fail-closed handling for Bash `coproc` and dynamic leading assignments;
 - ANSI-C and GNU `env --split-string` candidate recognition;
 - fail-closed handling when a hook payload exceeds 1 MiB;
+- exact alignment between snapshot producer text/path bounds and the verdict
+  parser contract;
 - contract and canary documentation for the supported command form.
 
 It does not add a wrapper, dependency, permission, environment variable,
@@ -49,6 +53,9 @@ snapshot until `gh` starts.
 | Static quote/backslash removal produces `gh` in executable position | Eligible for verdict checks |
 | GNU split-string uses `\c` termination | `AMBIGUOUS_CANDIDATE` |
 | Shell `-c`, brace/glob expansion, or dynamic content in a bound candidate | `AMBIGUOUS_CANDIDATE` |
+| Official `gh pr new` alias | `AMBIGUOUS_CANDIDATE` |
+| Candidate launched by Bash `coproc`, including named compound forms | `AMBIGUOUS_CANDIDATE` |
+| Dynamic or shell-expanding leading assignment before a bound candidate | `AMBIGUOUS_CANDIDATE` |
 
 A trailing newline or separator with no other executable segment does not by
 itself create a stale snapshot and may remain eligible.
@@ -73,6 +80,13 @@ The bound scan rejects:
   inherited `GH_HOST` other than the repository's supported `github.com` host.
 - shell- or `env`-assigned Git execution variables that can alter repository or
   ref resolution, including `GIT_CONFIG_*`, and their inherited equivalents.
+
+GitHub CLI can persist a repository-local default as
+`remote.<name>.gh-resolved=base`. Snapshot capture and revalidation accept no
+such marker or the single exact `remote.origin.gh-resolved=base` marker. A
+non-origin, duplicate, malformed, or unreadable marker is
+`REPOSITORY_UNSUPPORTED`; it cannot redirect a passing verdict to another
+remote.
 
 An inherited `GH_HOST=github.com` and a private runtime `GH_CONFIG_DIR` do not
 change the explicitly bound target and remain supported. The command itself may
@@ -108,6 +122,18 @@ Static quote or backslash removal in executable position is interpreted as the
 resulting argv name in both the normal parser and bounded streaming fallback.
 The GNU split-string `\c` control escape is deliberately unsupported and fails
 closed instead of attempting a partial emulation.
+The official `gh pr new` alias is treated as a PR-create candidate but is not
+eligible for the canonical pass envelope. Bash `coproc` candidates are unsafe
+whether direct or compound; the bounded streaming fallback retains them as
+ambiguous when its token budget is exhausted. Dynamic leading simple-command
+or `env` assignments are also ambiguous for a bound candidate because shell
+expansion can execute before `gh` starts.
+
+Snapshot fields written into a verdict use the same decoded-text domain as the
+strict reader: UTF-8, NFC, no Unicode `Cc`/`Cs`, and the reader's byte bounds.
+Changed paths additionally reject absolute paths, backslashes, and empty,
+`.` or `..` components. Round 1 records at most 1,024 unique initial paths, so
+the producer cannot create a verdict that its own parser later rejects.
 
 ## Oversized hook payloads
 
@@ -131,6 +157,12 @@ Regression tests exercise real scanner, gate, and copied-adapter behavior:
   candidate;
 - quote-removed executable names survive normal and token-limit scanning, and
   split-string `\c` termination cannot return `NO_MATCH`;
+- `gh pr new`, direct/named `coproc`, and dynamic leading assignments are
+  ambiguous in both scanner and adapter coverage;
+- absent or origin GitHub CLI defaults preserve the canonical target while a
+  non-origin default is rejected during capture and gate revalidation;
+- base, symbolic HEAD, changed paths, and initial-path count stay inside the
+  strict verdict parser's accepted domain;
 - the canonical explicit-base command still reaches `PASS`;
 - unrelated shell data and malformed in-limit payloads retain their existing
   no-output behavior.

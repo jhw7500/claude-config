@@ -172,6 +172,11 @@ Snapshot은 최소 다음 값을 가진다.
 Digest는 표시용 diff가 아니라 exact byte stream에서 계산한다. Locale, pager,
 color, text conversion이 결과를 바꾸지 않도록 Git 실행 환경을 고정한다. Symlink,
 submodule과 binary 변경도 name/status와 binary diff에 포함한다.
+Snapshot producer는 verdict strict parser와 같은 decoded-text 계약을 적용한다. Base,
+symbolic HEAD와 changed path는 UTF-8/NFC이고 Unicode `Cc`/`Cs`가 없으며 각 schema byte
+상한 안에 있어야 한다. Path는 absolute/backslash/빈 component/`.`/`..`를 거부하고,
+round 1의 unique initial path는 최대 1,024개다. Producer가 reader가 거부할 verdict를
+쓰는 상태는 `GIT_STATE_INVALID`로 시작 전에 중단한다.
 
 ### 8.3 Stale 판정
 
@@ -379,8 +384,10 @@ Hook matcher는 process spawn을 줄이는 최적화일 뿐 authority가 아니�
 payload에서 shell command를 직접 검증한다. Scanner는 최소 다음을 처리한다.
 
 - leading environment assignment
+- bound candidate 앞의 dynamic 또는 shell-expanding assignment
 - `command`/`exec`/`time`/`env` wrapper와 GNU `env -S` cluster, accepted
   long-option abbreviation, trailing argv를 포함한 alternate argv
+- official `gh pr new` alias와 Bash `coproc` direct/named compound form
 - shell `-c` 앞의 operand option과 `pr`/`create` 사이의 `gh` global option
 - absolute 또는 relative `gh` executable path의 basename
 - compound command, subshell, command substitution 안의 실제 subcommand
@@ -397,6 +404,9 @@ output-writing wrapper를 허용하지 않는다.
 Pass 후보는 literal `--base`를 정확히 한 번 포함하고 그 값이 verdict base와 같아야 한다.
 `GH_REPO`/`GH_HOST`/Git worktree assignment, `--repo`/`-R`, `--head`/`-H`, hostname/config
 override와 free-standing dynamic argv는 target binding을 증명할 수 없으므로 거부한다.
+Repository-local `remote.<name>.gh-resolved=base`는 없거나 exact origin marker 하나일 때만
+지원한다. 다른 remote를 선택하거나 duplicate/malformed인 marker는 snapshot capture와
+재검증에서 fail closed한다.
 
 v1 scanner는 기존 `verification-command-hygiene-hook.py` parser를 refactor하거나
 import하지 않는다. 요구하는 출력과 오류 경계가 다르므로 tribunal core 안에 작은
@@ -488,6 +498,7 @@ Raw subprocess output, absolute home path, token, credential, 전체 diff를 hoo
 - decision evidence 필수 필드와 크기 제한
 - round 1..3과 round exhaustion
 - initial path auto-fix boundary
+- snapshot text/path normalization, control-character and 1,024-path producer bounds
 - symlink/non-regular/permission/atomic replace/lock contention
 
 ### 16.2 Shell 명령 corpus
@@ -510,6 +521,8 @@ Ambiguous/deny fixture:
 - shell operand option 뒤 `-c` script와 `pr`/`create` 사이에 global option이 있는
   `gh` candidate
 - `env --`/`command -p` 뒤 quote-removed `gh`와 GNU split-string `\c` 종료형
+- official `gh pr new`, Bash `coproc` direct/named compound form, dynamic leading
+  simple-command/`env` assignment
 
 Negative fixture:
 

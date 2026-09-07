@@ -455,7 +455,7 @@ def _parse_verdict(raw: bytes) -> Verdict:
     initial_paths = tuple(
         m._path(item)
         for item in m._array(
-            obj["initial_paths"], m.MAX_FINDINGS_PER_REVIEWER * 8, "VERDICT_INVALID"
+            obj["initial_paths"], m.MAX_INITIAL_PATHS, "VERDICT_INVALID"
         )
     )
     if len(initial_paths) != len(set(initial_paths)):

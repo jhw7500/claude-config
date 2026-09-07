@@ -96,9 +96,12 @@ substitution, redirection, shell/glob expansion, cwd-changing `env`, output-writ
 short-option cluster, unambiguous long-option 축약, split operand 뒤 argv, shell `-c` 앞의
 operand option, `pr`과 `create` 사이의 `gh` global option이 포함된다. 실행 위치에서 quote나
 backslash가 제거되어 `gh`가 되는 이름도 후보이며, GNU split-string `\c` 종료 문법은
-`COMMAND_AMBIGUOUS`로 fail closed한다. Inherited
+`COMMAND_AMBIGUOUS`로 fail closed한다. Official `gh pr new` alias, Bash `coproc` candidate와
+bound candidate 앞의 dynamic simple-command/`env` assignment도 ambiguous다. Inherited
 `GH_HOST=github.com`과 격리된 `GH_CONFIG_DIR`는 target을 바꾸지 않으므로 허용하지만 다른
 inherited host, `GH_REPO`, target에 영향을 주는 Git execution environment는 거부한다.
+Repository-local `remote.<name>.gh-resolved=base` marker는 없거나 origin을 가리키는 exact
+marker 하나만 허용하며, 다른 default repository는 `REPOSITORY_UNSUPPORTED`다.
 1 MiB를 넘는 payload는 JSON을 해석하거나 입력을 반사하지 않고 `COMMAND_AMBIGUOUS`로 거부한다.
 
 deny reason code와 기본 복구는 다음과 같다.
@@ -179,7 +182,9 @@ phase, 두 30초 begin/finalize deadline과 30초 scheduling cushion을 합친 b
 330초 validity margin을 요구하고 child environment에만 전달한다. Codex auth는
 sealed memfd에 보관하고 bubblewrap 내 private writable tmpfs
 `CODEX_HOME/auth.json`을 초기화해 atomic refresh를 허용하며, hooks overlay는
-read-only로 유지한다. 따라서 host filesystem에 credential copy를 만들지 않는다.
+read-only로 유지한다. Environment-mode API key는 bubblewrap `--setenv`를 포함한 argv에
+넣지 않고 runtime별 최소 child environment로만 상속한다. 따라서 host filesystem이나
+process argv에 credential copy를 만들지 않는다.
 
 SIGTERM이나 SIGKILL로 probe가 비정상 종료되면 credential이 없는 임시
 repository/config residue는 남을 수 있다. Provider network는 Claude와 Codex별로

@@ -71,6 +71,13 @@ RUNTIME_ENV_KEYS = (
     "HTTPS_PROXY",
     "NO_PROXY",
 )
+SECRET_ENV_KEYS = frozenset(
+    {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"}
+)
+RUNTIME_SECRET_ENV_KEYS = {
+    "claude": frozenset({"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"}),
+    "codex": frozenset({"OPENAI_API_KEY"}),
+}
 
 
 class ProbeFailure(Exception):
@@ -1182,14 +1189,18 @@ def _sandbox_argv(
     arguments.extend(("--ro-bind", str(hosts_file), "/etc/hosts"))
     for target in _system_gh_targets():
         arguments.extend(("--ro-bind", str(fake_gh), str(target)))
-    claude_oauth_token = env.get("CLAUDE_CODE_OAUTH_TOKEN")
-    arguments.extend(("--chdir", str(repo)))
-    if claude_oauth_token is None:
-        arguments.append("--clearenv")
-    elif runtime != "claude":
+    inherited_secret_keys = SECRET_ENV_KEYS.intersection(env)
+    allowed_secret_keys = RUNTIME_SECRET_ENV_KEYS.get(runtime, frozenset())
+    if (
+        not inherited_secret_keys.issubset(allowed_secret_keys)
+        or len(inherited_secret_keys) > 1
+    ):
         raise ProbeFailure("ISOLATION_UNAVAILABLE")
+    arguments.extend(("--chdir", str(repo)))
+    if not inherited_secret_keys:
+        arguments.append("--clearenv")
     for key, value in sorted(env.items()):
-        if key == "CLAUDE_CODE_OAUTH_TOKEN":
+        if key in SECRET_ENV_KEYS:
             continue
         arguments.extend(("--setenv", key, value))
     arguments.extend(("--", "/usr/bin/env", "-u", "PWD", *inner))
@@ -1239,9 +1250,9 @@ def _run_sandboxed(
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
         }
-        claude_oauth_token = env.get("CLAUDE_CODE_OAUTH_TOKEN")
-        if claude_oauth_token is not None:
-            process_env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_oauth_token
+        for key in SECRET_ENV_KEYS:
+            if key in env:
+                process_env[key] = env[key]
         return _run_runtime(
             argv,
             cwd=repo,

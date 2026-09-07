@@ -136,7 +136,10 @@ fallback은 없다.
 
 `--auth-source environment`는 호환성을 위한 명시적 opt-in으로 유지한다. Claude에는
 `ANTHROPIC_API_KEY`만, Codex에는 `OPENAI_API_KEY`만 전달한다. Subscription mode는
-API key로 fallback하지 않는다.
+API key로 fallback하지 않는다. 허용된 key 하나는 bubblewrap을 시작하는 최소 child
+environment로만 상속하며 `--setenv` 인자나 다른 argv에 key 이름 또는 값을 넣지 않는다.
+Sandbox 내부에는 해당 runtime에 허용된 secret 하나만 남는다. 다른 runtime의 key,
+복수 secret 또는 예상하지 않은 secret 조합은 `ISOLATION_UNAVAILABLE`로 중단한다.
 
 ## 7. 격리 경계
 
@@ -161,6 +164,8 @@ API key로 fallback하지 않는다.
   허용해 code-mode 또는 이후 command-tool 이름 변경을 수용한다.
 - Fake `gh`는 exact argv와 cwd를 검증한다.
 - Runtime process에는 `--die-with-parent` bubblewrap boundary를 적용한다.
+- OAuth/API-key secret은 bubblewrap command argv, marker, report와 control/work tree에
+  기록하지 않고 최소 child environment로만 전달한다.
 
 Provider connectivity는 유지한다. 직접 HTTP client나 같은 UID의 의도적 marker
 위조를 막는 경계라고 표현하지 않는다.
