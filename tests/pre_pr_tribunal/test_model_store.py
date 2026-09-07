@@ -671,6 +671,49 @@ def test_begin_writes_in_progress_and_finalize_requires_all_reviewers(git_repo):
         )
 
 
+@pytest.mark.parametrize("control", ("\n", "\t"), ids=("lf", "tab"))
+def test_pending_round_recovers_from_invalid_text_with_a_fresh_complete_panel(
+    git_repo, control
+):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    verdict_path = git_repo / ".review/verdict.json"
+    pending_bytes = verdict_path.read_bytes()
+    invalid = finding()
+    invalid["rationale"] = f"first line{control}second line"
+    stale_blocker_b = finding(identifier="B-R1-001", reviewer="B")
+    stale_execution_b = execution("B-R1-E001")
+    stale_blocker_b["execution_ids"] = [stale_execution_b["id"]]
+    stale_blocker_c = finding(identifier="C-R1-001", reviewer="C")
+    malformed_paths = report_paths(
+        git_repo,
+        pending.snapshot,
+        overrides={
+            "A": {"findings": [invalid]},
+            "B": {
+                "findings": [stale_blocker_b],
+                "executions": [stale_execution_b],
+            },
+            "C": {"findings": [stale_blocker_c]},
+        },
+    )
+
+    with pytest.raises(SchemaError, match="TEXT_INVALID"):
+        finalize_round(git_repo, reviewer_paths=malformed_paths, now=NOW)
+
+    still_pending = read_verdict(git_repo)
+    assert still_pending.gate.status.value == "in_progress"
+    assert still_pending.snapshot == pending.snapshot
+    assert verdict_path.read_bytes() == pending_bytes
+
+    fresh_paths = report_paths(git_repo, pending.snapshot)
+    recovered = finalize_round(git_repo, reviewer_paths=fresh_paths, now=NOW)
+    assert recovered.gate.status.value == "pass"
+    assert recovered.snapshot == pending.snapshot
+    assert all(slot.status == "complete" for slot in recovered.reviewers.values())
+
+
 def test_empty_reports_pass_and_round_one_restart_resets_pending(git_repo):
     pending = begin_round(
         git_repo, base="master", runtime="claude", round_number=1, now=NOW

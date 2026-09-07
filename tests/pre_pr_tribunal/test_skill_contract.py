@@ -8,6 +8,7 @@ from pre_pr_tribunal.model import Reviewer, Snapshot, parse_decisions, parse_rev
 
 
 ROOT = Path(__file__).resolve().parents[2] / "skills" / "pre-pr-tribunal"
+REPOSITORY_ROOT = ROOT.parents[1]
 REFERENCES = (
     "references/reviewer-a.md",
     "references/reviewer-b.md",
@@ -283,6 +284,65 @@ def test_each_reviewer_prompt_is_read_only_self_contained_and_exactly_bounded():
         assert "128 executions" in body
         assert all(f'"{key}"' in body for key in REPORT_KEYS)
         assert all(mandate in body for mandate in mandates)
+
+
+def test_every_report_contract_matches_the_decoded_text_parser_boundary():
+    for name in REFERENCES:
+        body = text(name)
+        for token in (
+            "JSON-decoded string",
+            "Unicode NFC",
+            "General_Category",
+            "`Cc`",
+            "`Cs`",
+            "LF",
+            "TAB",
+            "one physical line",
+            "printable separator",
+            "` | `",
+        ):
+            assert token in body, f"{name} omits decoded-text rule: {token}"
+    assert "strict parser is authoritative" in text("references/report-schema.md")
+
+
+def test_approved_design_and_plan_use_the_same_decoded_text_contract():
+    documents = (
+        REPOSITORY_ROOT
+        / "docs/superpowers/specs/2026-09-01-pre-pr-adversarial-tribunal-design.md",
+        REPOSITORY_ROOT
+        / "docs/superpowers/plans/2026-09-01-pre-pr-adversarial-tribunal.md",
+    )
+    for document in documents:
+        body = document.read_text(encoding="utf-8")
+        for token in ("JSON-decoded string", "NFC", "`Cc`", "`Cs`", "LF", "TAB"):
+            assert token in body, f"{document.name} omits decoded-text rule: {token}"
+
+
+def test_pending_recovery_contract_preserves_state_and_reruns_the_complete_panel():
+    skill = text("SKILL.md")
+    recovery = re.search(
+        r"<!-- pending-recovery-contract -->(.*?)"
+        r"<!-- pending-recovery-contract-end -->",
+        skill,
+        re.DOTALL,
+    )
+    assert recovery is not None
+    body = recovery.group(1)
+    normalized = body.lower()
+    for token in (
+        "explicit user intervention",
+        "in_progress",
+        "same bound snapshot",
+        "do not run `begin`",
+        "do not reset",
+        "do not delete `.review`",
+        "fresh detached reviewer views",
+        "A, B, and C",
+        "Do not reuse",
+        "exact new terminal outputs",
+        "snapshot changed",
+    ):
+        assert token.lower() in normalized
 
 
 def test_empirical_reviewer_forbids_unsupported_claims_and_requires_capture_fields():

@@ -291,6 +291,10 @@ def test_scan_precedes_repository_and_verdict_work(git_repo: Path):
     "command",
     [
         "exec -- gh pr create --draft",
+        "exec -cl gh pr create --draft",
+        "/usr/bin/time --format elapsed gh pr create --draft",
+        "g$'\\150' pr create --draft",
+        "gh $'--re\\160o=owner/repo' pr create --draft",
         "gh p$'r' create --draft",
     ],
 )

@@ -87,7 +87,17 @@ _SHELL_CONTROL_PREFIXES = {
     "until",
     "while",
 }
-_EXEC_FLAGS = {"-c", "-l"}
+_TIME_FLAGS = {
+    "-a",
+    "--append",
+    "-p",
+    "--portability",
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+}
+_TIME_VALUE_OPTIONS = {"-f", "--format", "-o", "--output"}
 _SHELL_OPERATORS = ("&&", "||", ";", "|", "&")
 _SHELL_REDIRECTIONS = (
     "&>>",
@@ -537,15 +547,17 @@ def _scan_simple_command(tokens: list[_Token], depth: int, budget: _Budget) -> b
     while index < len(words):
         executable = words[index]
         if executable.dynamic:
+            if executable.ansi_c and _contains_pr_create(words[index + 1 :]):
+                raise ScanFailure("ANSI_C_QUOTE")
             return False
         name = _basename(executable.text)
         if not executable.quoted and name in _SHELL_CONTROL_PREFIXES:
             index += 1
             continue
-        if not executable.quoted and name == "exec":
+        if name == "exec":
             index = _skip_exec(words, index + 1)
             continue
-        if not executable.quoted and name == "time":
+        if name == "time":
             index = _skip_time(words, index + 1)
             continue
         if name == "command":
@@ -567,7 +579,7 @@ def _scan_simple_command(tokens: list[_Token], depth: int, budget: _Budget) -> b
     executable = words[index]
     arguments = words[index + 1 :]
     if executable.dynamic:
-        if executable.ansi_c and _could_form_pr_create(arguments):
+        if executable.ansi_c and _contains_pr_create(arguments):
             raise ScanFailure("ANSI_C_QUOTE")
         return False
     name = _basename(executable.text)
@@ -586,16 +598,30 @@ def _skip_exec(words: list[_Word], index: int) -> int:
     while index < len(words):
         word = words[index]
         if word.dynamic:
+            if word.ansi_c and _could_contain_gh_pr_create(words[index + 1 :]):
+                raise ScanFailure("ANSI_C_QUOTE")
             return len(words)
         value = word.text
         if value == "--":
             return index + 1
-        if value in _EXEC_FLAGS:
+        if not value.startswith("-") or value == "-":
+            return index
+        short = value[1:]
+        alternate_name = short.find("a")
+        flag_prefix = short if alternate_name < 0 else short[:alternate_name]
+        if any(flag not in "cl" for flag in flag_prefix):
+            if _could_contain_gh_pr_create(words[index + 1 :]):
+                raise ScanFailure("UNKNOWN_EXEC_OPTION")
+            return len(words)
+        if alternate_name < 0:
             index += 1
             continue
-        if value == "-a":
-            return min(index + 2, len(words))
-        return index
+        if alternate_name == len(short) - 1:
+            if index + 1 >= len(words):
+                raise ScanFailure("INCOMPLETE_EXEC_OPTION")
+            index += 2
+        else:
+            index += 1
     return index
 
 
@@ -603,12 +629,31 @@ def _skip_time(words: list[_Word], index: int) -> int:
     while index < len(words):
         word = words[index]
         if word.dynamic:
+            if word.ansi_c and _could_contain_gh_pr_create(words[index + 1 :]):
+                raise ScanFailure("ANSI_C_QUOTE")
             return len(words)
-        if word.text == "-p":
+        value = word.text
+        if value in _TIME_FLAGS:
             index += 1
             continue
-        if word.text == "--":
+        if value in _TIME_VALUE_OPTIONS:
+            if index + 1 >= len(words):
+                raise ScanFailure("INCOMPLETE_TIME_OPTION")
+            index += 2
+            continue
+        if (
+            value.startswith("--format=")
+            or value.startswith("--output=")
+            or (len(value) > 2 and value[:2] in {"-f", "-o"})
+        ):
+            index += 1
+            continue
+        if value == "--":
             return index + 1
+        if value.startswith("-"):
+            if _could_contain_gh_pr_create(words[index + 1 :]):
+                raise ScanFailure("UNKNOWN_TIME_OPTION")
+            return len(words)
         return index
     return index
 
@@ -646,7 +691,7 @@ def _scan_gh(arguments: list[_Word]) -> bool:
     while index < len(arguments):
         word = arguments[index]
         if word.dynamic:
-            if word.ansi_c and _could_form_pr_create(arguments[index:]):
+            if word.ansi_c and _could_contain_pr_create(arguments[index:]):
                 raise ScanFailure("ANSI_C_QUOTE")
             return False
         value = word.text
@@ -690,6 +735,19 @@ def _could_form_pr_create(words: list[_Word]) -> bool:
 
 def _could_equal(word: _Word, value: str) -> bool:
     return word.ansi_c and word.dynamic or not word.dynamic and word.text == value
+
+
+def _could_contain_pr_create(words: list[_Word]) -> bool:
+    return any(_could_form_pr_create(words[index:]) for index in range(len(words) - 1))
+
+
+def _could_contain_gh_pr_create(words: list[_Word]) -> bool:
+    return any(
+        not word.dynamic
+        and _basename(word.text) == "gh"
+        and _scan_gh(words[index + 1 :])
+        for index, word in enumerate(words)
+    )
 
 
 def _contains_pr_create(words: list[_Word]) -> bool:

@@ -101,6 +101,13 @@ deny reason code와 기본 복구는 다음과 같다.
 | `REPOSITORY_UNSUPPORTED` | exact repository root, GitHub origin 또는 supported Git 상태가 아니다. root와 remote를 확인한다. |
 | `VERDICT_UNSAFE`, `VERDICT_INVALID` | `.review` 권한·파일 형식·schema/state invariant가 안전하지 않다. 우회하지 말고 원인을 고친 뒤 Skill로 재생성한다. |
 
+`finalize`가 reviewer report의 `TEXT_INVALID` 같은 schema 오류로 멈췄지만 verdict가 여전히
+`in_progress`라면, 기존 verdict를 reset하거나 `.review`를 지우지 않는다. 같은 bound snapshot과
+clean 상태를 확인한 뒤 fresh detached view에서 A/B/C 전원을 다시 실행한다. 기존 C가 valid였더라도
+재사용하지 않고, 세 reviewer의 exact 새 terminal JSON으로 inbox 세 파일을 교체한 다음 같은 round를
+`finalize`한다. JSON-decoded string은 NFC여야 하고 Unicode `Cc`/`Cs`를 포함할 수 없으므로 LF/TAB은
+escape로 표현해도 invalid다. Snapshot이 달라졌으면 이 pending 복구를 중단하고 사용자 판단을 받는다.
+
 verdict는 exact clean repository root, GitHub origin, remote base SHA, HEAD, merge-base, diff digest에
 결합된다. 그중 하나가 바뀌거나 untracked 파일을 포함해 worktree가 dirty면 stale/dirty deny다.
 `.review/`는 repository-local ignored state이며 directory는 `0700`, JSON/lock file은 `0600`의

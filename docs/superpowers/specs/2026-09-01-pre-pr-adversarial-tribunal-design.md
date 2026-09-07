@@ -274,8 +274,11 @@ Path가 현재 diff 밖이거나 새 dependency/권한/secret을 요구하는 fi
 ```
 
 실제 schema는 unknown key, duplicate key, 잘못된 enum, control character와 크기
-초과를 거부한다. `producer_runtime`은 감사 정보일 뿐 gate 의미에는 영향을 주지
-않는다. 따라서 Codex가 만든 valid verdict를 Claude hook이, Claude가 만든 verdict를
+초과를 거부한다. Strict parser가 text acceptance의 정본이다. 모든 JSON-decoded string은
+NFC여야 하고 Unicode General_Category `Cc` 또는 `Cs`를 포함할 수 없다. 따라서 JSON escape가
+디코딩되는 LF, CR, TAB을 포함한 control character와 surrogate도 invalid다.
+`producer_runtime`은 감사 정보일 뿐 gate 의미에는 영향을 주지 않는다. 따라서 Codex가 만든
+valid verdict를 Claude hook이, Claude가 만든 verdict를
 Codex hook이 동일하게 인정한다.
 
 ### 10.2 Decision 종류

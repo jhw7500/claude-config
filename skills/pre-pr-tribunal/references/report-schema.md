@@ -2,6 +2,8 @@
 
 Reviewer reports are strict JSON objects with exactly `schema`, `reviewer`, `round`, `snapshot`, `status`, `findings`, `executions`, `claims`, and `prior_decisions`. Report size is at most 128 KiB; evidence text is at most 8 KiB; commands and repository-relative paths are at most 4 KiB. Each reviewer has at most 128 findings, 128 executions, 128 claims, and 128 prior decision responses. Decision files contain at most 384 decisions.
 
+The strict parser is authoritative for accepted report text. Every JSON-decoded string must already be Unicode NFC and contain no character whose Unicode General_Category is `Cc` or `Cs`. JSON escapes that decode to LF, CR, TAB, backspace, form feed, another control character, or a surrogate are therefore invalid. Emit the final report as one physical line of minified JSON. Flatten multi-line evidence excerpts with a printable separator such as ` | `; compute `capture_sha256` from the full original capture, not the flattened excerpt. Examples below are pretty-printed only for readability.
+
 IDs are round-local. Decisions are written after a round and enter only through the following round's `begin --decisions`. A prior decision may be acknowledged only by the originating reviewer. Evidence excerpts are sanitized and bounded; raw secret-bearing output, tokens, private keys, credentials, and absolute home paths invalidate evidence.
 
 A finding path may be any normalized repository-relative path, including outside the diff. Finding scope does not authorize source changes: only controller automatic fixes are limited to round-1 `initial_paths`.

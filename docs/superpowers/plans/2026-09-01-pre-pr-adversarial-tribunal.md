@@ -682,7 +682,7 @@ class TribunalError(Exception):
 stable codes such as `WORKTREE_DIRTY`, `DETACHED_HEAD`, `BASE_INVALID`,
 `REPOSITORY_UNSUPPORTED`, `EMPTY_DIFF` and `AUTO_FIX_SCOPE_EXPANDED`.
 
-Serialization must emit only relative UTF-8 paths, reject NUL/control characters other than escaped newline/tab in JSON, use lower-case 40/64 hex, and sort `initial_paths` by UTF-8 byte order.
+Serialization must emit only relative UTF-8 paths, require every JSON-decoded string to be NFC without Unicode General_Category `Cc` or `Cs`, and reject JSON escapes that decode to LF, CR, TAB, another control character, or a surrogate. It must also use lower-case 40/64 hex and sort `initial_paths` by UTF-8 byte order.
 
 - [ ] **Step 4: Git snapshot capture를 구현한다**
 

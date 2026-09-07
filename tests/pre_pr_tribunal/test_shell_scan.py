@@ -53,11 +53,17 @@ def test_detects_executable_pr_create(command):
     "command",
     [
         "exec -- gh pr create --draft",
+        "exec -ll gh pr create --draft",
+        "exec -cla alias gh pr create --draft",
+        "exec -acl gh pr create --draft",
+        "exec -a alias -cl gh pr create --draft",
         "{ command -- gh pr create --draft; }",
         "! command -- gh pr create --draft",
         "if ! false; then gh pr create --draft; fi",
         "for item in only; do gh pr create --draft; break; done",
         "time -p gh pr create --draft",
+        "/usr/bin/time -f elapsed gh pr create --draft",
+        "/usr/bin/time --format=elapsed gh pr create --draft",
     ],
 )
 def test_shell_control_candidates_are_not_silently_ignored(command):
@@ -71,8 +77,12 @@ def test_shell_control_candidates_are_not_silently_ignored(command):
     "command",
     [
         "g$'h' pr create --draft",
+        "g$'\\150' pr create --draft",
         "gh p$'r' create --draft",
         "gh pr c$'reate' --draft",
+        "gh $'--re\\160o=owner/repo' pr create --draft",
+        "e$'\\170'ec -cl gh pr create --draft",
+        "exec $'-\\143l' gh pr create --draft",
     ],
 )
 def test_ansi_c_candidate_words_are_not_silently_ignored(command):
@@ -111,7 +121,10 @@ def test_ansi_c_candidate_words_are_not_silently_ignored(command):
         "touch 'file\ngh pr create'",
         "touch $'file\\ngh pr create'",
         "printf $'gh pr create'",
+        "exec -a gh printf pr create",
         "time printf gh pr create",
+        "/usr/bin/time -f gh printf pr create",
+        "/usr/bin/time --format 'gh pr create' printf done",
         "if true; then printf gh pr create; fi",
         "gh --repo owner/repo issue create",
         "env -u",
