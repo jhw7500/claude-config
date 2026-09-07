@@ -561,7 +561,7 @@ def test_passing_verdict_rejects_unbound_target(git_repo: Path, command: str):
 
 @pytest.mark.parametrize(
     "name",
-    ("GH_REPO", "GH_HOST", "GH_CONFIG_DIR", "GIT_DIR", "GIT_WORK_TREE"),
+    ("GH_REPO", "GH_HOST", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"),
 )
 def test_passing_verdict_rejects_inherited_target_override(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, name: str
@@ -573,6 +573,25 @@ def test_passing_verdict_rejects_inherited_target_override(
 
     assert decision.block is True
     assert decision.code is GateCode.COMMAND_AMBIGUOUS
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (("GH_HOST", "github.com"), ("GH_CONFIG_DIR", "/isolated/gh-config")),
+)
+def test_passing_verdict_allows_inherited_non_target_runtime_config(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+):
+    _passing_verdict(git_repo)
+    monkeypatch.setenv(name, value)
+
+    decision = evaluate_gate(git_repo, BOUND_COMMAND)
+
+    assert decision.block is False
+    assert decision.code is GateCode.PASS
 
 
 @pytest.mark.parametrize(
@@ -743,16 +762,41 @@ def test_verdict_command_and_path_canaries_never_reach_deny_output(
     assert str(git_repo) not in result.stdout and result.stderr == ""
 
 
+def _payload_with_byte_size(repo: Path, size: int, marker: str = "") -> str:
+    body = payload(repo, COMMAND)
+    body["padding"] = marker
+    raw = json.dumps(body, separators=(",", ":"))
+    remaining = size - len(raw.encode())
+    assert remaining >= 0
+    body["padding"] = marker + "x" * remaining
+    raw = json.dumps(body, separators=(",", ":"))
+    assert len(raw.encode()) == size
+    return raw
+
+
 @pytest.mark.parametrize("name", ("claude_hook.py", "codex_hook.py"))
-def test_oversized_payload_is_silent(
+def test_payload_byte_boundary_fails_closed_above_limit(
     installed_package: Path, name: str, git_repo: Path
 ):
-    body = payload(git_repo, COMMAND)
-    body["padding"] = "x" * MAX_PAYLOAD_BYTES
-    raw = json.dumps(body)
-    assert len(raw.encode()) > MAX_PAYLOAD_BYTES
-    result = run_adapter(installed_package, name, raw, git_repo)
-    assert result.returncode == 0 and result.stdout == result.stderr == ""
+    canary = "payload_boundary_canary_123456"
+    at_limit = run_adapter(
+        installed_package,
+        name,
+        _payload_with_byte_size(git_repo, MAX_PAYLOAD_BYTES),
+        git_repo,
+    )
+    over_limit = run_adapter(
+        installed_package,
+        name,
+        _payload_with_byte_size(git_repo, MAX_PAYLOAD_BYTES + 1, canary),
+        git_repo,
+    )
+
+    assert at_limit.returncode == over_limit.returncode == 0
+    assert "TRIBUNAL_REQUIRED" in at_limit.stdout
+    assert "COMMAND_AMBIGUOUS" in over_limit.stdout
+    assert canary not in over_limit.stdout
+    assert at_limit.stderr == over_limit.stderr == ""
 
 
 @pytest.mark.parametrize("name", ("claude_hook.py", "codex_hook.py"))

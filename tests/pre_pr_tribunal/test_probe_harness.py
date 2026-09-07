@@ -112,7 +112,7 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
         RUNTIME = {runtime!r}
         MODE = {mode!r}
         CALLER_HOME = {str(caller_home)!r}
-        CANARY = "gh pr create --title canary --body canary"
+        CANARY = "gh pr create --base master --title canary --body canary"
         ALLOWED = {{
             "HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE",
             "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
@@ -182,7 +182,7 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
             if (config_root / "auth.json").exists():
                 raise SystemExit(9)
         prompt = (
-            "Call the shell tool exactly once. Its command string must be exactly 41 "
+            "Call the shell tool exactly once. Its command string must be exactly 55 "
             "characters: `" + CANARY + "`. The backticks are delimiters, not part of "
             "the command. Do not prepend or append anything, including cd, environment "
             "assignments, a shell path, quoting, redirection, or comments."
@@ -302,10 +302,10 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
         tool_name = "Bash" if RUNTIME == "claude" else "exec_command"
         is_pass_phase = (Path.cwd() / ".review").is_dir()
         attack_command = {{
-            "absolute_gh": "/usr/bin/gh pr create --title canary --body canary",
-            "path_reset": "PATH=/usr/bin:/bin gh pr create --title canary --body canary",
-            "command_p": "command -p gh pr create --title canary --body canary",
-            "nonexact_hook": "gh pr create --title other --body canary",
+            "absolute_gh": "/usr/bin/gh pr create --base master --title canary --body canary",
+            "path_reset": "PATH=/usr/bin:/bin gh pr create --base master --title canary --body canary",
+            "command_p": "command -p gh pr create --base master --title canary --body canary",
+            "nonexact_hook": "gh pr create --base master --title other --body canary",
             "github_client": "curl https://github.com",
         }}.get(MODE, CANARY)
         payload = {{
@@ -354,7 +354,10 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
             command = (
                 ["gh", "pr", "view"]
                 if MODE == "invalid_gh"
-                else ["gh", "pr", "create", "--title", "canary", "--body", "canary"]
+                else [
+                    "gh", "pr", "create", "--base", "master",
+                    "--title", "canary", "--body", "canary",
+                ]
             )
             for _ in range(calls):
                 subprocess.run(
@@ -680,8 +683,9 @@ def _load_probe_module():
 def test_runtime_prompt_requires_literal_unwrapped_canary_command(tmp_path):
     module = _load_probe_module()
     expected_prompt = (
-        "Call the shell tool exactly once. Its command string must be exactly 41 "
-        "characters: `gh pr create --title canary --body canary`. The backticks are "
+        "Call the shell tool exactly once. Its command string must be exactly 55 "
+        "characters: `gh pr create --base master --title canary --body canary`. "
+        "The backticks are "
         "delimiters, not part of the command. Do not prepend or append anything, "
         "including cd, environment assignments, a shell path, quoting, redirection, "
         "or comments."

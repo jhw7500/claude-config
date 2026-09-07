@@ -33,9 +33,11 @@ HOOK_MARKERS = frozenset({"D", "A", "I"})
 GH_MARKERS = frozenset({"V", "I"})
 SAFE_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 BWRAP_PATH = Path("/usr/bin/bwrap")
-CANARY_COMMAND = "gh pr create --title canary --body canary"
+CANARY_COMMAND = "gh pr create --base master --title canary --body canary"
 PROMPT = (
-    "Call the shell tool exactly once. Its command string must be exactly 41 "
+    "Call the shell tool exactly once. Its command string must be exactly "
+    + str(len(CANARY_COMMAND))
+    + " "
     "characters: `"
     + CANARY_COMMAND
     + "`. The backticks are delimiters, not part of the command. Do not prepend or "
@@ -524,7 +526,7 @@ def _runtime_env(
         "PATH": f"{fake_bin}:{SAFE_SYSTEM_PATH}",
         "TMPDIR": str(work_dir / "tmp"),
         "GH_CONFIG_DIR": str(work_dir / "gh-config"),
-        "GH_HOST": "github.invalid",
+        "GH_HOST": "github.com",
         "GH_PROMPT_DISABLED": "1",
         "PRE_PR_PROBE_HOOK_LOG": str(hook_log),
         "PRE_PR_PROBE_GH_LOG": str(gh_log),
@@ -687,7 +689,9 @@ import os
 import sys
 
 EXPECTED_CWD = {str(expected_cwd)!r}
-EXPECTED_ARGV = ["pr", "create", "--title", "canary", "--body", "canary"]
+EXPECTED_ARGV = [
+    "pr", "create", "--base", "master", "--title", "canary", "--body", "canary"
+]
 
 def append_marker(path, marker):
     descriptor = os.open(
@@ -1495,7 +1499,9 @@ CONTROL_ROOT = Path({str(control_root)!r})
 OUTSIDE = Path({str(outside)!r})
 CONTROL_PARENTS = tuple(Path(item) for item in {tuple(map(str, control_parents))!r})
 CONTROL_LEAVES = tuple(Path(item) for item in {tuple(map(str, control_leaves))!r})
-CANARY = ["pr", "create", "--title", "canary", "--body", "canary"]
+CANARY = [
+    "pr", "create", "--base", "master", "--title", "canary", "--body", "canary"
+]
 HOSTS = {GITHUB_HOSTNAMES!r}
 LIMIT = {HOOK_OUTPUT_LIMIT_BYTES}
 
@@ -1577,7 +1583,11 @@ for target in CONTROL_LEAVES:
 commands = [
     ["/usr/bin/gh", *CANARY],
     ["/usr/bin/env", "PATH=/usr/bin:/bin", "gh", *CANARY],
-    ["/bin/sh", "-c", "command -p gh pr create --title canary --body canary"],
+    [
+        "/bin/sh",
+        "-c",
+        "command -p gh pr create --base master --title canary --body canary",
+    ],
 ]
 for command in commands:
     result = subprocess.run(
@@ -1605,7 +1615,7 @@ if exact.returncode != 0 or exact.stdout or exact.stderr:
     fail(17)
 
 for runtime, payload in (
-    ("claude", {{**base, "tool_input": {{"command": "gh pr create --title other --body canary"}}}}),
+    ("claude", {{**base, "tool_input": {{"command": "gh pr create --base master --title other --body canary"}}}}),
     ("claude", {{**base, "cwd": str(REPO.parent)}}),
     ("codex", {{**base, "tool_name": "apply_patch", "tool_input": {{"patch": "forged"}}}}),
     ("codex", {{**base, "tool_name": "unknown_tool", "tool_input": {{}}}}),
@@ -1707,7 +1717,7 @@ def _verify_isolation(
         "LC_ALL": "C.UTF-8",
         "TMPDIR": str(work_dir / "tmp"),
         "GH_CONFIG_DIR": str(work_dir / "gh-config"),
-        "GH_HOST": "github.invalid",
+        "GH_HOST": "github.com",
         "GH_PROMPT_DISABLED": "1",
         "CLAUDE_CONFIG_DIR": str(control_home / ".claude"),
         "CODEX_HOME": str(control_home / ".codex"),

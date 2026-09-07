@@ -73,10 +73,23 @@ def deny_output(code: GateCode) -> dict[str, object]:
     }
 
 
+def _write_deny(code: GateCode) -> None:
+    try:
+        output = json.dumps(
+            deny_output(code), ensure_ascii=False, separators=(",", ":")
+        )
+        sys.stdout.write(output + "\n")
+    except Exception:
+        pass
+
+
 def adapter_main(runtime: str) -> int:
     try:
         raw = sys.stdin.buffer.read(MAX_STDIN_BYTES + 1)
     except Exception:
+        return 0
+    if len(raw) > MAX_STDIN_BYTES:
+        _write_deny(GateCode.COMMAND_AMBIGUOUS)
         return 0
     request = decode_request(raw, runtime=runtime)
     if request is None:
@@ -90,11 +103,5 @@ def adapter_main(runtime: str) -> int:
         block = True
     if not block:
         return 0
-    try:
-        output = json.dumps(
-            deny_output(code), ensure_ascii=False, separators=(",", ":")
-        )
-        sys.stdout.write(output + "\n")
-    except Exception:
-        pass
+    _write_deny(code)
     return 0

@@ -157,7 +157,10 @@ def _snapshot_is_bound(verdict, snapshot) -> bool:
 
 
 def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
-    if any(name in os.environ for name in TARGET_ENV_NAMES):
+    inherited_target_names = TARGET_ENV_NAMES - {"GH_CONFIG_DIR", "GH_HOST"}
+    if any(name in os.environ for name in inherited_target_names):
+        return _decision(True, GateCode.COMMAND_AMBIGUOUS)
+    if os.environ.get("GH_HOST") not in {None, "", "github.com"}:
         return _decision(True, GateCode.COMMAND_AMBIGUOUS)
 
     root, preflight_error = _exact_clean_root(cwd)
