@@ -32,6 +32,7 @@ SNAPSHOT = Snapshot(
     repository="owner/repository",
     base_ref="main",
     base_sha="0" * 40,
+    head_ref="refs/heads/feature",
     head_sha="1" * 40,
     merge_base_sha="0" * 40,
     diff_sha256="a" * 64,

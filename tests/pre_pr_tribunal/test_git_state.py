@@ -81,6 +81,7 @@ def test_snapshot_binds_repository_base_head_merge_base_diff_and_paths(git_repo)
     assert first == second
     assert first.repository == "jhw7500/claude-config"
     assert first.base_ref == "master"
+    assert first.head_ref == "refs/heads/feature"
     assert len(first.base_sha) == 40
     assert len(first.head_sha) == 40
     assert len(first.merge_base_sha) == 40
@@ -94,6 +95,7 @@ def test_snapshot_binds_repository_base_head_merge_base_diff_and_paths(git_repo)
         "schema": 1,
         "repository": "jhw7500/claude-config",
         "base": {"ref": "master", "sha": first.base_sha},
+        "head_ref": "refs/heads/feature",
         "head_sha": first.head_sha,
         "merge_base_sha": first.merge_base_sha,
         "diff_sha256": first.diff_sha256,
@@ -393,6 +395,19 @@ def test_snapshot_staleness_ignores_timestamp_but_detects_new_commit(git_repo):
 
     assert after.head_sha != before.head_sha
     assert after.diff_sha256 != before.diff_sha256
+    assert not snapshot_matches(before, after)
+
+
+def test_snapshot_staleness_detects_symbolic_branch_change_at_same_commit(git_repo):
+    before = capture_snapshot(git_repo, "master")
+    _git(git_repo, "branch", "alternate")
+    _git(git_repo, "checkout", "-q", "alternate")
+
+    after = capture_snapshot(git_repo, "master")
+
+    assert after.head_sha == before.head_sha
+    assert after.diff_sha256 == before.diff_sha256
+    assert after.head_ref == "refs/heads/alternate"
     assert not snapshot_matches(before, after)
 
 

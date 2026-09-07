@@ -812,6 +812,41 @@ def test_store_lock_is_nonblocking_and_atomic_file_is_private(git_repo):
         os.close(lock)
 
 
+def test_failed_legacy_verdict_without_head_ref_migrates_on_next_round(git_repo):
+    first = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo, first.snapshot, overrides={"A": {"findings": [finding()]}}
+        ),
+        now=NOW,
+    )
+    verdict_path = git_repo / ".review/verdict.json"
+    legacy = json.loads(verdict_path.read_text(encoding="utf-8"))
+    del legacy["head_ref"]
+    write_json(verdict_path, legacy)
+    commit_fix(git_repo)
+    decisions_path = write_json(
+        git_repo / ".review/inbox/round-1/decisions.json", [decision()]
+    )
+
+    second = begin_round(
+        git_repo,
+        base="master",
+        runtime="codex",
+        round_number=2,
+        decisions_path=decisions_path,
+        now=NOW,
+    )
+
+    assert second.head_ref == "refs/heads/feature"
+    assert json.loads(verdict_path.read_text(encoding="utf-8"))["head_ref"] == (
+        "refs/heads/feature"
+    )
+
+
 def test_oversized_combined_verdict_does_not_replace_pending_state(git_repo):
     pending = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW

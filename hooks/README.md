@@ -91,9 +91,10 @@ decision도 출력하지 않는다. direct 후보가 모호하거나 현재 verd
 
 Pass 경로의 canonical command는 `gh pr create --base <verdict-base>` 한 개다. Literal base가
 verdict와 정확히 같아야 하며 `GH_REPO`/repo/head override, 다른 command segment, command
-substitution, redirection, cwd-changing `env`, output-writing `time`, ANSI-C 또는 `env -S`로 만든
-대체 argv는 통과하지 않는다. Inherited `GH_HOST=github.com`과 격리된 `GH_CONFIG_DIR`는 target을
-바꾸지 않으므로 허용하지만 다른 inherited host, `GH_REPO`, Git worktree override는 거부한다.
+substitution, redirection, shell/glob expansion, cwd-changing `env`, output-writing `time`, shell
+`-c`, ANSI-C 또는 동적 `env -S`로 만든 대체 argv는 통과하지 않는다. Inherited
+`GH_HOST=github.com`과 격리된 `GH_CONFIG_DIR`는 target을 바꾸지 않으므로 허용하지만 다른
+inherited host, `GH_REPO`, target에 영향을 주는 Git execution environment는 거부한다.
 1 MiB를 넘는 payload는 JSON을 해석하거나 입력을 반사하지 않고 `COMMAND_AMBIGUOUS`로 거부한다.
 
 deny reason code와 기본 복구는 다음과 같다.
@@ -115,8 +116,13 @@ clean 상태를 확인한 뒤 fresh detached view에서 A/B/C 전원을 다시 �
 `finalize`한다. JSON-decoded string은 NFC여야 하고 Unicode `Cc`/`Cs`를 포함할 수 없으므로 LF/TAB은
 escape로 표현해도 invalid다. Snapshot이 달라졌으면 이 pending 복구를 중단하고 사용자 판단을 받는다.
 
-verdict는 exact clean repository root, GitHub origin, remote base SHA, HEAD, merge-base, diff digest에
-결합된다. 그중 하나가 바뀌거나 untracked 파일을 포함해 worktree가 dirty면 stale/dirty deny다.
+`head_ref`가 도입되기 전에 생성된 terminal FAIL verdict는 다음 round `begin`에서만 현재 named
+branch를 새 snapshot에 기록하며 자동 전환된다. 그런 legacy verdict 자체는 PR을 허용하지 않는다.
+Legacy PASS 또는 in-progress state는 stale/invalid로 닫고 새 Tribunal로 복구한다.
+
+verdict는 exact clean repository root, GitHub origin, remote base SHA, symbolic HEAD ref, HEAD SHA,
+merge-base, diff digest에 결합된다. 그중 하나가 바뀌거나 untracked 파일을 포함해 worktree가 dirty면
+stale/dirty deny다.
 `.review/`는 repository-local ignored state이며 directory는 `0700`, JSON/lock file은 `0600`의
 현재 사용자 소유 regular target이어야 한다. symlink, unsafe mode, 다른 checkout의 verdict 재사용은
 허용하지 않는다.

@@ -84,6 +84,7 @@ class Snapshot:
     repository: str
     base_ref: str
     base_sha: str
+    head_ref: str
     head_sha: str
     merge_base_sha: str
     diff_sha256: str
@@ -96,6 +97,7 @@ class Snapshot:
             "schema": self.schema,
             "repository": self.repository,
             "base": {"ref": self.base_ref, "sha": self.base_sha},
+            "head_ref": self.head_ref,
             "head_sha": self.head_sha,
             "merge_base_sha": self.merge_base_sha,
             "diff_sha256": self.diff_sha256,
@@ -276,6 +278,7 @@ class Verdict:
     repository: str
     base_ref: str
     base_sha: str
+    head_ref: str
     head_sha: str
     merge_base_sha: str
     diff_sha256: str
@@ -295,6 +298,7 @@ class Verdict:
             self.repository,
             self.base_ref,
             self.base_sha,
+            self.head_ref,
             self.head_sha,
             self.merge_base_sha,
             self.diff_sha256,
@@ -308,6 +312,7 @@ class Verdict:
             "schema": self.schema,
             "repository": self.repository,
             "base": {"ref": self.base_ref, "sha": self.base_sha},
+            "head_ref": self.head_ref,
             "head_sha": self.head_sha,
             "merge_base_sha": self.merge_base_sha,
             "diff_sha256": self.diff_sha256,
@@ -376,6 +381,31 @@ def _text(value: object, maximum: int, *, allow_empty: bool = False) -> str:
     ):
         raise SchemaError("TEXT_INVALID")
     return value
+
+
+def _head_ref(value: object) -> str:
+    ref = _text(value, 1024)
+    prefix = "refs/heads/"
+    if not ref.startswith(prefix):
+        raise SchemaError("VERDICT_INVALID")
+    branch = ref[len(prefix) :]
+    components = branch.split("/")
+    if (
+        not branch
+        or branch == "@"
+        or branch.endswith(".")
+        or ".." in branch
+        or "@{" in branch
+        or any(character in branch for character in " ~^:?*[\\")
+        or any(
+            not component
+            or component.startswith(".")
+            or component.endswith(".lock")
+            for component in components
+        )
+    ):
+        raise SchemaError("VERDICT_INVALID")
+    return ref
 
 
 @dataclass

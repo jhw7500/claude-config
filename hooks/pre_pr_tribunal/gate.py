@@ -17,7 +17,7 @@ from .git_state import (
     capture_snapshot,
 )
 from .model import GateStatus, SchemaError, TribunalError
-from .shell_scan import TARGET_ENV_NAMES, ScanKind, scan_pr_create
+from .shell_scan import ScanKind, is_target_environment_name, scan_pr_create
 from .verdict_store import read_verdict
 
 
@@ -143,6 +143,7 @@ def _snapshot_is_bound(verdict, snapshot) -> bool:
         verdict.repository,
         verdict.base_ref,
         verdict.base_sha,
+        verdict.head_ref,
         verdict.head_sha,
         verdict.merge_base_sha,
         verdict.diff_sha256,
@@ -150,6 +151,7 @@ def _snapshot_is_bound(verdict, snapshot) -> bool:
         snapshot.repository,
         snapshot.base_ref,
         snapshot.base_sha,
+        snapshot.head_ref,
         snapshot.head_sha,
         snapshot.merge_base_sha,
         snapshot.diff_sha256,
@@ -157,8 +159,11 @@ def _snapshot_is_bound(verdict, snapshot) -> bool:
 
 
 def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
-    inherited_target_names = TARGET_ENV_NAMES - {"GH_CONFIG_DIR", "GH_HOST"}
-    if any(name in os.environ for name in inherited_target_names):
+    safe_inherited_names = {"GH_CONFIG_DIR", "GH_HOST"}
+    if any(
+        is_target_environment_name(name) and name not in safe_inherited_names
+        for name in os.environ
+    ):
         return _decision(True, GateCode.COMMAND_AMBIGUOUS)
     if os.environ.get("GH_HOST") not in {None, "", "github.com"}:
         return _decision(True, GateCode.COMMAND_AMBIGUOUS)

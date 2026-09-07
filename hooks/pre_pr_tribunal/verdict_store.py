@@ -403,26 +403,29 @@ def _parse_verdict(raw: bytes) -> Verdict:
         schema = data.get("schema")
         if isinstance(schema, int) and not isinstance(schema, bool) and schema != 1:
             raise SchemaError("VERDICT_SCHEMA_UNSUPPORTED")
-    obj = m._object(
-        data,
-        {
-            "schema",
-            "repository",
-            "base",
-            "head_sha",
-            "merge_base_sha",
-            "diff_sha256",
-            "initial_paths",
-            "round",
-            "producer_runtime",
-            "reviewers",
-            "decisions",
-            "history",
-            "gate",
-            "created_at",
-        },
-        "VERDICT_INVALID",
-    )
+    verdict_keys = {
+        "schema",
+        "repository",
+        "base",
+        "head_ref",
+        "head_sha",
+        "merge_base_sha",
+        "diff_sha256",
+        "initial_paths",
+        "round",
+        "producer_runtime",
+        "reviewers",
+        "decisions",
+        "history",
+        "gate",
+        "created_at",
+    }
+    if not isinstance(data, dict) or set(data) not in {
+        frozenset(verdict_keys),
+        frozenset(verdict_keys - {"head_ref"}),
+    }:
+        raise SchemaError("VERDICT_INVALID")
+    obj = data
     if obj["schema"] != 1 or isinstance(obj["schema"], bool):
         raise SchemaError("VERDICT_INVALID")
     repository = m._text(obj["repository"], 256)
@@ -433,6 +436,7 @@ def _parse_verdict(raw: bytes) -> Verdict:
         raise SchemaError("VERDICT_INVALID")
     base = m._object(obj["base"], {"ref", "sha"}, "VERDICT_INVALID")
     base_ref = m._text(base["ref"], 256)
+    head_ref = m._head_ref(obj["head_ref"]) if "head_ref" in obj else ""
     base_sha, head_sha, merge_base_sha, digest = (
         base["sha"],
         obj["head_sha"],
@@ -473,6 +477,7 @@ def _parse_verdict(raw: bytes) -> Verdict:
         repository,
         base_ref,
         base_sha,
+        head_ref,
         head_sha,
         merge_base_sha,
         digest,
@@ -562,6 +567,7 @@ def _parse_verdict(raw: bytes) -> Verdict:
         repository,
         base_ref,
         base_sha,
+        head_ref,
         head_sha,
         merge_base_sha,
         digest,
@@ -706,6 +712,7 @@ def _snapshot_equal(verdict: Verdict, snapshot: Snapshot) -> bool:
         verdict.repository,
         verdict.base_ref,
         verdict.base_sha,
+        verdict.head_ref,
         verdict.head_sha,
         verdict.merge_base_sha,
         verdict.diff_sha256,
@@ -713,6 +720,7 @@ def _snapshot_equal(verdict: Verdict, snapshot: Snapshot) -> bool:
         snapshot.repository,
         snapshot.base_ref,
         snapshot.base_sha,
+        snapshot.head_ref,
         snapshot.head_sha,
         snapshot.merge_base_sha,
         snapshot.diff_sha256,
@@ -810,6 +818,10 @@ def begin_round(
                 snapshot.repository != previous.repository
                 or snapshot.base_ref != previous.base_ref
                 or snapshot.base_sha != previous.base_sha
+                or (
+                    previous.head_ref
+                    and snapshot.head_ref != previous.head_ref
+                )
             ):
                 raise SchemaError("REPOSITORY_OR_BASE_CHANGED")
             try:
@@ -840,6 +852,7 @@ def begin_round(
             snapshot.repository,
             snapshot.base_ref,
             snapshot.base_sha,
+            snapshot.head_ref,
             snapshot.head_sha,
             snapshot.merge_base_sha,
             snapshot.diff_sha256,
@@ -945,6 +958,7 @@ def finalize_round(
             pending.repository,
             pending.base_ref,
             pending.base_sha,
+            pending.head_ref,
             pending.head_sha,
             pending.merge_base_sha,
             pending.diff_sha256,

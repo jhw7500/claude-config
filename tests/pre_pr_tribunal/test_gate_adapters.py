@@ -435,6 +435,7 @@ def test_round_three_failure_exhausts_the_gate(git_repo: Path):
     ("mutation", "expected"),
     (
         ("repository", GateCode.VERDICT_STALE),
+        ("head_ref", GateCode.VERDICT_STALE),
         ("base_sha", GateCode.VERDICT_STALE),
         ("merge_base", GateCode.VERDICT_STALE),
         ("digest", GateCode.VERDICT_STALE),
@@ -448,6 +449,8 @@ def test_persisted_binding_mutations_fail_closed(
     value = _verdict_payload(git_repo)
     if mutation == "repository":
         value["repository"] = "other/repository"
+    elif mutation == "head_ref":
+        value["head_ref"] = "refs/heads/alternate"
     elif mutation == "base_sha":
         value["base"]["sha"] = value["head_sha"]
     elif mutation == "merge_base":
@@ -483,6 +486,14 @@ def test_malformed_stored_base_ref_is_invalid(git_repo: Path):
 def test_head_move_is_stale(git_repo: Path):
     _passing_verdict(git_repo)
     _commit(git_repo, "head moved\n")
+    assert_decision(git_repo, GateCode.VERDICT_STALE)
+
+
+def test_symbolic_head_change_at_same_commit_is_stale(git_repo: Path):
+    _passing_verdict(git_repo)
+    _git(git_repo, "branch", "alternate")
+    _git(git_repo, "checkout", "-q", "alternate")
+
     assert_decision(git_repo, GateCode.VERDICT_STALE)
 
 
@@ -560,8 +571,41 @@ def test_passing_verdict_rejects_unbound_target(git_repo: Path, command: str):
 
 
 @pytest.mark.parametrize(
+    "command",
+    (
+        "gh pr create --base master --{head,head}=other",
+        r"env -S 'gh\_pr\_create\_--base\_master'",
+        "env G'H'_REPO=other/repo gh pr create --base master",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.other.insteadOf "
+        "GIT_CONFIG_VALUE_0=origin gh pr create --base master",
+        "bash -c 'gh pr create --base master'",
+        'gh pr create --base master --title "${VALUE@P}"',
+    ),
+)
+def test_passing_verdict_rejects_round_one_bypasses(
+    git_repo: Path, command: str
+):
+    _passing_verdict(git_repo)
+
+    decision = evaluate_gate(git_repo, command)
+
+    assert decision.block is True
+    assert decision.code is GateCode.COMMAND_AMBIGUOUS
+
+
+@pytest.mark.parametrize(
     "name",
-    ("GH_REPO", "GH_HOST", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"),
+    (
+        "GH_REPO",
+        "GH_HOST",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_SSH_COMMAND",
+    ),
 )
 def test_passing_verdict_rejects_inherited_target_override(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, name: str
@@ -577,7 +621,12 @@ def test_passing_verdict_rejects_inherited_target_override(
 
 @pytest.mark.parametrize(
     ("name", "value"),
-    (("GH_HOST", "github.com"), ("GH_CONFIG_DIR", "/isolated/gh-config")),
+    (
+        ("GH_HOST", "github.com"),
+        ("GH_CONFIG_DIR", "/isolated/gh-config"),
+        ("GIT_PAGER", "cat"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+    ),
 )
 def test_passing_verdict_allows_inherited_non_target_runtime_config(
     git_repo: Path,

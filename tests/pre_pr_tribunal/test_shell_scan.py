@@ -21,6 +21,7 @@ from pre_pr_tribunal.shell_scan import (
         "command -- gh pr create",
         "env FOO=1 gh --repo owner/repo pr create",
         "bash -c 'gh pr create --draft'",
+        "bash -ec 'gh pr create --draft'",
         'dash -c "gh pr create --draft"',
         "/bin/sh -c 'gh pr create' shell-name",
         "g\\\nh pr create",
@@ -145,7 +146,6 @@ def test_alternate_argv_pr_candidates_are_not_ignored(command):
         "X=gh pr create",
         '"FOO=1" gh pr create',
         "bash -c gh pr create",
-        "bash -ec 'gh pr create'",
         "bash -c $'printf\\nx'",
         "echo './gh\npr create'",
         "echo 'gh\x01pr create'",
@@ -217,6 +217,106 @@ def test_target_binding_rejects_unbound_pr_command(command):
 )
 def test_target_binding_accepts_literal_matching_base(command):
     assert scan_pr_create(command, expected_base="master").kind is ScanKind.PR_CREATE
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"env -S 'gh\_pr\_create\_--base\_master'",
+        r"env --split-string='gh\_pr\_create\_--base\_master'",
+        r"env -S'gh\_pr\_create\_--base\_master'",
+        "env -S '${X} --base master'",
+        "env --split-string='${X} pr create --base master'",
+        "env -S${X}",
+        "env --split-string=${X}",
+    ],
+)
+def test_gnu_env_split_string_transformations_are_ambiguous(command):
+    assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
+
+
+def test_unrelated_literal_env_split_string_remains_no_match():
+    assert scan_pr_create(r"env -S 'printf\_%s\_okay'").kind is ScanKind.NO_MATCH
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env G'H'_REPO=other/repo gh pr create --base master",
+        r"env G\H_REPO=other/repo gh pr create --base master",
+        r"env G$'\x48'_REPO=other/repo gh pr create --base master",
+    ],
+)
+def test_quote_removed_target_assignment_names_are_rejected(command):
+    assert scan_pr_create(command, expected_base="master") == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "TARGET_OVERRIDE"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.other.insteadOf "
+        "GIT_CONFIG_VALUE_0=origin gh pr create --base master",
+        "env GIT_CONFIG_PARAMETERS=x gh pr create --base master",
+    ],
+)
+def test_git_configuration_assignments_are_target_overrides(command):
+    assert scan_pr_create(command, expected_base="master") == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "TARGET_OVERRIDE"
+    )
+
+
+def test_other_git_execution_environment_is_a_target_override():
+    assert scan_pr_create(
+        "GIT_SSH_COMMAND=helper gh pr create --base master",
+        expected_base="master",
+    ) == ScanResult(ScanKind.AMBIGUOUS_CANDIDATE, "TARGET_OVERRIDE")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -c 'gh pr create --base master'",
+        "BASH_ENV=/tmp/startup bash -c 'gh pr create --base master'",
+        "bash -lc 'gh pr create --base master'",
+        "dash -ec 'gh pr create --base master'",
+    ],
+)
+def test_bound_shell_command_envelopes_are_unsafe(command):
+    assert scan_pr_create(command, expected_base="master") == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "UNSAFE_PR_CONTEXT"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'gh pr create --base master --title "${VALUE@P}"',
+        'gh pr create --base master --title="${VALUE@P}"',
+        'gh pr create --base master -t"${VALUE@P}"',
+        'gh pr create --base master --body "$BODY"',
+    ],
+)
+def test_bound_dynamic_content_values_are_rejected(command):
+    assert scan_pr_create(command, expected_base="master") == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "DYNAMIC_PR_ARGUMENT"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr create --base master --{head,head}=other",
+        "gh pr create --base master --he*=other",
+        "gh pr create --ba{se,se} master",
+        "gh pr create --base ma*",
+    ],
+)
+def test_bound_shell_expansion_in_candidate_arguments_is_rejected(command):
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
 
 
 @pytest.mark.parametrize(

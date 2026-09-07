@@ -62,6 +62,7 @@ def _snapshot(verdict) -> dict[str, object]:
     return {
         "repository": verdict.repository,
         "base": {"ref": verdict.base_ref, "sha": verdict.base_sha},
+        "head_ref": verdict.head_ref,
         "head_sha": verdict.head_sha,
         "merge_base_sha": verdict.merge_base_sha,
         "diff_sha256": verdict.diff_sha256,

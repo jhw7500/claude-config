@@ -16,6 +16,25 @@ TARGET_ENV_NAMES = frozenset(
         "GIT_DIR",
         "GIT_WORK_TREE",
         "GIT_COMMON_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM",
+    }
+)
+_ENV_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
+_SAFE_GIT_ENV_NAMES = frozenset(
+    {
+        "GIT_CURL_VERBOSE",
+        "GIT_FLUSH",
+        "GIT_OPTIONAL_LOCKS",
+        "GIT_PAGER",
+        "GIT_TERMINAL_PROMPT",
+        "GIT_TRACE",
+        "GIT_TRACE_PACKET",
+        "GIT_TRACE_PERFORMANCE",
+        "GIT_TRACE_SETUP",
     }
 )
 
@@ -70,6 +89,7 @@ class _Word:
     dynamic: bool = False
     ansi_c: bool = False
     assignment: bool = False
+    shell_expansion: bool = False
     nested: list["_Context"] = field(default_factory=list)
 
 
@@ -360,6 +380,8 @@ class _Parser:
                 if not word.assignment:
                     assignment_prefix_valid = False
                 word.dynamic = True
+            if char in "*?[{}":
+                word.shell_expansion = True
             if (
                 char == "="
                 and not word.assignment
@@ -686,12 +708,13 @@ def _scan_simple_command(
         index += 1
     while index < len(words):
         executable = words[index]
-        if executable.dynamic:
-            if executable.ansi_c and (
+        if executable.dynamic or executable.shell_expansion:
+            if (
                 _could_form_pr_create(words[index + 1 :])
                 or _could_contain_gh_pr_create(words[index + 1 :])
             ):
-                raise ScanFailure("ANSI_C_QUOTE")
+                code = "ANSI_C_QUOTE" if executable.ansi_c else "DYNAMIC_PR_ARGUMENT"
+                raise ScanFailure(code)
             return False
         name = _basename(executable.text)
         if not executable.quoted and name in _SHELL_CONTROL_PREFIXES:
@@ -728,12 +751,13 @@ def _scan_simple_command(
         return False
     executable = words[index]
     arguments = words[index + 1 :]
-    if executable.dynamic:
-        if executable.ansi_c and (
+    if executable.dynamic or executable.shell_expansion:
+        if (
             _could_form_pr_create(arguments)
             or _could_contain_gh_pr_create(arguments)
         ):
-            raise ScanFailure("ANSI_C_QUOTE")
+            code = "ANSI_C_QUOTE" if executable.ansi_c else "DYNAMIC_PR_ARGUMENT"
+            raise ScanFailure(code)
         return False
     name = _basename(executable.text)
     if name == "gh":
@@ -741,8 +765,10 @@ def _scan_simple_command(
         if matched and expected_base is not None and target_assignment:
             raise ScanFailure("TARGET_OVERRIDE")
         return matched
-    if name in _SHELLS and len(arguments) >= 2 and arguments[0].text == "-c":
-        script = arguments[1]
+    if name in _SHELLS:
+        script = _shell_command_string(arguments)
+        if script is None:
+            return False
         if script.dynamic:
             if script.ansi_c and _has_unquoted_candidate_hint(script.text):
                 raise ScanFailure("ANSI_C_QUOTE")
@@ -753,10 +779,33 @@ def _scan_simple_command(
             parser = _Parser(script.text, budget)
             nested = parser.parse(depth + 1)
             matched = _scan_parsed_context(nested, budget, expected_base)
+            if matched and expected_base is not None:
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
             if matched and expected_base is not None and target_assignment:
                 raise ScanFailure("TARGET_OVERRIDE")
             return matched
     return False
+
+
+def _shell_command_string(arguments: list[_Word]) -> _Word | None:
+    for index, word in enumerate(arguments):
+        if word.dynamic or word.shell_expansion:
+            if any(
+                _has_unquoted_candidate_hint(candidate.text)
+                for candidate in arguments[index + 1 :]
+            ):
+                raise ScanFailure("DYNAMIC_SHELL_SCRIPT")
+            return None
+        value = word.text
+        if value == "--" or not value.startswith("-") or value == "-":
+            return None
+        if value == "-c" or (
+            not value.startswith("--") and "c" in value[1:]
+        ):
+            if index + 1 >= len(arguments):
+                raise ScanFailure("DYNAMIC_SHELL_SCRIPT")
+            return arguments[index + 1]
+    return None
 
 
 def _skip_exec(words: list[_Word], index: int) -> int:
@@ -842,13 +891,12 @@ def _skip_env(
 ) -> int:
     while index < len(words):
         word = words[index]
-        if word.dynamic:
-            return len(words)
         value = word.text
-        if _is_assignment(word):
+        assignment_name = _env_assignment_name(word)
+        if assignment_name is not None:
             if (
                 enforce_target_binding
-                and _is_target_assignment(word)
+                and is_target_environment_name(assignment_name)
                 and _could_contain_gh_pr_create(words[index + 1 :])
             ):
                 raise ScanFailure("TARGET_OVERRIDE")
@@ -877,6 +925,8 @@ def _skip_env(
             )
             _scan_env_split_string(split_word, depth, budget, expected_base)
             return len(words)
+        if word.dynamic or word.shell_expansion:
+            raise ScanFailure("DYNAMIC_PR_ARGUMENT")
         if value in _ENV_VALUE_OPTIONS:
             if index + 1 >= len(words):
                 raise ScanFailure("INCOMPLETE_ENV_OPTION")
@@ -906,10 +956,11 @@ def _scan_env_split_string(
     expected_base: str | None,
 ) -> None:
     if word.dynamic:
-        if word.ansi_c or _has_unquoted_candidate_hint(word.text):
-            raise ScanFailure("ENV_SPLIT_STRING")
-        return
-    parser = _Parser(word.text, budget)
+        raise ScanFailure("ENV_SPLIT_STRING")
+    if "$" in word.text or "`" in word.text:
+        raise ScanFailure("ENV_SPLIT_STRING")
+    candidate_text = word.text.replace("\\_", " ")
+    parser = _Parser(candidate_text, budget)
     nested = parser.parse(depth + 1)
     if _scan_parsed_context(nested, budget, expected_base):
         raise ScanFailure("ENV_SPLIT_STRING")
@@ -922,9 +973,11 @@ def _scan_gh(
     target_override = False
     while index < len(arguments):
         word = arguments[index]
-        if word.dynamic:
+        if word.dynamic or word.shell_expansion:
             if word.ansi_c and _could_contain_pr_create(arguments[index:]):
                 raise ScanFailure("ANSI_C_QUOTE")
+            if word.shell_expansion and _could_contain_pr_create(arguments[index:]):
+                raise ScanFailure("DYNAMIC_PR_ARGUMENT")
             return False
         value = word.text
         if value in _GH_VALUE_OPTIONS:
@@ -955,8 +1008,18 @@ def _scan_gh(
         break
     if not _could_form_pr_create(arguments[index:]):
         return False
-    if arguments[index].dynamic or arguments[index + 1].dynamic:
-        raise ScanFailure("ANSI_C_QUOTE")
+    if (
+        arguments[index].dynamic
+        or arguments[index + 1].dynamic
+        or arguments[index].shell_expansion
+        or arguments[index + 1].shell_expansion
+    ):
+        code = (
+            "ANSI_C_QUOTE"
+            if arguments[index].ansi_c or arguments[index + 1].ansi_c
+            else "DYNAMIC_PR_ARGUMENT"
+        )
+        raise ScanFailure(code)
     if expected_base is not None:
         if target_override:
             raise ScanFailure("TARGET_OVERRIDE")
@@ -972,6 +1035,9 @@ def _validate_pr_create_target(
     while index < len(arguments):
         word = arguments[index]
         value = word.text
+
+        if word.shell_expansion:
+            raise ScanFailure("DYNAMIC_PR_ARGUMENT")
 
         if value in {"--repo", "-R", "--hostname", "--config"}:
             raise ScanFailure("TARGET_OVERRIDE")
@@ -1000,7 +1066,7 @@ def _validate_pr_create_target(
             value.startswith(option + "=")
             for option in _PR_CONTENT_LONG_VALUE_OPTIONS
         ):
-            if word.dynamic and not word.quoted:
+            if word.dynamic:
                 raise ScanFailure("DYNAMIC_PR_ARGUMENT")
             index += 1
             continue
@@ -1026,7 +1092,7 @@ def _required_static_value(
     if index + 1 >= len(arguments):
         raise ScanFailure("INCOMPLETE_GH_OPTION")
     value = arguments[index + 1]
-    if value.dynamic:
+    if value.dynamic or value.shell_expansion:
         raise ScanFailure(code)
     return value.text, index + 2
 
@@ -1037,7 +1103,7 @@ def _required_content_value(
     if index + 1 >= len(arguments):
         raise ScanFailure("INCOMPLETE_GH_OPTION")
     value = arguments[index + 1]
-    if value.dynamic and not value.quoted:
+    if value.dynamic or value.shell_expansion:
         raise ScanFailure("DYNAMIC_PR_ARGUMENT")
     return value.text, index + 2
 
@@ -1046,6 +1112,8 @@ def _scan_pr_short_options(
     arguments: list[_Word], index: int, bases: list[str]
 ) -> int:
     word = arguments[index]
+    if word.shell_expansion:
+        raise ScanFailure("DYNAMIC_PR_ARGUMENT")
     options = word.text[1:]
     position = 0
     while position < len(options):
@@ -1066,7 +1134,7 @@ def _scan_pr_short_options(
             return next_index
         if option in _PR_CONTENT_SHORT_VALUE_OPTIONS:
             if remainder:
-                if word.dynamic and not word.quoted:
+                if word.dynamic:
                     raise ScanFailure("DYNAMIC_PR_ARGUMENT")
                 return index + 1
             _, next_index = _required_content_value(arguments, index)
@@ -1089,7 +1157,11 @@ def _could_form_pr_create(words: list[_Word]) -> bool:
 
 
 def _could_equal(word: _Word, value: str) -> bool:
-    return word.ansi_c and word.dynamic or not word.dynamic and word.text == value
+    return (
+        word.shell_expansion
+        or word.ansi_c and word.dynamic
+        or not word.dynamic and word.text == value
+    )
 
 
 def _could_contain_pr_create(words: list[_Word]) -> bool:
@@ -1127,7 +1199,20 @@ def _is_assignment(word: _Word) -> bool:
 
 
 def _is_target_assignment(word: _Word) -> bool:
-    return _is_assignment(word) and word.text.split("=", 1)[0] in TARGET_ENV_NAMES
+    return _is_assignment(word) and is_target_environment_name(
+        word.text.split("=", 1)[0]
+    )
+
+
+def _env_assignment_name(word: _Word) -> str | None:
+    match = _ENV_ASSIGNMENT.match(word.text)
+    return None if match is None else match.group(1)
+
+
+def is_target_environment_name(name: str) -> bool:
+    if name.startswith("GIT_"):
+        return name not in _SAFE_GIT_ENV_NAMES
+    return name in TARGET_ENV_NAMES
 
 
 def _basename(value: str) -> str:

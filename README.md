@@ -47,8 +47,9 @@ review 상태는 현재 저장소의 ignored `.review/`에만 남고 HOME이나 
 각 round는 독립 Reviewer A/B/C report로 finalize하며, blocker가 계속되면 최대 3 round에서 멈춰
 사용자 개입을 요청한다. 현재 snapshot에 결합된 pass verdict가 있을 때만 direct
 `gh pr create --base <verdict-base>` shell command가 통과한다. Base는 literal로 명시해야
-하며 repo/head override, 선행·후행 command, command substitution, redirection을 섞은 형태는
-`COMMAND_AMBIGUOUS`로 차단된다.
+하며 verdict는 symbolic branch 이름까지 저장한다. Repo/head override, 선행·후행 command,
+command substitution, redirection, shell expansion, 동적 shell/env 또는 Git target 환경을 섞은
+형태는 `COMMAND_AMBIGUOUS`로 차단된다.
 
 이 gate는 Claude/Codex shell hook에 보이는 direct `gh pr create`만 다룬다. GitHub UI에서의 PR
 생성, `gh api`, alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가

@@ -161,6 +161,7 @@ Snapshot은 최소 다음 값을 가진다.
 
 - canonical GitHub `owner/repository`
 - base ref와 base commit SHA
+- canonical symbolic HEAD ref (`refs/heads/...`)
 - HEAD SHA
 - merge-base SHA
 - `git diff --binary --no-ext-diff <merge-base>..HEAD`의 SHA-256
@@ -178,6 +179,7 @@ submodule과 binary 변경도 name/status와 binary diff에 포함한다.
 
 - repository identity가 다름
 - base ref가 다른 SHA를 가리킴
+- symbolic HEAD ref가 다름
 - HEAD SHA가 다름
 - merge-base 또는 diff digest가 다름
 - worktree가 dirty임
@@ -256,6 +258,7 @@ Path가 현재 diff 밖이거나 새 dependency/권한/secret을 요구하는 fi
   "schema": 1,
   "repository": "owner/repository",
   "base": {"ref": "master", "sha": "<40-hex>"},
+  "head_ref": "refs/heads/feature",
   "head_sha": "<40-hex>",
   "merge_base_sha": "<40-hex>",
   "diff_sha256": "<64-hex>",

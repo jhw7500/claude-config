@@ -45,6 +45,7 @@ snapshot until `gh` starts.
 | `env -C`/`--chdir` or `time -o`/`--output` before `gh` | `AMBIGUOUS_CANDIDATE` |
 | Dynamic shell `-c` script that can contain the candidate | `AMBIGUOUS_CANDIDATE` |
 | GNU `env -S`/`--split-string` containing a candidate | `AMBIGUOUS_CANDIDATE` |
+| Shell `-c`, brace/glob expansion, or dynamic content in a bound candidate | `AMBIGUOUS_CANDIDATE` |
 
 A trailing newline or separator with no other executable segment does not by
 itself create a stale snapshot and may remain eligible.
@@ -67,16 +68,21 @@ The bound scan rejects:
   or `GIT_COMMON_DIR` assignments, including assignments consumed by `env`;
 - inherited `GH_REPO`, `GIT_DIR`, `GIT_WORK_TREE`, or `GIT_COMMON_DIR`, and an
   inherited `GH_HOST` other than the repository's supported `github.com` host.
+- shell- or `env`-assigned Git execution variables that can alter repository or
+  ref resolution, including `GIT_CONFIG_*`, and their inherited equivalents.
 
 An inherited `GH_HOST=github.com` and a private runtime `GH_CONFIG_DIR` do not
 change the explicitly bound target and remain supported. The command itself may
 not assign either variable because that would change execution relative to the
 validated adapter environment.
 
-`--head` is intentionally absent: the gate already binds the named current
-branch and HEAD snapshot. Ordinary content options may remain supported, but a
-free-standing dynamic argument is ambiguous because it can expand into a
-target-changing option.
+`--head` is intentionally absent: every newly written snapshot and verdict
+persists the canonical `refs/heads/...` symbolic HEAD as `head_ref` and compares
+it with the current branch as well as the HEAD SHA. A terminal legacy FAIL
+without `head_ref` may migrate only while beginning its next repair round; a
+legacy verdict cannot authorize PR creation. Content options remain supported
+when literal, while dynamic values and shell expansion are ambiguous because
+their evaluation may execute work or form target-changing arguments.
 
 ## Scanner behavior
 
