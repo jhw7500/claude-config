@@ -94,7 +94,9 @@ verdict와 정확히 같아야 하며 `GH_REPO`/repo/head override, 다른 comma
 substitution, redirection, shell/glob expansion, cwd-changing `env`, output-writing `time`, shell
 `-c`, ANSI-C 또는 `env -S`로 만든 대체 argv는 통과하지 않는다. 여기에는 GNU `env`의
 short-option cluster, unambiguous long-option 축약, split operand 뒤 argv, shell `-c` 앞의
-operand option, `pr`과 `create` 사이의 `gh` global option이 포함된다. Inherited
+operand option, `pr`과 `create` 사이의 `gh` global option이 포함된다. 실행 위치에서 quote나
+backslash가 제거되어 `gh`가 되는 이름도 후보이며, GNU split-string `\c` 종료 문법은
+`COMMAND_AMBIGUOUS`로 fail closed한다. Inherited
 `GH_HOST=github.com`과 격리된 `GH_CONFIG_DIR`는 target을 바꾸지 않으므로 허용하지만 다른
 inherited host, `GH_REPO`, target에 영향을 주는 Git execution environment는 거부한다.
 1 MiB를 넘는 payload는 JSON을 해석하거나 입력을 반사하지 않고 `COMMAND_AMBIGUOUS`로 거부한다.

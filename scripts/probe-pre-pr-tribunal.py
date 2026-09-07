@@ -26,6 +26,9 @@ SCHEMA_VERSION = 2
 RUNTIME_TIMEOUT_SECONDS = 120.0
 INTERNAL_TIMEOUT_SECONDS = 30.0
 HOOK_OUTPUT_LIMIT_BYTES = 64 * 1024
+# Control sources are hashed under their own bounded budget, not the hook I/O budget.
+CONTROL_FILE_LIMIT_BYTES = 256 * 1024
+CONTROL_TREE_LIMIT_BYTES = 8 * 1024 * 1024
 MARKER_LIMIT_BYTES = 64
 CREDENTIAL_LIMIT_BYTES = 1024 * 1024
 AUTH_VALIDITY_MARGIN_SECONDS = 330
@@ -896,14 +899,14 @@ def _protected_digest(paths: Sequence[Path]) -> str:
         digest.update(metadata.st_dev.to_bytes(8, "big"))
         digest.update(metadata.st_ino.to_bytes(8, "big"))
         if stat.S_ISREG(metadata.st_mode):
-            if metadata.st_size > HOOK_OUTPUT_LIMIT_BYTES:
+            if metadata.st_size > CONTROL_FILE_LIMIT_BYTES:
                 raise ProbeFailure("ISOLATION_UNAVAILABLE")
             try:
                 data = path.read_bytes()
             except OSError:
                 raise ProbeFailure("ISOLATION_UNAVAILABLE") from None
             total_bytes += len(data)
-            if total_bytes > 8 * 1024 * 1024:
+            if total_bytes > CONTROL_TREE_LIMIT_BYTES:
                 raise ProbeFailure("ISOLATION_UNAVAILABLE")
             digest.update(data)
             return

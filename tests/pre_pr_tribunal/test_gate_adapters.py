@@ -610,6 +610,24 @@ def test_passing_verdict_rejects_round_two_bypasses(git_repo: Path, command: str
 
 
 @pytest.mark.parametrize(
+    "command",
+    (
+        'env -- "gh" pr create --base master',
+        'command -p "gh" pr create --base master',
+        r"env -S 'gh\cignored' pr create --base master",
+        r"env --split-string='gh\cignored' pr create --base master",
+    ),
+)
+def test_round_three_forms_cannot_bypass_state_preflight(
+    tmp_path: Path, command: str
+):
+    decision = evaluate_gate(tmp_path, command)
+
+    assert decision.block is True
+    assert decision.code is not GateCode.NOT_PR_CREATE
+
+
+@pytest.mark.parametrize(
     "name",
     (
         "GH_REPO",

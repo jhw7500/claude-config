@@ -10,7 +10,8 @@
 ## 1. 요약
 
 실제 runtime canary는 Claude Code와 Codex가 설치된 `PreToolUse` hook을 통해 같은
-`gh pr create --title canary --body canary` 명령을 차단하고 허용하는지만 검증한다.
+명령을 차단하고 허용하는지만 검증한다. 이 문서의 원래 unbound command는 후속 target-binding
+amendment에서 `gh pr create --base master --title canary --body canary`로 대체되었다.
 Runtime 출력의 version, hash, 진단 문자열 또는 민감정보 여부를 증거로 사용하지
 않는다. Stdout과 stderr는 `/dev/null`로 폐기하고, canary 전용 hook wrapper와 fake
 `gh`가 남기는 짧은 marker만 판정한다.
@@ -143,6 +144,8 @@ API key로 fallback하지 않는다.
 
 - Bubblewrap은 required이며 사용할 수 없으면 fail closed한다.
 - Control root 전체를 read-only mount한다.
+- Control root의 전후 digest는 1,024 entries, 파일당 256 KiB, 전체 8 MiB로 제한한다.
+  Hook 입출력의 64 KiB 상한은 이 제어파일 상한과 독립적으로 유지한다.
 - Runtime HOME, tmpfs Codex auth와 phase evidence만 최소 writable mount한다. Codex
   hook config는 tmpfs 안에서도 read-only overlay다.
 - Caller `.claude`와 `.codex`는 empty immutable directory로 가린다.
@@ -197,7 +200,8 @@ Runtime은 bubblewrap child process group으로 시작한다.
 - stdin은 `/dev/null`이다.
 - stdout과 stderr도 `/dev/null`이다.
 - Claude는 disposable sandbox와 fake `gh`만 설명하는 고정 canary system prompt를 사용하고,
-  user prompt는 41자 exact command 외의 prefix, suffix와 wrapper를 금지한다. 기본 agent
+  user prompt는 후속 target-binding amendment의 exact literal-base command 외의 prefix,
+  suffix와 wrapper를 금지한다. 기본 agent
   planning의 비결정성은 canary wiring 판정에 포함하지 않는다.
 - Runtime output byte, hash, version, auth marker 또는 sensitivity를 읽지 않는다.
 - 120초 timeout을 넘으면 process group에 TERM, bounded grace 뒤 KILL을 보내고 reap한다.

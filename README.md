@@ -51,7 +51,8 @@ review 상태는 현재 저장소의 ignored `.review/`에만 남고 HOME이나 
 command substitution, redirection, shell expansion, 동적 shell/env 또는 Git target 환경을 섞은
 형태는 `COMMAND_AMBIGUOUS`로 차단된다. GNU `env -S`의 option cluster/long-option 축약과
 split operand 뒤 argv, shell `-c` 앞의 operand option, `pr`과 `create` 사이의 `gh` global
-option도 같은 candidate 경계에서 검사한다.
+option도 같은 candidate 경계에서 검사한다. 실행 위치의 정적 quote/escape 제거 이름은 실제
+argv 이름으로 인식하며, GNU split-string의 `\c` 종료 문법은 안전하게 fail closed한다.
 
 이 gate는 Claude/Codex shell hook에 보이는 direct `gh pr create`만 다룬다. GitHub UI에서의 PR
 생성, `gh api`, alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가

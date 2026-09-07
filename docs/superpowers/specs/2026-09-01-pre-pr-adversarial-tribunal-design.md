@@ -385,6 +385,7 @@ payload에서 shell command를 직접 검증한다. Scanner는 최소 다음을 
 - absolute 또는 relative `gh` executable path의 basename
 - compound command, subshell, command substitution 안의 실제 subcommand
 - line continuation과 ANSI-C quoted word
+- 실행 위치에서 quote/backslash 제거 후 `gh`가 되는 정적 argv 이름
 - quote, comment, heredoc data 안의 예시 문자열 제외
 
 Regex 한 번으로 raw string의 `gh pr create` 포함 여부를 판정하지 않는다. Scanner가
@@ -508,6 +509,7 @@ Ambiguous/deny fixture:
   구성한 PR candidate
 - shell operand option 뒤 `-c` script와 `pr`/`create` 사이에 global option이 있는
   `gh` candidate
+- `env --`/`command -p` 뒤 quote-removed `gh`와 GNU split-string `\c` 종료형
 
 Negative fixture:
 

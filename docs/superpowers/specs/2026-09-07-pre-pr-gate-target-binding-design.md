@@ -46,6 +46,8 @@ snapshot until `gh` starts.
 | Dynamic shell `-c` script or an operand option before `-c` | `AMBIGUOUS_CANDIDATE` |
 | GNU `env -S`/`--split-string`, including clusters, accepted long abbreviations, and trailing argv, containing a candidate | `AMBIGUOUS_CANDIDATE` |
 | Target-changing `gh` global option before `pr`, between `pr` and `create`, or after `create` | `AMBIGUOUS_CANDIDATE` |
+| Static quote/backslash removal produces `gh` in executable position | Eligible for verdict checks |
+| GNU split-string uses `\c` termination | `AMBIGUOUS_CANDIDATE` |
 | Shell `-c`, brace/glob expansion, or dynamic content in a bound candidate | `AMBIGUOUS_CANDIDATE` |
 
 A trailing newline or separator with no other executable segment does not by
@@ -102,6 +104,10 @@ split operand remains part of the constructed command. A candidate inside that
 alternate argv construction is ambiguous. Shell options that consume an
 operand are skipped before locating `-c`; supported `gh` global options are
 recognized both before `pr` and between `pr` and `create`.
+Static quote or backslash removal in executable position is interpreted as the
+resulting argv name in both the normal parser and bounded streaming fallback.
+The GNU split-string `\c` control escape is deliberately unsupported and fails
+closed instead of attempting a partial emulation.
 
 ## Oversized hook payloads
 
@@ -123,6 +129,8 @@ Regression tests exercise real scanner, gate, and copied-adapter behavior:
   argv constructions do not return `NO_MATCH`;
 - shell option operands and interposed `gh` global options cannot conceal a
   candidate;
+- quote-removed executable names survive normal and token-limit scanning, and
+  split-string `\c` termination cannot return `NO_MATCH`;
 - the canonical explicit-base command still reaches `PASS`;
 - unrelated shell data and malformed in-limit payloads retain their existing
   no-output behavior.

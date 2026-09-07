@@ -800,6 +800,20 @@ def test_probe_guard_accepts_unfamiliar_codex_command_tool(tmp_path):
     assert result.stderr == ""
 
 
+def test_protected_digest_has_a_distinct_control_file_bound(tmp_path):
+    module = _load_probe_module()
+    control = tmp_path / "control"
+    control.mkdir()
+    payload = control / "payload"
+    payload.write_bytes(b"x" * (module.HOOK_OUTPUT_LIMIT_BYTES + 1))
+
+    assert module._protected_digest((control,))
+
+    payload.write_bytes(b"x" * (module.CONTROL_FILE_LIMIT_BYTES + 1))
+    with pytest.raises(module.ProbeFailure, match="ISOLATION_UNAVAILABLE"):
+        module._protected_digest((control,))
+
+
 def _isolation_fixture(module, tmp_path: Path) -> IsolationFixture:
     work_dir = tmp_path / "work"
     control_root = tmp_path / "control"

@@ -738,13 +738,7 @@ def _scan_simple_command(
             index = _skip_time(words, index + 1)
             continue
         if name == "command":
-            index += 1
-            if index < len(words) and words[index].text == "--":
-                index += 1
-            elif index < len(words) and words[index].text.startswith("-"):
-                if _has_remaining_gh(words, index + 1):
-                    raise ScanFailure("UNKNOWN_COMMAND_OPTION")
-                return False
+            index = _skip_command(words, index + 1)
             continue
         if name == "env":
             index = _skip_env(
@@ -841,12 +835,39 @@ def _shell_option_action(value: str) -> str:
     return "option"
 
 
+def _skip_command(words: list[_Word], index: int) -> int:
+    while index < len(words):
+        word = words[index]
+        if word.dynamic or word.shell_expansion:
+            if _could_form_pr_create(
+                words[index + 1 :]
+            ) or _could_contain_gh_pr_create(words[index + 1 :]):
+                code = "ANSI_C_QUOTE" if word.ansi_c else "DYNAMIC_PR_ARGUMENT"
+                raise ScanFailure(code)
+            return len(words)
+        value = word.text
+        if value == "--":
+            return index + 1
+        if value == "-p":
+            index += 1
+            continue
+        if value.startswith("-"):
+            if _has_remaining_gh(words, index + 1):
+                raise ScanFailure("UNKNOWN_COMMAND_OPTION")
+            return len(words)
+        return index
+    return index
+
+
 def _skip_exec(words: list[_Word], index: int) -> int:
     while index < len(words):
         word = words[index]
-        if word.dynamic:
-            if word.ansi_c and _could_contain_gh_pr_create(words[index + 1 :]):
-                raise ScanFailure("ANSI_C_QUOTE")
+        if word.dynamic or word.shell_expansion:
+            if _could_form_pr_create(
+                words[index + 1 :]
+            ) or _could_contain_gh_pr_create(words[index + 1 :]):
+                code = "ANSI_C_QUOTE" if word.ansi_c else "DYNAMIC_PR_ARGUMENT"
+                raise ScanFailure(code)
             return len(words)
         value = word.text
         if value == "--":
@@ -875,9 +896,12 @@ def _skip_exec(words: list[_Word], index: int) -> int:
 def _skip_time(words: list[_Word], index: int) -> int:
     while index < len(words):
         word = words[index]
-        if word.dynamic:
-            if word.ansi_c and _could_contain_gh_pr_create(words[index + 1 :]):
-                raise ScanFailure("ANSI_C_QUOTE")
+        if word.dynamic or word.shell_expansion:
+            if _could_form_pr_create(
+                words[index + 1 :]
+            ) or _could_contain_gh_pr_create(words[index + 1 :]):
+                code = "ANSI_C_QUOTE" if word.ansi_c else "DYNAMIC_PR_ARGUMENT"
+                raise ScanFailure(code)
             return len(words)
         value = word.text
         if value in _TIME_FLAGS:
@@ -935,6 +959,8 @@ def _skip_env(
                 raise ScanFailure("TARGET_OVERRIDE")
             index += 1
             continue
+        if value == "--":
+            return index + 1
         long_option = _env_long_option(value)
         if long_option is not None:
             separator = value.find("=")
@@ -1039,7 +1065,7 @@ def _scan_env_split_string(
 ) -> None:
     if word.dynamic or word.shell_expansion:
         raise ScanFailure("ENV_SPLIT_STRING")
-    if "$" in word.text or "`" in word.text:
+    if "$" in word.text or "`" in word.text or "\\c" in word.text:
         raise ScanFailure("ENV_SPLIT_STRING")
     try:
         candidate_text = word.text.replace("\\_", " ")
@@ -1093,10 +1119,9 @@ def _scan_gh(arguments: list[_Word], expected_base: str | None = None) -> bool:
     while index < len(arguments):
         word = arguments[index]
         if word.dynamic or word.shell_expansion:
-            if word.ansi_c and _could_contain_pr_create(arguments[index:]):
-                raise ScanFailure("ANSI_C_QUOTE")
-            if word.shell_expansion and _could_contain_pr_create(arguments[index:]):
-                raise ScanFailure("DYNAMIC_PR_ARGUMENT")
+            if _could_contain_pr_create(arguments[index:]):
+                code = "ANSI_C_QUOTE" if word.ansi_c else "DYNAMIC_PR_ARGUMENT"
+                raise ScanFailure(code)
             return False
         option = _gh_global_option(arguments, index)
         if option is not None:
@@ -1325,7 +1350,7 @@ def _contains_pr_create(words: list[_Word]) -> bool:
 
 def _has_remaining_gh(words: list[_Word], index: int) -> bool:
     return any(
-        not word.dynamic and not word.quoted and _basename(word.text) == "gh"
+        not word.dynamic and not word.shell_expansion and _basename(word.text) == "gh"
         for word in words[index:]
     )
 
@@ -1671,38 +1696,37 @@ class _StreamingHint:
 
         static = not frame.dynamic and not frame.truncated
         name = _basename(text) if static else ""
-        unquoted_gh = static and not frame.quoted and name == "gh"
+        executable_gh = static and name == "gh"
         if frame.phase in {"EXEC", "WRAPPED_EXEC"}:
             if frame.phase == "EXEC" and frame.assignment:
                 pass
-            elif unquoted_gh:
-                return True
-            elif name == "command":
-                frame.phase = "COMMAND"
-            elif name == "env":
-                frame.phase = "ENV"
-            elif name in _SHELLS:
-                frame.phase = "SHELL_OPTION"
-            else:
-                frame.phase = "ARGS"
-        elif frame.phase == "COMMAND":
-            if static and text == "--":
-                frame.phase = "WRAPPED_EXEC"
-            elif static and text.startswith("-"):
+            elif not static:
                 frame.phase = "UNKNOWN_WRAPPER"
-            elif unquoted_gh:
+            elif self._enter_executable(frame, name, executable_gh):
                 return True
-            elif name == "env":
-                frame.phase = "ENV"
-            elif name == "command":
-                frame.phase = "COMMAND"
-            elif name in _SHELLS:
-                frame.phase = "SHELL_OPTION"
-            else:
-                frame.phase = "ARGS"
+        elif frame.phase == "COMMAND":
+            if not static:
+                frame.phase = "UNKNOWN_WRAPPER"
+            elif text == "--":
+                frame.phase = "WRAPPED_EXEC"
+            elif text == "-p":
+                pass
+            elif text.startswith("-"):
+                frame.phase = "UNKNOWN_WRAPPER"
+            elif self._enter_executable(frame, name, executable_gh):
+                return True
         elif frame.phase == "ENV":
             short_option = _env_short_option(text) if static else None
             long_option = _env_long_option(text) if static else None
+            split_attached: str | None = None
+            if (
+                short_option is not None
+                and short_option[0] == "S"
+                and short_option[1]
+            ):
+                split_attached = short_option[1]
+            elif long_option == _ENV_SPLIT_LONG_OPTION and "=" in text:
+                split_attached = text.split("=", 1)[1]
             if frame.assignment or (
                 static
                 and (
@@ -1714,39 +1738,88 @@ class _StreamingHint:
                 )
             ):
                 pass
-            elif static and (
+            elif not static:
+                frame.phase = "UNKNOWN_WRAPPER"
+            elif text == "--":
+                frame.phase = "WRAPPED_EXEC"
+            elif short_option is not None and short_option[0] == "S" or (
+                long_option == _ENV_SPLIT_LONG_OPTION
+            ):
+                if split_attached is None:
+                    frame.phase = "ENV_SPLIT_VALUE"
+                elif self._consume_env_split_hint(frame, split_attached):
+                    return True
+            elif (
                 short_option is not None
-                and short_option[0] in {"u", "C", "S"}
+                and short_option[0] in {"u", "C"}
                 and not short_option[1]
-                or long_option in _ENV_LONG_VALUE_OPTIONS | {_ENV_SPLIT_LONG_OPTION}
-                and "=" not in text
+                or long_option in _ENV_LONG_VALUE_OPTIONS and "=" not in text
             ):
                 frame.phase = "ENV_VALUE"
-            elif static and (short_option is not None or long_option is not None):
+            elif short_option is not None or long_option is not None:
                 pass
-            elif static and text.startswith("-"):
+            elif text.startswith("-"):
                 frame.phase = "UNKNOWN_WRAPPER"
-            elif unquoted_gh:
+            elif self._enter_executable(frame, name, executable_gh):
                 return True
-            elif name == "command":
-                frame.phase = "COMMAND"
-            elif name in _SHELLS:
-                frame.phase = "SHELL_OPTION"
-            else:
-                frame.phase = "ARGS"
         elif frame.phase == "ENV_VALUE":
             frame.phase = "ENV"
+        elif frame.phase == "ENV_SPLIT_VALUE":
+            if not static or self._consume_env_split_hint(frame, text):
+                return True
+        elif frame.phase == "EXEC_OPTION":
+            if not static:
+                frame.phase = "UNKNOWN_WRAPPER"
+            elif text == "--":
+                frame.phase = "WRAPPED_EXEC"
+            elif text.startswith("-") and text != "-":
+                short = text[1:]
+                alternate_name = short.find("a")
+                flag_prefix = short if alternate_name < 0 else short[:alternate_name]
+                if any(flag not in "cl" for flag in flag_prefix):
+                    frame.phase = "UNKNOWN_WRAPPER"
+                elif alternate_name == len(short) - 1:
+                    frame.phase = "EXEC_VALUE"
+            elif self._enter_executable(frame, name, executable_gh):
+                return True
+        elif frame.phase == "EXEC_VALUE":
+            frame.phase = "EXEC_OPTION"
+        elif frame.phase == "TIME_OPTION":
+            if not static:
+                frame.phase = "UNKNOWN_WRAPPER"
+            elif text in _TIME_FLAGS:
+                pass
+            elif text in _TIME_VALUE_OPTIONS:
+                frame.phase = "TIME_VALUE"
+            elif (
+                text.startswith("--format=")
+                or text.startswith("--output=")
+                or len(text) > 2
+                and text[:2] in {"-f", "-o"}
+            ):
+                pass
+            elif text == "--":
+                frame.phase = "WRAPPED_EXEC"
+            elif text.startswith("-"):
+                frame.phase = "UNKNOWN_WRAPPER"
+            elif self._enter_executable(frame, name, executable_gh):
+                return True
+        elif frame.phase == "TIME_VALUE":
+            frame.phase = "TIME_OPTION"
         elif frame.phase == "UNKNOWN_WRAPPER":
-            if unquoted_gh:
+            if executable_gh:
                 return True
         elif frame.phase == "SHELL_OPTION":
-            action = _shell_option_action(text) if static else "end"
-            if action == "script":
-                frame.phase = "SHELL_SCRIPT"
-            elif action == "value":
-                frame.phase = "SHELL_OPTION_VALUE"
-            elif action == "end":
-                frame.phase = "ARGS"
+            if not static:
+                frame.phase = "UNKNOWN_WRAPPER"
+            else:
+                action = _shell_option_action(text)
+                if action == "script":
+                    frame.phase = "SHELL_SCRIPT"
+                elif action == "value":
+                    frame.phase = "SHELL_OPTION_VALUE"
+                elif action == "end":
+                    frame.phase = "ARGS"
         elif frame.phase == "SHELL_OPTION_VALUE":
             frame.phase = "SHELL_OPTION"
         elif frame.phase == "SHELL_SCRIPT":
@@ -1754,6 +1827,37 @@ class _StreamingHint:
                 self.work.add(text)
             frame.phase = "ARGS"
         frame.reset_word()
+        return False
+
+    def _consume_env_split_hint(self, frame: _HintFrame, text: str) -> bool:
+        if "\\c" in text:
+            return True
+        script = text.replace("\\_", " ")
+        if script:
+            self.work.add(script)
+            frame.phase = "ARGS"
+        else:
+            frame.phase = "ENV"
+        return False
+
+    @staticmethod
+    def _enter_executable(
+        frame: _HintFrame, name: str, executable_gh: bool
+    ) -> bool:
+        if executable_gh:
+            return True
+        if name == "command":
+            frame.phase = "COMMAND"
+        elif name == "env":
+            frame.phase = "ENV"
+        elif name == "exec":
+            frame.phase = "EXEC_OPTION"
+        elif name == "time":
+            frame.phase = "TIME_OPTION"
+        elif name in _SHELLS:
+            frame.phase = "SHELL_OPTION"
+        else:
+            frame.phase = "ARGS"
         return False
 
     def _push_command(self, terminator: str) -> None:

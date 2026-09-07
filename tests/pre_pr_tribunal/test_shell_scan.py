@@ -160,6 +160,110 @@ def test_round_two_alternate_argv_candidates_are_not_ignored(command):
 @pytest.mark.parametrize(
     "command",
     [
+        'env -- "gh" pr create --base master',
+        r"env -- \g\h pr create --base master",
+        'command -p "gh" pr create --base master',
+        r"command -p \g\h pr create --base master",
+        r"env -S 'gh\cignored' pr create --base master",
+        r"env --split-string='gh\cignored' pr create --base master",
+        "exec $OPTS gh pr create --base master",
+        "time $OPTS gh pr create --base master",
+        "command $OPTS gh pr create --base master",
+        "gh $OPTS pr create --base master",
+    ],
+)
+def test_round_three_executable_candidates_are_not_ignored(command):
+    assert scan_pr_create(command).kind in {
+        ScanKind.PR_CREATE,
+        ScanKind.AMBIGUOUS_CANDIDATE,
+    }
+    assert scan_pr_create(command, expected_base="master").kind in {
+        ScanKind.PR_CREATE,
+        ScanKind.AMBIGUOUS_CANDIDATE,
+    }
+
+
+def test_quote_removed_executable_survives_token_limit_fallback():
+    command = "X=x " * (MAX_TOKENS - 2)
+    command += r"\g\h pr create --base master"
+
+    assert scan_pr_create(command) == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "TOKEN_LIMIT"
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        r"exec -- \g\h pr create --base master",
+        r"time -p \g\h pr create --base master",
+        r"exec -- command -p \g\h pr create --base master",
+        r"time -p env -- \g\h pr create --base master",
+    ],
+)
+def test_wrapped_executable_survives_token_limit_fallback(tail):
+    command = "X=x " * MAX_TOKENS + tail
+
+    assert scan_pr_create(command) == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "TOKEN_LIMIT"
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "$COMMAND gh pr create --base master",
+        "command $OPTS gh pr create --base master",
+        "env $OPTS gh pr create --base master",
+        "exec $OPTS gh pr create --base master",
+        "time $OPTS gh pr create --base master",
+        "bash $OPTS gh pr create --base master",
+    ],
+)
+def test_dynamic_wrapper_boundary_survives_token_limit_fallback(tail):
+    command = "X=x " * MAX_TOKENS + tail
+
+    assert scan_pr_create(command) == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "TOKEN_LIMIT"
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        r"env -S 'gh\_pr\_create\_--base\_master'",
+        r"env --split-string='gh\_pr\_create\_--base\_master'",
+        r"env -S 'gh\cignored' pr create --base master",
+        r"env --split-string='gh\cignored' pr create --base master",
+    ],
+)
+def test_env_split_candidate_survives_token_limit_fallback(tail):
+    command = "X=x " * MAX_TOKENS + tail
+
+    assert scan_pr_create(command) == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "TOKEN_LIMIT"
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "exec -a gh printf pr create --base master",
+        "/usr/bin/time -f gh printf pr create --base master",
+        "/usr/bin/time --format 'gh pr create' printf done",
+        r"env -S 'printf\_%s\_okay'",
+        r"env --split-string='printf' gh pr create --base master",
+    ],
+)
+def test_wrapper_option_data_stays_ignored_at_token_limit(tail):
+    command = "X=x " * MAX_TOKENS + tail
+
+    assert scan_pr_create(command) == ScanResult(ScanKind.NO_MATCH, "TOKEN_LIMIT")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "echo 'gh pr create'",
         'printf "%s\\n" "gh pr create"',
         "true # gh pr create",
