@@ -287,6 +287,22 @@ def test_scan_precedes_repository_and_verdict_work(git_repo: Path):
     assert ambiguous == (type(ambiguous))(True, GateCode.COMMAND_AMBIGUOUS)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "exec -- gh pr create --draft",
+        "gh p$'r' create --draft",
+    ],
+)
+def test_shell_forms_cannot_bypass_state_preflight(
+    tmp_path: Path, command: str
+):
+    decision = evaluate_gate(tmp_path, command)
+
+    assert decision.block is True
+    assert decision.code is not GateCode.NOT_PR_CREATE
+
+
 def test_scanner_exception_on_unrelated_request_is_silent(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ):

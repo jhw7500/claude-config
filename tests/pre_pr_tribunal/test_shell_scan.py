@@ -52,6 +52,39 @@ def test_detects_executable_pr_create(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "exec -- gh pr create --draft",
+        "{ command -- gh pr create --draft; }",
+        "! command -- gh pr create --draft",
+        "if ! false; then gh pr create --draft; fi",
+        "for item in only; do gh pr create --draft; break; done",
+        "time -p gh pr create --draft",
+    ],
+)
+def test_shell_control_candidates_are_not_silently_ignored(command):
+    assert scan_pr_create(command).kind in {
+        ScanKind.PR_CREATE,
+        ScanKind.AMBIGUOUS_CANDIDATE,
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "g$'h' pr create --draft",
+        "gh p$'r' create --draft",
+        "gh pr c$'reate' --draft",
+    ],
+)
+def test_ansi_c_candidate_words_are_not_silently_ignored(command):
+    assert scan_pr_create(command).kind in {
+        ScanKind.PR_CREATE,
+        ScanKind.AMBIGUOUS_CANDIDATE,
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "echo 'gh pr create'",
         'printf "%s\\n" "gh pr create"',
         "true # gh pr create",
@@ -77,6 +110,9 @@ def test_detects_executable_pr_create(command):
         "true;\rgh pr create",
         "touch 'file\ngh pr create'",
         "touch $'file\\ngh pr create'",
+        "printf $'gh pr create'",
+        "time printf gh pr create",
+        "if true; then printf gh pr create; fi",
         "gh --repo owner/repo issue create",
         "env -u",
     ],

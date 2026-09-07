@@ -47,6 +47,7 @@ class _Word:
     text: str
     quoted: bool = False
     dynamic: bool = False
+    ansi_c: bool = False
     assignment: bool = False
     nested: list["_Context"] = field(default_factory=list)
 
@@ -73,6 +74,20 @@ _GH_FLAG_OPTIONS = {"--help", "--version"}
 _ENV_FLAGS = {"-i", "--ignore-environment"}
 _ENV_VALUE_OPTIONS = {"-u", "-C"}
 _SHELLS = {"sh", "bash", "dash"}
+_SHELL_CONTROL_PREFIXES = {
+    "!",
+    "{",
+    "do",
+    "elif",
+    "else",
+    "for",
+    "if",
+    "select",
+    "then",
+    "until",
+    "while",
+}
+_EXEC_FLAGS = {"-c", "-l"}
 _SHELL_OPERATORS = ("&&", "||", ";", "|", "&")
 _SHELL_REDIRECTIONS = (
     "&>>",
@@ -101,6 +116,8 @@ def scan_pr_create(command: str) -> ScanResult:
         return _scan_context(command, depth=0)
     except (RecursionError, ScanFailure) as error:
         code = "RECURSION_LIMIT" if isinstance(error, RecursionError) else error.code
+        if code == "ANSI_C_QUOTE":
+            return ScanResult(ScanKind.AMBIGUOUS_CANDIDATE, code)
         candidate_hint = _has_unquoted_candidate_hint(command)
         kind = ScanKind.AMBIGUOUS_CANDIDATE if candidate_hint else ScanKind.NO_MATCH
         return ScanResult(kind, code)
@@ -226,6 +243,13 @@ class _Parser:
                         assignment_prefix_valid = False
                     pieces.append(escaped)
                 continue
+            if char == "$" and self._peek(1) == "'":
+                if not word.assignment:
+                    assignment_prefix_valid = False
+                word.quoted = True
+                word.ansi_c = True
+                self._parse_ansi_c_quoted(word, pieces)
+                continue
             if char == "'":
                 if not word.assignment:
                     assignment_prefix_valid = False
@@ -282,6 +306,25 @@ class _Parser:
             self.index += 1
         word.text = "".join(pieces)
         return word, start, self.index
+
+    def _parse_ansi_c_quoted(self, word: _Word, pieces: list[str]) -> None:
+        self.index += 2
+        while self.index < self.length:
+            char = self.command[self.index]
+            if char == "'":
+                self.index += 1
+                return
+            if char == "\\":
+                word.dynamic = True
+                self.index += 1
+                if self.index >= self.length:
+                    break
+                self.index += 1
+                continue
+            pieces.append(char)
+            self.index += 1
+        if not self.tolerant:
+            raise ScanFailure("PARSE_ERROR")
 
     def _parse_double_quoted(
         self, word: _Word, pieces: list[str], depth: int
@@ -496,6 +539,15 @@ def _scan_simple_command(tokens: list[_Token], depth: int, budget: _Budget) -> b
         if executable.dynamic:
             return False
         name = _basename(executable.text)
+        if not executable.quoted and name in _SHELL_CONTROL_PREFIXES:
+            index += 1
+            continue
+        if not executable.quoted and name == "exec":
+            index = _skip_exec(words, index + 1)
+            continue
+        if not executable.quoted and name == "time":
+            index = _skip_time(words, index + 1)
+            continue
         if name == "command":
             index += 1
             if index < len(words) and words[index].text == "--":
@@ -513,10 +565,12 @@ def _scan_simple_command(tokens: list[_Token], depth: int, budget: _Budget) -> b
     if index >= len(words):
         return False
     executable = words[index]
+    arguments = words[index + 1 :]
     if executable.dynamic:
+        if executable.ansi_c and _could_form_pr_create(arguments):
+            raise ScanFailure("ANSI_C_QUOTE")
         return False
     name = _basename(executable.text)
-    arguments = words[index + 1 :]
     if name == "gh":
         return _scan_gh(arguments)
     if name in _SHELLS and len(arguments) >= 2 and arguments[0].text == "-c":
@@ -526,6 +580,37 @@ def _scan_simple_command(tokens: list[_Token], depth: int, budget: _Budget) -> b
             nested = parser.parse(depth + 1)
             return _scan_parsed_context(nested, budget)
     return False
+
+
+def _skip_exec(words: list[_Word], index: int) -> int:
+    while index < len(words):
+        word = words[index]
+        if word.dynamic:
+            return len(words)
+        value = word.text
+        if value == "--":
+            return index + 1
+        if value in _EXEC_FLAGS:
+            index += 1
+            continue
+        if value == "-a":
+            return min(index + 2, len(words))
+        return index
+    return index
+
+
+def _skip_time(words: list[_Word], index: int) -> int:
+    while index < len(words):
+        word = words[index]
+        if word.dynamic:
+            return len(words)
+        if word.text == "-p":
+            index += 1
+            continue
+        if word.text == "--":
+            return index + 1
+        return index
+    return index
 
 
 def _skip_env(words: list[_Word], index: int) -> int:
@@ -561,6 +646,8 @@ def _scan_gh(arguments: list[_Word]) -> bool:
     while index < len(arguments):
         word = arguments[index]
         if word.dynamic:
+            if word.ansi_c and _could_form_pr_create(arguments[index:]):
+                raise ScanFailure("ANSI_C_QUOTE")
             return False
         value = word.text
         if value in _GH_VALUE_OPTIONS:
@@ -586,13 +673,23 @@ def _scan_gh(arguments: list[_Word]) -> bool:
                 raise ScanFailure("UNKNOWN_GH_OPTION")
             return False
         break
+    if not _could_form_pr_create(arguments[index:]):
+        return False
+    if arguments[index].dynamic or arguments[index + 1].dynamic:
+        raise ScanFailure("ANSI_C_QUOTE")
+    return True
+
+
+def _could_form_pr_create(words: list[_Word]) -> bool:
     return (
-        index + 1 < len(arguments)
-        and not arguments[index].dynamic
-        and not arguments[index + 1].dynamic
-        and arguments[index].text == "pr"
-        and arguments[index + 1].text == "create"
+        len(words) >= 2
+        and _could_equal(words[0], "pr")
+        and _could_equal(words[1], "create")
     )
+
+
+def _could_equal(word: _Word, value: str) -> bool:
+    return word.ansi_c and word.dynamic or not word.dynamic and word.text == value
 
 
 def _contains_pr_create(words: list[_Word]) -> bool:
