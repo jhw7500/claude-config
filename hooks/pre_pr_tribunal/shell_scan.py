@@ -140,9 +140,27 @@ _ANSI_C_SIMPLE_ESCAPES = {
     "'": "'",
     '"': '"',
 }
-_ENV_FLAGS = {"-i", "--ignore-environment"}
-_ENV_VALUE_OPTIONS = {"-u", "-C"}
+_ENV_SPLIT_LONG_OPTION = "--split-string"
+_ENV_LONG_OPTIONS = frozenset(
+    {
+        "--block-signal",
+        "--chdir",
+        "--debug",
+        "--default-signal",
+        "--help",
+        "--ignore-environment",
+        "--ignore-signal",
+        "--list-signal-handling",
+        "--null",
+        _ENV_SPLIT_LONG_OPTION,
+        "--unset",
+        "--version",
+    }
+)
+_ENV_LONG_VALUE_OPTIONS = {"--chdir", "--unset"}
+_ENV_SHORT_FLAGS = frozenset("iv0")
 _SHELLS = {"sh", "bash", "dash"}
+_SHELL_LONG_VALUE_OPTIONS = {"--init-file", "--rcfile"}
 _SHELL_CONTROL_PREFIXES = {
     "!",
     "{",
@@ -184,9 +202,7 @@ _SHELL_REDIRECTIONS = (
 )
 
 
-def scan_pr_create(
-    command: str, *, expected_base: str | None = None
-) -> ScanResult:
+def scan_pr_create(command: str, *, expected_base: str | None = None) -> ScanResult:
     if not isinstance(command, str) or "\x00" in command:
         return ScanResult(ScanKind.NO_MATCH)
     if expected_base is not None and (
@@ -459,9 +475,7 @@ class _Parser:
         if not self.tolerant:
             raise ScanFailure("PARSE_ERROR")
 
-    def _parse_double_quoted(
-        self, word: _Word, pieces: list[str], depth: int
-    ) -> None:
+    def _parse_double_quoted(self, word: _Word, pieces: list[str], depth: int) -> None:
         while self.index < self.length:
             char = self.command[self.index]
             if char == '"':
@@ -469,7 +483,7 @@ class _Parser:
                 return
             if char == "\\":
                 following = self._peek(1)
-                if following in {'$', '`', '"', "\\"}:
+                if following in {"$", "`", '"', "\\"}:
                     pieces.append(following)
                     self.index += 2
                     continue
@@ -664,9 +678,7 @@ def _scan_parsed_context(
 
     candidate: list[_Token] | None = None
     for segment in segments:
-        if _scan_simple_command(
-            segment, context.depth, budget, expected_base
-        ):
+        if _scan_simple_command(segment, context.depth, budget, expected_base):
             if candidate is not None:
                 raise ScanFailure("UNSAFE_PR_CONTEXT")
             candidate = segment
@@ -709,9 +721,8 @@ def _scan_simple_command(
     while index < len(words):
         executable = words[index]
         if executable.dynamic or executable.shell_expansion:
-            if (
-                _could_form_pr_create(words[index + 1 :])
-                or _could_contain_gh_pr_create(words[index + 1 :])
+            if _could_form_pr_create(words[index + 1 :]) or _could_contain_gh_pr_create(
+                words[index + 1 :]
             ):
                 code = "ANSI_C_QUOTE" if executable.ansi_c else "DYNAMIC_PR_ARGUMENT"
                 raise ScanFailure(code)
@@ -752,10 +763,7 @@ def _scan_simple_command(
     executable = words[index]
     arguments = words[index + 1 :]
     if executable.dynamic or executable.shell_expansion:
-        if (
-            _could_form_pr_create(arguments)
-            or _could_contain_gh_pr_create(arguments)
-        ):
+        if _could_form_pr_create(arguments) or _could_contain_gh_pr_create(arguments):
             code = "ANSI_C_QUOTE" if executable.ansi_c else "DYNAMIC_PR_ARGUMENT"
             raise ScanFailure(code)
         return False
@@ -788,7 +796,9 @@ def _scan_simple_command(
 
 
 def _shell_command_string(arguments: list[_Word]) -> _Word | None:
-    for index, word in enumerate(arguments):
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
         if word.dynamic or word.shell_expansion:
             if any(
                 _has_unquoted_candidate_hint(candidate.text)
@@ -796,16 +806,39 @@ def _shell_command_string(arguments: list[_Word]) -> _Word | None:
             ):
                 raise ScanFailure("DYNAMIC_SHELL_SCRIPT")
             return None
-        value = word.text
-        if value == "--" or not value.startswith("-") or value == "-":
+        action = _shell_option_action(word.text)
+        if action == "value":
+            if index + 1 >= len(arguments):
+                return None
+            index += 2
+            continue
+        if action == "option":
+            index += 1
+            continue
+        if action == "end":
             return None
-        if value == "-c" or (
-            not value.startswith("--") and "c" in value[1:]
-        ):
+        if action == "script":
             if index + 1 >= len(arguments):
                 raise ScanFailure("DYNAMIC_SHELL_SCRIPT")
             return arguments[index + 1]
     return None
+
+
+def _shell_option_action(value: str) -> str:
+    if value in _SHELL_LONG_VALUE_OPTIONS:
+        return "value"
+    if any(value.startswith(option + "=") for option in _SHELL_LONG_VALUE_OPTIONS):
+        return "option"
+    if value == "--" or (not value.startswith(("-", "+"))) or value in {"-", "+"}:
+        return "end"
+    if value.startswith("--"):
+        return "option"
+    options = value[1:]
+    if "c" in options:
+        return "script"
+    if "O" in options or "o" in options:
+        return "value"
+    return "option"
 
 
 def _skip_exec(words: list[_Word], index: int) -> int:
@@ -902,43 +935,91 @@ def _skip_env(
                 raise ScanFailure("TARGET_OVERRIDE")
             index += 1
             continue
-        if value in _ENV_FLAGS:
+        long_option = _env_long_option(value)
+        if long_option is not None:
+            separator = value.find("=")
+            has_attached_value = separator >= 0
+            attached = value[separator + 1 :] if has_attached_value else ""
+            if long_option == _ENV_SPLIT_LONG_OPTION:
+                if word.dynamic or word.shell_expansion:
+                    raise ScanFailure("ENV_SPLIT_STRING")
+                if has_attached_value:
+                    split_word = _Word(
+                        attached,
+                        quoted=word.quoted,
+                        dynamic=word.dynamic,
+                        ansi_c=word.ansi_c,
+                        shell_expansion=word.shell_expansion,
+                        nested=list(word.nested),
+                    )
+                    suffix = words[index + 1 :]
+                else:
+                    if index + 1 >= len(words):
+                        raise ScanFailure("INCOMPLETE_ENV_OPTION")
+                    split_word = words[index + 1]
+                    suffix = words[index + 2 :]
+                _scan_env_split_string(
+                    split_word,
+                    suffix,
+                    depth,
+                    budget,
+                    expected_base,
+                )
+                return len(words)
+            if long_option in _ENV_LONG_VALUE_OPTIONS:
+                if has_attached_value:
+                    next_index = index + 1
+                else:
+                    if index + 1 >= len(words):
+                        raise ScanFailure("INCOMPLETE_ENV_OPTION")
+                    next_index = index + 2
+                if long_option == "--chdir" and _could_contain_gh_pr_create(
+                    words[next_index:]
+                ):
+                    raise ScanFailure("UNSAFE_PR_CONTEXT")
+                index = next_index
+                continue
             index += 1
             continue
-        if value in {"-S", "--split-string"}:
-            if index + 1 >= len(words):
-                raise ScanFailure("INCOMPLETE_ENV_OPTION")
-            _scan_env_split_string(
-                words[index + 1], depth, budget, expected_base
-            )
-            return len(words)
-        if value.startswith("--split-string=") or (
-            value.startswith("-S") and value != "-S"
-        ):
-            prefix = "--split-string=" if value.startswith("--") else "-S"
-            split_word = _Word(
-                value[len(prefix) :],
-                quoted=word.quoted,
-                dynamic=word.dynamic,
-                ansi_c=word.ansi_c,
-                nested=list(word.nested),
-            )
-            _scan_env_split_string(split_word, depth, budget, expected_base)
-            return len(words)
+        short_option = _env_short_option(value)
+        if short_option is not None:
+            option, attached = short_option
+            if option == "flag":
+                index += 1
+                continue
+            if attached:
+                next_index = index + 1
+                split_word = _Word(
+                    attached,
+                    quoted=word.quoted,
+                    dynamic=word.dynamic,
+                    ansi_c=word.ansi_c,
+                    shell_expansion=word.shell_expansion,
+                    nested=list(word.nested),
+                )
+            else:
+                if index + 1 >= len(words):
+                    raise ScanFailure("INCOMPLETE_ENV_OPTION")
+                next_index = index + 2
+                split_word = words[index + 1]
+            if option == "S":
+                if word.dynamic or word.shell_expansion:
+                    raise ScanFailure("ENV_SPLIT_STRING")
+                _scan_env_split_string(
+                    split_word,
+                    words[next_index:],
+                    depth,
+                    budget,
+                    expected_base,
+                )
+                return len(words)
+            if option == "C" and _could_contain_gh_pr_create(words[next_index:]):
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
+            index = next_index
+            continue
         if word.dynamic or word.shell_expansion:
             raise ScanFailure("DYNAMIC_PR_ARGUMENT")
-        if value in _ENV_VALUE_OPTIONS:
-            if index + 1 >= len(words):
-                raise ScanFailure("INCOMPLETE_ENV_OPTION")
-            if value == "-C" and _could_contain_gh_pr_create(words[index + 2 :]):
-                raise ScanFailure("UNSAFE_PR_CONTEXT")
-            index += 2
-            continue
-        if value.startswith("--unset=") or value.startswith("--chdir="):
-            if value.startswith("--chdir=") and _could_contain_gh_pr_create(
-                words[index + 1 :]
-            ):
-                raise ScanFailure("UNSAFE_PR_CONTEXT")
+        if value == "-":
             index += 1
             continue
         if value.startswith("-"):
@@ -951,24 +1032,62 @@ def _skip_env(
 
 def _scan_env_split_string(
     word: _Word,
+    suffix: list[_Word],
     depth: int,
     budget: _Budget,
     expected_base: str | None,
 ) -> None:
-    if word.dynamic:
+    if word.dynamic or word.shell_expansion:
         raise ScanFailure("ENV_SPLIT_STRING")
     if "$" in word.text or "`" in word.text:
         raise ScanFailure("ENV_SPLIT_STRING")
-    candidate_text = word.text.replace("\\_", " ")
-    parser = _Parser(candidate_text, budget)
-    nested = parser.parse(depth + 1)
-    if _scan_parsed_context(nested, budget, expected_base):
+    try:
+        candidate_text = word.text.replace("\\_", " ")
+        parser = _Parser(candidate_text, budget)
+        nested = parser.parse(depth + 1)
+        if all(
+            token.kind == "WORD" and token.role == "NORMAL" and token.word is not None
+            for token in nested.tokens
+        ):
+            nested = _Context(
+                nested.depth,
+                [_Token("WORD", -1, -1, word=_Word("env"))]
+                + nested.tokens
+                + [_Token("WORD", -1, -1, word=suffix_word) for suffix_word in suffix],
+            )
+        if not _scan_parsed_context(nested, budget, expected_base):
+            return
+    except (RecursionError, ScanFailure) as error:
+        if isinstance(error, ScanFailure) and error.code == "ENV_SPLIT_STRING":
+            raise
         raise ScanFailure("ENV_SPLIT_STRING")
+    raise ScanFailure("ENV_SPLIT_STRING")
 
 
-def _scan_gh(
-    arguments: list[_Word], expected_base: str | None = None
-) -> bool:
+def _env_long_option(value: str) -> str | None:
+    name = value.split("=", 1)[0]
+    if name in _ENV_LONG_OPTIONS:
+        return name
+    if len(name) <= 2:
+        return None
+    matches = [option for option in _ENV_LONG_OPTIONS if option.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _env_short_option(value: str) -> tuple[str, str] | None:
+    if not value.startswith("-") or value.startswith("--"):
+        return None
+    if value == "-":
+        return "flag", ""
+    for index, option in enumerate(value[1:], start=1):
+        if option in {"u", "C", "S"}:
+            return option, value[index + 1 :]
+        if option not in _ENV_SHORT_FLAGS:
+            return None
+    return "flag", ""
+
+
+def _scan_gh(arguments: list[_Word], expected_base: str | None = None) -> bool:
     index = 0
     target_override = False
     while index < len(arguments):
@@ -979,57 +1098,79 @@ def _scan_gh(
             if word.shell_expansion and _could_contain_pr_create(arguments[index:]):
                 raise ScanFailure("DYNAMIC_PR_ARGUMENT")
             return False
+        option = _gh_global_option(arguments, index)
+        if option is not None:
+            index, overrides_target = option
+            target_override = target_override or overrides_target
+            continue
         value = word.text
-        if value in _GH_VALUE_OPTIONS:
-            if index + 1 >= len(arguments):
-                raise ScanFailure("INCOMPLETE_GH_OPTION")
-            target_override = True
-            index += 2
-            continue
-        if (
-            value.startswith("--repo=")
-            or value.startswith("--hostname=")
-            or value.startswith("--config=")
-        ):
-            target_override = True
-            index += 1
-            continue
-        if value.startswith("-R") and value != "-R":
-            target_override = True
-            index += 1
-            continue
-        if value in _GH_FLAG_OPTIONS:
-            index += 1
-            continue
         if value.startswith("-"):
             if _contains_pr_create(arguments[index + 1 :]):
                 raise ScanFailure("UNKNOWN_GH_OPTION")
             return False
         break
-    if not _could_form_pr_create(arguments[index:]):
+    if index >= len(arguments) or not _could_equal(arguments[index], "pr"):
         return False
-    if (
-        arguments[index].dynamic
-        or arguments[index + 1].dynamic
-        or arguments[index].shell_expansion
-        or arguments[index + 1].shell_expansion
-    ):
-        code = (
-            "ANSI_C_QUOTE"
-            if arguments[index].ansi_c or arguments[index + 1].ansi_c
-            else "DYNAMIC_PR_ARGUMENT"
-        )
+    if arguments[index].dynamic or arguments[index].shell_expansion:
+        code = "ANSI_C_QUOTE" if arguments[index].ansi_c else "DYNAMIC_PR_ARGUMENT"
+        raise ScanFailure(code)
+    index += 1
+
+    while index < len(arguments):
+        word = arguments[index]
+        if word.dynamic or word.shell_expansion:
+            if any(
+                _could_equal(candidate, "create") for candidate in arguments[index:]
+            ):
+                code = "ANSI_C_QUOTE" if word.ansi_c else "DYNAMIC_PR_ARGUMENT"
+                raise ScanFailure(code)
+            return False
+        option = _gh_global_option(arguments, index)
+        if option is not None:
+            index, overrides_target = option
+            target_override = target_override or overrides_target
+            continue
+        if word.text.startswith("-"):
+            if any(
+                _could_equal(candidate, "create")
+                for candidate in arguments[index + 1 :]
+            ):
+                raise ScanFailure("UNKNOWN_GH_OPTION")
+            return False
+        break
+
+    if index >= len(arguments) or not _could_equal(arguments[index], "create"):
+        return False
+    if arguments[index].dynamic or arguments[index].shell_expansion:
+        code = "ANSI_C_QUOTE" if arguments[index].ansi_c else "DYNAMIC_PR_ARGUMENT"
         raise ScanFailure(code)
     if expected_base is not None:
         if target_override:
             raise ScanFailure("TARGET_OVERRIDE")
-        _validate_pr_create_target(arguments[index + 2 :], expected_base)
+        _validate_pr_create_target(arguments[index + 1 :], expected_base)
     return True
 
 
-def _validate_pr_create_target(
-    arguments: list[_Word], expected_base: str
-) -> None:
+def _gh_global_option(arguments: list[_Word], index: int) -> tuple[int, bool] | None:
+    value = arguments[index].text
+    if value in _GH_VALUE_OPTIONS:
+        if index + 1 >= len(arguments):
+            raise ScanFailure("INCOMPLETE_GH_OPTION")
+        return index + 2, True
+    if (
+        value.startswith("--repo=")
+        or value.startswith("--hostname=")
+        or value.startswith("--config=")
+    ):
+        return index + 1, True
+    if value.startswith("-R") and value != "-R":
+        return index + 1, True
+    if value in _GH_FLAG_OPTIONS:
+        return index + 1, False
+    return None
+
+
+def _validate_pr_create_target(arguments: list[_Word], expected_base: str) -> None:
     bases: list[str] = []
     index = 0
     while index < len(arguments):
@@ -1063,8 +1204,7 @@ def _validate_pr_create_target(
             _, index = _required_content_value(arguments, index)
             continue
         if any(
-            value.startswith(option + "=")
-            for option in _PR_CONTENT_LONG_VALUE_OPTIONS
+            value.startswith(option + "=") for option in _PR_CONTENT_LONG_VALUE_OPTIONS
         ):
             if word.dynamic:
                 raise ScanFailure("DYNAMIC_PR_ARGUMENT")
@@ -1097,9 +1237,7 @@ def _required_static_value(
     return value.text, index + 2
 
 
-def _required_content_value(
-    arguments: list[_Word], index: int
-) -> tuple[str, int]:
+def _required_content_value(arguments: list[_Word], index: int) -> tuple[str, int]:
     if index + 1 >= len(arguments):
         raise ScanFailure("INCOMPLETE_GH_OPTION")
     value = arguments[index + 1]
@@ -1108,9 +1246,7 @@ def _required_content_value(
     return value.text, index + 2
 
 
-def _scan_pr_short_options(
-    arguments: list[_Word], index: int, bases: list[str]
-) -> int:
+def _scan_pr_short_options(arguments: list[_Word], index: int, bases: list[str]) -> int:
     word = arguments[index]
     if word.shell_expansion:
         raise ScanFailure("DYNAMIC_PR_ARGUMENT")
@@ -1127,9 +1263,7 @@ def _scan_pr_short_options(
                     raise ScanFailure("TARGET_BINDING")
                 bases.append(remainder)
                 return index + 1
-            base, next_index = _required_static_value(
-                arguments, index, "BASE_OPTION"
-            )
+            base, next_index = _required_static_value(arguments, index, "BASE_OPTION")
             bases.append(base)
             return next_index
         if option in _PR_CONTENT_SHORT_VALUE_OPTIONS:
@@ -1159,8 +1293,10 @@ def _could_form_pr_create(words: list[_Word]) -> bool:
 def _could_equal(word: _Word, value: str) -> bool:
     return (
         word.shell_expansion
-        or word.ansi_c and word.dynamic
-        or not word.dynamic and word.text == value
+        or word.ansi_c
+        and word.dynamic
+        or not word.dynamic
+        and word.text == value
     )
 
 
@@ -1314,7 +1450,7 @@ class _StreamingHint:
                 return False
             if char == "\\":
                 following = self._peek(1)
-                if following in {'$', '`', '"', "\\"}:
+                if following in {"$", "`", '"', "\\"}:
                     self._append(frame, following)
                     self.index += 2
                 elif following == "\n":
@@ -1565,13 +1701,28 @@ class _StreamingHint:
             else:
                 frame.phase = "ARGS"
         elif frame.phase == "ENV":
-            if frame.assignment or (static and text in _ENV_FLAGS):
-                pass
-            elif static and text in _ENV_VALUE_OPTIONS:
-                frame.phase = "ENV_VALUE"
-            elif static and (
-                text.startswith("--unset=") or text.startswith("--chdir=")
+            short_option = _env_short_option(text) if static else None
+            long_option = _env_long_option(text) if static else None
+            if frame.assignment or (
+                static
+                and (
+                    text == "-"
+                    or short_option == ("flag", "")
+                    or long_option is not None
+                    and long_option
+                    not in _ENV_LONG_VALUE_OPTIONS | {_ENV_SPLIT_LONG_OPTION}
+                )
             ):
+                pass
+            elif static and (
+                short_option is not None
+                and short_option[0] in {"u", "C", "S"}
+                and not short_option[1]
+                or long_option in _ENV_LONG_VALUE_OPTIONS | {_ENV_SPLIT_LONG_OPTION}
+                and "=" not in text
+            ):
+                frame.phase = "ENV_VALUE"
+            elif static and (short_option is not None or long_option is not None):
                 pass
             elif static and text.startswith("-"):
                 frame.phase = "UNKNOWN_WRAPPER"
@@ -1589,7 +1740,15 @@ class _StreamingHint:
             if unquoted_gh:
                 return True
         elif frame.phase == "SHELL_OPTION":
-            frame.phase = "SHELL_SCRIPT" if static and text == "-c" else "ARGS"
+            action = _shell_option_action(text) if static else "end"
+            if action == "script":
+                frame.phase = "SHELL_SCRIPT"
+            elif action == "value":
+                frame.phase = "SHELL_OPTION_VALUE"
+            elif action == "end":
+                frame.phase = "ARGS"
+        elif frame.phase == "SHELL_OPTION_VALUE":
+            frame.phase = "SHELL_OPTION"
         elif frame.phase == "SHELL_SCRIPT":
             if static:
                 self.work.add(text)

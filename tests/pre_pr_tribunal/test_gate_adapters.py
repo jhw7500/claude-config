@@ -299,9 +299,7 @@ def test_scan_precedes_repository_and_verdict_work(git_repo: Path):
         "gh p$'r' create --draft",
     ],
 )
-def test_shell_forms_cannot_bypass_state_preflight(
-    tmp_path: Path, command: str
-):
+def test_shell_forms_cannot_bypass_state_preflight(tmp_path: Path, command: str):
     decision = evaluate_gate(tmp_path, command)
 
     assert decision.block is True
@@ -318,9 +316,7 @@ def test_shell_forms_cannot_bypass_state_preflight(
         "env --split-string='gh pr create --base master'",
     ),
 )
-def test_alternate_argv_cannot_bypass_state_preflight(
-    tmp_path: Path, command: str
-):
+def test_alternate_argv_cannot_bypass_state_preflight(tmp_path: Path, command: str):
     decision = evaluate_gate(tmp_path, command)
 
     assert decision.block is True
@@ -582,9 +578,29 @@ def test_passing_verdict_rejects_unbound_target(git_repo: Path, command: str):
         'gh pr create --base master --title "${VALUE@P}"',
     ),
 )
-def test_passing_verdict_rejects_round_one_bypasses(
-    git_repo: Path, command: str
-):
+def test_passing_verdict_rejects_round_one_bypasses(git_repo: Path, command: str):
+    _passing_verdict(git_repo)
+
+    decision = evaluate_gate(git_repo, command)
+
+    assert decision.block is True
+    assert decision.code is GateCode.COMMAND_AMBIGUOUS
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "env -vS 'gh pr create --base master'",
+        "env -iv -S 'gh pr create --base master'",
+        "env --unset OLD --debug --s='gh pr create --base master'",
+        "env --split-str='gh pr create --base master'",
+        "env -S 'gh' pr create --base master",
+        "bash -O extglob -c 'gh pr create --base master'",
+        "bash -o posix -c 'gh pr create --base master'",
+        "gh pr --repo owner/repository create --base master",
+    ),
+)
+def test_passing_verdict_rejects_round_two_bypasses(git_repo: Path, command: str):
     _passing_verdict(git_repo)
 
     decision = evaluate_gate(git_repo, command)

@@ -128,6 +128,38 @@ def test_alternate_argv_pr_candidates_are_not_ignored(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "env -vS 'gh pr create --base master'",
+        "env -iS 'gh pr create --base master'",
+        "env -ivS 'gh pr create --base master'",
+        "env -vS'gh pr create --base master'",
+        "env -iv -S 'gh pr create --base master'",
+        "env -vuOLD -S 'gh pr create --base master'",
+        "env --unset OLD --debug --s='gh pr create --base master'",
+        "env --split-string= gh pr create --base master",
+        "env -S '' -S 'gh pr create --base master'",
+        "env --split-string= --s='gh pr create --base master'",
+        "env --s='gh pr create --base master'",
+        "env --split-str='gh pr create --base master'",
+        "env -S 'gh' pr create --base master",
+        "bash -O extglob -c 'gh pr create --base master'",
+        "bash -eO extglob -c 'gh pr create --base master'",
+        "bash -o posix -c 'gh pr create --base master'",
+        "bash -ro posix -c 'gh pr create --base master'",
+        "bash +O extglob -c 'gh pr create --base master'",
+        "gh pr --repo owner/repository create --base master",
+        "gh pr -Rowner/repository create --base master",
+    ],
+)
+def test_round_two_alternate_argv_candidates_are_not_ignored(command):
+    assert scan_pr_create(command).kind in {
+        ScanKind.PR_CREATE,
+        ScanKind.AMBIGUOUS_CANDIDATE,
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "echo 'gh pr create'",
         'printf "%s\\n" "gh pr create"',
         "true # gh pr create",
@@ -235,8 +267,27 @@ def test_gnu_env_split_string_transformations_are_ambiguous(command):
     assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
 
 
-def test_unrelated_literal_env_split_string_remains_no_match():
-    assert scan_pr_create(r"env -S 'printf\_%s\_okay'").kind is ScanKind.NO_MATCH
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"env -S 'printf\_%s\_okay'",
+        r"env -vS 'printf\_%s\_okay'",
+        r"env -iv -S 'printf\_%s\_okay'",
+        r"env --unset OLD --debug --s='printf\_%s\_okay'",
+        r"env --s='printf\_%s\_okay'",
+        r"env --split-str='printf\_%s\_okay'",
+        r"env -S 'printf' gh pr create",
+    ],
+)
+def test_unrelated_literal_env_split_string_remains_no_match(command):
+    assert scan_pr_create(command).kind is ScanKind.NO_MATCH
+
+
+def test_repeated_empty_env_split_strings_cannot_exhaust_candidate_scan():
+    command = "env " + "-S '' " * (MAX_RECURSION + 1)
+    command += "-S 'gh pr create --base master'"
+
+    assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
 
 
 @pytest.mark.parametrize(
@@ -286,6 +337,37 @@ def test_other_git_execution_environment_is_a_target_override():
 def test_bound_shell_command_envelopes_are_unsafe(command):
     assert scan_pr_create(command, expected_base="master") == ScanResult(
         ScanKind.AMBIGUOUS_CANDIDATE, "UNSAFE_PR_CONTEXT"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env -vS 'gh pr create --base master'",
+        "env -iS 'gh pr create --base master'",
+        "env -ivS 'gh pr create --base master'",
+        "env -vS'gh pr create --base master'",
+        "env -iv -S 'gh pr create --base master'",
+        "env -vuOLD -S 'gh pr create --base master'",
+        "env --unset OLD --debug --s='gh pr create --base master'",
+        "env --split-string= gh pr create --base master",
+        "env -S '' -S 'gh pr create --base master'",
+        "env --split-string= --s='gh pr create --base master'",
+        "env --s='gh pr create --base master'",
+        "env --split-str='gh pr create --base master'",
+        "env -S 'gh' pr create --base master",
+        "bash -O extglob -c 'gh pr create --base master'",
+        "bash -eO extglob -c 'gh pr create --base master'",
+        "bash -o posix -c 'gh pr create --base master'",
+        "bash -ro posix -c 'gh pr create --base master'",
+        "bash +O extglob -c 'gh pr create --base master'",
+        "gh pr --repo owner/repository create --base master",
+        "gh pr -Rowner/repository create --base master",
+    ],
+)
+def test_round_two_bypasses_are_rejected_under_target_binding(command):
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
     )
 
 
@@ -413,11 +495,9 @@ def test_token_limit_is_exact():
 def test_recursion_depth_17_is_bounded_not_executed():
     at_limit = "$(" * MAX_RECURSION + "gh pr create" + ")" * MAX_RECURSION
     too_deep = "$(" + at_limit + ")"
-    unrelated = "$(" * (MAX_RECURSION + 1) + "printf x" + ")" * (
-        MAX_RECURSION + 1
-    )
-    quoted_data = "$(" * (MAX_RECURSION + 1) + "printf 'gh pr create'" + ")" * (
-        MAX_RECURSION + 1
+    unrelated = "$(" * (MAX_RECURSION + 1) + "printf x" + ")" * (MAX_RECURSION + 1)
+    quoted_data = (
+        "$(" * (MAX_RECURSION + 1) + "printf 'gh pr create'" + ")" * (MAX_RECURSION + 1)
     )
 
     assert scan_pr_create(at_limit) == ScanResult(
@@ -497,9 +577,7 @@ def test_deep_backtick_child_preserves_outer_argument_context():
         + " gh pr create"
     )
 
-    assert scan_pr_create(command) == ScanResult(
-        ScanKind.NO_MATCH, "RECURSION_LIMIT"
-    )
+    assert scan_pr_create(command) == ScanResult(ScanKind.NO_MATCH, "RECURSION_LIMIT")
 
 
 def test_escaped_digit_is_not_a_numeric_fd_hint():

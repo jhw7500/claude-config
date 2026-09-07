@@ -43,8 +43,9 @@ snapshot until `gh` starts.
 | Subshell or command-substitution execution context | `AMBIGUOUS_CANDIDATE` |
 | Redirection on the candidate command | `AMBIGUOUS_CANDIDATE` |
 | `env -C`/`--chdir` or `time -o`/`--output` before `gh` | `AMBIGUOUS_CANDIDATE` |
-| Dynamic shell `-c` script that can contain the candidate | `AMBIGUOUS_CANDIDATE` |
-| GNU `env -S`/`--split-string` containing a candidate | `AMBIGUOUS_CANDIDATE` |
+| Dynamic shell `-c` script or an operand option before `-c` | `AMBIGUOUS_CANDIDATE` |
+| GNU `env -S`/`--split-string`, including clusters, accepted long abbreviations, and trailing argv, containing a candidate | `AMBIGUOUS_CANDIDATE` |
+| Target-changing `gh` global option before `pr`, between `pr` and `create`, or after `create` | `AMBIGUOUS_CANDIDATE` |
 | Shell `-c`, brace/glob expansion, or dynamic content in a bound candidate | `AMBIGUOUS_CANDIDATE` |
 
 A trailing newline or separator with no other executable segment does not by
@@ -95,8 +96,12 @@ ANSI-C words are treated conservatively. Multiple ANSI-C fragments that can
 jointly form the executable, `pr`, and `create` words are ambiguous rather than
 ignored. A dynamic ANSI-C shell `-c` script is ambiguous when it can conceal a
 candidate. GNU split-string operands are scanned as executable text with the
-existing recursion and token budget; a candidate inside that alternate argv
-construction is ambiguous.
+existing recursion and token budget. Supported short-option clusters and
+unambiguous long-option abbreviations are normalized first, and argv after the
+split operand remains part of the constructed command. A candidate inside that
+alternate argv construction is ambiguous. Shell options that consume an
+operand are skipped before locating `-c`; supported `gh` global options are
+recognized both before `pr` and between `pr` and `create`.
 
 ## Oversized hook payloads
 
@@ -114,7 +119,10 @@ Regression tests exercise real scanner, gate, and copied-adapter behavior:
 - a passing verdict denies prelude, redirection, and substitution mutations;
 - the exact 1 MiB boundary is parsed normally and a larger payload is denied;
 - combined ANSI-C fragments and ANSI-C shell scripts do not return `NO_MATCH`;
-- both GNU split-string spellings do not return `NO_MATCH`;
+- GNU split-string spellings, clusters, accepted abbreviations, and trailing
+  argv constructions do not return `NO_MATCH`;
+- shell option operands and interposed `gh` global options cannot conceal a
+  candidate;
 - the canonical explicit-base command still reaches `PASS`;
 - unrelated shell data and malformed in-limit payloads retain their existing
   no-output behavior.

@@ -379,7 +379,9 @@ Hook matcher는 process spawn을 줄이는 최적화일 뿐 authority가 아니�
 payload에서 shell command를 직접 검증한다. Scanner는 최소 다음을 처리한다.
 
 - leading environment assignment
-- `command`/`exec`/`time`/`env` wrapper와 GNU `env -S` alternate argv
+- `command`/`exec`/`time`/`env` wrapper와 GNU `env -S` cluster, accepted
+  long-option abbreviation, trailing argv를 포함한 alternate argv
+- shell `-c` 앞의 operand option과 `pr`/`create` 사이의 `gh` global option
 - absolute 또는 relative `gh` executable path의 basename
 - compound command, subshell, command substitution 안의 실제 subcommand
 - line continuation과 ANSI-C quoted word
@@ -502,7 +504,10 @@ Ambiguous/deny fixture:
 - `tests && gh pr create --base master`
 - executable command substitution 안의 `gh pr create`
 - redirection을 포함한 PR candidate
-- combined ANSI-C word와 `env -S`가 구성한 PR candidate
+- combined ANSI-C word와 option cluster/축약/trailing argv를 포함한 `env -S`가
+  구성한 PR candidate
+- shell operand option 뒤 `-c` script와 `pr`/`create` 사이에 global option이 있는
+  `gh` candidate
 
 Negative fixture:
 
