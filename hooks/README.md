@@ -100,8 +100,9 @@ backslash가 제거되어 `gh`가 되는 이름도 후보이며, GNU split-strin
 bound candidate 앞의 dynamic simple-command/`env` assignment도 ambiguous다. Inherited
 `GH_HOST=github.com`과 격리된 `GH_CONFIG_DIR`는 target을 바꾸지 않으므로 허용하지만 다른
 inherited host, `GH_REPO`, target에 영향을 주는 Git execution environment는 거부한다.
-Repository-local `remote.<name>.gh-resolved=base` marker는 없거나 origin을 가리키는 exact
-marker 하나만 허용하며, 다른 default repository는 `REPOSITORY_UNSUPPORTED`다.
+System/global/local/worktree scope의 effective `remote.<name>.gh-resolved=base` marker는
+없거나 origin을 가리키는 exact marker 하나만 허용하며, 다른 default repository는
+`REPOSITORY_UNSUPPORTED`다.
 1 MiB를 넘는 payload는 JSON을 해석하거나 입력을 반사하지 않고 `COMMAND_AMBIGUOUS`로 거부한다.
 
 deny reason code와 기본 복구는 다음과 같다.

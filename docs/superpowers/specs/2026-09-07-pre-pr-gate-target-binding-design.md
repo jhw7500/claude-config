@@ -81,9 +81,10 @@ The bound scan rejects:
 - shell- or `env`-assigned Git execution variables that can alter repository or
   ref resolution, including `GIT_CONFIG_*`, and their inherited equivalents.
 
-GitHub CLI can persist a repository-local default as
-`remote.<name>.gh-resolved=base`. Snapshot capture and revalidation accept no
-such marker or the single exact `remote.origin.gh-resolved=base` marker. A
+GitHub CLI reads `remote.<name>.gh-resolved=base` from effective Git config.
+Snapshot capture and revalidation inspect the same system, global, local, and
+worktree scopes and accept no such marker or the single exact
+`remote.origin.gh-resolved=base` marker. A
 non-origin, duplicate, malformed, or unreadable marker is
 `REPOSITORY_UNSUPPORTED`; it cannot redirect a passing verdict to another
 remote.
@@ -160,7 +161,8 @@ Regression tests exercise real scanner, gate, and copied-adapter behavior:
 - `gh pr new`, direct/named `coproc`, and dynamic leading assignments are
   ambiguous in both scanner and adapter coverage;
 - absent or origin GitHub CLI defaults preserve the canonical target while a
-  non-origin default is rejected during capture and gate revalidation;
+  non-origin local, worktree, or global default is rejected during capture and
+  gate revalidation;
 - base, symbolic HEAD, changed paths, and initial-path count stay inside the
   strict verdict parser's accepted domain;
 - the canonical explicit-base command still reaches `PASS`;

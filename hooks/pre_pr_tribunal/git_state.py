@@ -67,6 +67,13 @@ def _git_environment() -> dict[str, str]:
     return environment
 
 
+def _gh_config_environment() -> dict[str, str]:
+    environment = _git_environment()
+    environment.pop("GIT_CONFIG_NOSYSTEM", None)
+    environment.pop("GIT_CONFIG_GLOBAL", None)
+    return environment
+
+
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -101,7 +108,9 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
                 pass
 
 
-def _run_git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
+def _run_git_with_environment(
+    cwd: Path, arguments: Sequence[str], environment: dict[str, str]
+) -> subprocess.CompletedProcess[bytes]:
     argv = [GIT, "-C", str(cwd), *arguments]
     try:
         selector = selectors.DefaultSelector()
@@ -116,7 +125,7 @@ def _run_git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_git_environment(),
+            env=environment,
             start_new_session=True,
         )
         if process.stdout is None or process.stderr is None:
@@ -174,6 +183,10 @@ def _run_git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
             pass
 
     return result
+
+
+def _run_git(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
+    return _run_git_with_environment(cwd, arguments, _git_environment())
 
 
 def _command_output(
@@ -311,13 +324,10 @@ def _valid_path_text(value: object) -> bool:
 
 
 def _validate_gh_default_repository(root: Path) -> None:
-    result = _run_git(
+    result = _run_git_with_environment(
         root,
-        "config",
-        "--local",
-        "--null",
-        "--get-regexp",
-        r"^remote\..*\.gh-resolved$",
+        ("config", "--null", "--get-regexp", r"^remote\..*\.gh-resolved$"),
+        _gh_config_environment(),
     )
     if result.returncode == 1 and not result.stdout and not result.stderr:
         return

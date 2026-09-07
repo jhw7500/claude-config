@@ -577,6 +577,43 @@ def test_non_origin_gh_default_repository_cannot_reuse_pass(git_repo: Path):
     assert_decision(git_repo, GateCode.REPOSITORY_UNSUPPORTED)
 
 
+def test_worktree_gh_default_repository_cannot_reuse_pass(git_repo: Path):
+    _passing_verdict(git_repo)
+    _git(
+        git_repo,
+        "remote",
+        "add",
+        "other",
+        "https://github.com/other/repository.git",
+    )
+    _git(git_repo, "config", "extensions.worktreeConfig", "true")
+    _git(git_repo, "config", "--worktree", "remote.other.gh-resolved", "base")
+
+    assert_decision(git_repo, GateCode.REPOSITORY_UNSUPPORTED)
+
+
+def test_global_gh_default_repository_cannot_reuse_pass(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    isolated_home = tmp_path / "git-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(isolated_home / "xdg"))
+    _passing_verdict(git_repo)
+    _git(
+        git_repo,
+        "remote",
+        "add",
+        "other",
+        "https://github.com/other/repository.git",
+    )
+    (isolated_home / ".gitconfig").write_text(
+        '[remote "other"]\n\tgh-resolved = base\n', encoding="utf-8"
+    )
+
+    assert_decision(git_repo, GateCode.REPOSITORY_UNSUPPORTED)
+
+
 def test_origin_gh_default_repository_preserves_bound_pass(git_repo: Path):
     _git(git_repo, "config", "--local", "remote.origin.gh-resolved", "base")
     _passing_verdict(git_repo)

@@ -404,9 +404,10 @@ output-writing wrapper를 허용하지 않는다.
 Pass 후보는 literal `--base`를 정확히 한 번 포함하고 그 값이 verdict base와 같아야 한다.
 `GH_REPO`/`GH_HOST`/Git worktree assignment, `--repo`/`-R`, `--head`/`-H`, hostname/config
 override와 free-standing dynamic argv는 target binding을 증명할 수 없으므로 거부한다.
-Repository-local `remote.<name>.gh-resolved=base`는 없거나 exact origin marker 하나일 때만
-지원한다. 다른 remote를 선택하거나 duplicate/malformed인 marker는 snapshot capture와
-재검증에서 fail closed한다.
+GitHub CLI가 읽는 system/global/local/worktree scope의
+`remote.<name>.gh-resolved=base`는 없거나 exact origin marker 하나일 때만 지원한다.
+다른 remote를 선택하거나 duplicate/malformed인 marker는 snapshot capture와 재검증에서
+fail closed한다. 다른 snapshot Git 명령의 deterministic config isolation은 유지한다.
 
 v1 scanner는 기존 `verification-command-hygiene-hook.py` parser를 refactor하거나
 import하지 않는다. 요구하는 출력과 오류 경계가 다르므로 tribunal core 안에 작은
