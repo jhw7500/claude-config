@@ -376,15 +376,21 @@ Hook matcher는 process spawn을 줄이는 최적화일 뿐 authority가 아니�
 payload에서 shell command를 직접 검증한다. Scanner는 최소 다음을 처리한다.
 
 - leading environment assignment
-- `command`/`env` wrapper
+- `command`/`exec`/`time`/`env` wrapper와 GNU `env -S` alternate argv
 - absolute 또는 relative `gh` executable path의 basename
-- compound command 안의 실제 subcommand
-- line continuation과 command substitution
+- compound command, subshell, command substitution 안의 실제 subcommand
+- line continuation과 ANSI-C quoted word
 - quote, comment, heredoc data 안의 예시 문자열 제외
 
 Regex 한 번으로 raw string의 `gh pr create` 포함 여부를 판정하지 않는다. Scanner가
 실제 실행 가능 위치에서 후보를 찾은 뒤 `gh` argv가 `pr create` subcommand인지
-확인한다. 명령이 관련 없다고 증명되면 아무 출력 없이 exit 0이다.
+확인한다. 명령이 관련 없다고 증명되면 아무 출력 없이 exit 0이다. 실행 후보가 있으면
+다른 non-empty command segment, nested execution, redirection, cwd-changing wrapper 또는
+output-writing wrapper를 허용하지 않는다.
+
+Pass 후보는 literal `--base`를 정확히 한 번 포함하고 그 값이 verdict base와 같아야 한다.
+`GH_REPO`/`GH_HOST`/Git worktree assignment, `--repo`/`-R`, `--head`/`-H`, hostname/config
+override와 free-standing dynamic argv는 target binding을 증명할 수 없으므로 거부한다.
 
 v1 scanner는 기존 `verification-command-hygiene-hook.py` parser를 refactor하거나
 import하지 않는다. 요구하는 출력과 오류 경계가 다르므로 tribunal core 안에 작은
@@ -399,9 +405,10 @@ import하지 않는다. 요구하는 출력과 오류 경계가 다르므로 tri
 2. worktree clean 여부
 3. `.review/verdict.json` 안전한 open과 strict parse
 4. repository/base/head/merge-base/diff binding
-5. 세 reviewer terminal 상태
-6. round 범위와 gate status
-7. 열린 CRITICAL/HIGH count가 0인지
+5. command의 explicit base와 repo/head/environment target binding
+6. 세 reviewer terminal 상태
+7. round 범위와 gate status
+8. 열린 CRITICAL/HIGH count가 0인지
 
 하나라도 실패하면 PR 명령을 실행하지 않고 bounded reason과 tribunal 재실행 방법을
 agent에게 돌려준다. Passing verdict에서는 `allow`를 출력하지 않고 no-decision으로
@@ -420,6 +427,7 @@ Claude와 Codex adapter는 각 runtime이 지원하는 `PreToolUse` structured o
 - 실제 PR 생성 후보가 아닌 명령에서 parser/core 오류: fail-open, bounded diagnostic
 - 실제 PR 생성 후보를 식별한 뒤 verdict/core 오류: fail-closed
 - malformed hook payload로 command 자체를 읽을 수 없음: unrelated Bash까지 막지 않음
+- 1 MiB 초과 hook payload: command를 신뢰할 수 없으므로 parse 전에 bounded deny
 
 Hook은 network에 접근하거나 reviewer를 실행하지 않는다. Local Git과 bounded file
 read만 수행해 일반 shell latency를 제한한다.
@@ -480,11 +488,18 @@ Raw subprocess output, absolute home path, token, credential, 전체 diff를 hoo
 
 Positive fixture:
 
-- `gh pr create`
 - `/usr/bin/gh pr create --base master`
-- `FOO=1 command gh pr create`
-- `tests && gh pr create`
+- `FOO=1 command gh pr create --base master`
+- `gh pr create -Bmaster --fill`
+
+Ambiguous/deny fixture:
+
+- explicit base가 없는 `gh pr create`
+- `GH_REPO=other/repo gh pr create --base master`
+- `tests && gh pr create --base master`
 - executable command substitution 안의 `gh pr create`
+- redirection을 포함한 PR candidate
+- combined ANSI-C word와 `env -S`가 구성한 PR candidate
 
 Negative fixture:
 
@@ -503,7 +518,7 @@ scanner corpus와 함께 기존 #19 전체 test suite도 실행해 동작 격리
 - no-match에서는 빈 stdout/exit 0
 - match + fail verdict에서는 각 runtime이 이해하는 deny JSON
 - match + pass verdict에서는 no-decision
-- oversized/deep/malformed input의 bounded behavior
+- oversized input의 bounded deny와 deep/malformed in-limit input의 bounded behavior
 - error message에 secret/path canary가 없는지
 
 ### 16.4 Installer tests

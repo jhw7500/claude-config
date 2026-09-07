@@ -89,11 +89,18 @@ fi
 decision도 출력하지 않는다. direct 후보가 모호하거나 현재 verdict가 없거나 안전하지 않으면
 `[PRE-PR-TRIBUNAL:<CODE>]` reason이 포함된 deny를 출력한다.
 
+Pass 경로의 canonical command는 `gh pr create --base <verdict-base>` 한 개다. Literal base가
+verdict와 정확히 같아야 하며 `GH_REPO`/repo/head override, 다른 command segment, command
+substitution, redirection, cwd-changing `env`, output-writing `time`, ANSI-C 또는 `env -S`로 만든
+대체 argv는 통과하지 않는다. Inherited `GH_HOST=github.com`과 격리된 `GH_CONFIG_DIR`는 target을
+바꾸지 않으므로 허용하지만 다른 inherited host, `GH_REPO`, Git worktree override는 거부한다.
+1 MiB를 넘는 payload는 JSON을 해석하거나 입력을 반사하지 않고 `COMMAND_AMBIGUOUS`로 거부한다.
+
 deny reason code와 기본 복구는 다음과 같다.
 
 | Code | 의미와 복구 |
 |---|---|
-| `COMMAND_AMBIGUOUS` | direct command 여부를 보수적으로 확정할 수 없다. command를 지원되는 direct 형태로 단순화한 뒤 Skill을 다시 실행한다. |
+| `COMMAND_AMBIGUOUS` | direct command, target 또는 실행 전 snapshot 보존을 확정할 수 없다. 다른 shell 동작을 제거하고 literal `--base <verdict-base>`를 쓰며, oversized payload면 command를 줄인 뒤 다시 실행한다. |
 | `TRIBUNAL_REQUIRED`, `REVIEW_INCOMPLETE` | verdict가 없거나 round가 끝나지 않았다. `/pre-pr-tribunal` 또는 `$pre-pr-tribunal`로 현재 round를 완료한다. |
 | `BLOCKERS_OPEN` | Critical/High finding이 열려 있다. Skill의 decision/fix/re-review 흐름을 계속한다. |
 | `ROUND_LIMIT_EXHAUSTED` | 3 round 뒤에도 blocker가 남았다. 자동 진행을 멈추고 사용자 결정을 받는다. |

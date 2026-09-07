@@ -296,3 +296,30 @@ run, and this checkpoint does not satisfy the required real-runtime PASS gate.
 - All discovered fixed `gh` paths remained replaced by the fake client and GitHub hostnames remained
   loopback-sinkholed. No real GitHub endpoint, push, merge, PR creation, or readiness action occurred
   during these canaries.
+
+## Canonical target-binding regression checkpoint — 2026-09-07
+
+- Scope: Round 3 HIGH findings for PR target binding, pre-command snapshot staleness,
+  ANSI-C/GNU `env -S` alternate argv, and oversized hook payloads.
+- Canonical pass command: `gh pr create --base master`; repo/head override, compound or nested
+  execution, redirection, and dynamic target argv receive bounded deny.
+- Implementation commits:
+  `c1a4d7cd2d8d2fbd47e3ddc393bd561198c35d6f`,
+  `898014d6146bee562c774f224b4c55aa19a32f86`, and
+  `ed600bed3eeee2c37b5fd48b50ac35935e4626c8`.
+- Scanner/gate/contract command:
+  `rtk pytest -q tests/pre_pr_tribunal/test_skill_contract.py tests/pre_pr_tribunal/test_shell_scan.py tests/pre_pr_tribunal/test_gate_adapters.py`.
+  Result: `261 passed`; exit 0.
+- Synthetic fake-runtime harness command:
+  `rtk pytest -q tests/pre_pr_tribunal/test_probe_harness.py`.
+  Result: `105 passed`; exit 0.
+- Complete Tribunal command: `rtk pytest -q tests/pre_pr_tribunal`.
+  Result: `650 passed`; exit 0.
+- The first whole-repository collection reported the declared optional `slack_bolt` package was
+  absent. `slack-bridge/requirements.txt` was installed into an isolated `/tmp` target only, then
+  `rtk env PYTHONPATH=<temporary-target> python3 -m pytest -q` completed with
+  `2709 passed in 164.09s`; exit 0.
+- `rtk python3 -m py_compile` for the changed Python implementation/tests and
+  `rtk git diff --check` both exited 0.
+- No live Claude/Codex canary, real `gh`, GitHub/provider endpoint, push, merge, PR creation, or
+  Project Control mutation occurred in this checkpoint.

@@ -1,0 +1,119 @@
+# Pre-PR Gate Target Binding Design
+
+## Goal
+
+Close the five Round 3 HIGH findings without adding a PR execution wrapper or a
+release workflow. A passing Tribunal verdict may authorize only one canonical,
+direct `gh pr create` command whose repository, base, head, working tree, and
+reviewed snapshot remain the values represented by that verdict.
+
+## Scope
+
+This amendment covers:
+
+- repository/base/head target binding for the PR command;
+- rejection of shell work that can run before the PR command;
+- ANSI-C and GNU `env --split-string` candidate recognition;
+- fail-closed handling when a hook payload exceeds 1 MiB;
+- contract and canary documentation for the supported command form.
+
+It does not add a wrapper, dependency, permission, environment variable,
+network endpoint, release step, or fix for an unrelated intermittent probe
+timeout.
+
+## Canonical command envelope
+
+The supported form is one simple command, optionally using the already
+recognized non-mutating `command`, `exec`, `time`, or `env` wrappers, with an
+explicit literal base:
+
+```sh
+gh pr create --base master --fill
+```
+
+The scanner continues to return `NO_MATCH` for data and unrelated commands.
+Once an executable `gh pr create` candidate is present, it returns
+`AMBIGUOUS_CANDIDATE` for any envelope that cannot preserve the reviewed
+snapshot until `gh` starts.
+
+| Candidate property | Result |
+|---|---|
+| One simple command with no redirection or command substitution | Eligible for verdict checks |
+| Another non-empty command before or after it | `AMBIGUOUS_CANDIDATE` |
+| Subshell or command-substitution execution context | `AMBIGUOUS_CANDIDATE` |
+| Redirection on the candidate command | `AMBIGUOUS_CANDIDATE` |
+| `env -C`/`--chdir` or `time -o`/`--output` before `gh` | `AMBIGUOUS_CANDIDATE` |
+| Dynamic shell `-c` script that can contain the candidate | `AMBIGUOUS_CANDIDATE` |
+| GNU `env -S`/`--split-string` containing a candidate | `AMBIGUOUS_CANDIDATE` |
+
+A trailing newline or separator with no other executable segment does not by
+itself create a stale snapshot and may remain eligible.
+
+## Target binding
+
+The first scan answers only whether a PR-create candidate exists and whether
+its shell context is safe. After the current verdict is read, the gate rescans
+with `expected_base=verdict.base_ref`. The bound scan requires exactly one
+literal `--base VALUE`, `--base=VALUE`, `-B VALUE`, or `-BVALUE`, and the value
+must equal the verdict base exactly.
+
+The bound scan rejects:
+
+- a missing, duplicated, dynamic, or mismatched base;
+- `--head`, `--head=`, `-H`, or an attached `-HVALUE`;
+- `--repo`, `--repo=`, `-R`, or an attached `-RVALUE`;
+- `--hostname`, `--config`, and their attached value forms;
+- leading `GH_REPO`, `GH_HOST`, `GH_CONFIG_DIR`, `GIT_DIR`, `GIT_WORK_TREE`,
+  or `GIT_COMMON_DIR` assignments, including assignments consumed by `env`;
+- inherited `GH_REPO`, `GIT_DIR`, `GIT_WORK_TREE`, or `GIT_COMMON_DIR`, and an
+  inherited `GH_HOST` other than the repository's supported `github.com` host.
+
+An inherited `GH_HOST=github.com` and a private runtime `GH_CONFIG_DIR` do not
+change the explicitly bound target and remain supported. The command itself may
+not assign either variable because that would change execution relative to the
+validated adapter environment.
+
+`--head` is intentionally absent: the gate already binds the named current
+branch and HEAD snapshot. Ordinary content options may remain supported, but a
+free-standing dynamic argument is ambiguous because it can expand into a
+target-changing option.
+
+## Scanner behavior
+
+`scan_pr_create(command, expected_base=None)` keeps its public classification
+shape. The optional expected base activates target-policy validation. Internal
+context scanning preserves whether a candidate was nested, accompanied by
+another command segment, redirected, or preceded by a mutating wrapper option.
+
+ANSI-C words are treated conservatively. Multiple ANSI-C fragments that can
+jointly form the executable, `pr`, and `create` words are ambiguous rather than
+ignored. A dynamic ANSI-C shell `-c` script is ambiguous when it can conceal a
+candidate. GNU split-string operands are scanned as executable text with the
+existing recursion and token budget; a candidate inside that alternate argv
+construction is ambiguous.
+
+## Oversized hook payloads
+
+The adapter already reads at most `MAX_STDIN_BYTES + 1`. If that read produces
+more than `MAX_STDIN_BYTES`, the adapter emits the existing bounded native deny
+payload with `COMMAND_AMBIGUOUS`. It does not attempt to parse, reflect, or log
+the oversized input. Malformed inputs within the limit remain silent when no
+command can be extracted reliably.
+
+## Verification
+
+Regression tests exercise real scanner, gate, and copied-adapter behavior:
+
+- a passing verdict denies repository, base, and head overrides;
+- a passing verdict denies prelude, redirection, and substitution mutations;
+- the exact 1 MiB boundary is parsed normally and a larger payload is denied;
+- combined ANSI-C fragments and ANSI-C shell scripts do not return `NO_MATCH`;
+- both GNU split-string spellings do not return `NO_MATCH`;
+- the canonical explicit-base command still reaches `PASS`;
+- unrelated shell data and malformed in-limit payloads retain their existing
+  no-output behavior.
+
+After targeted and repository tests pass, the exhausted Round 3 `.review`
+directory is moved intact to a private recoverable archive outside the
+worktree. A new Tribunal begins at round 1 on the new clean commit. Push and PR
+creation occur only if that new Tribunal returns PASS.

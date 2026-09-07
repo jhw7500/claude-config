@@ -46,11 +46,14 @@ PR을 만들기 전 Claude에서는 `/pre-pr-tribunal`, Codex에서는 `$pre-pr-
 review 상태는 현재 저장소의 ignored `.review/`에만 남고 HOME이나 다른 checkout과 공유되지 않는다.
 각 round는 독립 Reviewer A/B/C report로 finalize하며, blocker가 계속되면 최대 3 round에서 멈춰
 사용자 개입을 요청한다. 현재 snapshot에 결합된 pass verdict가 있을 때만 direct
-`gh pr create` shell command가 통과한다.
+`gh pr create --base <verdict-base>` shell command가 통과한다. Base는 literal로 명시해야
+하며 repo/head override, 선행·후행 command, command substitution, redirection을 섞은 형태는
+`COMMAND_AMBIGUOUS`로 차단된다.
 
 이 gate는 Claude/Codex shell hook에 보이는 direct `gh pr create`만 다룬다. GitHub UI에서의 PR
 생성, `gh api`, alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가
-필요하다. 설치·복구와 검증 절차는 [hook 운영 문서](hooks/README.md#pre-pr-tribunal-운영)를 따른다.
+필요하다. 1 MiB를 넘는 hook payload는 command를 신뢰할 수 없으므로 bounded deny한다.
+설치·복구와 검증 절차는 [hook 운영 문서](hooks/README.md#pre-pr-tribunal-운영)를 따른다.
 
 실제 runtime canary는 `/usr/bin/bwrap` 안에서 GitHub hostname을 sinkhole하고 발견된
 모든 fixed `gh` 경로를 exact fake executable로 덮는다. Runtime stdout/stderr는
