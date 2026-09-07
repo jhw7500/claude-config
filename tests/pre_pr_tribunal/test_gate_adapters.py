@@ -308,6 +308,25 @@ def test_shell_forms_cannot_bypass_state_preflight(
     assert decision.code is not GateCode.NOT_PR_CREATE
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        "g$'\\x68' p$'\\x72' c$'\\x72'eate --base master",
+        "bash -c $'g\\x68 pr create --base master'",
+        'bash -c "gh pr create --base master $DYNAMIC"',
+        "env -S 'gh pr create --base master'",
+        "env --split-string='gh pr create --base master'",
+    ),
+)
+def test_alternate_argv_cannot_bypass_state_preflight(
+    tmp_path: Path, command: str
+):
+    decision = evaluate_gate(tmp_path, command)
+
+    assert decision.block is True
+    assert decision.code is not GateCode.NOT_PR_CREATE
+
+
 def test_scanner_exception_on_unrelated_request_is_silent(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ):

@@ -23,6 +23,8 @@ _ALWAYS_AMBIGUOUS_FAILURES = {
     "ANSI_C_QUOTE",
     "BASE_OPTION",
     "DYNAMIC_PR_ARGUMENT",
+    "DYNAMIC_SHELL_SCRIPT",
+    "ENV_SPLIT_STRING",
     "TARGET_BINDING",
     "TARGET_OVERRIDE",
     "UNSAFE_PR_CONTEXT",
@@ -104,6 +106,20 @@ _PR_CONTENT_LONG_VALUE_OPTIONS = {
 }
 _PR_CONTENT_SHORT_VALUE_OPTIONS = set("abFlmprTt")
 _PR_BOOLEAN_SHORT_OPTIONS = set("defw")
+_ANSI_C_SIMPLE_ESCAPES = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+}
 _ENV_FLAGS = {"-i", "--ignore-environment"}
 _ENV_VALUE_OPTIONS = {"-u", "-C"}
 _SHELLS = {"sh", "bash", "dash"}
@@ -368,6 +384,52 @@ class _Parser:
                 self.index += 1
                 if self.index >= self.length:
                     break
+                escape = self.command[self.index]
+                if escape in _ANSI_C_SIMPLE_ESCAPES:
+                    pieces.append(_ANSI_C_SIMPLE_ESCAPES[escape])
+                    self.index += 1
+                    continue
+                if escape == "\n":
+                    self.index += 1
+                    continue
+                if escape in {"x", "u", "U"}:
+                    limit = {"x": 2, "u": 4, "U": 8}[escape]
+                    start = self.index + 1
+                    end = start
+                    while (
+                        end < self.length
+                        and end - start < limit
+                        and self.command[end] in "0123456789abcdefABCDEF"
+                    ):
+                        end += 1
+                    if end == start:
+                        pieces.extend(("\\", escape))
+                        self.index += 1
+                        continue
+                    try:
+                        pieces.append(chr(int(self.command[start:end], 16)))
+                    except ValueError:
+                        pieces.append("\ufffd")
+                    self.index = end
+                    continue
+                if escape in "01234567":
+                    start = self.index
+                    end = start
+                    while (
+                        end < self.length
+                        and end - start < 3
+                        and self.command[end] in "01234567"
+                    ):
+                        end += 1
+                    pieces.append(chr(int(self.command[start:end], 8)))
+                    self.index = end
+                    continue
+                if escape == "c" and self.index + 1 < self.length:
+                    controlled = self.command[self.index + 1]
+                    pieces.append(chr(ord(controlled.upper()) & 0x1F))
+                    self.index += 2
+                    continue
+                pieces.extend(("\\", escape))
                 self.index += 1
                 continue
             pieces.append(char)
@@ -625,7 +687,10 @@ def _scan_simple_command(
     while index < len(words):
         executable = words[index]
         if executable.dynamic:
-            if executable.ansi_c and _contains_pr_create(words[index + 1 :]):
+            if executable.ansi_c and (
+                _could_form_pr_create(words[index + 1 :])
+                or _could_contain_gh_pr_create(words[index + 1 :])
+            ):
                 raise ScanFailure("ANSI_C_QUOTE")
             return False
         name = _basename(executable.text)
@@ -651,6 +716,9 @@ def _scan_simple_command(
             index = _skip_env(
                 words,
                 index + 1,
+                depth=depth,
+                budget=budget,
+                expected_base=expected_base,
                 enforce_target_binding=expected_base is not None,
             )
             continue
@@ -661,7 +729,10 @@ def _scan_simple_command(
     executable = words[index]
     arguments = words[index + 1 :]
     if executable.dynamic:
-        if executable.ansi_c and _contains_pr_create(arguments):
+        if executable.ansi_c and (
+            _could_form_pr_create(arguments)
+            or _could_contain_gh_pr_create(arguments)
+        ):
             raise ScanFailure("ANSI_C_QUOTE")
         return False
     name = _basename(executable.text)
@@ -672,6 +743,12 @@ def _scan_simple_command(
         return matched
     if name in _SHELLS and len(arguments) >= 2 and arguments[0].text == "-c":
         script = arguments[1]
+        if script.dynamic:
+            if script.ansi_c and _has_unquoted_candidate_hint(script.text):
+                raise ScanFailure("ANSI_C_QUOTE")
+            if not script.ansi_c and _has_unquoted_candidate_hint(script.text):
+                raise ScanFailure("DYNAMIC_SHELL_SCRIPT")
+            return False
         if not script.dynamic and not script.nested:
             parser = _Parser(script.text, budget)
             nested = parser.parse(depth + 1)
@@ -755,7 +832,13 @@ def _skip_time(words: list[_Word], index: int) -> int:
 
 
 def _skip_env(
-    words: list[_Word], index: int, *, enforce_target_binding: bool = False
+    words: list[_Word],
+    index: int,
+    *,
+    depth: int,
+    budget: _Budget,
+    expected_base: str | None = None,
+    enforce_target_binding: bool = False,
 ) -> int:
     while index < len(words):
         word = words[index]
@@ -774,6 +857,26 @@ def _skip_env(
         if value in _ENV_FLAGS:
             index += 1
             continue
+        if value in {"-S", "--split-string"}:
+            if index + 1 >= len(words):
+                raise ScanFailure("INCOMPLETE_ENV_OPTION")
+            _scan_env_split_string(
+                words[index + 1], depth, budget, expected_base
+            )
+            return len(words)
+        if value.startswith("--split-string=") or (
+            value.startswith("-S") and value != "-S"
+        ):
+            prefix = "--split-string=" if value.startswith("--") else "-S"
+            split_word = _Word(
+                value[len(prefix) :],
+                quoted=word.quoted,
+                dynamic=word.dynamic,
+                ansi_c=word.ansi_c,
+                nested=list(word.nested),
+            )
+            _scan_env_split_string(split_word, depth, budget, expected_base)
+            return len(words)
         if value in _ENV_VALUE_OPTIONS:
             if index + 1 >= len(words):
                 raise ScanFailure("INCOMPLETE_ENV_OPTION")
@@ -794,6 +897,22 @@ def _skip_env(
             return len(words)
         return index
     return index
+
+
+def _scan_env_split_string(
+    word: _Word,
+    depth: int,
+    budget: _Budget,
+    expected_base: str | None,
+) -> None:
+    if word.dynamic:
+        if word.ansi_c or _has_unquoted_candidate_hint(word.text):
+            raise ScanFailure("ENV_SPLIT_STRING")
+        return
+    parser = _Parser(word.text, budget)
+    nested = parser.parse(depth + 1)
+    if _scan_parsed_context(nested, budget, expected_base):
+        raise ScanFailure("ENV_SPLIT_STRING")
 
 
 def _scan_gh(

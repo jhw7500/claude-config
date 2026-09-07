@@ -110,6 +110,23 @@ def test_ansi_c_candidate_words_are_not_silently_ignored(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "g$'\\x68' p$'\\x72' c$'\\x72'eate --base master",
+        "bash -c $'g\\x68 pr create --base master'",
+        'bash -c "gh pr create --base master $DYNAMIC"',
+        "env -S 'gh pr create --base master'",
+        "env --split-string='gh pr create --base master'",
+    ],
+)
+def test_alternate_argv_pr_candidates_are_not_ignored(command):
+    assert scan_pr_create(command).kind in {
+        ScanKind.PR_CREATE,
+        ScanKind.AMBIGUOUS_CANDIDATE,
+    }
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "echo 'gh pr create'",
         'printf "%s\\n" "gh pr create"',
         "true # gh pr create",
@@ -129,7 +146,7 @@ def test_ansi_c_candidate_words_are_not_silently_ignored(command):
         '"FOO=1" gh pr create',
         "bash -c gh pr create",
         "bash -ec 'gh pr create'",
-        'bash -c "gh pr create $DYNAMIC"',
+        "bash -c $'printf\\nx'",
         "echo './gh\npr create'",
         "echo 'gh\x01pr create'",
         "true;\rgh pr create",
