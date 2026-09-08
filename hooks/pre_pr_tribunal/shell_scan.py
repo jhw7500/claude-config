@@ -1052,7 +1052,7 @@ def _skip_builtin(words: list[_Word], index: int) -> int:
     if index >= len(words):
         return index
     builtin_name = _basename(words[index].text)
-    if builtin_name in {"command", "exec"}:
+    if builtin_name in {"builtin", "command", "exec"}:
         return index
     if builtin_name == "eval" and _could_contain_gh_pr_create(words[index + 1 :]):
         raise ScanFailure("UNSAFE_PR_CONTEXT")
@@ -1076,15 +1076,11 @@ def _skip_execution_wrapper(
             break
         option_arity = _execution_wrapper_option_arity(wrapper, value)
         if option_arity == 1:
-            if wrapper == "taskset" and _taskset_cpu_list_option(value):
-                required_positionals = 0
             index += 1
             continue
         if option_arity == 2:
             if index + 1 >= len(words):
                 return len(words)
-            if wrapper == "taskset" and value in {"-c", "--cpu-list"}:
-                required_positionals = 0
             index += 2
             continue
         if value.startswith("-") and value != "-":
@@ -1095,12 +1091,6 @@ def _skip_execution_wrapper(
     if index + required_positionals > len(words):
         return len(words)
     return index + required_positionals
-
-
-def _taskset_cpu_list_option(value: str) -> bool:
-    return (len(value) > 2 and value.startswith("-c")) or value.startswith(
-        "--cpu-list="
-    )
 
 
 def _execution_wrapper_option_arity(wrapper: str, value: str) -> int | None:
@@ -1117,11 +1107,9 @@ def _execution_wrapper_option_arity(wrapper: str, value: str) -> int | None:
             return 1
         return None
     if wrapper == "taskset":
-        if value in {"-c", "--cpu-list"}:
-            return 2
-        if _taskset_cpu_list_option(value):
-            return 1
-        if value in {"-a", "--all-tasks"}:
+        if value in {"--all-tasks", "--cpu-list"} or re.fullmatch(
+            r"-[ac]+", value
+        ):
             return 1
         return None
     if wrapper == "chrt":

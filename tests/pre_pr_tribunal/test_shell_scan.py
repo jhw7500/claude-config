@@ -169,6 +169,53 @@ def test_transparent_execution_launcher_argument_data_remains_unrelated(command)
 @pytest.mark.parametrize(
     "command",
     [
+        "builtin builtin command /usr/bin/gh pr create --base master",
+        "builtin -- builtin -- exec /usr/bin/gh pr create --base master",
+    ],
+)
+def test_nested_builtin_launchers_are_ambiguous(command):
+    assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
+def test_nested_builtin_argument_data_remains_unrelated():
+    command = "builtin -- builtin -- printf /usr/bin/gh pr create --base master"
+
+    assert scan_pr_create(command).kind is ScanKind.NO_MATCH
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "taskset -ca 0 /usr/bin/gh pr create --base master",
+        "taskset -ac 0 /usr/bin/gh pr create --base master",
+        "taskset -c -a 0 /usr/bin/gh pr create --base master",
+    ],
+)
+def test_taskset_short_option_clusters_are_ambiguous(command):
+    assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "taskset -ca 0 printf /usr/bin/gh pr create --base master",
+        "taskset -ac 0 printf /usr/bin/gh pr create --base master",
+        "taskset -c -a 0 printf /usr/bin/gh pr create --base master",
+    ],
+)
+def test_taskset_short_option_cluster_argument_data_remains_unrelated(command):
+    assert scan_pr_create(command).kind is ScanKind.NO_MATCH
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "g$'h' pr create --draft",
         "g$'\\150' pr create --draft",
         "gh p$'r' create --draft",

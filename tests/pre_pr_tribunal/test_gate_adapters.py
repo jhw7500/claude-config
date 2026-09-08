@@ -361,6 +361,11 @@ def test_alias_and_coproc_forms_are_command_ambiguous(
         "ionice --class 3 /usr/bin/gh pr create --base master",
         "builtin command /usr/bin/gh pr create --base master",
         "builtin exec /usr/bin/gh pr create --base master",
+        "builtin builtin command /usr/bin/gh pr create --base master",
+        "builtin -- builtin -- exec /usr/bin/gh pr create --base master",
+        "taskset -ca 0 /usr/bin/gh pr create --base master",
+        "taskset -ac 0 /usr/bin/gh pr create --base master",
+        "taskset -c -a 0 /usr/bin/gh pr create --base master",
     ),
 )
 def test_control_and_execution_wrappers_are_command_ambiguous(
