@@ -3,181 +3,50 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Callable
 import argparse
-import ctypes
-import errno
-import json
 import os
-import re
-import secrets
 import stat
 import sys
 
 
 REPO = Path(__file__).resolve().parents[1]
+LIB = Path(__file__).resolve().parent / "lib"
+sys.path.insert(0, str(LIB))
+
+from runtime_hook_installer import (  # noqa: E402
+    InstallError,
+    PlannedWrite,
+    SelectorPrecondition as _SelectorPrecondition,
+    TargetSnapshot as _TargetSnapshot,
+    apply_transaction as _apply_transaction,
+    inspect_target as _inspect_target,
+    merge_pre_tool_hook,
+    read_regular_source as _read_regular_source,
+    render_json_config,
+    snapshot_matches as _snapshot_matches,
+    strict_json_object as _parse_json_config,
+    _retain_source_parent,
+)
+
+
 AGENTS_START = "<!-- claude-config:task-nudge:START -->"
 AGENTS_END = "<!-- claude-config:task-nudge:END -->"
 CLAUDE_MATCHER = "Edit|Write|NotebookEdit"
 CLAUDE_COMMAND = "$HOME/.claude/hooks/task-nudge.sh"
 CODEX_MATCHER = "apply_patch|Edit|Write"
 CODEX_COMMAND = "/usr/bin/python3 $HOME/.local/share/claude-config/hooks/task-nudge-codex.py"
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-_READ_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
-_SYSTEM_REPLACE = os.replace
-_RENAME_NOREPLACE = 1
-_LIBC = ctypes.CDLL(None, use_errno=True)
-_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
-if _RENAMEAT2 is not None:
-    _RENAMEAT2.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    ]
-    _RENAMEAT2.restype = ctypes.c_int
-
-
-@dataclass(frozen=True)
-class PlannedWrite:
-    path: Path
-    data: bytes
-    mode: int
-    backup: bool
-    allow_legacy_symlink: bool = False
-    precondition: _TargetSnapshot | None = None
-    selector_preconditions: tuple[_SelectorPrecondition, ...] = ()
-
-
-@dataclass(frozen=True)
-class _TargetSnapshot:
-    exists: bool
-    data: bytes = b""
-    mode: int = 0
-    link_target: str | None = None
-    identity: tuple[int, int, int] | None = None
-    link_identity: tuple[int, int, int] | None = None
-
-
-@dataclass(frozen=True)
-class _SelectorPrecondition:
-    path: Path
-    snapshot: _TargetSnapshot
-
-
-@dataclass(frozen=True)
-class _ParentHandle:
-    path: Path
-    descriptor: int
-
-
-@dataclass(frozen=True)
-class _OwnedEntry:
-    name: str
-    identity: tuple[int, int, int]
-
-
-@dataclass(frozen=True)
-class _CreatedDirectory:
-    parent_descriptor: int
-    name: str
-    identity: tuple[int, int, int]
-
-
-class InstallError(Exception):
-    """A bounded installer failure safe to surface without file contents."""
-
-
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    value: dict[str, object] = {}
-    for key, item in pairs:
-        if key in value:
-            raise InstallError("invalid JSON: duplicate key")
-        value[key] = item
-    return value
-
-
-def _parse_json_config(raw: bytes) -> dict[str, object]:
-    try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
-    except InstallError:
-        raise
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as error:
-        raise InstallError("invalid JSON configuration") from error
-    if not isinstance(value, dict):
-        raise InstallError("JSON configuration must be an object")
-    return value
 
 
 def load_json_config(path: Path) -> dict[str, object]:
     """Load one optional configuration object with duplicate-key rejection."""
     try:
-        raw = path.read_bytes()
+        return _parse_json_config(path.read_bytes())
     except FileNotFoundError:
         return {}
     except OSError as error:
         raise InstallError("cannot read JSON configuration") from error
-    return _parse_json_config(raw)
-
-
-def render_json_config(value: dict[str, object]) -> bytes:
-    return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-
-
-def managed_group(matcher: str, command: str) -> dict[str, object]:
-    return {
-        "matcher": matcher,
-        "hooks": [{"type": "command", "command": command}],
-    }
-
-
-def normalize_command(command: object, home: Path) -> str | None:
-    """Normalize HOME spellings only at a shell-token path boundary."""
-    if not isinstance(command, str):
-        return None
-    home_text = str(home)
-    if not home_text or home_text == "/":
-        return command
-    pattern = re.compile(r"(?:(?<=^)|(?<=\s))" + re.escape(home_text) + r"(?=/|$)")
-    return pattern.sub("$HOME", command)
-
-
-def _validated_pre_tool_groups(config: dict[str, object]) -> list[dict[str, object]]:
-    hooks = config.get("hooks")
-    if hooks is None:
-        hooks = {}
-        config["hooks"] = hooks
-    if not isinstance(hooks, dict):
-        raise InstallError("hooks must be an object")
-    groups = hooks.get("PreToolUse")
-    if groups is None:
-        groups = []
-        hooks["PreToolUse"] = groups
-    if not isinstance(groups, list):
-        raise InstallError("PreToolUse hooks must be a list")
-    for group in groups:
-        if not isinstance(group, dict):
-            raise InstallError("hook group must be an object")
-        matcher = group.get("matcher")
-        if matcher is not None and not isinstance(matcher, str):
-            raise InstallError("hook matcher must be a string")
-        records = group.get("hooks")
-        if not isinstance(records, list) or not records:
-            raise InstallError("hook records must be a non-empty list")
-        for record in records:
-            if (
-                not isinstance(record, dict)
-                or set(record) != {"type", "command"}
-                or record.get("type") != "command"
-                or not isinstance(record.get("command"), str)
-            ):
-                raise InstallError("unknown hook record shape")
-    return groups
 
 
 def merge_hook_config(
@@ -188,39 +57,13 @@ def merge_hook_config(
     legacy_commands: tuple[str, ...],
     home: Path,
 ) -> dict[str, object]:
-    """Add or replace exactly one managed PreToolUse command group."""
-    if not isinstance(original, dict):
-        raise InstallError("JSON configuration must be an object")
-    merged = deepcopy(original)
-    groups = _validated_pre_tool_groups(merged)
-    managed_commands = {
-        normalized
-        for candidate in (command, *legacy_commands)
-        if (normalized := normalize_command(candidate, home)) is not None
-    }
-    found: list[int] = []
-    for index, group in enumerate(groups):
-        records = group["hooks"]
-        assert isinstance(records, list)
-        matching = [
-            record
-            for record in records
-            if normalize_command(record["command"], home) in managed_commands
-        ]
-        if matching and len(records) != 1:
-            raise InstallError("managed command appears in a multi-hook group")
-        if matching:
-            if set(group) != {"matcher", "hooks"}:
-                raise InstallError("managed hook group has unknown fields")
-            found.append(index)
-    if len(found) > 1:
-        raise InstallError("multiple managed hook groups conflict")
-    replacement = managed_group(matcher, command)
-    if found:
-        groups[found[0]] = replacement
-    else:
-        groups.append(replacement)
-    return merged
+    return merge_pre_tool_hook(
+        original,
+        matcher=matcher,
+        command=command,
+        legacy_commands=legacy_commands,
+        home=home,
+    )
 
 
 def select_agents_path(home: Path) -> Path:
@@ -279,163 +122,17 @@ def agents_policy_block() -> str:
     )
 
 
-def _identity(metadata: os.stat_result) -> tuple[int, int, int]:
-    return (metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode))
-
-
-def _rename_noreplace(
-    source_descriptor: int,
-    source_name: str,
-    target_descriptor: int,
-    target_name: str,
-) -> None:
-    if _RENAMEAT2 is None:
-        raise InstallError("atomic no-replace rename is unavailable")
-    result = _RENAMEAT2(
-        source_descriptor,
-        os.fsencode(source_name),
-        target_descriptor,
-        os.fsencode(target_name),
-        _RENAME_NOREPLACE,
-    )
-    if result != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number))
-
-
-def _path_components(path: Path) -> tuple[str, ...]:
-    if not path.is_absolute() or ".." in path.parts:
-        raise InstallError("filesystem path must be absolute and normalized")
-    return tuple(part for part in path.parts[1:] if part not in {"", "."})
-
-
-def _open_absolute_directory(path: Path, *, missing_ok: bool = False) -> int | None:
-    descriptor = -1
+def _validate_home(home: Path) -> None:
+    """Require an existing real HOME after a descriptor-anchored path walk."""
+    if not home.is_absolute():
+        raise InstallError("HOME is unavailable")
+    _inspect_target(PlannedWrite(home / ".task-nudge-home-probe", b"", 0o600, False))
     try:
-        descriptor = os.open("/", _DIRECTORY_FLAGS)
-        for component in _path_components(path):
-            try:
-                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
-            except FileNotFoundError:
-                if missing_ok:
-                    os.close(descriptor)
-                    return None
-                raise
-            os.close(descriptor)
-            descriptor = child
-        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise InstallError("filesystem component is not a directory")
-        return descriptor
-    except InstallError:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise
+        metadata = home.lstat()
     except OSError as error:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise InstallError("cannot open filesystem directory safely") from error
-
-
-def _read_descriptor(descriptor: int) -> bytes:
-    chunks: list[bytes] = []
-    while True:
-        chunk = os.read(descriptor, 64 * 1024)
-        if not chunk:
-            return b"".join(chunks)
-        chunks.append(chunk)
-
-
-def _read_regular_at(
-    parent_descriptor: int,
-    name: str,
-    *,
-    before_open: Callable[[], None] | None = None,
-    missing_ok: bool = False,
-) -> tuple[bytes, os.stat_result] | None:
-    descriptor = -1
-    try:
-        before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-    except FileNotFoundError:
-        if missing_ok:
-            return None
-        raise InstallError("required file is missing")
-    except OSError as error:
-        raise InstallError("cannot inspect file safely") from error
-    if not stat.S_ISREG(before.st_mode):
-        raise InstallError("file is not a regular file")
-    if before_open is not None:
-        before_open()
-    try:
-        descriptor = os.open(name, _READ_FLAGS, dir_fd=parent_descriptor)
-        after = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or not stat.S_ISREG(after.st_mode)
-            or _identity(before) != _identity(after)
-        ):
-            raise InstallError("file identity changed during validation")
-        return _read_descriptor(descriptor), after
-    except InstallError:
-        raise
-    except OSError as error:
-        raise InstallError("cannot open regular file safely") from error
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _validate_absolute_directory(path: Path, label: str) -> None:
-    descriptor = -1
-    try:
-        descriptor = _open_absolute_directory(path)
-        assert descriptor is not None
-    except InstallError as error:
-        raise InstallError(f"{label} is unavailable") from error
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _read_source(
-    hooks_descriptor: int,
-    name: str,
-    path: Path,
-    before_source_open: Callable[[Path], None] | None,
-) -> bytes:
-    callback = None
-    if before_source_open is not None:
-        callback = lambda: before_source_open(path)
-    result = _read_regular_at(hooks_descriptor, name, before_open=callback)
-    assert result is not None
-    data, _ = result
-    if not data:
-        raise InstallError("required source is empty")
-    return data
-
-
-def _read_optional_regular_path(path: Path) -> bytes | None:
-    parent_descriptor = _open_absolute_directory(path.parent, missing_ok=True)
-    if parent_descriptor is None:
-        return None
-    try:
-        result = _read_regular_at(parent_descriptor, path.name, missing_ok=True)
-        return None if result is None else result[0]
-    finally:
-        os.close(parent_descriptor)
-
-
-def _inspect_target(plan: PlannedWrite) -> _TargetSnapshot:
-    if not plan.path.is_absolute():
-        raise InstallError("planned target must be absolute")
-    if plan.mode not in {0o600, 0o700}:
-        raise InstallError("planned target mode is not owner-only")
-    handle = _open_parent(plan.path, create=False, created_directories=[])
-    if handle is None:
-        return _TargetSnapshot(False)
-    try:
-        return _snapshot_at(handle, plan)
-    finally:
-        os.close(handle.descriptor)
+        raise InstallError("HOME is unavailable") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise InstallError("HOME is unavailable")
 
 
 def build_plan(
@@ -447,9 +144,7 @@ def build_plan(
     """Validate every input and return the complete task-nudge write set."""
     repo = Path(repo)
     home = Path(home)
-    _validate_absolute_directory(repo, "repository")
-    _validate_absolute_directory(home, "HOME")
-    _validate_absolute_directory(repo / "hooks", "source hooks directory")
+    _validate_home(home)
 
     source_names = (
         "task_nudge.py",
@@ -457,20 +152,14 @@ def build_plan(
         "task-nudge-codex.py",
         "task-nudge.sh",
     )
-    hooks_descriptor = _open_absolute_directory(repo / "hooks")
-    assert hooks_descriptor is not None
-    try:
+    with _retain_source_parent(repo / "hooks"):
         sources = {
-            name: _read_source(
-                hooks_descriptor,
-                name,
+            name: _read_regular_source(
                 repo / "hooks" / name,
-                before_source_open,
+                before_open=before_source_open,
             )
             for name in source_names
         }
-    finally:
-        os.close(hooks_descriptor)
 
     claude_config = home / ".claude" / "settings.json"
     codex_config = home / ".codex" / "hooks.json"
@@ -497,7 +186,9 @@ def build_plan(
     override_snapshot = _inspect_target(PlannedWrite(override, b"", 0o600, True))
     override_raw = override_snapshot.data if override_snapshot.exists else None
     try:
-        override_nonempty = override_raw is not None and bool(override_raw.decode("utf-8").strip())
+        override_nonempty = override_raw is not None and bool(
+            override_raw.decode("utf-8").strip()
+        )
     except UnicodeDecodeError as error:
         raise InstallError("AGENTS override is not UTF-8") from error
     agents_path = override if override_nonempty else home / ".codex" / "AGENTS.md"
@@ -511,13 +202,25 @@ def build_plan(
         agents_original = "" if agents_raw is None else agents_raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise InstallError("active AGENTS file is not UTF-8") from error
-    agents_data = merge_agents_block(agents_original, agents_policy_block()).encode("utf-8")
+    agents_data = merge_agents_block(agents_original, agents_policy_block()).encode(
+        "utf-8"
+    )
 
     installed = home / ".local" / "share" / "claude-config" / "hooks"
     plans = [
         PlannedWrite(installed / "task_nudge.py", sources["task_nudge.py"], 0o600, True),
-        PlannedWrite(installed / "task-nudge-claude.py", sources["task-nudge-claude.py"], 0o600, True),
-        PlannedWrite(installed / "task-nudge-codex.py", sources["task-nudge-codex.py"], 0o600, True),
+        PlannedWrite(
+            installed / "task-nudge-claude.py",
+            sources["task-nudge-claude.py"],
+            0o600,
+            True,
+        ),
+        PlannedWrite(
+            installed / "task-nudge-codex.py",
+            sources["task-nudge-codex.py"],
+            0o600,
+            True,
+        ),
         PlannedWrite(
             home / ".claude" / "hooks" / "task-nudge.sh",
             sources["task-nudge.sh"],
@@ -564,529 +267,8 @@ def build_plan(
     return validated_plans
 
 
-def _open_parent(
-    path: Path,
-    *,
-    create: bool,
-    created_directories: list[_CreatedDirectory],
-) -> _ParentHandle | None:
-    descriptor = os.open("/", _DIRECTORY_FLAGS)
-    try:
-        for component in _path_components(path.parent):
-            try:
-                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
-            except FileNotFoundError:
-                if not create:
-                    os.close(descriptor)
-                    return None
-                os.mkdir(component, 0o700, dir_fd=descriptor)
-                metadata = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
-                created_directories.append(
-                    _CreatedDirectory(os.dup(descriptor), component, _identity(metadata))
-                )
-                os.fsync(descriptor)
-                child = os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptor)
-                os.fchmod(child, 0o700)
-                os.fsync(child)
-            os.close(descriptor)
-            descriptor = child
-        return _ParentHandle(path.parent, descriptor)
-    except BaseException as error:
-        os.close(descriptor)
-        if isinstance(error, InstallError):
-            raise
-        raise InstallError("cannot open target parent safely") from error
-
-
-def _read_regular_absolute(path: Path) -> tuple[bytes, os.stat_result]:
-    parent_descriptor = _open_absolute_directory(path.parent)
-    assert parent_descriptor is not None
-    try:
-        result = _read_regular_at(parent_descriptor, path.name)
-        assert result is not None
-        return result
-    finally:
-        os.close(parent_descriptor)
-
-
-def _snapshot_at(
-    handle: _ParentHandle,
-    plan: PlannedWrite,
-    *,
-    entry_name: str | None = None,
-) -> _TargetSnapshot:
-    name = plan.path.name if entry_name is None else entry_name
-    try:
-        metadata = os.stat(name, dir_fd=handle.descriptor, follow_symlinks=False)
-    except FileNotFoundError:
-        return _TargetSnapshot(False)
-    except OSError as error:
-        raise InstallError("cannot inspect planned target safely") from error
-    if stat.S_ISLNK(metadata.st_mode):
-        is_legacy_shim = (
-            plan.allow_legacy_symlink
-            and plan.path.name == "task-nudge.sh"
-            and plan.path.parent.name == "hooks"
-            and plan.path.parent.parent.name == ".claude"
-        )
-        if not is_legacy_shim:
-            raise InstallError("planned target is an unsafe symlink")
-        try:
-            link_target = os.readlink(name, dir_fd=handle.descriptor)
-            candidate = Path(link_target)
-            if not candidate.is_absolute():
-                candidate = Path(os.path.normpath(os.fspath(handle.path / candidate)))
-            data, target_metadata = _read_regular_absolute(candidate)
-        except InstallError:
-            raise
-        except OSError as error:
-            raise InstallError("cannot read legacy shim symlink safely") from error
-        return _TargetSnapshot(
-            True,
-            data,
-            stat.S_IMODE(target_metadata.st_mode),
-            link_target,
-            _identity(metadata),
-            _identity(target_metadata),
-        )
-    result = _read_regular_at(handle.descriptor, name)
-    if result is None:
-        raise InstallError("planned target changed during validation")
-    data, opened_metadata = result
-    return _TargetSnapshot(
-        True,
-        data,
-        stat.S_IMODE(opened_metadata.st_mode),
-        None,
-        _identity(opened_metadata),
-    )
-
-
-def _snapshot_matches(left: _TargetSnapshot, right: _TargetSnapshot) -> bool:
-    return left == right
-
-
-def _entry_identity(handle: _ParentHandle, name: str) -> tuple[int, int, int] | None:
-    try:
-        return _identity(os.stat(name, dir_fd=handle.descriptor, follow_symlinks=False))
-    except FileNotFoundError:
-        return None
-    except OSError as error:
-        raise InstallError("cannot inspect transaction entry") from error
-
-
-def _write_all(descriptor: int, data: bytes) -> None:
-    view = memoryview(data)
-    while view:
-        written = os.write(descriptor, view)
-        if written <= 0:
-            raise OSError("short transactional write")
-        view = view[written:]
-
-
-def _unlink_owned(handle: _ParentHandle, entry: _OwnedEntry) -> None:
-    identity = _entry_identity(handle, entry.name)
-    if identity is None:
-        return
-    if identity != entry.identity:
-        raise InstallError("transaction entry ownership changed")
-    os.unlink(entry.name, dir_fd=handle.descriptor)
-    os.fsync(handle.descriptor)
-
-
-def _stage_regular_at(
-    handle: _ParentHandle,
-    data: bytes,
-    mode: int,
-    prefix: str,
-) -> _OwnedEntry:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-    for _ in range(128):
-        name = prefix + secrets.token_hex(12)
-        descriptor = -1
-        owned: _OwnedEntry | None = None
-        try:
-            descriptor = os.open(name, flags, mode, dir_fd=handle.descriptor)
-            os.fchmod(descriptor, mode)
-            owned = _OwnedEntry(name, _identity(os.fstat(descriptor)))
-            _write_all(descriptor, data)
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = -1
-            os.fsync(handle.descriptor)
-            return owned
-        except FileExistsError:
-            continue
-        except BaseException as error:
-            if descriptor >= 0:
-                os.close(descriptor)
-            if owned is not None:
-                try:
-                    _unlink_owned(handle, owned)
-                except BaseException:
-                    pass
-            if isinstance(error, InstallError):
-                raise
-            raise InstallError("cannot stage transactional file") from error
-    raise InstallError("cannot allocate transactional stage name")
-
-
-def _stage_restore_at(handle: _ParentHandle, snapshot: _TargetSnapshot) -> _OwnedEntry:
-    if snapshot.link_target is None:
-        return _stage_regular_at(
-            handle,
-            snapshot.data,
-            snapshot.mode,
-            ".task-nudge-restore.",
-        )
-    for _ in range(128):
-        name = ".task-nudge-restore." + secrets.token_hex(12)
-        try:
-            os.symlink(snapshot.link_target, name, dir_fd=handle.descriptor)
-            identity = _entry_identity(handle, name)
-            assert identity is not None
-            owned = _OwnedEntry(name, identity)
-            os.fsync(handle.descriptor)
-            return owned
-        except FileExistsError:
-            continue
-        except BaseException as error:
-            if "owned" in locals():
-                try:
-                    _unlink_owned(handle, owned)
-                except BaseException:
-                    pass
-            if isinstance(error, InstallError):
-                raise
-            raise InstallError("cannot stage transaction restore") from error
-    raise InstallError("cannot allocate transaction restore name")
-
-
-def _write_backup_at(handle: _ParentHandle, name: str, data: bytes) -> _OwnedEntry:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-    descriptor = -1
-    owned: _OwnedEntry | None = None
-    try:
-        descriptor = os.open(name, flags, 0o600, dir_fd=handle.descriptor)
-        os.fchmod(descriptor, 0o600)
-        owned = _OwnedEntry(name, _identity(os.fstat(descriptor)))
-        _write_all(descriptor, data)
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        os.fsync(handle.descriptor)
-        return owned
-    except BaseException as error:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if owned is not None:
-            try:
-                _unlink_owned(handle, owned)
-            except BaseException:
-                pass
-        if isinstance(error, InstallError):
-            raise
-        raise InstallError("cannot create transaction backup") from error
-
-
-def _claim_target_at(handle: _ParentHandle, target_name: str) -> _OwnedEntry:
-    for _ in range(128):
-        quarantine_name = ".task-nudge-quarantine." + secrets.token_hex(12)
-        try:
-            _rename_noreplace(
-                handle.descriptor,
-                target_name,
-                handle.descriptor,
-                quarantine_name,
-            )
-        except OSError as error:
-            if error.errno == errno.EEXIST:
-                continue
-            raise InstallError("cannot atomically claim target") from error
-        identity = _entry_identity(handle, quarantine_name)
-        if identity is None:
-            raise InstallError("claimed target disappeared")
-        return _OwnedEntry(quarantine_name, identity)
-    raise InstallError("cannot allocate target quarantine")
-
-
-def _restore_claim_at(
-    handle: _ParentHandle,
-    quarantine: _OwnedEntry,
-    target_name: str,
-) -> None:
-    if _entry_identity(handle, quarantine.name) != quarantine.identity:
-        raise InstallError("target quarantine ownership changed")
-    _rename_noreplace(
-        handle.descriptor,
-        quarantine.name,
-        handle.descriptor,
-        target_name,
-    )
-    os.fsync(handle.descriptor)
-
-
-def _remove_created_directories(
-    created: list[_CreatedDirectory],
-    *,
-    require_empty: bool = False,
-) -> bool:
-    failed = False
-    for directory in reversed(created):
-        try:
-            current = os.stat(
-                directory.name,
-                dir_fd=directory.parent_descriptor,
-                follow_symlinks=False,
-            )
-            if _identity(current) != directory.identity:
-                failed = True
-                continue
-            os.rmdir(directory.name, dir_fd=directory.parent_descriptor)
-            os.fsync(directory.parent_descriptor)
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            if require_empty or error.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
-                failed = True
-        finally:
-            os.close(directory.parent_descriptor)
-    return failed
-
-
-def apply_transaction(
-    writes: list[PlannedWrite],
-    *,
-    replace: Callable[[os.PathLike[str], os.PathLike[str]], object] = _SYSTEM_REPLACE,
-    stamp: str | None = None,
-    phase_hook: Callable[[str, Path], None] | None = None,
-) -> list[Path]:
-    """Apply a descriptor-anchored write set and roll it back on failure."""
-    stamp = stamp or datetime.now().strftime("%Y%m%d%H%M%S")
-    if re.fullmatch(r"[0-9]{14}", stamp) is None:
-        raise InstallError("invalid backup timestamp")
-    ordered = sorted(writes, key=lambda plan: os.fspath(plan.path))
-    if len({plan.path for plan in ordered}) != len(ordered):
-        raise InstallError("duplicate planned target")
-    selector_preconditions: dict[Path, _TargetSnapshot] = {}
-    for plan in ordered:
-        if not plan.path.is_absolute() or plan.mode not in {0o600, 0o700}:
-            raise InstallError("invalid planned target")
-        for selector in plan.selector_preconditions:
-            if not selector.path.is_absolute():
-                raise InstallError("invalid selector precondition")
-            if (
-                selector.path in selector_preconditions
-                and selector_preconditions[selector.path] != selector.snapshot
-            ):
-                raise InstallError("conflicting selector preconditions")
-            selector_preconditions[selector.path] = selector.snapshot
-
-    snapshots: dict[Path, _TargetSnapshot] = {}
-    for plan in ordered:
-        handle = _open_parent(plan.path, create=False, created_directories=[])
-        if handle is None:
-            current = _TargetSnapshot(False)
-        else:
-            try:
-                current = _snapshot_at(handle, plan)
-            finally:
-                os.close(handle.descriptor)
-        if plan.precondition is not None and not _snapshot_matches(
-            current, plan.precondition
-        ):
-            raise InstallError("planned target changed since plan was built")
-        snapshots[plan.path] = current
-    for path, expected in selector_preconditions.items():
-        current = snapshots.get(path)
-        if current is None:
-            current = _inspect_target(PlannedWrite(path, b"", 0o600, False))
-        if not _snapshot_matches(current, expected):
-            raise InstallError("AGENTS selector changed since plan was built")
-    changed = [
-        plan
-        for plan in ordered
-        if not (
-            snapshots[plan.path].exists
-            and snapshots[plan.path].link_target is None
-            and snapshots[plan.path].data == plan.data
-            and snapshots[plan.path].mode == plan.mode
-        )
-    ]
-    if not changed:
-        return []
-
-    backup_names = {
-        plan.path: plan.path.name + ".bak.task-nudge." + stamp
-        for plan in changed
-        if plan.backup and snapshots[plan.path].exists
-    }
-    for plan in changed:
-        backup_name = backup_names.get(plan.path)
-        if backup_name is None:
-            continue
-        handle = _open_parent(plan.path, create=False, created_directories=[])
-        assert handle is not None
-        try:
-            if _entry_identity(handle, backup_name) is not None:
-                raise InstallError("transaction backup already exists")
-        finally:
-            os.close(handle.descriptor)
-
-    created_directories: list[_CreatedDirectory] = []
-    handles: dict[Path, _ParentHandle] = {}
-    staged: dict[Path, _OwnedEntry] = {}
-    restores: dict[Path, _OwnedEntry] = {}
-    created_backups: dict[Path, _OwnedEntry] = {}
-    quarantines: dict[Path, _OwnedEntry] = {}
-    replaced: list[PlannedWrite] = []
-    rollback_failed = False
-    try:
-        for plan in changed:
-            handle = _open_parent(
-                plan.path,
-                create=True,
-                created_directories=created_directories,
-            )
-            assert handle is not None
-            handles[plan.path] = handle
-            if not _snapshot_matches(_snapshot_at(handle, plan), snapshots[plan.path]):
-                raise InstallError("planned target changed after preflight")
-        for plan in changed:
-            handle = handles[plan.path]
-            staged[plan.path] = _stage_regular_at(
-                handle,
-                plan.data,
-                plan.mode,
-                ".task-nudge-stage.",
-            )
-            if snapshots[plan.path].exists:
-                restores[plan.path] = _stage_restore_at(handle, snapshots[plan.path])
-        for plan in changed:
-            backup_name = backup_names.get(plan.path)
-            if backup_name is None:
-                continue
-            handle = handles[plan.path]
-            if phase_hook is not None:
-                phase_hook("before_backup_revalidate", plan.path)
-            if not _snapshot_matches(_snapshot_at(handle, plan), snapshots[plan.path]):
-                raise InstallError("planned target changed before backup")
-            if phase_hook is not None:
-                phase_hook("before_backup_create", plan.path.with_name(backup_name))
-            created_backups[plan.path] = _write_backup_at(
-                handle,
-                backup_name,
-                snapshots[plan.path].data,
-            )
-        for plan in changed:
-            handle = handles[plan.path]
-            if phase_hook is not None:
-                phase_hook("before_replace_revalidate", plan.path)
-            if not _snapshot_matches(_snapshot_at(handle, plan), snapshots[plan.path]):
-                raise InstallError("planned target changed before replacement")
-            stage = staged[plan.path]
-            if snapshots[plan.path].exists:
-                if phase_hook is not None:
-                    phase_hook("before_target_claim", plan.path)
-                quarantine = _claim_target_at(handle, plan.path.name)
-                quarantines[plan.path] = quarantine
-                os.fsync(handle.descriptor)
-                captured = _snapshot_at(handle, plan, entry_name=quarantine.name)
-                if not _snapshot_matches(captured, snapshots[plan.path]):
-                    raise InstallError("atomically claimed target did not match snapshot")
-            if phase_hook is not None:
-                phase_hook("after_target_claim", plan.path)
-            try:
-                if replace is _SYSTEM_REPLACE:
-                    _rename_noreplace(
-                        handle.descriptor,
-                        stage.name,
-                        handle.descriptor,
-                        plan.path.name,
-                    )
-                else:
-                    replace(handle.path / stage.name, plan.path)
-            except BaseException:
-                if _entry_identity(handle, stage.name) is None:
-                    replaced.append(plan)
-                raise
-            replaced.append(plan)
-            os.fsync(handle.descriptor)
-        for plan, quarantine in list(quarantines.items()):
-            _unlink_owned(handles[plan], quarantine)
-            del quarantines[plan]
-        for plan, restore in list(restores.items()):
-            _unlink_owned(handles[plan], restore)
-            del restores[plan]
-        return [plan.path for plan in changed]
-    except BaseException as error:
-        for plan in reversed(replaced):
-            handle = handles[plan.path]
-            snapshot = snapshots[plan.path]
-            try:
-                current_identity = _entry_identity(handle, plan.path.name)
-                if current_identity != staged[plan.path].identity:
-                    raise InstallError("replacement ownership changed before rollback")
-                _unlink_owned(
-                    handle,
-                    _OwnedEntry(plan.path.name, staged[plan.path].identity),
-                )
-                if snapshot.exists:
-                    quarantine = quarantines.get(plan.path)
-                    if (
-                        quarantine is not None
-                        and _entry_identity(handle, quarantine.name) == quarantine.identity
-                    ):
-                        _restore_claim_at(handle, quarantine, plan.path.name)
-                        quarantines.pop(plan.path, None)
-                    else:
-                        restore = restores.get(plan.path)
-                        if restore is None or _entry_identity(handle, restore.name) != restore.identity:
-                            restore = _stage_restore_at(handle, snapshot)
-                        _rename_noreplace(
-                            handle.descriptor,
-                            restore.name,
-                            handle.descriptor,
-                            plan.path.name,
-                        )
-                        os.fsync(handle.descriptor)
-                        restores.pop(plan.path, None)
-            except BaseException:
-                rollback_failed = True
-        for plan, quarantine in list(quarantines.items()):
-            try:
-                if _entry_identity(handles[plan], plan.name) is not None:
-                    rollback_failed = True
-                    continue
-                _restore_claim_at(handles[plan], quarantine, plan.name)
-                quarantines.pop(plan, None)
-            except BaseException:
-                rollback_failed = True
-        if not rollback_failed:
-            for plan, backup in reversed(list(created_backups.items())):
-                try:
-                    _unlink_owned(handles[plan], backup)
-                except BaseException:
-                    rollback_failed = True
-        for mapping in (staged, restores):
-            for plan, entry in list(mapping.items()):
-                try:
-                    _unlink_owned(handles[plan], entry)
-                except BaseException:
-                    rollback_failed = True
-        if _remove_created_directories(created_directories, require_empty=True):
-            rollback_failed = True
-        created_directories = []
-        message = "transaction failed and rollback was incomplete" if rollback_failed else "transaction failed"
-        raise InstallError(message) from error
-    finally:
-        for handle in handles.values():
-            try:
-                os.close(handle.descriptor)
-            except OSError:
-                pass
-        if created_directories:
-            _remove_created_directories(created_directories)
+def apply_transaction(writes, **kwargs):
+    return _apply_transaction(writes, namespace="task-nudge", **kwargs)
 
 
 def _cli_home(value: str | None) -> Path:
@@ -1111,7 +293,10 @@ def main(argv: list[str] | None = None) -> int:
     except InstallError as error:
         print(f"install-task-nudge: {error}", file=sys.stderr)
         return 1
-    print(f"task-nudge installed ({len(changed)} changed); review and trust the Codex hook with /hooks")
+    print(
+        f"task-nudge installed ({len(changed)} changed); "
+        "review and trust the Codex hook with /hooks"
+    )
     return 0
 
 

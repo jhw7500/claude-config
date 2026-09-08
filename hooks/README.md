@@ -60,12 +60,14 @@ fi
 | `task-nudge-claude.py` | Claude PreToolUse: `Edit\|Write\|NotebookEdit` | 공통 core 결과를 Claude 평문 `[TASK-NUDGE]`로 어댑트 |
 | `task-nudge-codex.py` | Codex PreToolUse: `apply_patch\|Edit\|Write` | 공통 core 결과를 Codex `systemMessage`로 어댑트; `--manual-check`는 state를 만들지 않는 fallback 확인 |
 | `task-nudge.sh` | Claude PreToolUse compatibility shim | 설치된 neutral Claude adapter를 호출 |
+| `pre_pr_tribunal/claude_hook.py` | Claude PreToolUse: `Bash` | direct `gh pr create`를 현재 repository snapshot의 tribunal pass verdict에 결합 |
+| `pre_pr_tribunal/codex_hook.py` | Codex PreToolUse: matcher 없음 | 미래 shell tool 이름도 포함해 같은 tribunal gate를 적용 |
 | `delegate-nudge-hook.py` | UserPromptSubmit | 직전 턴 메인 스레드 탐색성 호출·tool_result 바이트가 임계(기본 10회/100KB) 초과 시 위임 넛지 주입 — 세션당 최대 3회, 발화마다 임계 2배, 발화/억제를 `state/delegate-nudge/log.jsonl`에 기록 |
 | `precompact-handoff.sh` | PreCompact | HANDOFF 파일이 없거나 낡았으면 auto compaction 을 막고 /handoff 를 요구 (manual 은 경고만) |
 
 ## 동작 원칙
 
-1. **exit 0, permission deny 없음**: 모든 훅은 예외가 나도 exit 0이며 Claude/Codex의 도구 실행을 permission-deny하지 않는다. `task-nudge`만은 bounded `unknown`을 출력해 에이전트가 분류 복구 전 후속 실질 변경을 멈추게 하는 명시적 예외이고, 훅 자체는 여전히 차단하지 않는다.
+1. **bounded adapter**: 일반 reminder 훅은 예외가 나도 exit 0이며 permission-deny하지 않는다. `pre-pr-tribunal` adapter도 exit 0이지만 direct `gh pr create`에는 runtime-native deny JSON을 내는 명시적 gate다. `task-nudge`의 bounded `unknown`은 분류 복구 전 변경을 멈추게 하지만 훅 자체는 차단하지 않는다.
 2. **선택적 주입**: 트리거 조건이 맞지 않으면 stdout에 아무것도 쓰지 않는다 (훅이 없는 것과 동일).
 3. **Escape hatch**: 사용자 메시지 시작에 `#noreminder`, `#nr`, `#raw`, `#silent`, `#조용히` 중 하나가 있으면 UserPromptSubmit 훅들이 주입을 스킵한다.
 4. **전역 규칙 참조**: 훅 reminder는 행동 트리거만 담고, 세부 규칙은 `~/.claude/CLAUDE.md`를 참조하도록 설계.
@@ -79,6 +81,135 @@ fi
 ```
 
 정상 `registered`/`unregistered` 안내는 runtime+session별 atomic marker로 **최대 한 번**만 출력한다. `unknown`과 결정적 제외는 marker를 소비하지 않으므로, unknown은 다음 변경 후보에서 재조회·재안내할 수 있다. 두 adapter의 matcher 범위는 표의 exact scope뿐이며, 이 안내는 Task/Claim이나 Project Control mutation을 실행하지 않는다.
+
+## pre-PR tribunal 운영
+
+설치기는 Claude의 `Bash` matcher와 Codex의 matcherless `PreToolUse` group을 한 transaction으로
+추가한다. 관련 없는 command와 current pass verdict에 결합된 direct PR command에는 adapter가 아무
+decision도 출력하지 않는다. direct 후보가 모호하거나 현재 verdict가 없거나 안전하지 않으면
+`[PRE-PR-TRIBUNAL:<CODE>]` reason이 포함된 deny를 출력한다.
+
+Pass 경로의 canonical command는 `PATH=/usr/bin:/bin /usr/bin/gh pr create --base <verdict-base>` 한 개다. Literal base가
+verdict와 정확히 같아야 하며 `GH_REPO`/repo/head override, 다른 command segment, command
+substitution, redirection, shell/glob expansion, cwd-changing `env`, output-writing `time`, shell
+`-c`, ANSI-C 또는 `env -S`로 만든 대체 argv는 통과하지 않는다. 여기에는 GNU `env`의
+short-option cluster, unambiguous long-option 축약, split operand 뒤 argv, shell `-c` 앞의
+operand option, `pr`과 `create` 사이의 `gh` global option이 포함된다. 실행 위치에서 quote나
+backslash가 제거되어 `gh`가 되는 이름도 후보이며, GNU split-string `\c` 종료 문법은
+`COMMAND_AMBIGUOUS`로 fail closed한다. Official `gh pr new` alias, Bash `coproc` candidate와
+bound candidate 앞의 dynamic simple-command/`env` assignment도 ambiguous다. Inherited
+`GH_HOST=github.com`과 격리된 `GH_CONFIG_DIR`는 target을 바꾸지 않으므로 허용하지만 다른
+inherited host, `GH_REPO`, target에 영향을 주는 Git execution environment는 거부한다.
+System/global/local/worktree scope의 effective `remote.<name>.gh-resolved=base` marker는
+없거나 origin을 가리키는 exact marker 하나만 허용하며, 다른 default repository는
+`REPOSITORY_UNSUPPORTED`다.
+Command-local PATH는 유일한 선행 assignment인 exact `PATH=/usr/bin:/bin`이고 executable은
+literal `/usr/bin/gh`여야 한다. PATH 바인딩 누락·중복·변형, Bash `+=`, 추가 `HOME`/config
+assignment, bare/다른 path, control/process wrapper와 `LD_*`, `DYLD_*` override는
+`COMMAND_AMBIGUOUS`로 fail closed한다. Process wrapper에는 Bash `builtin command`/
+`builtin exec`, `chrt`, `ionice`, `nice`, `nohup`, `setsid`, `stdbuf`, `sudo`, `taskset`,
+`timeout`이 포함된다.
+1 MiB를 넘는 payload는 JSON을 해석하거나 입력을 반사하지 않고 `COMMAND_AMBIGUOUS`로 거부한다.
+
+deny reason code와 기본 복구는 다음과 같다.
+
+| Code | 의미와 복구 |
+|---|---|
+| `COMMAND_AMBIGUOUS` | direct command, target 또는 실행 전 snapshot 보존을 확정할 수 없다. 다른 shell 동작을 제거하고 literal `--base <verdict-base>`를 쓰며, oversized payload면 command를 줄인 뒤 다시 실행한다. |
+| `TRIBUNAL_REQUIRED`, `REVIEW_INCOMPLETE` | verdict가 없거나 round가 끝나지 않았다. `/pre-pr-tribunal` 또는 `$pre-pr-tribunal`로 현재 round를 완료한다. |
+| `BLOCKERS_OPEN` | Critical/High finding이 열려 있다. Skill의 decision/fix/re-review 흐름을 계속한다. |
+| `ROUND_LIMIT_EXHAUSTED` | 3 round 뒤에도 blocker가 남았다. 자동 진행을 멈추고 사용자 결정을 받는다. |
+| `WORKTREE_DIRTY`, `VERDICT_STALE` | HEAD/base/merge-base/diff 또는 clean 상태가 verdict와 다르다. 변경을 정리하고 새 snapshot으로 Skill을 다시 시작한다. |
+| `REPOSITORY_UNSUPPORTED` | exact repository root, GitHub origin 또는 supported Git 상태가 아니다. root와 remote를 확인한다. |
+| `VERDICT_UNSAFE`, `VERDICT_INVALID` | `.review` 권한·파일 형식·schema/state invariant가 안전하지 않다. 우회하지 말고 원인을 고친 뒤 Skill로 재생성한다. |
+
+`finalize`가 reviewer report의 `TEXT_INVALID` 같은 schema 오류로 멈췄지만 verdict가 여전히
+`in_progress`라면, 기존 verdict를 reset하거나 `.review`를 지우지 않는다. 같은 bound snapshot과
+clean 상태를 확인한 뒤 fresh detached view에서 A/B/C 전원을 다시 실행한다. 기존 C가 valid였더라도
+재사용하지 않고, 세 reviewer의 exact 새 terminal JSON으로 inbox 세 파일을 교체한 다음 같은 round를
+`finalize`한다. JSON-decoded string은 NFC여야 하고 Unicode `Cc`/`Cs`를 포함할 수 없으므로 LF/TAB은
+escape로 표현해도 invalid다. Snapshot이 달라졌으면 이 pending 복구를 중단하고 사용자 판단을 받는다.
+
+`head_ref`가 도입되기 전에 생성된 terminal FAIL verdict는 다음 round `begin`에서만 현재 named
+branch를 새 snapshot에 기록하며 자동 전환된다. 그런 legacy verdict 자체는 PR을 허용하지 않는다.
+Legacy PASS 또는 in-progress state는 stale/invalid로 닫고 새 Tribunal로 복구한다.
+
+verdict는 exact clean repository root, GitHub origin, remote base SHA, symbolic HEAD ref, HEAD SHA,
+merge-base, diff digest에 결합된다. 그중 하나가 바뀌거나 untracked 파일을 포함해 worktree가 dirty면
+stale/dirty deny다.
+`.review/`는 repository-local ignored state이며 directory는 `0700`, JSON/lock file은 `0600`의
+현재 사용자 소유 regular target이어야 한다. symlink, unsafe mode, 다른 checkout의 verdict 재사용은
+허용하지 않는다.
+
+직접 adapter와 fake-runtime harness 검증은 다음 exact command다.
+
+```bash
+rtk python3 -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py tests/pre_pr_tribunal/test_gate_adapters.py
+```
+
+실제 runtime canary는 verified `/usr/bin/bwrap` 안에서 GitHub hostname을 sinkhole하고,
+발견된 모든 fixed `gh` 경로를 exact fake executable로 덮는다. Runtime
+stdout/stderr는 `/dev/null`로 폐기하고 canary wrapper와 fake `gh`가 남긴 marker만
+판정한다. Missing phase는 hook `D`, fake-`gh` 0회여야 하고 pass phase는 hook `A`,
+fake-`gh` 1회여야 한다. 그 경계를 준비할 수 없으면 fail closed하며 live config나
+real `gh`로 fallback하지 않는다.
+
+Report는 schema v2의 bounded JSON이며 성공 예시는 다음과 같다.
+
+```json
+{
+  "schema": 2,
+  "status": "PASS",
+  "claude": {
+    "status": "PASS",
+    "missing": {"runtime_exit": "ZERO", "hook": "DENY", "gh_calls": 0},
+    "pass": {"runtime_exit": "ZERO", "hook": "ALLOW", "gh_calls": 1}
+  }
+}
+```
+
+Runtime/execution 단계의 stable public failure status는 정확히 다음 8개다.
+
+- `CREDENTIAL_UNAVAILABLE`
+- `RUNTIME_UNAVAILABLE`
+- `ISOLATION_UNAVAILABLE`
+- `RUNTIME_FAILED`
+- `TIMEOUT`
+- `CANARY_MISMATCH`
+- `SETUP_FAILED`
+- `CLEANUP_FAILED`
+
+CLI 입력 검증 단계의 public failure status는 별도로 `USAGE`,
+`INVALID_REPO_SOURCE`, `INVALID_WORK_DIR`를 사용한다.
+
+기본 `--auth-source subscription`은 caller의 기존 subscription login만 사용하며 API key로
+fallback하지 않는다. API-key billing을 의도적으로 승인한 경우에만
+`--auth-source environment`를 명시해 opt-in한다. Claude OAuth는 두 120초 runtime
+phase, 두 30초 begin/finalize deadline과 30초 scheduling cushion을 합친 behavioral
+330초 validity margin을 요구하고 child environment에만 전달한다. Codex auth는
+sealed memfd에 보관하고 bubblewrap 내 private writable tmpfs
+`CODEX_HOME/auth.json`을 초기화해 atomic refresh를 허용하며, hooks overlay는
+read-only로 유지한다. Environment-mode API key는 bubblewrap `--setenv`를 포함한 argv에
+넣지 않고 runtime별 최소 child environment로만 상속한다. 따라서 host filesystem이나
+process argv에 credential copy를 만들지 않는다.
+
+SIGTERM이나 SIGKILL로 probe가 비정상 종료되면 credential이 없는 임시
+repository/config residue는 남을 수 있다. Provider network는 Claude와 Codex별로
+분리하지 않고 connectivity를 공유한다. 따라서 GitHub sinkhole/fake executable
+경계 밖의 일반 egress 차단이나 provider connectivity 보장은 이 harness의 계약이 아니다.
+
+```bash
+rtk python3 scripts/probe-pre-pr-tribunal.py --runtime claude --repo-source "$PWD"
+rtk python3 scripts/probe-pre-pr-tribunal.py --runtime codex --repo-source "$PWD"
+rtk python3 scripts/probe-pre-pr-tribunal.py --runtime claude --auth-source environment --repo-source "$PWD"
+```
+
+uninstall 또는 수동 복구 시 전체 `settings.json`, `hooks.json`, `hooks.PreToolUse`를 삭제하지 않는다.
+Claude에서는 matcher가 `Bash`이고 command가 installed `pre_pr_tribunal/claude_hook.py`인 group만,
+Codex에서는 command가 installed `pre_pr_tribunal/codex_hook.py`인 matcherless group만 제거한다. 이어서
+두 runtime의 `skills/pre-pr-tribunal` link와
+`$HOME/.local/share/claude-config/pre_pr_tribunal/` package만 대상으로 한다. 다른 hook group과 Skill은
+보존하며, repository의 `.review/`는 해당 review를 명시적으로 폐기할 때만 별도로 제거한다.
 
 ## 검증 명령 위생 가드
 

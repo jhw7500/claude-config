@@ -1,16 +1,16 @@
 import json
 import os
+from pathlib import Path
 import shutil
 import stat
 import subprocess
 
 import pytest
 
-from conftest import REPO
-
-
+REPO = Path(__file__).resolve().parents[2]
 CLAUDE_COMMAND = "$HOME/.claude/hooks/task-nudge.sh"
 CODEX_COMMAND = "/usr/bin/python3 $HOME/.local/share/claude-config/hooks/task-nudge-codex.py"
+TRIBUNAL_CODEX_COMMAND = "/usr/bin/python3 $HOME/.local/share/claude-config/pre_pr_tribunal/codex_hook.py"
 START = "<!-- claude-config:task-nudge:START -->"
 END = "<!-- claude-config:task-nudge:END -->"
 
@@ -95,7 +95,10 @@ def test_fresh_install_adds_neutral_hooks_codex_config_and_agents(home, run_inst
     assert stat.S_IMODE(shim.stat().st_mode) == 0o700
     codex = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     groups = codex["hooks"]["PreToolUse"]
-    assert groups == [{"matcher": "apply_patch|Edit|Write", "hooks": [{"type": "command", "command": CODEX_COMMAND}]}]
+    assert groups == [
+        {"matcher": "apply_patch|Edit|Write", "hooks": [{"type": "command", "command": CODEX_COMMAND}]},
+        {"hooks": [{"type": "command", "command": TRIBUNAL_CODEX_COMMAND}]},
+    ]
     claude_groups = _pretool_entries(home / ".claude" / "settings.json")
     assert [group for group in claude_groups if group["hooks"] == [{"type": "command", "command": CLAUDE_COMMAND}]] == [
         {"matcher": "Edit|Write|NotebookEdit", "hooks": [{"type": "command", "command": CLAUDE_COMMAND}]}

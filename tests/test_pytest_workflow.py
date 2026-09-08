@@ -77,11 +77,60 @@ def _assert_unconditional_required_gate(element, label):
     assert continue_on_error != "true", f"{label} must not continue on error"
 
 
+def _load_workflow():
+    return yaml.load(WORKFLOW_PATH.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+
+
+def test_pytest_workflow_pins_ubuntu_22_for_bubblewrap_user_namespaces():
+    workflow = _load_workflow()
+
+    assert workflow["jobs"]["pytest"]["runs-on"] == "ubuntu-22.04"
+
+
+def test_pytest_workflow_installs_bubblewrap_before_running_tests():
+    workflow = _load_workflow()
+    steps = workflow["jobs"]["pytest"]["steps"]
+    pytest_step_index = next(
+        index
+        for index, step in enumerate(steps)
+        if ["python", "-m", "pytest", "-q"] in _commands(step)
+    )
+    installers = [
+        (index, step, command)
+        for index, step in enumerate(steps)
+        for command in _commands(step)
+        if command[:3] == ["sudo", "apt-get", "install"]
+        and "bubblewrap" in command
+    ]
+
+    assert len(installers) == 1
+    install_index, install_step, install_command = installers[0]
+    assert install_index < pytest_step_index
+    _assert_unconditional_required_gate(install_step, "bubblewrap install step")
+    assert "--yes" in install_command or "-y" in install_command
+
+
+def test_pytest_workflow_unsets_setup_python_loader_override():
+    workflow = _load_workflow()
+    steps = workflow["jobs"]["pytest"]["steps"]
+    test_steps = [
+        step
+        for step in steps
+        if ["python", "-m", "pytest", "-q"] in _commands(step)
+    ]
+
+    assert len(test_steps) == 1
+    assert _commands(test_steps[0]) == [
+        ["unset", "LD_LIBRARY_PATH"],
+        ["python", "-m", "pytest", "-q"],
+    ]
+
+
 def test_pytest_workflow_is_an_unfiltered_reproducible_required_gate():
     assert WORKFLOW_PATH.is_file(), "the repository has no pytest workflow"
     assert LOCK_PATH.is_file(), "the repository has no hashed pytest lock"
     assert DIRECT_REQUIREMENTS_PATH.is_file(), "the direct pytest inputs are missing"
-    workflow = yaml.load(WORKFLOW_PATH.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    workflow = _load_workflow()
 
     assert workflow["name"] == "Pytest"
     triggers = workflow["on"]

@@ -68,9 +68,8 @@ def test_fresh_install_creates_private_settings_with_all_non_notion_hooks(home: 
     assert result.returncode == 0, result.stderr
     assert settings.is_file(), result.stdout
     assert mode_of(settings) == 0o600
-    # The generic Claude writer creates settings first; the dedicated task-nudge
-    # transaction then records that just-created configuration before its merge.
-    assert len(backups(settings)) == 1
+    # The two dedicated transactions record the configuration before each merge.
+    assert len(backups(settings)) == 2
     assert mode_of(backups(settings)[0]) == 0o600
 
     data = json.loads(settings.read_text(encoding="utf-8"))
@@ -95,9 +94,14 @@ def test_fresh_install_creates_private_settings_with_all_non_notion_hooks(home: 
         ("UserPromptSubmit", "python3 $HOME/.claude/hooks/handoff-checkpoint-hook.py"),
             ("PostToolUse", "python3 $HOME/.claude/hooks/control-char-guard-hook.py"),
             ("PreToolUse", "$HOME/.claude/hooks/task-nudge.sh"),
+            (
+                "PreToolUse",
+                "/usr/bin/python3 $HOME/.local/share/claude-config/"
+                "pre_pr_tribunal/claude_hook.py",
+            ),
             ("PreCompact", "$HOME/.claude/hooks/precompact-handoff.sh"),
         }
-    assert len(wired) == 15
+    assert len(wired) == 16
     assert set(wired) == expected
 
     hygiene_groups = [
@@ -127,17 +131,17 @@ def test_existing_settings_change_keeps_distinct_private_backups(home: Path) -> 
     settings.write_text(json.dumps({"hooks": {}}) + "\n", encoding="utf-8")
     settings.chmod(0o744)                                   # 이슈 #50 이 보고한 실제 조건
 
-    result = run_install(home)                              # 두 installer-owned merge 발생
+    result = run_install(home)                              # 세 installer-owned merge 발생
     assert result.returncode == 0, result.stderr
 
     saved = backups(settings)
-    assert len(saved) == 2
+    assert len(saved) == 3
     assert all(mode_of(path) == 0o600 for path in saved)
     assert mode_of(settings) == 0o600
 
     result = run_install(home)                              # 이제 변경 없음
     assert result.returncode == 0, result.stderr
-    assert len(backups(settings)) == 2
+    assert len(backups(settings)) == 3
 
 
 def test_hook_wiring_stays_idempotent(home: Path) -> None:
@@ -297,7 +301,7 @@ def test_launcher_install_never_executes_user_local_path_canaries(
         real_tool = Path("/usr/bin") / name
         body = (
             "#!/bin/sh\n"
-            f'printf "%s\\n" "${{0##*/}}" >> "$PATH_CANARY_LOG"\n'
+            'printf "%s\\n" "${0##*/}" >> "$PATH_CANARY_LOG"\n'
         )
         if name == "rtk":
             body += "exit 97\n"

@@ -35,6 +35,46 @@ source ~/.bashrc
   - 설치기는 portfolio 조회나 자격증명 접근을 실행하지 않는다. 새 설치 또는 파일 hash가 바뀐 뒤에는 Codex에서 `/hooks`를 열어 변경 hash를 직접 검토한 뒤 trust한다; installer는 trust를 자동 승인하지 않는다.
 - `context-bar`(statusLine 교체)는 **미포함** (현재 OMC HUD와 상호배타라 별도 결정 필요)
 
+## pre-PR tribunal
+
+`./install.sh`는 Claude/Codex 공용 tribunal package와 Skill을 owner-only 대상으로 설치하고,
+Claude `settings.json`에는 `Bash` matcher를, Codex `hooks.json`에는 matcher 없는
+`PreToolUse` group을 기존 hook을 보존하며 추가한다. 설치 뒤 Codex에서는 `/hooks`를 열어 새 hook
+hash와 command를 직접 검토하고 trust해야 한다. installer는 trust를 대신 승인하지 않는다.
+
+PR을 만들기 전 Claude에서는 `/pre-pr-tribunal`, Codex에서는 `$pre-pr-tribunal`을 실행한다.
+review 상태는 현재 저장소의 ignored `.review/`에만 남고 HOME이나 다른 checkout과 공유되지 않는다.
+각 round는 독립 Reviewer A/B/C report로 finalize하며, blocker가 계속되면 최대 3 round에서 멈춰
+사용자 개입을 요청한다. 현재 snapshot에 결합된 pass verdict가 있을 때만 direct
+`PATH=/usr/bin:/bin /usr/bin/gh pr create --base <verdict-base>` shell command가 통과한다. Base는 literal로 명시해야
+하며 verdict는 symbolic branch 이름까지 저장한다. Repo/head override, 선행·후행 command,
+command substitution, redirection, shell expansion, 동적 shell/env 또는 Git target 환경을 섞은
+형태는 `COMMAND_AMBIGUOUS`로 차단된다. GNU `env -S`의 option cluster/long-option 축약과
+split operand 뒤 argv, shell `-c` 앞의 operand option, `pr`과 `create` 사이의 `gh` global
+option도 같은 candidate 경계에서 검사한다. 실행 위치의 정적 quote/escape 제거 이름은 실제
+argv 이름으로 인식하며, GNU split-string의 `\c` 종료 문법, official `gh pr new` alias와
+Bash `coproc` candidate도 안전하게 fail closed한다. GitHub CLI가 system/global/local/worktree
+scope에서 읽는 effective default는 없거나 origin을 가리키는 exact marker 하나만 허용한다.
+Pass 경로는 exact command-local `PATH=/usr/bin:/bin`과 literal `/usr/bin/gh`를 함께 요구한다.
+이 PATH 바인딩은 유일한 선행 assignment여야 한다. 바인딩 누락·중복·변형, Bash `+=`, 추가
+`HOME`/config assignment, bare/다른 executable 경로, control/process wrapper 또는 `LD_*`
+loader override는 `COMMAND_AMBIGUOUS`로 차단된다. 인식 범위에는 Bash `builtin command`/
+`builtin exec`와 `chrt`, `ionice`, `nice`, `nohup`, `setsid`, `stdbuf`, `sudo`, `taskset`,
+`timeout` 실행 래퍼가 포함된다.
+
+이 gate는 Claude/Codex shell hook에 보이는 direct `gh pr create`만 다룬다. GitHub UI에서의 PR
+생성, `gh api`, shell alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가
+필요하다. 1 MiB를 넘는 hook payload는 command를 신뢰할 수 없으므로 bounded deny한다.
+설치·복구와 검증 절차는 [hook 운영 문서](hooks/README.md#pre-pr-tribunal-운영)를 따른다.
+
+실제 runtime canary는 `/usr/bin/bwrap` 안에서 GitHub hostname을 sinkhole하고 발견된
+모든 fixed `gh` 경로를 exact fake executable로 덮는다. Runtime stdout/stderr는
+`/dev/null`로 폐기하며 missing phase의 `D/0`, pass phase의 `A/1` marker만 schema-v2
+report로 판정한다. Claude OAuth는 child environment에만 전달하고 Codex auth는 sealed
+memfd에서 tmpfs `CODEX_HOME/auth.json`으로만 초기화하므로 host filesystem에 credential
+copy를 만들지 않는다. Environment-mode API key도 bubblewrap argv가 아닌 최소 child
+environment로만 전달한다. 이 경계를 준비할 수 없으면 fail closed한다.
+
 ## 토글 메커니즘 — 2종류 (대체 불가, 병행)
 
 | 대상 | 메커니즘 | 도구 |
