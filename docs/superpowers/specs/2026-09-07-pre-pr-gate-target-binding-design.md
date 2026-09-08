@@ -46,7 +46,7 @@ snapshot until `gh` starts.
 | Missing, repeated, augmented, or different command-local `PATH` binding | `AMBIGUOUS_CANDIDATE` |
 | Any additional leading assignment, including `HOME` or another config root | `AMBIGUOUS_CANDIDATE` |
 | Bare `gh`, another executable path, or an execution wrapper | `AMBIGUOUS_CANDIDATE` |
-| Control prefix or recognized process wrapper around the candidate | `AMBIGUOUS_CANDIDATE` |
+| Control prefix, Bash `builtin command`/`builtin exec`, or a recognized process wrapper (`chrt`, `ionice`, `nice`, `nohup`, `setsid`, `stdbuf`, `sudo`, `taskset`, `timeout`) around the candidate | `AMBIGUOUS_CANDIDATE` |
 | Another non-empty command before or after it | `AMBIGUOUS_CANDIDATE` |
 | Subshell or command-substitution execution context | `AMBIGUOUS_CANDIDATE` |
 | Redirection on the candidate command | `AMBIGUOUS_CANDIDATE` |

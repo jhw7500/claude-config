@@ -39,7 +39,19 @@ _SAFE_GIT_ENV_NAMES = frozenset(
 )
 _TRUSTED_GH_EXECUTABLES = frozenset({"/usr/bin/gh"})
 _TRUSTED_GIT_PATH_ASSIGNMENT = "PATH=/usr/bin:/bin"
-_EXECUTION_WRAPPERS = frozenset({"nice", "nohup", "setsid", "stdbuf", "sudo"})
+_EXECUTION_WRAPPERS = frozenset(
+    {
+        "chrt",
+        "ionice",
+        "nice",
+        "nohup",
+        "setsid",
+        "stdbuf",
+        "sudo",
+        "taskset",
+        "timeout",
+    }
+)
 
 _ALWAYS_AMBIGUOUS_FAILURES = {
     "ANSI_C_QUOTE",
@@ -789,6 +801,11 @@ def _scan_simple_command(
             unsafe_wrapper_context = True
             index = _skip_time(words, index + 1)
             continue
+        if name == "builtin":
+            execution_wrapper = True
+            unsafe_wrapper_context = True
+            index = _skip_builtin(words, index + 1)
+            continue
         if name == "command":
             execution_wrapper = True
             index = _skip_command(words, index + 1)
@@ -1015,9 +1032,7 @@ def _skip_time(words: list[_Word], index: int) -> int:
     return index
 
 
-def _skip_execution_wrapper(
-    words: list[_Word], index: int, wrapper: str
-) -> int:
+def _skip_builtin(words: list[_Word], index: int) -> int:
     while index < len(words):
         word = words[index]
         if word.dynamic or word.shell_expansion:
@@ -1027,25 +1042,142 @@ def _skip_execution_wrapper(
             return len(words)
         value = word.text
         if value == "--":
-            return index + 1
+            index += 1
+            break
+        if value.startswith("-") and value != "-":
+            if _could_contain_gh_pr_create(words[index + 1 :]):
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
+            return len(words)
+        break
+    if index >= len(words):
+        return index
+    builtin_name = _basename(words[index].text)
+    if builtin_name in {"command", "exec"}:
+        return index
+    if builtin_name == "eval" and _could_contain_gh_pr_create(words[index + 1 :]):
+        raise ScanFailure("UNSAFE_PR_CONTEXT")
+    return len(words)
+
+
+def _skip_execution_wrapper(
+    words: list[_Word], index: int, wrapper: str
+) -> int:
+    required_positionals = 1 if wrapper in {"chrt", "taskset", "timeout"} else 0
+    while index < len(words):
+        word = words[index]
+        if word.dynamic or word.shell_expansion:
+            if _could_contain_gh_pr_create(words[index + 1 :]):
+                code = "ANSI_C_QUOTE" if word.ansi_c else "DYNAMIC_PR_ARGUMENT"
+                raise ScanFailure(code)
+            return len(words)
+        value = word.text
+        if value == "--":
+            index += 1
+            break
         option_arity = _execution_wrapper_option_arity(wrapper, value)
         if option_arity == 1:
+            if wrapper == "taskset" and _taskset_cpu_list_option(value):
+                required_positionals = 0
             index += 1
             continue
         if option_arity == 2:
             if index + 1 >= len(words):
                 return len(words)
+            if wrapper == "taskset" and value in {"-c", "--cpu-list"}:
+                required_positionals = 0
             index += 2
             continue
         if value.startswith("-") and value != "-":
             if _could_contain_gh_pr_create(words[index + 1 :]):
                 raise ScanFailure("UNSAFE_PR_CONTEXT")
             return len(words)
-        return index
-    return index
+        break
+    if index + required_positionals > len(words):
+        return len(words)
+    return index + required_positionals
+
+
+def _taskset_cpu_list_option(value: str) -> bool:
+    return (len(value) > 2 and value.startswith("-c")) or value.startswith(
+        "--cpu-list="
+    )
 
 
 def _execution_wrapper_option_arity(wrapper: str, value: str) -> int | None:
+    if wrapper == "timeout":
+        if value in {"-k", "--kill-after", "-s", "--signal"}:
+            return 2
+        if value.startswith(("-k", "-s", "--kill-after=", "--signal=")):
+            return 1
+        if value in {
+            "--foreground",
+            "--preserve-status",
+            "--verbose",
+        }:
+            return 1
+        return None
+    if wrapper == "taskset":
+        if value in {"-c", "--cpu-list"}:
+            return 2
+        if _taskset_cpu_list_option(value):
+            return 1
+        if value in {"-a", "--all-tasks"}:
+            return 1
+        return None
+    if wrapper == "chrt":
+        if value in {
+            "-D",
+            "--sched-deadline",
+            "-P",
+            "--sched-period",
+            "-T",
+            "--sched-runtime",
+        }:
+            return 2
+        if value.startswith(
+            (
+                "-D",
+                "-P",
+                "-T",
+                "--sched-deadline=",
+                "--sched-period=",
+                "--sched-runtime=",
+            )
+        ):
+            return 1
+        if value in {
+            "-b",
+            "--batch",
+            "-d",
+            "--deadline",
+            "-f",
+            "--fifo",
+            "-i",
+            "--idle",
+            "-o",
+            "--other",
+            "-r",
+            "--rr",
+            "-R",
+            "--reset-on-fork",
+            "-v",
+            "--verbose",
+        }:
+            return 1
+        return None
+    if wrapper == "ionice":
+        if value in {
+            "-c",
+            "--class",
+            "-n",
+            "--classdata",
+        }:
+            return 2
+        if value.startswith(("-c", "-n", "--class=", "--classdata=")):
+            return 1
+        if value in {"-t", "--ignore"}:
+            return 1
+        return None
     if wrapper == "nice":
         if re.fullmatch(r"-[0-9]+", value):
             return 1
@@ -2026,6 +2158,8 @@ class _StreamingHint:
             frame.phase = "EXEC_OPTION"
         elif name == "time":
             frame.phase = "TIME_OPTION"
+        elif name == "builtin":
+            frame.phase = "UNKNOWN_WRAPPER"
         elif name == "coproc":
             frame.phase = "UNKNOWN_WRAPPER"
         elif name in _EXECUTION_WRAPPERS:

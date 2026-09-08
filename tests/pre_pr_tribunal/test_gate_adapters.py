@@ -355,6 +355,12 @@ def test_alias_and_coproc_forms_are_command_ambiguous(
         "stdbuf -oL /usr/bin/gh pr create --base master",
         "setsid --fork /usr/bin/gh pr create --base master",
         "sudo -n /usr/bin/gh pr create --base master",
+        "timeout 2 /usr/bin/gh pr create --base master",
+        "taskset 0x1 /usr/bin/gh pr create --base master",
+        "chrt --idle 0 /usr/bin/gh pr create --base master",
+        "ionice --class 3 /usr/bin/gh pr create --base master",
+        "builtin command /usr/bin/gh pr create --base master",
+        "builtin exec /usr/bin/gh pr create --base master",
     ),
 )
 def test_control_and_execution_wrappers_are_command_ambiguous(

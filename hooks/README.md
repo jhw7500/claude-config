@@ -106,7 +106,9 @@ System/global/local/worktree scope의 effective `remote.<name>.gh-resolved=base`
 Command-local PATH는 유일한 선행 assignment인 exact `PATH=/usr/bin:/bin`이고 executable은
 literal `/usr/bin/gh`여야 한다. PATH 바인딩 누락·중복·변형, Bash `+=`, 추가 `HOME`/config
 assignment, bare/다른 path, control/process wrapper와 `LD_*`, `DYLD_*` override는
-`COMMAND_AMBIGUOUS`로 fail closed한다.
+`COMMAND_AMBIGUOUS`로 fail closed한다. Process wrapper에는 Bash `builtin command`/
+`builtin exec`, `chrt`, `ionice`, `nice`, `nohup`, `setsid`, `stdbuf`, `sudo`, `taskset`,
+`timeout`이 포함된다.
 1 MiB를 넘는 payload는 JSON을 해석하거나 입력을 반사하지 않고 `COMMAND_AMBIGUOUS`로 거부한다.
 
 deny reason code와 기본 복구는 다음과 같다.

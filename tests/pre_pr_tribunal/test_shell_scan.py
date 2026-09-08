@@ -135,6 +135,40 @@ def test_known_execution_wrapper_argument_data_remains_unrelated(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "timeout 2 /usr/bin/gh pr create --base master",
+        "timeout --signal TERM 2 /usr/bin/gh pr create --base master",
+        "taskset 0x1 /usr/bin/gh pr create --base master",
+        "taskset --cpu-list 0 /usr/bin/gh pr create --base master",
+        "chrt --idle 0 /usr/bin/gh pr create --base master",
+        "ionice --class 3 /usr/bin/gh pr create --base master",
+        "builtin command /usr/bin/gh pr create --base master",
+        "builtin exec /usr/bin/gh pr create --base master",
+    ],
+)
+def test_transparent_execution_launcher_candidates_are_ambiguous(command):
+    assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "timeout 2 printf /usr/bin/gh pr create --base master",
+        "taskset 0x1 printf /usr/bin/gh pr create --base master",
+        "chrt --idle 0 printf /usr/bin/gh pr create --base master",
+        "ionice --class 3 printf /usr/bin/gh pr create --base master",
+        "builtin printf /usr/bin/gh pr create --base master",
+    ],
+)
+def test_transparent_execution_launcher_argument_data_remains_unrelated(command):
+    assert scan_pr_create(command).kind is ScanKind.NO_MATCH
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "g$'h' pr create --draft",
         "g$'\\150' pr create --draft",
         "gh p$'r' create --draft",
@@ -288,6 +322,25 @@ def test_quote_removed_executable_survives_token_limit_fallback():
     ],
 )
 def test_wrapped_executable_survives_token_limit_fallback(tail):
+    command = "X=x " * MAX_TOKENS + tail
+
+    assert scan_pr_create(command) == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "TOKEN_LIMIT"
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "timeout 2 /usr/bin/gh pr create --base master",
+        "taskset 0x1 /usr/bin/gh pr create --base master",
+        "chrt --idle 0 /usr/bin/gh pr create --base master",
+        "ionice --class 3 /usr/bin/gh pr create --base master",
+        "builtin command /usr/bin/gh pr create --base master",
+        "builtin exec /usr/bin/gh pr create --base master",
+    ],
+)
+def test_transparent_execution_launchers_survive_token_limit_fallback(tail):
     command = "X=x " * MAX_TOKENS + tail
 
     assert scan_pr_create(command) == ScanResult(

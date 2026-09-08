@@ -58,7 +58,9 @@ scope에서 읽는 effective default는 없거나 origin을 가리키는 exact m
 Pass 경로는 exact command-local `PATH=/usr/bin:/bin`과 literal `/usr/bin/gh`를 함께 요구한다.
 이 PATH 바인딩은 유일한 선행 assignment여야 한다. 바인딩 누락·중복·변형, Bash `+=`, 추가
 `HOME`/config assignment, bare/다른 executable 경로, control/process wrapper 또는 `LD_*`
-loader override는 `COMMAND_AMBIGUOUS`로 차단된다.
+loader override는 `COMMAND_AMBIGUOUS`로 차단된다. 인식 범위에는 Bash `builtin command`/
+`builtin exec`와 `chrt`, `ionice`, `nice`, `nohup`, `setsid`, `stdbuf`, `sudo`, `taskset`,
+`timeout` 실행 래퍼가 포함된다.
 
 이 gate는 Claude/Codex shell hook에 보이는 direct `gh pr create`만 다룬다. GitHub UI에서의 PR
 생성, `gh api`, shell alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가
