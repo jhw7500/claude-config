@@ -451,7 +451,11 @@ def parse_portfolio_output(raw: bytes, slug: str) -> RegistrationResult:
             repository_ids.add(repo_id)
             normalized_repositories.add(repository_slug)
         items = result["items"]
-        if not isinstance(items, list) or len(items) != total_items:
+        if (
+            not isinstance(items, list)
+            or len(items) > total_items
+            or (not truncated and len(items) != total_items)
+        ):
             raise ValueError("items are inconsistent")
         for item in items:
             if not isinstance(item, dict) or set(item) != {"project_id", "title", "repo_ids"}:

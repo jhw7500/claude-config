@@ -37,7 +37,7 @@ def test_parse_github_slug_rejects_ambiguous_or_sensitive_forms(core, remote):
     assert core.parse_github_slug(remote) is None
 
 
-def portfolio_payload(*, slugs=(), truncated=False):
+def portfolio_payload(*, slugs=(), truncated=False, total_items=None):
     repositories = [
         {"repo_id": f"repo-{index}", "slug": slug, "allow_public": False}
         for index, slug in enumerate(slugs, start=1)
@@ -56,7 +56,11 @@ def portfolio_payload(*, slugs=(), truncated=False):
         "items": items,
         "repositories": repositories,
         "truncated": truncated,
-        "total_items": len(items),
+        "total_items": (
+            len(items) + (1 if truncated else 0)
+            if total_items is None
+            else total_items
+        ),
     }
     if truncated:
         result["next_page_id"] = "page-2"
@@ -73,6 +77,47 @@ def test_portfolio_exact_hit_is_registered_even_when_truncated(core):
         "jhw7500/claude-config",
     )
     assert result.status is core.RegistrationStatus.REGISTERED
+
+
+def test_portfolio_exact_hit_accepts_partial_truncated_page(core):
+    payload = portfolio_payload(
+        slugs=("jhw7500/gstapp",),
+        truncated=True,
+        total_items=19,
+    )
+    payload["result"]["items"] = [
+        {
+            "project_id": f"project-{index}",
+            "title": f"Project {index}",
+            "repo_ids": ["repo-1"],
+        }
+        for index in range(1, 15)
+    ]
+    result = core.parse_portfolio_output(
+        json.dumps(payload).encode(),
+        "jhw7500/gstapp",
+    )
+
+    assert result.status is core.RegistrationStatus.REGISTERED
+
+
+def test_portfolio_rejects_truncated_page_larger_than_total(core):
+    payload = portfolio_payload(
+        slugs=("jhw7500/other",),
+        truncated=True,
+        total_items=0,
+    )
+
+    result = core.parse_portfolio_output(
+        json.dumps(payload).encode(),
+        "jhw7500/claude-config",
+    )
+
+    assert result == core.RegistrationResult(
+        core.RegistrationStatus.UNKNOWN,
+        "jhw7500/claude-config",
+        "PORTFOLIO_UNAVAILABLE",
+    )
 
 
 def test_portfolio_complete_miss_is_unregistered(core):
