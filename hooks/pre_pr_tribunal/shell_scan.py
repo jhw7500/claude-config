@@ -38,6 +38,7 @@ _SAFE_GIT_ENV_NAMES = frozenset(
     }
 )
 _TRUSTED_GH_EXECUTABLES = frozenset({"/usr/bin/gh"})
+_TRUSTED_GIT_PATH_ASSIGNMENT = "PATH=/usr/bin:/bin"
 
 _ALWAYS_AMBIGUOUS_FAILURES = {
     "ANSI_C_QUOTE",
@@ -718,11 +719,17 @@ def _scan_simple_command(
 
     index = 0
     target_assignment = False
+    trusted_git_path_assignments = 0
     coproc_context = False
     execution_wrapper = False
     while index < len(words) and _is_assignment(words[index]):
         assignment = words[index]
-        assignment_targets_repository = _is_target_assignment(assignment)
+        trusted_git_path = _is_trusted_git_path_assignment(assignment)
+        if trusted_git_path:
+            trusted_git_path_assignments += 1
+        assignment_targets_repository = _is_target_assignment(
+            assignment
+        ) and not trusted_git_path
         if expected_base is not None and (
             assignment.dynamic or assignment.shell_expansion
         ) and _could_contain_gh_pr_create(words[index + 1 :]):
@@ -800,7 +807,9 @@ def _scan_simple_command(
         matched = _scan_gh(arguments, expected_base=expected_base)
         if matched and coproc_context:
             raise ScanFailure("UNSAFE_PR_CONTEXT")
-        if matched and expected_base is not None and target_assignment:
+        if matched and expected_base is not None and (
+            target_assignment or trusted_git_path_assignments != 1
+        ):
             raise ScanFailure("TARGET_OVERRIDE")
         if (
             matched
@@ -1424,6 +1433,16 @@ def _is_assignment(word: _Word) -> bool:
 def _is_target_assignment(word: _Word) -> bool:
     return _is_assignment(word) and is_target_environment_name(
         word.text.split("=", 1)[0]
+    )
+
+
+def _is_trusted_git_path_assignment(word: _Word) -> bool:
+    return (
+        _is_assignment(word)
+        and not word.quoted
+        and not word.dynamic
+        and not word.shell_expansion
+        and word.text == _TRUSTED_GIT_PATH_ASSIGNMENT
     )
 
 

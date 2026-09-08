@@ -404,10 +404,10 @@ def test_target_binding_rejects_unbound_pr_command(command):
 @pytest.mark.parametrize(
     "command",
     [
-        "/usr/bin/gh pr create --base master --fill",
-        "/usr/bin/gh pr create --base=master --draft",
-        "/usr/bin/gh pr create -B master --title title",
-        "/usr/bin/gh pr create -Bmaster --body body",
+        "PATH=/usr/bin:/bin /usr/bin/gh pr create --base master --fill",
+        "PATH=/usr/bin:/bin /usr/bin/gh pr create --base=master --draft",
+        "PATH=/usr/bin:/bin /usr/bin/gh pr create -B master --title title",
+        "PATH=/usr/bin:/bin /usr/bin/gh pr create -Bmaster --body body",
     ],
 )
 def test_target_binding_accepts_literal_matching_base(command):
@@ -417,6 +417,7 @@ def test_target_binding_accepts_literal_matching_base(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "/usr/bin/gh pr create --base master",
         "gh pr create --base master",
         "/tmp/gh pr create --base master",
         "/tmp/env /usr/bin/gh pr create --base master",

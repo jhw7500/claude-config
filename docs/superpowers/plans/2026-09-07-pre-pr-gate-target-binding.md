@@ -78,7 +78,7 @@ Add direct scanner tests using `expected_base="master"` and passing-verdict gate
 tests for these literal cases:
 
 ```python
-allowed = "/usr/bin/gh pr create --base master --fill"
+allowed = "PATH=/usr/bin:/bin /usr/bin/gh pr create --base master --fill"
 denied = [
     "gh pr create",
     "GH_REPO=other/repo gh pr create --base master",
@@ -234,7 +234,7 @@ rtk git commit -m "fix: deny oversized tribunal hook payloads"
 
 - [x] **Step 1: Align command examples and behavior tables**
 
-Replace pass-path examples with `/usr/bin/gh pr create --base master`. State that
+Replace pass-path examples with `PATH=/usr/bin:/bin /usr/bin/gh pr create --base master`. State that
 compound/prelude commands, repository/head overrides, dynamic target argv, and
 oversized payloads receive bounded denial. Keep unrelated in-limit input silent.
 
@@ -277,7 +277,7 @@ Run the canonical command with the new verdict base:
 
 ```bash
 rtk git push -u origin task/da281cdf8e81-jhw7500-claude-config-32
-rtk /usr/bin/gh pr create --base master --fill
+PATH=/usr/bin:/bin /usr/bin/gh pr create --base master --fill
 ```
 
 Expected: a PR URL only after the gate reports PASS. On FAIL, stop with the new

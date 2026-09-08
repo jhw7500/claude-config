@@ -4,7 +4,7 @@
 
 Close the five Round 3 HIGH findings without adding a PR execution wrapper or a
 release workflow. A passing Tribunal verdict may authorize only one canonical,
-direct `/usr/bin/gh pr create` command whose repository, base, head, working tree, and
+direct `PATH=/usr/bin:/bin /usr/bin/gh pr create` command whose repository, base, head, working tree, and
 reviewed snapshot remain the values represented by that verdict.
 
 ## Scope
@@ -21,17 +21,18 @@ This amendment covers:
   parser contract;
 - contract and canary documentation for the supported command form.
 
-It does not add a wrapper, dependency, permission, environment variable,
+It does not add a wrapper, dependency, permission, persistent environment variable,
 network endpoint, release step, or fix for an unrelated intermittent probe
 timeout.
 
 ## Canonical command envelope
 
-The supported form is one simple command with the literal `/usr/bin/gh`
-executable, no execution wrapper, and an explicit literal base:
+The supported form is one simple command with one exact static
+`PATH=/usr/bin:/bin` assignment, the literal `/usr/bin/gh` executable, no
+execution wrapper, and an explicit literal base:
 
 ```sh
-/usr/bin/gh pr create --base master --fill
+PATH=/usr/bin:/bin /usr/bin/gh pr create --base master --fill
 ```
 
 The scanner continues to return `NO_MATCH` for data and unrelated commands.
@@ -41,7 +42,8 @@ snapshot until `gh` starts.
 
 | Candidate property | Result |
 |---|---|
-| One simple `/usr/bin/gh` command with no wrapper, redirection, or command substitution | Eligible for verdict checks |
+| One simple `PATH=/usr/bin:/bin /usr/bin/gh` command with no wrapper, redirection, or command substitution | Eligible for verdict checks |
+| Missing, repeated, or different command-local `PATH` binding | `AMBIGUOUS_CANDIDATE` |
 | Bare `gh`, another executable path, or an execution wrapper | `AMBIGUOUS_CANDIDATE` |
 | Another non-empty command before or after it | `AMBIGUOUS_CANDIDATE` |
 | Subshell or command-substitution execution context | `AMBIGUOUS_CANDIDATE` |

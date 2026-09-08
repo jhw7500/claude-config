@@ -19,7 +19,8 @@ from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verd
 PACKAGE = Path(__file__).resolve().parents[2] / "hooks" / "pre_pr_tribunal"
 MAX_PAYLOAD_BYTES = 1024 * 1024
 COMMAND = "gh pr create"
-BOUND_COMMAND = "/usr/bin/gh pr create --base master"
+BOUND_COMMAND = "PATH=/usr/bin:/bin /usr/bin/gh pr create --base master"
+INHERITED_PATH_COMMAND = "/usr/bin/gh pr create --base master"
 
 
 def _git(repo: Path, *arguments: str) -> str:
@@ -756,6 +757,34 @@ def test_passing_verdict_never_authorizes_mutable_bare_gh_lookup(
 
     denied = gate.GateDecision(True, GateCode.COMMAND_AMBIGUOUS)
     assert before == after == denied
+
+
+def test_passing_verdict_never_authorizes_inherited_git_lookup(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _passing_verdict(git_repo)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "git").symlink_to("/usr/bin/false")
+    monkeypatch.setenv("PATH", f"{fake_bin}:/usr/bin:/bin")
+
+    decision = evaluate_gate(git_repo, INHERITED_PATH_COMMAND)
+
+    assert decision == gate.GateDecision(True, GateCode.COMMAND_AMBIGUOUS)
+
+
+def test_command_local_system_path_overrides_inherited_git_lookup(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _passing_verdict(git_repo)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "git").symlink_to("/usr/bin/false")
+    monkeypatch.setenv("PATH", f"{fake_bin}:/usr/bin:/bin")
+
+    decision = evaluate_gate(git_repo, BOUND_COMMAND)
+
+    assert decision == gate.GateDecision(False, GateCode.PASS)
 
 
 @pytest.mark.parametrize(

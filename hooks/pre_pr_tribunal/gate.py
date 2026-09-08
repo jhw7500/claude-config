@@ -159,6 +159,8 @@ def _snapshot_is_bound(verdict, snapshot) -> bool:
 
 
 def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
+    # The bound scan requires PATH=/usr/bin:/bin on the command itself, so the
+    # inherited PATH cannot influence the gh child process.
     safe_inherited_names = {"GH_CONFIG_DIR", "GH_HOST", "PATH"}
     if any(
         is_target_environment_name(name) and name not in safe_inherited_names
