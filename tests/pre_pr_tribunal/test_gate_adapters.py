@@ -721,6 +721,40 @@ def test_passing_verdict_rejects_round_two_bypasses(git_repo: Path, command: str
 @pytest.mark.parametrize(
     "command",
     (
+        "/tmp/gh pr create --base master",
+        "PATH=/tmp gh pr create --base master",
+        "LD_PRELOAD=/tmp/interpose.so /usr/bin/gh pr create --base master",
+    ),
+)
+def test_passing_verdict_rejects_untrusted_gh_resolution(
+    git_repo: Path, command: str
+):
+    _passing_verdict(git_repo)
+
+    decision = evaluate_gate(git_repo, command)
+
+    assert decision == gate.GateDecision(True, GateCode.COMMAND_AMBIGUOUS)
+
+
+def test_passing_verdict_rejects_poisoned_inherited_path(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _passing_verdict(git_repo)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    decision = evaluate_gate(git_repo, BOUND_COMMAND)
+
+    assert decision == gate.GateDecision(True, GateCode.COMMAND_AMBIGUOUS)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
         'env -- "gh" pr create --base master',
         'command -p "gh" pr create --base master',
         r"env -S 'gh\cignored' pr create --base master",

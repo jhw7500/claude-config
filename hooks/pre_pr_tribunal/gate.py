@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 import os
 from pathlib import Path
+import shutil
 
 from .git_state import (
     GitStateError,
@@ -60,6 +61,7 @@ _UNSUPPORTED_GIT_CODES = {
     "REPOSITORY_UNSUPPORTED",
 }
 _STALE_GIT_CODES = {"BASE_INVALID", "EMPTY_DIFF", "SNAPSHOT_CHANGED"}
+_TRUSTED_GH_PATH = Path("/usr/bin/gh")
 
 
 def _decision(block: bool, code: GateCode) -> GateDecision:
@@ -158,14 +160,24 @@ def _snapshot_is_bound(verdict, snapshot) -> bool:
     )
 
 
+def _trusted_gh_resolves_from_path() -> bool:
+    try:
+        resolved = shutil.which("gh", path=os.environ.get("PATH", ""))
+        return resolved is not None and Path(resolved).samefile(_TRUSTED_GH_PATH)
+    except (OSError, RuntimeError):
+        return False
+
+
 def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
-    safe_inherited_names = {"GH_CONFIG_DIR", "GH_HOST"}
+    safe_inherited_names = {"GH_CONFIG_DIR", "GH_HOST", "PATH"}
     if any(
         is_target_environment_name(name) and name not in safe_inherited_names
         for name in os.environ
     ):
         return _decision(True, GateCode.COMMAND_AMBIGUOUS)
     if os.environ.get("GH_HOST") not in {None, "", "github.com"}:
+        return _decision(True, GateCode.COMMAND_AMBIGUOUS)
+    if not _trusted_gh_resolves_from_path():
         return _decision(True, GateCode.COMMAND_AMBIGUOUS)
 
     root, preflight_error = _exact_clean_root(cwd)

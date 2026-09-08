@@ -103,6 +103,9 @@ inherited host, `GH_REPO`, target에 영향을 주는 Git execution environment�
 System/global/local/worktree scope의 effective `remote.<name>.gh-resolved=base` marker는
 없거나 origin을 가리키는 exact marker 하나만 허용하며, 다른 default repository는
 `REPOSITORY_UNSUPPORTED`다.
+Canonical `gh`는 inherited `PATH`에서 `/usr/bin/gh`로 resolve되어야 한다. `/usr/bin/gh`
+외의 explicit path와 command-local `PATH`, `LD_*`, `DYLD_*` override는
+`COMMAND_AMBIGUOUS`로 fail closed한다.
 1 MiB를 넘는 payload는 JSON을 해석하거나 입력을 반사하지 않고 `COMMAND_AMBIGUOUS`로 거부한다.
 
 deny reason code와 기본 복구는 다음과 같다.

@@ -417,6 +417,21 @@ def test_target_binding_accepts_literal_matching_base(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "/tmp/gh pr create --base master",
+        "PATH=/tmp gh pr create --base master",
+        "LD_PRELOAD=/tmp/interpose.so /usr/bin/gh pr create --base master",
+        "env LD_LIBRARY_PATH=/tmp gh pr create --base master",
+    ],
+)
+def test_bound_candidate_rejects_untrusted_gh_resolution(command):
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         r"env -S 'gh\_pr\_create\_--base\_master'",
         r"env --split-string='gh\_pr\_create\_--base\_master'",
         r"env -S'gh\_pr\_create\_--base\_master'",

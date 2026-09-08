@@ -37,6 +37,7 @@ _SAFE_GIT_ENV_NAMES = frozenset(
         "GIT_TRACE_SETUP",
     }
 )
+_TRUSTED_GH_EXECUTABLES = frozenset({"gh", "/usr/bin/gh"})
 
 _ALWAYS_AMBIGUOUS_FAILURES = {
     "ANSI_C_QUOTE",
@@ -44,6 +45,7 @@ _ALWAYS_AMBIGUOUS_FAILURES = {
     "DYNAMIC_PR_ARGUMENT",
     "DYNAMIC_SHELL_SCRIPT",
     "ENV_SPLIT_STRING",
+    "EXECUTABLE_UNTRUSTED",
     "PR_CREATE_ALIAS",
     "TARGET_BINDING",
     "TARGET_OVERRIDE",
@@ -791,6 +793,12 @@ def _scan_simple_command(
     name = _basename(executable.text)
     if name == "gh":
         matched = _scan_gh(arguments, expected_base=expected_base)
+        if (
+            matched
+            and expected_base is not None
+            and executable.text not in _TRUSTED_GH_EXECUTABLES
+        ):
+            raise ScanFailure("EXECUTABLE_UNTRUSTED")
         if matched and coproc_context:
             raise ScanFailure("UNSAFE_PR_CONTEXT")
         if matched and expected_base is not None and target_assignment:
@@ -1417,6 +1425,8 @@ def _env_assignment_name(word: _Word) -> str | None:
 
 
 def is_target_environment_name(name: str) -> bool:
+    if name == "PATH" or name.startswith(("LD_", "DYLD_")):
+        return True
     if name.startswith("GIT_"):
         return name not in _SAFE_GIT_ENV_NAMES
     return name in TARGET_ENV_NAMES

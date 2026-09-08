@@ -268,6 +268,29 @@ def test_execution_requires_exact_typed_sanitized_evidence(snapshot, change, cod
 
 
 @pytest.mark.parametrize(
+    "value",
+    [
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "Authorization: Bearer examplecredential123456789",
+        "xoxb-exampletoken123456789",
+    ],
+)
+@pytest.mark.parametrize("field", ["command", "stdout_excerpt", "stderr_excerpt"])
+def test_common_credential_formats_are_rejected(snapshot, field, value):
+    item = execution()
+    item[field] = value
+
+    with pytest.raises(SchemaError, match="EVIDENCE_SECRET_DETECTED"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("command", "tool --cwd=/home/alice/private"),
