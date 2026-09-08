@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import os
 from pathlib import Path
+import re
 
 from .git_state import (
     GitStateError,
@@ -40,6 +41,7 @@ class GateCode(str, Enum):
 class GateDecision:
     block: bool
     code: GateCode
+    reason: str | None = field(default=None, compare=False)
 
 
 _UNSAFE_VERDICT_CODES = {
@@ -60,10 +62,24 @@ _UNSUPPORTED_GIT_CODES = {
     "REPOSITORY_UNSUPPORTED",
 }
 _STALE_GIT_CODES = {"BASE_INVALID", "EMPTY_DIFF", "SNAPSHOT_CHANGED"}
+_AMBIGUITY_REASON = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 
 
-def _decision(block: bool, code: GateCode) -> GateDecision:
-    return GateDecision(block=block, code=code)
+def _decision(
+    block: bool, code: GateCode, reason: str | None = None
+) -> GateDecision:
+    bounded_reason = (
+        reason
+        if code is GateCode.COMMAND_AMBIGUOUS
+        and isinstance(reason, str)
+        and _AMBIGUITY_REASON.fullmatch(reason) is not None
+        else None
+    )
+    return GateDecision(block=block, code=code, reason=bounded_reason)
+
+
+def _allowed_inherited_target(name: str, value: str) -> bool:
+    return name == "GIT_EDITOR" and value == "true"
 
 
 def _exact_clean_root(cwd: Path) -> tuple[Path | None, GateCode | None]:
@@ -164,11 +180,16 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
     safe_inherited_names = {"GH_CONFIG_DIR", "GH_HOST", "PATH"}
     if any(
         is_target_environment_name(name) and name not in safe_inherited_names
-        for name in os.environ
+        and not _allowed_inherited_target(name, value)
+        for name, value in os.environ.items()
     ):
-        return _decision(True, GateCode.COMMAND_AMBIGUOUS)
+        return _decision(
+            True, GateCode.COMMAND_AMBIGUOUS, "TARGET_ENVIRONMENT"
+        )
     if os.environ.get("GH_HOST") not in {None, "", "github.com"}:
-        return _decision(True, GateCode.COMMAND_AMBIGUOUS)
+        return _decision(
+            True, GateCode.COMMAND_AMBIGUOUS, "TARGET_ENVIRONMENT"
+        )
 
     root, preflight_error = _exact_clean_root(cwd)
     if preflight_error is not None or root is None:
@@ -186,7 +207,9 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
 
     bound_scan = scan_pr_create(command, expected_base=verdict.base_ref)
     if bound_scan.kind is not ScanKind.PR_CREATE:
-        return _decision(True, GateCode.COMMAND_AMBIGUOUS)
+        return _decision(
+            True, GateCode.COMMAND_AMBIGUOUS, bound_scan.reason
+        )
 
     if set(verdict.reviewers) != set("ABC") or any(
         slot.status != "complete" or slot.report is None
@@ -218,7 +241,7 @@ def evaluate_gate(cwd: Path, command: str) -> GateDecision:
     if scan.kind is ScanKind.NO_MATCH:
         return _decision(False, GateCode.NOT_PR_CREATE)
     if scan.kind is ScanKind.AMBIGUOUS_CANDIDATE:
-        return _decision(True, GateCode.COMMAND_AMBIGUOUS)
+        return _decision(True, GateCode.COMMAND_AMBIGUOUS, scan.reason)
     try:
         return _evaluate_direct_pr_create(cwd, command)
     except Exception:
