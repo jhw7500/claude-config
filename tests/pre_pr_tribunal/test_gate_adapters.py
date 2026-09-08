@@ -341,6 +341,30 @@ def test_alias_and_coproc_forms_are_command_ambiguous(
     )
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        "! PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+        "time PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+        "coproc PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+        "if true; then PATH=/usr/bin:/bin /usr/bin/gh pr create --base master; fi",
+        "while false; do PATH=/usr/bin:/bin /usr/bin/gh pr create --base master; done",
+        "until true; do PATH=/usr/bin:/bin /usr/bin/gh pr create --base master; done",
+        "nohup /usr/bin/gh pr create --base master",
+        "nice -n 1 /usr/bin/gh pr create --base master",
+        "stdbuf -oL /usr/bin/gh pr create --base master",
+        "setsid --fork /usr/bin/gh pr create --base master",
+        "sudo -n /usr/bin/gh pr create --base master",
+    ),
+)
+def test_control_and_execution_wrappers_are_command_ambiguous(
+    tmp_path: Path, command: str
+):
+    assert evaluate_gate(tmp_path, command) == gate.GateDecision(
+        True, GateCode.COMMAND_AMBIGUOUS
+    )
+
+
 def test_scanner_exception_on_unrelated_request_is_silent(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -785,6 +809,26 @@ def test_command_local_system_path_overrides_inherited_git_lookup(
     decision = evaluate_gate(git_repo, BOUND_COMMAND)
 
     assert decision == gate.GateDecision(False, GateCode.PASS)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "HOME=/tmp/alternate PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+        "XDG_CONFIG_HOME=/tmp/alternate PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+        "PATH+=:/tmp /usr/bin/gh pr create --base master",
+        "PATH=/usr/bin:/bin PATH+=:/tmp /usr/bin/gh pr create --base master",
+        "GIT_DIR+=suffix /usr/bin/gh pr create --base master",
+    ),
+)
+def test_passing_verdict_rejects_noncanonical_leading_assignments(
+    git_repo: Path, command: str
+):
+    _passing_verdict(git_repo)
+
+    decision = evaluate_gate(git_repo, command)
+
+    assert decision == gate.GateDecision(True, GateCode.COMMAND_AMBIGUOUS)
 
 
 @pytest.mark.parametrize(

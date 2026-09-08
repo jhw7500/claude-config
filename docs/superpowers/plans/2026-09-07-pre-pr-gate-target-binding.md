@@ -81,6 +81,8 @@ tests for these literal cases:
 allowed = "PATH=/usr/bin:/bin /usr/bin/gh pr create --base master --fill"
 denied = [
     "gh pr create",
+    "HOME=/tmp/alternate PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+    "PATH+=:/tmp /usr/bin/gh pr create --base master",
     "GH_REPO=other/repo gh pr create --base master",
     "gh -R other/repo pr create --base master",
     "gh pr create --base other",

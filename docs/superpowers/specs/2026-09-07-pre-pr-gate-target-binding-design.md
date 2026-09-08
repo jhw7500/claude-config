@@ -43,8 +43,10 @@ snapshot until `gh` starts.
 | Candidate property | Result |
 |---|---|
 | One simple `PATH=/usr/bin:/bin /usr/bin/gh` command with no wrapper, redirection, or command substitution | Eligible for verdict checks |
-| Missing, repeated, or different command-local `PATH` binding | `AMBIGUOUS_CANDIDATE` |
+| Missing, repeated, augmented, or different command-local `PATH` binding | `AMBIGUOUS_CANDIDATE` |
+| Any additional leading assignment, including `HOME` or another config root | `AMBIGUOUS_CANDIDATE` |
 | Bare `gh`, another executable path, or an execution wrapper | `AMBIGUOUS_CANDIDATE` |
+| Control prefix or recognized process wrapper around the candidate | `AMBIGUOUS_CANDIDATE` |
 | Another non-empty command before or after it | `AMBIGUOUS_CANDIDATE` |
 | Subshell or command-substitution execution context | `AMBIGUOUS_CANDIDATE` |
 | Redirection on the candidate command | `AMBIGUOUS_CANDIDATE` |

@@ -23,7 +23,7 @@ TARGET_ENV_NAMES = frozenset(
         "GIT_CONFIG_SYSTEM",
     }
 )
-_ENV_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
+_ENV_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\+)?=")
 _SAFE_GIT_ENV_NAMES = frozenset(
     {
         "GIT_CURL_VERBOSE",
@@ -39,6 +39,7 @@ _SAFE_GIT_ENV_NAMES = frozenset(
 )
 _TRUSTED_GH_EXECUTABLES = frozenset({"/usr/bin/gh"})
 _TRUSTED_GIT_PATH_ASSIGNMENT = "PATH=/usr/bin:/bin"
+_EXECUTION_WRAPPERS = frozenset({"nice", "nohup", "setsid", "stdbuf", "sudo"})
 
 _ALWAYS_AMBIGUOUS_FAILURES = {
     "ANSI_C_QUOTE",
@@ -406,7 +407,9 @@ class _Parser:
                 char == "="
                 and not word.assignment
                 and assignment_prefix_valid
-                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", "".join(pieces))
+                and re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_]*\+?", "".join(pieces)
+                )
             ):
                 word.assignment = True
             pieces.append(char)
@@ -719,30 +722,38 @@ def _scan_simple_command(
 
     index = 0
     target_assignment = False
+    assignment_count = 0
     trusted_git_path_assignments = 0
     coproc_context = False
+    control_context = False
     execution_wrapper = False
-    while index < len(words) and _is_assignment(words[index]):
-        assignment = words[index]
-        trusted_git_path = _is_trusted_git_path_assignment(assignment)
-        if trusted_git_path:
-            trusted_git_path_assignments += 1
-        assignment_targets_repository = _is_target_assignment(
-            assignment
-        ) and not trusted_git_path
-        if expected_base is not None and (
-            assignment.dynamic or assignment.shell_expansion
-        ) and _could_contain_gh_pr_create(words[index + 1 :]):
-            if assignment_targets_repository:
-                code = "TARGET_OVERRIDE"
-            else:
-                code = (
-                    "ANSI_C_QUOTE" if assignment.ansi_c else "DYNAMIC_PR_ARGUMENT"
-                )
-            raise ScanFailure(code)
-        target_assignment = target_assignment or assignment_targets_repository
-        index += 1
+    unsafe_wrapper_context = False
     while index < len(words):
+        while index < len(words) and _is_assignment(words[index]):
+            assignment = words[index]
+            assignment_count += 1
+            trusted_git_path = _is_trusted_git_path_assignment(assignment)
+            if trusted_git_path:
+                trusted_git_path_assignments += 1
+            assignment_targets_repository = _is_target_assignment(
+                assignment
+            ) and not trusted_git_path
+            if expected_base is not None and (
+                assignment.dynamic or assignment.shell_expansion
+            ) and _could_contain_gh_pr_create(words[index + 1 :]):
+                if assignment_targets_repository:
+                    code = "TARGET_OVERRIDE"
+                else:
+                    code = (
+                        "ANSI_C_QUOTE"
+                        if assignment.ansi_c
+                        else "DYNAMIC_PR_ARGUMENT"
+                    )
+                raise ScanFailure(code)
+            target_assignment = target_assignment or assignment_targets_repository
+            index += 1
+        if index >= len(words):
+            break
         executable = words[index]
         if executable.dynamic or executable.shell_expansion:
             if _could_form_pr_create(words[index + 1 :]) or _could_contain_gh_pr_create(
@@ -753,6 +764,7 @@ def _scan_simple_command(
             return False
         name = _basename(executable.text)
         if not executable.quoted and name in _SHELL_CONTROL_PREFIXES:
+            control_context = True
             index += 1
             continue
         if not executable.quoted and name == "coproc":
@@ -774,6 +786,7 @@ def _scan_simple_command(
             continue
         if name == "time":
             execution_wrapper = True
+            unsafe_wrapper_context = True
             index = _skip_time(words, index + 1)
             continue
         if name == "command":
@@ -791,6 +804,11 @@ def _scan_simple_command(
                 enforce_target_binding=expected_base is not None,
             )
             continue
+        if name in _EXECUTION_WRAPPERS:
+            execution_wrapper = True
+            unsafe_wrapper_context = True
+            index = _skip_execution_wrapper(words, index + 1, name)
+            continue
         break
 
     if index >= len(words):
@@ -805,10 +823,14 @@ def _scan_simple_command(
     name = _basename(executable.text)
     if name == "gh":
         matched = _scan_gh(arguments, expected_base=expected_base)
-        if matched and coproc_context:
+        if matched and (
+            coproc_context or control_context or unsafe_wrapper_context
+        ):
             raise ScanFailure("UNSAFE_PR_CONTEXT")
         if matched and expected_base is not None and (
-            target_assignment or trusted_git_path_assignments != 1
+            target_assignment
+            or assignment_count != 1
+            or trusted_git_path_assignments != 1
         ):
             raise ScanFailure("TARGET_OVERRIDE")
         if (
@@ -991,6 +1013,68 @@ def _skip_time(words: list[_Word], index: int) -> int:
             return len(words)
         return index
     return index
+
+
+def _skip_execution_wrapper(
+    words: list[_Word], index: int, wrapper: str
+) -> int:
+    while index < len(words):
+        word = words[index]
+        if word.dynamic or word.shell_expansion:
+            if _could_contain_gh_pr_create(words[index + 1 :]):
+                code = "ANSI_C_QUOTE" if word.ansi_c else "DYNAMIC_PR_ARGUMENT"
+                raise ScanFailure(code)
+            return len(words)
+        value = word.text
+        if value == "--":
+            return index + 1
+        option_arity = _execution_wrapper_option_arity(wrapper, value)
+        if option_arity == 1:
+            index += 1
+            continue
+        if option_arity == 2:
+            if index + 1 >= len(words):
+                return len(words)
+            index += 2
+            continue
+        if value.startswith("-") and value != "-":
+            if _could_contain_gh_pr_create(words[index + 1 :]):
+                raise ScanFailure("UNSAFE_PR_CONTEXT")
+            return len(words)
+        return index
+    return index
+
+
+def _execution_wrapper_option_arity(wrapper: str, value: str) -> int | None:
+    if wrapper == "nice":
+        if re.fullmatch(r"-[0-9]+", value):
+            return 1
+        if value in {"-n", "--adjustment"}:
+            return 2
+        if value.startswith("-n") or value.startswith("--adjustment="):
+            return 1
+        return None
+    if wrapper == "stdbuf":
+        if value in {"-i", "-o", "-e", "--input", "--output", "--error"}:
+            return 2
+        if (
+            len(value) > 2
+            and value[:2] in {"-i", "-o", "-e"}
+            or value.startswith(("--input=", "--output=", "--error="))
+        ):
+            return 1
+        return None
+    if wrapper == "setsid":
+        if value in {"--ctty", "--fork", "--wait"} or (
+            value.startswith("-")
+            and value[1:]
+            and set(value[1:]) <= set("cfw")
+        ):
+            return 1
+        return None
+    if wrapper == "sudo" and value in {"-n", "--non-interactive"}:
+        return 1
+    return None
 
 
 def _skip_env(
@@ -1431,9 +1515,8 @@ def _is_assignment(word: _Word) -> bool:
 
 
 def _is_target_assignment(word: _Word) -> bool:
-    return _is_assignment(word) and is_target_environment_name(
-        word.text.split("=", 1)[0]
-    )
+    name = _env_assignment_name(word)
+    return _is_assignment(word) and name is not None and is_target_environment_name(name)
 
 
 def _is_trusted_git_path_assignment(word: _Word) -> bool:
@@ -1705,7 +1788,9 @@ class _StreamingHint:
             char == "="
             and not frame.assignment
             and frame.assignment_prefix_valid
-            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", "".join(frame.chars))
+            and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*\+?", "".join(frame.chars)
+            )
         ):
             frame.assignment = True
         frame.started = True
@@ -1868,7 +1953,9 @@ class _StreamingHint:
         elif frame.phase == "EXEC_VALUE":
             frame.phase = "EXEC_OPTION"
         elif frame.phase == "TIME_OPTION":
-            if not static:
+            if frame.assignment:
+                pass
+            elif not static:
                 frame.phase = "UNKNOWN_WRAPPER"
             elif text in _TIME_FLAGS:
                 pass
@@ -1929,7 +2016,9 @@ class _StreamingHint:
     ) -> bool:
         if executable_gh:
             return True
-        if name == "command":
+        if name in _SHELL_CONTROL_PREFIXES:
+            frame.phase = "EXEC"
+        elif name == "command":
             frame.phase = "COMMAND"
         elif name == "env":
             frame.phase = "ENV"
@@ -1938,6 +2027,8 @@ class _StreamingHint:
         elif name == "time":
             frame.phase = "TIME_OPTION"
         elif name == "coproc":
+            frame.phase = "UNKNOWN_WRAPPER"
+        elif name in _EXECUTION_WRAPPERS:
             frame.phase = "UNKNOWN_WRAPPER"
         elif name in _SHELLS:
             frame.phase = "SHELL_OPTION"

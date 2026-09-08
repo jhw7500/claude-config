@@ -92,6 +92,49 @@ def test_shell_control_candidates_are_not_silently_ignored(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "! PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+        "time PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+        "coproc PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+        "if true; then PATH=/usr/bin:/bin /usr/bin/gh pr create --base master; fi",
+        "while false; do PATH=/usr/bin:/bin /usr/bin/gh pr create --base master; done",
+        "until true; do PATH=/usr/bin:/bin /usr/bin/gh pr create --base master; done",
+    ],
+)
+def test_path_bound_candidates_after_control_prefix_are_ambiguous(command):
+    assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nohup /usr/bin/gh pr create --base master",
+        "nice -n 1 /usr/bin/gh pr create --base master",
+        "stdbuf -oL /usr/bin/gh pr create --base master",
+        "setsid --fork /usr/bin/gh pr create --base master",
+        "sudo -n PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+    ],
+)
+def test_known_execution_wrapper_candidates_are_ambiguous(command):
+    assert scan_pr_create(command).kind is ScanKind.AMBIGUOUS_CANDIDATE
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nohup printf /usr/bin/gh pr create --base master",
+        "nice -n 1 printf /usr/bin/gh pr create --base master",
+        "stdbuf -oL printf /usr/bin/gh pr create --base master",
+        "setsid --fork printf /usr/bin/gh pr create --base master",
+        "sudo -n printf /usr/bin/gh pr create --base master",
+    ],
+)
+def test_known_execution_wrapper_argument_data_remains_unrelated(command):
+    assert scan_pr_create(command).kind is ScanKind.NO_MATCH
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "g$'h' pr create --draft",
         "g$'\\150' pr create --draft",
         "gh p$'r' create --draft",
@@ -430,6 +473,45 @@ def test_target_binding_accepts_literal_matching_base(command):
 def test_bound_candidate_rejects_untrusted_gh_resolution(command):
     assert scan_pr_create(command, expected_base="master").kind is (
         ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "HOME=/tmp/alternate PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+        "XDG_CONFIG_HOME=/tmp/alternate PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+        "FOO=bar PATH=/usr/bin:/bin /usr/bin/gh pr create --base master",
+    ],
+)
+def test_bound_candidate_requires_path_as_the_only_leading_assignment(command):
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "PATH+=:/tmp /usr/bin/gh pr create --base master",
+        "PATH=/usr/bin:/bin PATH+=:/tmp /usr/bin/gh pr create --base master",
+        "GIT_DIR+=suffix /usr/bin/gh pr create --base master",
+    ],
+)
+def test_augmented_assignments_cannot_hide_bound_candidates(command):
+    assert scan_pr_create(command).kind is not ScanKind.NO_MATCH
+    assert scan_pr_create(command, expected_base="master").kind is (
+        ScanKind.AMBIGUOUS_CANDIDATE
+    )
+
+
+def test_augmented_assignment_candidate_survives_token_limit_fallback():
+    command = "X=x " * MAX_TOKENS + (
+        "PATH+=:/tmp /usr/bin/gh pr create --base master"
+    )
+
+    assert scan_pr_create(command) == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "TOKEN_LIMIT"
     )
 
 
