@@ -453,7 +453,7 @@ def parse_portfolio_output(raw: bytes, slug: str) -> RegistrationResult:
         items = result["items"]
         if (
             not isinstance(items, list)
-            or len(items) > total_items
+            or (truncated and len(items) >= total_items)
             or (not truncated and len(items) != total_items)
         ):
             raise ValueError("items are inconsistent")

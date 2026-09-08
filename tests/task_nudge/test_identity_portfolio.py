@@ -120,6 +120,25 @@ def test_portfolio_rejects_truncated_page_larger_than_total(core):
     )
 
 
+def test_portfolio_rejects_truncated_page_equal_to_total(core):
+    payload = portfolio_payload(
+        slugs=("jhw7500/other",),
+        truncated=True,
+        total_items=1,
+    )
+
+    result = core.parse_portfolio_output(
+        json.dumps(payload).encode(),
+        "jhw7500/claude-config",
+    )
+
+    assert result == core.RegistrationResult(
+        core.RegistrationStatus.UNKNOWN,
+        "jhw7500/claude-config",
+        "PORTFOLIO_UNAVAILABLE",
+    )
+
+
 def test_portfolio_complete_miss_is_unregistered(core):
     result = core.parse_portfolio_output(portfolio_bytes(), "jhw7500/claude-config")
     assert result.status is core.RegistrationStatus.UNREGISTERED
