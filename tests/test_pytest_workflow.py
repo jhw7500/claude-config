@@ -81,6 +81,12 @@ def _load_workflow():
     return yaml.load(WORKFLOW_PATH.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
 
+def test_pytest_workflow_pins_ubuntu_22_for_bubblewrap_user_namespaces():
+    workflow = _load_workflow()
+
+    assert workflow["jobs"]["pytest"]["runs-on"] == "ubuntu-22.04"
+
+
 def test_pytest_workflow_installs_bubblewrap_before_running_tests():
     workflow = _load_workflow()
     steps = workflow["jobs"]["pytest"]["steps"]
