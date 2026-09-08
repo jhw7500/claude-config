@@ -89,7 +89,7 @@ fi
 decision도 출력하지 않는다. direct 후보가 모호하거나 현재 verdict가 없거나 안전하지 않으면
 `[PRE-PR-TRIBUNAL:<CODE>]` reason이 포함된 deny를 출력한다.
 
-Pass 경로의 canonical command는 `gh pr create --base <verdict-base>` 한 개다. Literal base가
+Pass 경로의 canonical command는 `/usr/bin/gh pr create --base <verdict-base>` 한 개다. Literal base가
 verdict와 정확히 같아야 하며 `GH_REPO`/repo/head override, 다른 command segment, command
 substitution, redirection, shell/glob expansion, cwd-changing `env`, output-writing `time`, shell
 `-c`, ANSI-C 또는 `env -S`로 만든 대체 argv는 통과하지 않는다. 여기에는 GNU `env`의
@@ -103,9 +103,8 @@ inherited host, `GH_REPO`, target에 영향을 주는 Git execution environment�
 System/global/local/worktree scope의 effective `remote.<name>.gh-resolved=base` marker는
 없거나 origin을 가리키는 exact marker 하나만 허용하며, 다른 default repository는
 `REPOSITORY_UNSUPPORTED`다.
-Canonical `gh`는 inherited `PATH`에서 `/usr/bin/gh`로 resolve되어야 한다. `/usr/bin/gh`
-외의 explicit path와 command-local `PATH`, `LD_*`, `DYLD_*` override는
-`COMMAND_AMBIGUOUS`로 fail closed한다.
+Executable은 literal `/usr/bin/gh`여야 한다. Bare/다른 path, execution wrapper와
+command-local `PATH`, `LD_*`, `DYLD_*` override는 `COMMAND_AMBIGUOUS`로 fail closed한다.
 1 MiB를 넘는 payload는 JSON을 해석하거나 입력을 반사하지 않고 `COMMAND_AMBIGUOUS`로 거부한다.
 
 deny reason code와 기본 복구는 다음과 같다.

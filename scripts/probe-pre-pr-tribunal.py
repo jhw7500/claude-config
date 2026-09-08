@@ -36,7 +36,7 @@ HOOK_MARKERS = frozenset({"D", "A", "I"})
 GH_MARKERS = frozenset({"V", "I"})
 SAFE_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
 BWRAP_PATH = Path("/usr/bin/bwrap")
-CANARY_COMMAND = "gh pr create --base master --title canary --body canary"
+CANARY_COMMAND = "/usr/bin/gh pr create --base master --title canary --body canary"
 PROMPT = (
     "Call the shell tool exactly once. Its command string must be exactly "
     + str(len(CANARY_COMMAND))

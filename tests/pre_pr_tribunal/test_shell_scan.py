@@ -404,10 +404,10 @@ def test_target_binding_rejects_unbound_pr_command(command):
 @pytest.mark.parametrize(
     "command",
     [
-        "gh pr create --base master --fill",
-        "gh pr create --base=master --draft",
-        "gh pr create -B master --title title",
-        "gh pr create -Bmaster --body body",
+        "/usr/bin/gh pr create --base master --fill",
+        "/usr/bin/gh pr create --base=master --draft",
+        "/usr/bin/gh pr create -B master --title title",
+        "/usr/bin/gh pr create -Bmaster --body body",
     ],
 )
 def test_target_binding_accepts_literal_matching_base(command):
@@ -417,7 +417,10 @@ def test_target_binding_accepts_literal_matching_base(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "gh pr create --base master",
         "/tmp/gh pr create --base master",
+        "/tmp/env /usr/bin/gh pr create --base master",
+        "/tmp/command /usr/bin/gh pr create --base master",
         "PATH=/tmp gh pr create --base master",
         "LD_PRELOAD=/tmp/interpose.so /usr/bin/gh pr create --base master",
         "env LD_LIBRARY_PATH=/tmp gh pr create --base master",

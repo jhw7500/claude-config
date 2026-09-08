@@ -4,7 +4,7 @@
 
 Close the five Round 3 HIGH findings without adding a PR execution wrapper or a
 release workflow. A passing Tribunal verdict may authorize only one canonical,
-direct `gh pr create` command whose repository, base, head, working tree, and
+direct `/usr/bin/gh pr create` command whose repository, base, head, working tree, and
 reviewed snapshot remain the values represented by that verdict.
 
 ## Scope
@@ -27,12 +27,11 @@ timeout.
 
 ## Canonical command envelope
 
-The supported form is one simple command, optionally using the already
-recognized non-mutating `command`, `exec`, `time`, or `env` wrappers, with an
-explicit literal base:
+The supported form is one simple command with the literal `/usr/bin/gh`
+executable, no execution wrapper, and an explicit literal base:
 
 ```sh
-gh pr create --base master --fill
+/usr/bin/gh pr create --base master --fill
 ```
 
 The scanner continues to return `NO_MATCH` for data and unrelated commands.
@@ -42,7 +41,8 @@ snapshot until `gh` starts.
 
 | Candidate property | Result |
 |---|---|
-| One simple command with no redirection or command substitution | Eligible for verdict checks |
+| One simple `/usr/bin/gh` command with no wrapper, redirection, or command substitution | Eligible for verdict checks |
+| Bare `gh`, another executable path, or an execution wrapper | `AMBIGUOUS_CANDIDATE` |
 | Another non-empty command before or after it | `AMBIGUOUS_CANDIDATE` |
 | Subshell or command-substitution execution context | `AMBIGUOUS_CANDIDATE` |
 | Redirection on the candidate command | `AMBIGUOUS_CANDIDATE` |
@@ -50,7 +50,7 @@ snapshot until `gh` starts.
 | Dynamic shell `-c` script or an operand option before `-c` | `AMBIGUOUS_CANDIDATE` |
 | GNU `env -S`/`--split-string`, including clusters, accepted long abbreviations, and trailing argv, containing a candidate | `AMBIGUOUS_CANDIDATE` |
 | Target-changing `gh` global option before `pr`, between `pr` and `create`, or after `create` | `AMBIGUOUS_CANDIDATE` |
-| Static quote/backslash removal produces `gh` in executable position | Eligible for verdict checks |
+| Static quote/backslash removal produces a noncanonical executable | `AMBIGUOUS_CANDIDATE` |
 | GNU split-string uses `\c` termination | `AMBIGUOUS_CANDIDATE` |
 | Shell `-c`, brace/glob expansion, or dynamic content in a bound candidate | `AMBIGUOUS_CANDIDATE` |
 | Official `gh pr new` alias | `AMBIGUOUS_CANDIDATE` |

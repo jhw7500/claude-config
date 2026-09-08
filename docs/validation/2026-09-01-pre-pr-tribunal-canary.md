@@ -301,7 +301,7 @@ run, and this checkpoint does not satisfy the required real-runtime PASS gate.
 
 - Scope: Round 3 HIGH findings for PR target binding, pre-command snapshot staleness,
   ANSI-C/GNU `env -S` alternate argv, and oversized hook payloads.
-- Canonical pass command: `gh pr create --base master`; repo/head override, compound or nested
+- Canonical pass command: `/usr/bin/gh pr create --base master`; repo/head override, compound or nested
   execution, redirection, and dynamic target argv receive bounded deny.
 - Implementation commits:
   `c1a4d7cd2d8d2fbd47e3ddc393bd561198c35d6f`,

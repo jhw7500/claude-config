@@ -402,6 +402,8 @@ Regex 한 번으로 raw string의 `gh pr create` 포함 여부를 판정하지 �
 output-writing wrapper를 허용하지 않는다.
 
 Pass 후보는 literal `--base`를 정확히 한 번 포함하고 그 값이 verdict base와 같아야 한다.
+Bound pass executable은 wrapper 없는 literal `/usr/bin/gh`로 제한해 hook 반환 뒤 mutable
+`PATH`가 다른 executable을 선택할 수 없게 한다. Wrapper와 다른 path는 후보로 식별하되 거부한다.
 `GH_REPO`/`GH_HOST`/Git worktree assignment, `--repo`/`-R`, `--head`/`-H`, hostname/config
 override와 free-standing dynamic argv는 target binding을 증명할 수 없으므로 거부한다.
 GitHub CLI가 읽는 system/global/local/worktree scope의

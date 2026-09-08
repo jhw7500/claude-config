@@ -30,7 +30,7 @@ _CLAIM_ID = re.compile(r"([ABC])-R([1-3])-C([0-9]{3})\Z")
 _SECRET = re.compile(
     r"BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY|"
     r"(?i:Authorization[ \t]*:[ \t]*Bearer[ \t]+[^\s\"']{8,})|"
-    r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{8,}|"
+    r"(?<![A-Za-z0-9])(?:xox[a-z]|xapp)-[A-Za-z0-9-]{8,}|"
     r"ghp_[A-Za-z0-9]{8}|github_pat_[A-Za-z0-9_]{8}|"
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8}|AKIA[A-Z0-9]{12}"
 )

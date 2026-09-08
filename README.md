@@ -46,7 +46,7 @@ PR을 만들기 전 Claude에서는 `/pre-pr-tribunal`, Codex에서는 `$pre-pr-
 review 상태는 현재 저장소의 ignored `.review/`에만 남고 HOME이나 다른 checkout과 공유되지 않는다.
 각 round는 독립 Reviewer A/B/C report로 finalize하며, blocker가 계속되면 최대 3 round에서 멈춰
 사용자 개입을 요청한다. 현재 snapshot에 결합된 pass verdict가 있을 때만 direct
-`gh pr create --base <verdict-base>` shell command가 통과한다. Base는 literal로 명시해야
+`/usr/bin/gh pr create --base <verdict-base>` shell command가 통과한다. Base는 literal로 명시해야
 하며 verdict는 symbolic branch 이름까지 저장한다. Repo/head override, 선행·후행 command,
 command substitution, redirection, shell expansion, 동적 shell/env 또는 Git target 환경을 섞은
 형태는 `COMMAND_AMBIGUOUS`로 차단된다. GNU `env -S`의 option cluster/long-option 축약과
@@ -55,8 +55,8 @@ option도 같은 candidate 경계에서 검사한다. 실행 위치의 정적 qu
 argv 이름으로 인식하며, GNU split-string의 `\c` 종료 문법, official `gh pr new` alias와
 Bash `coproc` candidate도 안전하게 fail closed한다. GitHub CLI가 system/global/local/worktree
 scope에서 읽는 effective default는 없거나 origin을 가리키는 exact marker 하나만 허용한다.
-Pass 경로의 `gh`는 inherited `PATH`에서 `/usr/bin/gh`로 resolve되어야 하고, 다른 executable
-경로나 command-local `PATH`/`LD_*` loader override는 `COMMAND_AMBIGUOUS`로 차단된다.
+Pass 경로의 executable은 literal `/usr/bin/gh`여야 하고, bare/다른 executable 경로,
+wrapper 또는 command-local `PATH`/`LD_*` loader override는 `COMMAND_AMBIGUOUS`로 차단된다.
 
 이 gate는 Claude/Codex shell hook에 보이는 direct `gh pr create`만 다룬다. GitHub UI에서의 PR
 생성, `gh api`, shell alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가

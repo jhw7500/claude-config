@@ -37,7 +37,7 @@ _SAFE_GIT_ENV_NAMES = frozenset(
         "GIT_TRACE_SETUP",
     }
 )
-_TRUSTED_GH_EXECUTABLES = frozenset({"gh", "/usr/bin/gh"})
+_TRUSTED_GH_EXECUTABLES = frozenset({"/usr/bin/gh"})
 
 _ALWAYS_AMBIGUOUS_FAILURES = {
     "ANSI_C_QUOTE",
@@ -719,6 +719,7 @@ def _scan_simple_command(
     index = 0
     target_assignment = False
     coproc_context = False
+    execution_wrapper = False
     while index < len(words) and _is_assignment(words[index]):
         assignment = words[index]
         assignment_targets_repository = _is_target_assignment(assignment)
@@ -761,15 +762,19 @@ def _scan_simple_command(
                 index += 1
             continue
         if name == "exec":
+            execution_wrapper = True
             index = _skip_exec(words, index + 1)
             continue
         if name == "time":
+            execution_wrapper = True
             index = _skip_time(words, index + 1)
             continue
         if name == "command":
+            execution_wrapper = True
             index = _skip_command(words, index + 1)
             continue
         if name == "env":
+            execution_wrapper = True
             index = _skip_env(
                 words,
                 index + 1,
@@ -793,16 +798,19 @@ def _scan_simple_command(
     name = _basename(executable.text)
     if name == "gh":
         matched = _scan_gh(arguments, expected_base=expected_base)
-        if (
-            matched
-            and expected_base is not None
-            and executable.text not in _TRUSTED_GH_EXECUTABLES
-        ):
-            raise ScanFailure("EXECUTABLE_UNTRUSTED")
         if matched and coproc_context:
             raise ScanFailure("UNSAFE_PR_CONTEXT")
         if matched and expected_base is not None and target_assignment:
             raise ScanFailure("TARGET_OVERRIDE")
+        if (
+            matched
+            and expected_base is not None
+            and (
+                execution_wrapper
+                or executable.text not in _TRUSTED_GH_EXECUTABLES
+            )
+        ):
+            raise ScanFailure("EXECUTABLE_UNTRUSTED")
         return matched
     if name in _SHELLS:
         script = _shell_command_string(arguments)
@@ -817,7 +825,7 @@ def _scan_simple_command(
         if not script.dynamic and not script.nested:
             parser = _Parser(script.text, budget)
             nested = parser.parse(depth + 1)
-            matched = _scan_parsed_context(nested, budget, expected_base)
+            matched = _scan_parsed_context(nested, budget, None)
             if matched and coproc_context:
                 raise ScanFailure("UNSAFE_PR_CONTEXT")
             if matched and expected_base is not None:

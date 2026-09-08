@@ -19,7 +19,7 @@ from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verd
 PACKAGE = Path(__file__).resolve().parents[2] / "hooks" / "pre_pr_tribunal"
 MAX_PAYLOAD_BYTES = 1024 * 1024
 COMMAND = "gh pr create"
-BOUND_COMMAND = "gh pr create --base master"
+BOUND_COMMAND = "/usr/bin/gh pr create --base master"
 
 
 def _git(repo: Path, *arguments: str) -> str:
@@ -736,7 +736,7 @@ def test_passing_verdict_rejects_untrusted_gh_resolution(
     assert decision == gate.GateDecision(True, GateCode.COMMAND_AMBIGUOUS)
 
 
-def test_passing_verdict_rejects_poisoned_inherited_path(
+def test_passing_verdict_never_authorizes_mutable_bare_gh_lookup(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     _passing_verdict(git_repo)
@@ -744,12 +744,18 @@ def test_passing_verdict_rejects_poisoned_inherited_path(
     fake_bin.mkdir()
     fake_gh = fake_bin / "gh"
     fake_gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    fake_gh.chmod(0o755)
+    fake_gh.unlink()
+    fake_gh.symlink_to("/usr/bin/gh")
     monkeypatch.setenv("PATH", str(fake_bin))
 
-    decision = evaluate_gate(git_repo, BOUND_COMMAND)
+    before = evaluate_gate(git_repo, "gh pr create --base master")
+    replacement = fake_bin / "replacement"
+    replacement.symlink_to("/usr/bin/false")
+    replacement.replace(fake_gh)
+    after = evaluate_gate(git_repo, "gh pr create --base master")
 
-    assert decision == gate.GateDecision(True, GateCode.COMMAND_AMBIGUOUS)
+    denied = gate.GateDecision(True, GateCode.COMMAND_AMBIGUOUS)
+    assert before == after == denied
 
 
 @pytest.mark.parametrize(

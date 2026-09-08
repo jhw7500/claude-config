@@ -274,6 +274,9 @@ def test_execution_requires_exact_typed_sanitized_evidence(snapshot, change, cod
         "-----BEGIN RSA PRIVATE KEY-----",
         "Authorization: Bearer examplecredential123456789",
         "xoxb-exampletoken123456789",
+        "xoxc-exampletoken123456789",
+        "xoxe-1-exampletoken123456789",
+        "xapp-1-exampletoken123456789",
     ],
 )
 @pytest.mark.parametrize("field", ["command", "stdout_excerpt", "stderr_excerpt"])
@@ -288,6 +291,21 @@ def test_common_credential_formats_are_rejected(snapshot, field, value):
             expected_round=1,
             snapshot=snapshot,
         )
+
+
+@pytest.mark.parametrize("value", ["xoxc-short", "xoxe-label", "xapp-doc"])
+def test_short_slack_like_labels_are_not_credentials(snapshot, value):
+    item = execution()
+    item["stdout_excerpt"] = value
+
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+
+    assert parsed.executions[0].stdout_excerpt == value
 
 
 @pytest.mark.parametrize(
