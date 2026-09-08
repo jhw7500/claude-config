@@ -201,6 +201,31 @@ def test_origin_gh_default_repository_is_accepted(git_repo):
     )
 
 
+@pytest.mark.parametrize("scope", ("global", "system"))
+def test_effective_url_rewrite_to_other_repository_is_rejected(
+    git_repo, tmp_path, monkeypatch, scope
+):
+    isolated_home = tmp_path / "git-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("HOME", str(isolated_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(isolated_home / "xdg"))
+    config = (
+        isolated_home / ".gitconfig"
+        if scope == "global"
+        else tmp_path / "system.gitconfig"
+    )
+    config.write_text(
+        '[url "https://github.com/other/repository.git"]\n'
+        "\tinsteadOf = https://github.com/jhw7500/claude-config.git\n",
+        encoding="utf-8",
+    )
+    if scope == "system":
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(config))
+
+    with pytest.raises(GitStateError, match="^REPOSITORY_UNSUPPORTED$"):
+        capture_snapshot(git_repo, "master")
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     (

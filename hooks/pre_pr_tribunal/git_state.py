@@ -69,8 +69,14 @@ def _git_environment() -> dict[str, str]:
 
 def _gh_config_environment() -> dict[str, str]:
     environment = _git_environment()
-    environment.pop("GIT_CONFIG_NOSYSTEM", None)
-    environment.pop("GIT_CONFIG_GLOBAL", None)
+    for name in (
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_GLOBAL",
+    ):
+        environment.pop(name, None)
+        if name in os.environ:
+            environment[name] = os.environ[name]
     return environment
 
 
@@ -337,6 +343,18 @@ def _validate_gh_default_repository(root: Path) -> None:
         raise GitStateError("REPOSITORY_UNSUPPORTED")
 
 
+def _validate_effective_repository(root: Path, repository: str) -> None:
+    result = _run_git_with_environment(
+        root,
+        ("remote", "get-url", "origin"),
+        _gh_config_environment(),
+    )
+    if result.returncode != 0:
+        raise GitStateError("REPOSITORY_UNSUPPORTED")
+    if _repository_from_origin(result.stdout) != repository:
+        raise GitStateError("REPOSITORY_UNSUPPORTED")
+
+
 def _path(raw: bytes) -> str:
     try:
         value = raw.decode("utf-8", "strict")
@@ -452,6 +470,7 @@ def _revalidate_snapshot_state(
             failure="SNAPSHOT_CHANGED",
         )
         final_repository = _repository_from_origin(final_origin)
+        _validate_effective_repository(root, final_repository)
         _validate_gh_default_repository(root)
     except GitStateError:
         raise GitStateError("SNAPSHOT_CHANGED") from None
@@ -511,6 +530,17 @@ def capture_snapshot(
         failure="REPOSITORY_UNSUPPORTED",
     )
     repository = _repository_from_origin(origin)
+    try:
+        _validate_effective_repository(root, repository)
+    except GitStateError:
+        current_origin = _command_output(
+            root,
+            ("remote", "get-url", "origin"),
+            failure="SNAPSHOT_CHANGED",
+        )
+        if _repository_from_origin(current_origin) != repository:
+            raise GitStateError("SNAPSHOT_CHANGED") from None
+        raise
     _validate_gh_default_repository(root)
 
     status = _command_output(
