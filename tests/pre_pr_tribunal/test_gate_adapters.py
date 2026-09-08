@@ -307,6 +307,14 @@ def test_shell_forms_cannot_bypass_state_preflight(tmp_path: Path, command: str)
     assert decision.code is not GateCode.NOT_PR_CREATE
 
 
+def test_eval_candidate_cannot_bypass_state_preflight(tmp_path: Path):
+    decision = evaluate_gate(
+        tmp_path, "eval '/usr/bin/gh pr' create --base master"
+    )
+
+    assert decision == gate.GateDecision(True, GateCode.COMMAND_AMBIGUOUS)
+
+
 @pytest.mark.parametrize(
     "command",
     (

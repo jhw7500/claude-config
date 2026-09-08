@@ -121,6 +121,30 @@ def test_known_execution_wrapper_candidates_are_ambiguous(command):
 @pytest.mark.parametrize(
     "command",
     [
+        "eval /usr/bin/gh pr create --base master",
+        "eval -- /usr/bin/gh pr create --base master",
+        "eval '/usr/bin/gh pr' create --base master",
+        'eval "$launcher" pr create --base master',
+        'eval "$(printf /usr/bin/gh)" pr create --base master',
+        "eval eval /usr/bin/gh pr create --base master",
+        "builtin eval 'eval /usr/bin/gh pr' create --base master",
+    ],
+)
+def test_eval_constructed_candidates_are_ambiguous(command):
+    assert scan_pr_create(command) == ScanResult(
+        ScanKind.AMBIGUOUS_CANDIDATE, "UNSAFE_PR_CONTEXT"
+    )
+
+
+def test_eval_unrelated_argument_data_is_not_a_candidate():
+    assert scan_pr_create("eval printf '%s' /usr/bin/gh pr create") == ScanResult(
+        ScanKind.NO_MATCH
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "nohup printf /usr/bin/gh pr create --base master",
         "nice -n 1 printf /usr/bin/gh pr create --base master",
         "stdbuf -oL printf /usr/bin/gh pr create --base master",

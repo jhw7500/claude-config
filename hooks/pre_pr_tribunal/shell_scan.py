@@ -860,6 +860,9 @@ def _scan_simple_command(
         ):
             raise ScanFailure("EXECUTABLE_UNTRUSTED")
         return matched
+    if name == "eval":
+        _scan_eval(arguments, depth, budget)
+        return False
     if name in _SHELLS:
         script = _shell_command_string(arguments)
         if script is None:
@@ -882,6 +885,40 @@ def _scan_simple_command(
                 raise ScanFailure("TARGET_OVERRIDE")
             return matched
     return False
+
+
+def _scan_eval(arguments: list[_Word], depth: int, budget: _Budget) -> None:
+    index = 0
+    if (
+        arguments
+        and not arguments[0].dynamic
+        and not arguments[0].shell_expansion
+        and arguments[0].text == "--"
+    ):
+        index = 1
+
+    pieces = []
+    for word in arguments[index:]:
+        piece = word.text
+        if word.dynamic:
+            piece += "${__PRE_PR_TRIBUNAL_DYNAMIC__}"
+        pieces.append(piece)
+    command = " ".join(pieces)
+    if not command:
+        return
+
+    try:
+        nested = _Parser(command, budget).parse(depth + 1)
+        matched = _scan_parsed_context(nested, budget, None)
+    except (RecursionError, ScanFailure) as error:
+        code = "RECURSION_LIMIT" if isinstance(error, RecursionError) else error.code
+        if code in _ALWAYS_AMBIGUOUS_FAILURES or _has_unquoted_candidate_hint(
+            command
+        ):
+            raise ScanFailure("UNSAFE_PR_CONTEXT") from error
+        raise
+    if matched:
+        raise ScanFailure("UNSAFE_PR_CONTEXT")
 
 
 def _shell_command_string(arguments: list[_Word]) -> _Word | None:
@@ -1052,10 +1089,8 @@ def _skip_builtin(words: list[_Word], index: int) -> int:
     if index >= len(words):
         return index
     builtin_name = _basename(words[index].text)
-    if builtin_name in {"builtin", "command", "exec"}:
+    if builtin_name in {"builtin", "command", "eval", "exec"}:
         return index
-    if builtin_name == "eval" and _could_contain_gh_pr_create(words[index + 1 :]):
-        raise ScanFailure("UNSAFE_PR_CONTEXT")
     return len(words)
 
 
