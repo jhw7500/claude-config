@@ -5,7 +5,10 @@ import re
 import shlex
 import subprocess
 
+import pytest
+
 from pre_pr_tribunal import cli
+from pre_pr_tribunal.telemetry import read_ledger
 from pre_pr_tribunal.model import Reviewer, Snapshot, parse_decisions, parse_reviewer_report
 
 
@@ -453,6 +456,112 @@ def test_operator_telemetry_command_examples_parse_through_the_cli_contract():
         )
     assert by_command["telemetry-recover"][0].run_id == "$RUN_ID"
     assert by_command["telemetry-summary"][0].run_id == "$RUN_ID"
+
+
+def telemetry_lifecycle_commands():
+    match = re.search(
+        r"<!-- telemetry-lifecycle-commands -->(.*?)"
+        r"<!-- telemetry-lifecycle-commands-end -->",
+        text("SKILL.md"), re.DOTALL,
+    )
+    assert match is not None, "missing executable telemetry lifecycle contract"
+    commands = {}
+    for line in match.group(1).splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) == 3 and "`telemetry-" in cells[2]:
+            key = (cells[0].strip("`"), cells[1].strip("`"))
+            assert key not in commands
+            commands[key] = [shlex.split(value) for value in re.findall(r"`(telemetry-[^`]+)`", cells[2])]
+    return commands
+
+
+def run_lifecycle_commands(monkeypatch, capsys, variables, commands, second):
+    results = []
+    for arguments in commands:
+        expanded = [variables.get(item, item) for item in arguments]
+        # The executable CLI parser, not a second argument schema, owns usage.
+        cli._parser().parse_args(expanded)
+        result = cli.main(
+            expanded,
+            wall_clock=lambda: f"2026-09-09T00:00:{second:02d}Z",
+            monotonic_ns=lambda: second * 1_000_000_000,
+        )
+        captured = capsys.readouterr()
+        assert (result, captured.err) == (0, "")
+        payload = json.loads(captured.out)
+        if arguments[0] == "begin":
+            variables["$RUN_ID"] = payload["telemetry"]["run_id"]
+        elif arguments[0] == "telemetry-start":
+            slot = {
+                "reviewer_dispatch_wait": "$DISPATCH_SPAN_ID",
+                "reviewer_total": "$TOTAL_SPAN_ID",
+                "recovery_retry": "$RETRY_SPAN_ID",
+            }[payload["stage"]]
+            variables[slot] = payload["span_id"]
+        results.append(payload)
+    return results
+
+
+@pytest.mark.parametrize(("signal", "total_ms"), (("accepted", 5000), ("unavailable", 7000)))
+def test_skill_dispatch_lifecycle_measures_observed_boundaries(git_repo, monkeypatch, capsys, signal, total_ms):
+    commands = telemetry_lifecycle_commands()
+    monkeypatch.chdir(git_repo)
+    variables = {"$REVIEWER": "A", "$ATTEMPT": "1"}
+    run = lambda rows, second: run_lifecycle_commands(monkeypatch, capsys, variables, rows, second)
+    run([["begin", "--base", "master", "--runtime", "codex", "--round", "1"]], 0)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    run(commands[signal, "dispatch_request"], 1)
+    if signal == "accepted":
+        run(commands[signal, "dispatch_accepted"], 3)
+    run(commands[signal, "terminal_response"], 8)
+    run(commands["exit", "success"], 9)
+    stored = read_ledger(git_repo).runs[0]
+    totals = [span for span in stored.spans if span.stage.value == "reviewer_total"]
+    dispatches = [span for span in stored.spans if span.stage.value == "reviewer_dispatch_wait"]
+    assert len(totals) == len(dispatches) == 1
+    assert totals[0].duration_ms == total_ms
+    assert totals[0].attempt == 1 and totals[0].outcome.value == "success"
+    if signal == "unavailable":
+        assert (dispatches[0].outcome.value, dispatches[0].reason_code, dispatches[0].duration_ms) == (
+            "incomplete", "RUNTIME_SIGNAL_UNAVAILABLE", 7000,
+        )
+    else:
+        assert (dispatches[0].outcome.value, dispatches[0].reason_code, dispatches[0].duration_ms) == (
+            "success", None, 2000,
+        )
+    assert stored.outcome.value == "success"
+    assert all(span.outcome is not None for span in stored.spans)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+
+
+@pytest.mark.parametrize(("outcome", "reason"), (
+    ("failure", "REPORT_SCHEMA_INVALID"),
+    ("timeout", "REVIEWER_TIMEOUT"),
+    ("incomplete", "CONTROLLER_INTERRUPTED"),
+))
+def test_skill_interrupted_lifecycle_recovers_then_closes_without_changing_gate(
+    git_repo, monkeypatch, capsys, outcome, reason,
+):
+    commands = telemetry_lifecycle_commands()
+    monkeypatch.chdir(git_repo)
+    variables = {"$REVIEWER": "A", "$ATTEMPT": "1", "$PRIMARY_CODE": reason}
+    run = lambda rows, second: run_lifecycle_commands(monkeypatch, capsys, variables, rows, second)
+    run([["begin", "--base", "master", "--runtime", "codex", "--round", "1"]], 0)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    run(commands["recovery", "retry_start"], 0)
+    run(commands["unavailable", "dispatch_request"], 1)
+    recovered = run(commands["recovery", "interrupted"], 4)
+    assert recovered == [{"run_id": variables["$RUN_ID"], "recovered_count": 3}]
+    variables["$ATTEMPT"] = "2"
+    run(commands["recovery", "retry_start"], 5)
+    run(commands["recovery", "retry_terminal"], 6)
+    run(commands["exit", outcome], 7)
+    stored = read_ledger(git_repo).runs[0]
+    assert (stored.outcome.value, stored.reason_code) == (outcome, reason)
+    assert all(span.outcome is not None for span in stored.spans)
+    retries = [span for span in stored.spans if span.stage.value == "recovery_retry"]
+    assert [(span.attempt, span.outcome.value) for span in retries] == [(1, "incomplete"), (2, "success")]
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
 
 
 def test_empirical_reviewer_forbids_unsupported_claims_and_requires_capture_fields():

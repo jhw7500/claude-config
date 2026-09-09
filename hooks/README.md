@@ -155,10 +155,14 @@ responses are terminal before any replacement, then replace all three exact byte
 
 ### Telemetry is observational
 
-`begin` returns the telemetry run ID and records `snapshot_preflight`. The controller surrounds view creation and
-dispatch/wait with `view_create` and `reviewer_dispatch_wait`, records each terminal reviewer as `reviewer_total`,
-records `report_store` and `report_validation`, and records `view_cleanup`, `recovery_retry`, and `finalize` when
-those operations occur.
+`begin` returns the telemetry run ID and records `snapshot_preflight`. Telemetry requires the whole `.review/`
+namespace to be ignored and untracked, including possible private staging artifacts; individual file ignore rules
+make telemetry unavailable without changing the primary `begin` result. The controller starts `reviewer_dispatch_wait`
+before dispatch, finishes it at runtime acceptance, and starts `reviewer_total` at acceptance through the terminal
+response. If acceptance is unavailable, both spans start before dispatch and finish at the terminal response;
+dispatch is `incomplete` with `RUNTIME_SIGNAL_UNAVAILABLE`, and total retains the actual dispatch-to-terminal duration.
+Do not invent a 0ms acceptance interval. Other spans surround their operations: `view_create`, `report_store`,
+`report_validation`, `view_cleanup`, `recovery_retry`, and pre-final checks through `finalize`.
 
 <!-- telemetry-command-examples -->
 ```bash
@@ -187,6 +191,14 @@ rule without a span ID. `telemetry-recover` and `telemetry-summary` require only
 If `begin` cannot create an observation, it returns `{status:"unavailable", reason_code}`; an external telemetry
 command returns its bounded telemetry error. In both cases, retain the primary tribunal result and record the missing
 observation rather than inventing a run or changing a gate result.
+
+Attempts start at 1 per run/stage/reviewer and increase for repeated operations. Before every terminal success or
+failure exit, finish observed spans, recover any remaining running spans with `telemetry-recover`, and call
+`telemetry-close` with the primary outcome after the required peer wait and non-force cleanup. Close each round
+before beginning another. On resumed interruption, recover the known running run before a new `recovery_retry`
+attempt. A previously closed or unavailable run remains an observation gap during pending report recovery;
+never reopen it or call `begin` solely for telemetry. The canonical Skill's telemetry lifecycle tables define the
+executable event/command order for both runtimes.
 
 Telemetry failure is an observation gap only. Telemetry is never a gate input and does not change report validity,
 gate status, or the finalize decision.
