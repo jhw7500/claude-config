@@ -82,6 +82,19 @@ def _status(verdict) -> dict[str, object]:
     }
 
 
+def _context_decision(decision) -> dict[str, object]:
+    return {
+        "id": decision.id,
+        "finding_ref": {
+            "round": decision.finding_round,
+            "id": decision.finding_id,
+            "reviewer": decision.reviewer.value,
+        },
+        "disposition": decision.disposition,
+        "rationale": decision.rationale,
+    }
+
+
 def _context(verdict, reviewer: Reviewer) -> dict[str, object]:
     findings = [
         dict(item)
@@ -90,7 +103,9 @@ def _context(verdict, reviewer: Reviewer) -> dict[str, object]:
         if item["reviewer"] == reviewer.value
     ]
     decisions = [
-        item.to_json() for item in verdict.decisions if item.reviewer is reviewer
+        _context_decision(item)
+        for item in verdict.decisions
+        if item.reviewer is reviewer
     ]
     return {
         "schema": 1,

@@ -1431,6 +1431,53 @@ def test_round_three_failure_rejects_round_one_with_exhaustion(git_repo):
         begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
 
 
+def test_cli_later_round_context_omits_own_decision_executions(git_repo):
+    first = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo, first.snapshot, overrides={"A": {"findings": [finding()]}}
+        ),
+        now=NOW,
+    )
+    commit_fix(git_repo)
+    decisions_path = write_json(
+        git_repo / ".review/inbox/round-1/decisions.json", [decision()]
+    )
+    begin_round(
+        git_repo,
+        base="master",
+        runtime="codex",
+        round_number=2,
+        decisions_path=decisions_path,
+        now=NOW,
+    )
+
+    cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    context = subprocess.run(
+        [sys.executable, str(cli), "context", "--reviewer", "A"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+    )
+
+    assert context.returncode == 0 and context.stderr == ""
+    payload = json.loads(context.stdout)
+    assert payload["own_decisions"] == [
+        {
+            "id": "D-R1-A-001",
+            "finding_ref": {"round": 1, "id": "A-R1-001", "reviewer": "A"},
+            "disposition": "fixed",
+            "rationale": "The failure is now covered by an independent test.",
+        }
+    ]
+    assert "executions" not in json.dumps(payload["own_decisions"])
+    assert "python3 -m pytest -q" not in json.dumps(payload)
+    assert "1 passed" not in json.dumps(payload)
+
+
 def test_cli_json_only_success_and_bounded_domain_error(git_repo):
     cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
     begun = subprocess.run(
