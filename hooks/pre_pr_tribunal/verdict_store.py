@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 
 from .git_state import GitStateError, assert_auto_fix_scope, capture_snapshot
 from . import model as m
@@ -420,17 +421,40 @@ def _expected_input(root: Path, supplied: Path, relative: str, code: str) -> Non
         raise SchemaError(code)
 
 
-def _round_fd(review_fd: int, round_number: int, *, create: bool) -> int:
+def _exact_report_directory(fd: int) -> None:
+    try:
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+            raise SchemaError("FILE_UNSAFE")
+    except OSError:
+        raise SchemaError("FILE_UNSAFE") from None
+
+
+def _round_fd(
+    review_fd: int,
+    round_number: int,
+    *,
+    create: bool,
+    exact_report_directories: bool = False,
+) -> int:
     inbox_fd = open_directory(
         review_fd, "inbox", create=create, code="INBOX_DIRECTORY_UNSAFE"
     )
     try:
-        return open_directory(
+        if exact_report_directories:
+            _exact_report_directory(inbox_fd)
+        round_fd = open_directory(
             inbox_fd,
             f"round-{round_number}",
             create=create,
             code="ROUND_DIRECTORY_UNSAFE",
         )
+        try:
+            if exact_report_directories:
+                _exact_report_directory(round_fd)
+            return round_fd
+        except BaseException:
+            os.close(round_fd)
+            raise
     finally:
         os.close(inbox_fd)
 
@@ -549,7 +573,12 @@ def store_reviewer_report(
     with locked_review(root, create=False) as review_fd:
         pending = _read_verdict_locked(review_fd)
         _require_all_pending(pending)
-        round_fd = _round_fd(review_fd, pending.round, create=True)
+        round_fd = _round_fd(
+            review_fd,
+            pending.round,
+            create=True,
+            exact_report_directories=True,
+        )
         try:
             name = f"{reviewer.value}.json"
             if replace_pending_recovery:
