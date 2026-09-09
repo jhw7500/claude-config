@@ -260,7 +260,7 @@ def test_temporary_cleanup_failure_surfaces_unsafe_and_retains_evidence(
                 raise OSError("injected fchmod failure")
 
             def fail_temp_unlink(name, *args, **kwargs):
-                if str(name).startswith(".tmp."):
+                if str(name).startswith((".tmp.", ".cleanup.")):
                     raise OSError("injected cleanup failure")
                 return real_unlink(name, *args, **kwargs)
 
@@ -274,7 +274,7 @@ def test_temporary_cleanup_failure_surfaces_unsafe_and_retains_evidence(
                 )
         finally:
             os.close(inbox_fd)
-    artifacts = _temporary_artifacts(git_repo / ".review/inbox")
+    artifacts = tuple((git_repo / ".review/inbox").glob(".cleanup.*"))
     assert len(artifacts) == 1
 
 
@@ -373,6 +373,132 @@ def test_temporary_name_collision_preserves_unowned_inode(git_repo, monkeypatch)
         finally:
             os.close(inbox_fd)
     assert foreign.read_bytes() == b"foreign temporary"
+
+
+@pytest.mark.parametrize("cleanup_stage", ("fstat", "close"))
+def test_temporary_cleanup_descriptor_failures_map_to_unsafe(
+    git_repo, monkeypatch, cleanup_stage
+):
+    """Raw cleanup descriptor failures must not escape the stable unsafe boundary."""
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        try:
+            real_fstat = os.fstat
+            real_close = os.close
+            fstat_calls = 0
+            close_failed = False
+
+            def fail_fchmod(*args, **kwargs):
+                raise OSError("injected primary failure")
+
+            def fail_cleanup_fstat(fd):
+                nonlocal fstat_calls
+                fstat_calls += 1
+                if cleanup_stage == "fstat" and fstat_calls == 3:
+                    raise OSError("injected cleanup fstat failure")
+                return real_fstat(fd)
+
+            def fail_cleanup_close(fd):
+                nonlocal close_failed
+                if cleanup_stage == "close" and not close_failed:
+                    close_failed = True
+                    raise OSError("injected cleanup close failure")
+                return real_close(fd)
+
+            monkeypatch.setattr(os, "fchmod", fail_fchmod)
+            monkeypatch.setattr(os, "fstat", fail_cleanup_fstat)
+            monkeypatch.setattr(os, "close", fail_cleanup_close)
+            with pytest.raises(SchemaError, match="^UNSAFE$"):
+                atomic_replace_bytes(
+                    inbox_fd, "A.json", b"new", maximum=1024,
+                    too_large="TOO_LARGE", unsafe="UNSAFE", exact_mode=0o600,
+                    write_failed="WRITE_FAILED",
+                )
+        finally:
+            os.close(inbox_fd)
+
+
+def test_atomic_create_source_substitution_without_held_inode_preserves_foreign(
+    git_repo, monkeypatch
+):
+    """Closing the source early lets inode reuse turn a foreign publish into ours."""
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        try:
+            real_link = os.link
+
+            def substitute_then_link(source, target, **kwargs):
+                os.unlink(source, dir_fd=kwargs["src_dir_fd"])
+                foreign_fd = os.open(
+                    source,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=kwargs["src_dir_fd"],
+                )
+                try:
+                    os.write(foreign_fd, b"foreign source")
+                finally:
+                    os.close(foreign_fd)
+                return real_link(source, target, **kwargs)
+
+            monkeypatch.setattr(os, "link", substitute_then_link)
+            with pytest.raises(SchemaError, match="^UNSAFE$"):
+                atomic_create_bytes(
+                    inbox_fd, "A.json", b"expected", maximum=1024,
+                    exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
+                )
+        finally:
+            os.close(inbox_fd)
+    inbox = git_repo / ".review/inbox"
+    assert (inbox / "A.json").read_bytes() == b"foreign source"
+    assert tuple(item.read_bytes() for item in _temporary_artifacts(inbox)) == (
+        b"foreign source",
+    )
+
+
+def test_cleanup_boundary_substitution_preserves_foreign_name(git_repo, monkeypatch):
+    """A name swapped at cleanup must be preserved rather than pathname-unlinked."""
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        try:
+            real_fsync = os.fsync
+            fsync_calls = 0
+
+            def fail_directory_fsync(fd):
+                nonlocal fsync_calls
+                fsync_calls += 1
+                if fsync_calls == 2:
+                    raise OSError("injected directory fsync failure")
+                return real_fsync(fd)
+
+            def substitute_before_cleanup(*args, **kwargs):
+                source = args[1]
+                if source == "A.json":
+                    os.unlink(source, dir_fd=args[0])
+                    foreign_fd = os.open(
+                        source,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=args[0],
+                    )
+                    try:
+                        os.write(foreign_fd, b"foreign cleanup")
+                    finally:
+                        os.close(foreign_fd)
+                raise OSError("cleanup exchange unavailable")
+
+            monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+            monkeypatch.setattr(
+                review_store, "_rename_noreplace", substitute_before_cleanup, raising=False
+            )
+            with pytest.raises(SchemaError, match="^UNSAFE$"):
+                atomic_create_bytes(
+                    inbox_fd, "A.json", b"expected", maximum=1024,
+                    exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
+                )
+        finally:
+            os.close(inbox_fd)
+    assert (git_repo / ".review/inbox/A.json").read_bytes() == b"foreign cleanup"
 
 
 def test_atomic_create_rejects_wrong_parent_descriptor_mode_without_publishing(git_repo):
