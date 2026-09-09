@@ -26,6 +26,7 @@ from .model import (
 GIT = "/usr/bin/git"
 MAX_GIT_STDOUT_BYTES = 32 * 1024 * 1024
 MAX_GIT_STDERR_BYTES = 64 * 1024
+MAX_GIT_STDIN_BYTES = 4096
 GIT_TIMEOUT_SECONDS = 30
 GIT_READ_CHUNK_BYTES = 64 * 1024
 GIT_TERMINATION_GRACE_SECONDS = 0.2
@@ -87,12 +88,32 @@ def capture_telemetry_candidate(cwd: Path) -> TelemetryCandidate:
 def check_telemetry_ignored(cwd: Path) -> None:
     """Require the entire artifact namespace to be ignored and untracked."""
     root = _physical_root(_validated_cwd(cwd))
-    # Failed atomic replacement may retain a private .tmp.* publication. Only
-    # an ignored directory covers every possible staging name before we write.
-    _command_output(
-        root, ("check-ignore", "-q", "--", ".review/"),
-        failure="TELEMETRY_FILE_UNSAFE",
-    )
+    # A trailing slash also matches .review/*, whose children can be negated.
+    # Prove an exact whole-parent exclusion instead: Git cannot reinclude any
+    # child beneath it, including staging links retained after failed rename.
+    try:
+        proof = _run_git_with_environment(
+            root, ("check-ignore", "-z", "-v", "--no-index", "--stdin"),
+            _git_environment(), input_bytes=b".review/\x00",
+        )
+    except GitStateError:
+        raise GitStateError("TELEMETRY_FILE_UNSAFE") from None
+    fields = proof.stdout.split(b"\x00")
+    if (
+        proof.returncode != 0
+        or proof.stderr
+        or len(fields) != 5
+        or not fields[0]
+        or re.fullmatch(rb"[1-9][0-9]*", fields[1]) is None
+        or fields[2] not in {b".review/", b"/.review/", b".review", b"/.review"}
+        or fields[3:] != [b".review/", b""]
+    ):
+        raise GitStateError("TELEMETRY_FILE_UNSAFE")
+    for path in (".review/telemetry.json", ".review/lock"):
+        _command_output(
+            root, ("check-ignore", "-q", "--", path),
+            failure="TELEMETRY_FILE_UNSAFE",
+        )
     if _command_output(
         root, ("ls-files", "-z", "--", ".review"),
         failure="TELEMETRY_FILE_UNSAFE",
@@ -167,8 +188,13 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def _run_git_with_environment(
-    cwd: Path, arguments: Sequence[str], environment: dict[str, str]
+    cwd: Path, arguments: Sequence[str], environment: dict[str, str],
+    *, input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    if input_bytes is not None and (
+        not isinstance(input_bytes, bytes) or len(input_bytes) > MAX_GIT_STDIN_BYTES
+    ):
+        raise GitStateError("GIT_COMMAND_FAILED")
     argv = [GIT, "-C", str(cwd), *arguments]
     try:
         selector = selectors.DefaultSelector()
@@ -180,7 +206,7 @@ def _run_git_with_environment(
         process = subprocess.Popen(
             argv,
             shell=False,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if input_bytes is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
@@ -188,6 +214,17 @@ def _run_git_with_environment(
         )
         if process.stdout is None or process.stderr is None:
             raise RuntimeError("missing Git capture pipe")
+        if input_bytes is not None:
+            if process.stdin is None:
+                raise RuntimeError("missing Git input pipe")
+            try:
+                # One bounded, nonblocking write; an unread input cannot stall
+                # the existing output limits and process-group timeout path.
+                os.set_blocking(process.stdin.fileno(), False)
+                if os.write(process.stdin.fileno(), input_bytes) != len(input_bytes):
+                    raise RuntimeError("incomplete Git input")
+            finally:
+                process.stdin.close()
         stdout = bytearray()
         stderr = bytearray()
         selector.register(

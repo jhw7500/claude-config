@@ -359,6 +359,65 @@ def test_cli_individual_ignores_and_failed_rename_cannot_dirty_primary_begin(
     )
 
 
+@pytest.mark.parametrize("exposed_child", ("telemetry.json", ".tmp.*"))
+@pytest.mark.parametrize("failed_rename", (False, True))
+def test_cli_wildcard_negations_cannot_dirty_primary_begin(
+    git_repo, tmp_path, monkeypatch, capsys, exposed_child, failed_rename,
+):
+    from pre_pr_tribunal.verdict_store import begin_round
+
+    (git_repo / ".gitignore").write_text(f".review/*\n!.review/{exposed_child}\n")
+    subprocess.run(
+        ["/usr/bin/git", "-C", str(git_repo), "commit", "-qam", "negated telemetry child"],
+        check=True,
+    )
+    control = tmp_path / "without-telemetry"
+    shutil.copytree(git_repo, control)
+    monkeypatch.setattr(cli, "begin_round", lambda *a, **kw: begin_round(*a, **kw, now=NOW))
+
+    def command(repo):
+        monkeypatch.chdir(repo)
+        code = cli.main(list(BEGIN), wall_clock=NOW, monotonic_ns=lambda: 0)
+        captured = capsys.readouterr()
+        return code, captured.out, captured.err
+
+    def disable_telemetry(_cwd):
+        raise git_state.GitStateError("TELEMETRY_FILE_UNSAFE")
+
+    # Disable only telemetry in the control; the primary CLI transaction is real.
+    with monkeypatch.context() as disabled:
+        disabled.setattr(cli, "check_telemetry_ignored", disable_telemetry)
+        expected = command(control)
+    assert expected[0] == 0 and expected[2] == ""
+    assert subprocess.check_output([
+        "/usr/bin/git", "-C", str(control), "status", "--porcelain", "--untracked-files=all",
+    ]) == b""
+
+    real_replace = review_store.os.replace
+
+    def fail_telemetry_rename(source, destination, **kwargs):
+        if destination == "telemetry.json":
+            raise OSError("injected telemetry rename failure")
+        return real_replace(source, destination, **kwargs)
+
+    if failed_rename:
+        monkeypatch.setattr(review_store.os, "replace", fail_telemetry_rename)
+    actual = command(git_repo)
+    assert actual == expected
+    assert json.loads(actual[1])["telemetry"] == {
+        "status": "unavailable", "reason_code": "TELEMETRY_FILE_UNSAFE",
+    }
+    assert (git_repo / ".review/verdict.json").read_bytes() == (control / ".review/verdict.json").read_bytes()
+    assert not ledger_path(git_repo).exists()
+    assert list((git_repo / ".review").glob(".tmp.*")) == []
+    assert sorted(path.relative_to(git_repo) for path in (git_repo / ".review").rglob("*")) == sorted(
+        path.relative_to(control) for path in (control / ".review").rglob("*")
+    )
+    assert subprocess.check_output([
+        "/usr/bin/git", "-C", str(git_repo), "status", "--porcelain", "--untracked-files=all",
+    ]) == b""
+
+
 @pytest.mark.parametrize("operation", ("create_run", "start_span", "record_candidate", "bind_run", "finish_span", "close_run"))
 @pytest.mark.parametrize("primary_failure", (False, True))
 def test_cli_telemetry_exception_cannot_replace_primary_result(git_repo, monkeypatch, capsys, operation, primary_failure):

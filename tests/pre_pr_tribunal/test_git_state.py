@@ -303,6 +303,115 @@ def test_ignored_review_state_is_clean_but_untracked_source_is_dirty(git_repo):
         capture_snapshot(git_repo, "master")
 
 
+@pytest.mark.parametrize("pattern", (".review/", "/.review/", ".review", "/.review", ".review/*"))
+@pytest.mark.parametrize("review_exists", (False, True))
+def test_telemetry_ignore_pattern_distinguishes_parent_from_child_wildcard(
+    git_repo, pattern, review_exists,
+):
+    (git_repo / ".gitignore").write_text(
+        f"{pattern}\n!.review/telemetry.json\n!.review/lock\n!.review/.tmp.*\n"
+    )
+    _git(git_repo, "commit", "-qam", "excluded parent with child negations")
+    review = git_repo / ".review"
+    if review_exists:
+        review.mkdir(mode=0o700)
+
+    result = subprocess.run(
+        [GIT, "-C", str(git_repo), "check-ignore", "-z", "-v", "--no-index", "--stdin"],
+        input=b".review/\x00", capture_output=True, env=git_state._git_environment(),
+    )
+    assert (result.returncode, result.stderr) == (0, b"")
+    assert result.stdout == b"\x00".join((b".gitignore", b"1", pattern.encode("ascii"), b".review/", b""))
+    whole_parent = pattern != ".review/*"
+    for path in (".review/telemetry.json", ".review/lock", ".review/.tmp.1234.0123456789abcdef"):
+        assert git_state._run_git(git_repo, "check-ignore", "-q", "--", path).returncode == (0 if whole_parent else 1)
+    assert _git(git_repo, "ls-files", "-z", "--", ".review") == b""
+    assert _git(git_repo, "status", "--porcelain", "--untracked-files=all") == b""
+    if whole_parent:
+        git_state.check_telemetry_ignored(git_repo)
+        before = capture_snapshot(git_repo, "master")
+        review.mkdir(mode=0o700, exist_ok=True)
+        for name in ("telemetry.json", "lock", ".tmp.1234.0123456789abcdef"):
+            (review / name).write_bytes(b"private artifact")
+        assert _git(git_repo, "status", "--porcelain", "--untracked-files=all") == b""
+        assert snapshot_matches(before, capture_snapshot(git_repo, "master"))
+
+
+@pytest.mark.parametrize("output", (
+    b"",
+    b".gitignore\x001\x00.review/\x00.review/",
+    b"\x001\x00.review/\x00.review/\x00",
+    b".gitignore\x00\x00.review/\x00.review/\x00",
+    b".gitignore\x000\x00.review/\x00.review/\x00",
+    b".gitignore\x0001\x00.review/\x00.review/\x00",
+    b".gitignore\x00+1\x00.review/\x00.review/\x00",
+    b".gitignore\x001\n\x00.review/\x00.review/\x00",
+    b".gitignore\x00\xff\x00.review/\x00.review/\x00",
+    b".gitignore\x001\x00.review/*\x00.review/\x00",
+    b".gitignore\x001\x00**/.review/\x00.review/\x00",
+    b".gitignore\x001\x00!.review/\x00.review/\x00",
+    b".gitignore\x001\x00.review/ \x00.review/\x00",
+    b".gitignore\x001\x00\xff\x00.review/\x00",
+    b".gitignore\x001\x00.review/\x00.review/telemetry.json\x00",
+    b".gitignore\x001\x00.review/\x00\x00",
+    b".gitignore\x001\x00.review/\x00.review/\x00extra\x00",
+    b".gitignore\x001\x00.review/\x00.review/\x00" * 2,
+    b".gitignore:1:.review/\t.review/\n",
+))
+def test_telemetry_ignore_guard_rejects_malformed_or_unproven_nul_record(git_repo, monkeypatch, output):
+    original = git_state._run_git_with_environment
+
+    def run(cwd, arguments, environment, **kwargs):
+        if arguments[0] == "check-ignore" and ("--stdin" in arguments or arguments[-1] == ".review/"):
+            return subprocess.CompletedProcess([], 0, output, b"")
+        return original(cwd, arguments, environment, **kwargs)
+
+    monkeypatch.setattr(git_state, "_run_git_with_environment", run)
+    with pytest.raises(GitStateError, match="^TELEMETRY_FILE_UNSAFE$"):
+        git_state.check_telemetry_ignored(git_repo)
+    assert not (git_repo / ".review").exists()
+
+
+@pytest.mark.parametrize(("returncode", "stderr"), ((1, b""), (0, b"unexpected warning\n")))
+def test_telemetry_ignore_guard_rejects_unsuccessful_proof(git_repo, monkeypatch, returncode, stderr):
+    original = git_state._run_git_with_environment
+
+    def run(cwd, arguments, environment, **kwargs):
+        if arguments[0] == "check-ignore" and ("--stdin" in arguments or arguments[-1] == ".review/"):
+            return subprocess.CompletedProcess(
+                [], returncode, b".gitignore\x001\x00.review/\x00.review/\x00", stderr,
+            )
+        return original(cwd, arguments, environment, **kwargs)
+
+    monkeypatch.setattr(git_state, "_run_git_with_environment", run)
+    with pytest.raises(GitStateError, match="^TELEMETRY_FILE_UNSAFE$"):
+        git_state.check_telemetry_ignored(git_repo)
+
+
+@pytest.mark.parametrize("child", ("telemetry.json", "lock"))
+def test_telemetry_ignore_guard_rechecks_canonical_children_after_parent_proof(git_repo, monkeypatch, child):
+    original = git_state._run_git_with_environment
+
+    def run(cwd, arguments, environment, **kwargs):
+        result = original(cwd, arguments, environment, **kwargs)
+        if arguments[0] == "check-ignore" and ("--stdin" in arguments or arguments[-1] == ".review/"):
+            (git_repo / ".gitignore").write_text(f".review/*\n!.review/{child}\n")
+        return result
+
+    monkeypatch.setattr(git_state, "_run_git_with_environment", run)
+    with pytest.raises(GitStateError, match="^TELEMETRY_FILE_UNSAFE$"):
+        git_state.check_telemetry_ignored(git_repo)
+
+
+@pytest.mark.parametrize("input_bytes", (b"x" * 4097, "not bytes"), ids=("oversized", "not-bytes"))
+def test_git_runner_rejects_unbounded_or_invalid_stdin(git_repo, input_bytes):
+    with pytest.raises(GitStateError, match="^GIT_COMMAND_FAILED$"):
+        git_state._run_git_with_environment(
+            git_repo, ("hash-object", "--stdin"), git_state._git_environment(),
+            input_bytes=input_bytes,
+        )
+
+
 @pytest.mark.parametrize(
     "path", ["line\nbreak.txt", "tab\tpath.txt", "cafe\u0301.txt"]
 )
