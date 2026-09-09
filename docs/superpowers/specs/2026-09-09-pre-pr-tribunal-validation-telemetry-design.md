@@ -208,7 +208,10 @@ controller가 terminal response를 받은 뒤 다음을 지킨다.
    기록한다.
 4. 저장 전후 raw SHA-256을 비교하고 mismatch면 `REPORT_BYTES_MISMATCH`로 중단한다.
 5. invalid JSON이나 schema 오류여도 이미 받은 original file은 수정하지 않는다.
-6. 기존 canonical file을 덮어쓰지 않는다. 같은 slot의 재실행은 #115 범위다.
+6. 일반 실행에서는 기존 canonical file을 덮어쓰지 않는다. 예외는 기존
+   pending-round 계약에 따라 사용자가 명시적으로 요청한 A/B/C 전체 재실행 recovery다.
+   이 경우 세 새 terminal response가 모두 준비된 뒤에만 recovery 전용 atomic replace를
+   사용한다. 한 slot만 재실행하거나 이전 peer 결과를 재사용하는 동작은 #115 범위다.
 
 safe store는 `.review`와 `inbox/round-N`을 current user 소유의 mode `0700` directory로
 열고 symlink를 따라가지 않는다. report는 ambient `umask`와 무관하게 descriptor에
@@ -223,6 +226,12 @@ path를 전달하지 않는다. 성공 시 reviewer, round, `status=stored`, raw
 bounded JSON으로 반환한다. JSON/schema validation은 저장 bytes를 바꾸지 않도록
 별도 `validate-report`가 담당한다. 저장 중 발견한 oversized input, unsafe directory,
 기존 target 또는 digest mismatch는 stable error로 끝난다.
+
+기존 pending-round full-panel recovery에서만 `store-report`의 명시적 recovery replace
+mode를 허용한다. controller는 사용자 개입, unchanged bound snapshot, all-pending
+verdict, A/B/C 전체 fresh rerun과 세 terminal response 준비를 먼저 확인한다. replace는
+각 새 response bytes를 고치지 않고 atomic하게 저장하며 exact `0600`을 다시 적용한다.
+일반 실행, 일부 panel만의 rerun 또는 이전 peer report 재사용에는 이 mode를 쓰지 않는다.
 
 ### 8.4 Finalize 직전 검증
 
@@ -307,7 +316,7 @@ validation 목적으로 취소하거나 A의 결과를 전달하지 않는다. i
 ```
 
 snapshot capture가 성공하기 전에는 repository/base request와 candidate HEAD만 가진
-`binding_status=pending` run을 허용한다. capture가 성공하면 exact binding을 한 번
+binding object의 `status=pending` run을 허용한다. capture가 성공하면 exact binding을 한 번
 채우고 이후 수정하지 않는다. safe repository root를 확정하기 전에 난 오류는 local
 ledger를 둘 신뢰할 위치가 없으므로 bounded stderr에만 남긴다.
 
@@ -374,8 +383,11 @@ unsafe 또는 oversized 기존 telemetry는 bounded telemetry error를 내고 �
 ### 10.5 Sanitized summary
 
 summary는 raw span을 그대로 내보내지 않고 snapshot/contract, stage별 count와
-duration, reviewer별 total, outcome count와 anomaly code만 반환한다. 다음은 형식
-예시이며 실제 기준선 수치가 아니다.
+duration, reviewer별 total, outcome count와 anomaly code만 반환한다. immediate
+validation의 개선을 비교할 때는 run start 기준의 bounded relative milestone만 추가해
+첫 invalid report 탐지와 마지막 reviewer terminal 사이의 `wait_all_delay_ms`를
+계산한다. raw wall timestamp, monotonic absolute value와 span ID는 내보내지 않는다.
+다음은 형식 예시이며 실제 기준선 수치가 아니다.
 
 ```json
 {
@@ -383,9 +395,15 @@ duration, reviewer별 total, outcome count와 anomaly code만 반환한다. 다�
   "binding":{"diff_sha256":"<64-hex>","contract":{"report_text":2,"diff_recipe":1}},
   "reviewers":{"A":{"total_ms":1200},"B":{"total_ms":4200},"C":{"total_ms":900}},
   "stages":{"report_validation":{"count":3,"total_ms":18}},
-  "outcomes":{"success":12,"failure":0,"timeout":0,"incomplete":0,"clock_anomaly":0}
+  "outcomes":{"success":12,"failure":0,"timeout":0,"incomplete":0,"clock_anomaly":0},
+  "early_detection":null
 }
 ```
+
+invalid report run에서는 `early_detection`이 reviewer, stable validation reason,
+`detected_elapsed_ms`, nullable `all_reviewers_terminal_elapsed_ms`와 nullable
+`wait_all_delay_ms`만 가진다. 필요한 milestone이 incomplete이거나 clock anomaly면
+비교값을 0으로 꾸미지 않고 null로 남긴다.
 
 고정 lockfile-only fixture에서 성능 최적화 전 automatic baseline summary와 최적화 후
 summary를 같은 binding/contract 조건으로 보존해 Reviewer B 병목 구간을 식별한다.
@@ -423,6 +441,7 @@ commit path와 telemetry update exception boundary를 분리하고, regression t
 | `FILE_UNSAFE` | 기존 code 유지; type, owner, symlink 또는 exact mode 위반 |
 | `REPORT_BYTES_MISMATCH` | captured bytes와 stored bytes digest 불일치 |
 | `TELEMETRY_INVALID` | telemetry schema/state transition 위반 |
+| `TELEMETRY_FILE_UNSAFE` | telemetry type, owner, symlink 또는 exact mode 위반 |
 | `TELEMETRY_TOO_LARGE` | configured byte/span/run bound 초과 |
 | `TELEMETRY_CLOCK_ANOMALY` | monotonic 또는 wall clock 순서 위반 |
 
@@ -441,6 +460,8 @@ commit path와 telemetry update exception boundary를 분리하고, regression t
   `incomplete`로 표시한다.
 - 기존 `0644` report를 자동 chmod하거나 rewrite하지 않는다. controller가 직접 받은
   current response를 secure store로 만든 경우만 신뢰한다.
+- 기존 pending-round recovery는 explicit recovery replace mode로 A/B/C 전체 새 응답만
+  교체한다. 이전 valid peer 재사용과 단일 slot 교체는 허용하지 않는다.
 - `finalize`의 세 reviewer all-or-nothing 상태 모델은 유지한다. partial slot migration은
   #115가 별도 schema/state 설계로 다룬다.
 - telemetry schema가 future reader보다 새로우면 telemetry만 unavailable이고 verdict
