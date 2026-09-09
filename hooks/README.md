@@ -130,9 +130,51 @@ deny reason code와 기본 복구는 다음과 같다.
 `finalize`가 reviewer report의 `TEXT_INVALID` 같은 schema 오류로 멈췄지만 verdict가 여전히
 `in_progress`라면, 기존 verdict를 reset하거나 `.review`를 지우지 않는다. 같은 bound snapshot과
 clean 상태를 확인한 뒤 fresh detached view에서 A/B/C 전원을 다시 실행한다. 기존 C가 valid였더라도
-재사용하지 않고, 세 reviewer의 exact 새 terminal JSON으로 inbox 세 파일을 교체한 다음 같은 round를
-`finalize`한다. JSON-decoded string은 NFC여야 하고 Unicode `Cc`/`Cs`를 포함할 수 없으므로 LF/TAB은
-escape로 표현해도 invalid다. Snapshot이 달라졌으면 이 pending 복구를 중단하고 사용자 판단을 받는다.
+재사용하지 않고, 세 reviewer의 fresh exact terminal JSON을 모두 받은 뒤에만 inbox 세 파일을 모두
+교체한 다음 같은 round를 `finalize`한다. JSON-decoded string은 NFC여야 한다. Physical unescaped
+newline은 invalid JSON이지만 JSON escape가 decode한 LF/TAB은 `stdout_excerpt`와 `stderr_excerpt`에서만
+허용된다. CR, NUL, ESC, DEL, other `Cc`, all `Cs`, secret, absolute home path는 invalid다. Snapshot이
+달라졌으면 이 pending 복구를 중단하고 사용자 판단을 받는다.
+
+### Reviewer report handoff and validation
+
+The controller handles each terminal response privately: it never sends one reviewer's output or validation status
+to another reviewer. Pipe the exact response bytes directly to `store-report --reviewer A|B|C`; do not trim,
+parse-and-re-emit, or reserialize them. The receipt returns `raw_sha256`. Immediately validate the stored file with
+`validate-report --reviewer A|B|C --source stored` and retain the matching digest. `validate-report --source stdin`
+is available only to validate supplied input without writing it; it is not a replacement for stored validation.
+
+Before the unchanged three-path `finalize`, validate each stored A/B/C report again and compare each `raw_sha256`
+with its store receipt. Immediately before that call, check every inbox report is a current-user-owned, regular,
+non-symlink file with exact mode `0600`. A missing, mismatched, unsafe, malformed, timed-out, or invalid report is
+non-pass: wait for already-started reviewers, attempt non-force detached-view cleanup, and do not call `finalize`.
+
+Pending recovery requires explicit user intervention and a fresh complete A/B/C panel. Wait until all three fresh
+responses are terminal before any replacement, then replace all three exact byte inputs with
+`store-report --reviewer X --replace-pending-recovery`; never reuse a prior-round artifact or one valid peer.
+
+### Telemetry is observational
+
+`begin` returns the telemetry run ID and records `snapshot_preflight`. The controller surrounds view creation and
+dispatch/wait with `view_create` and `reviewer_dispatch_wait`, records each terminal reviewer as `reviewer_total`,
+records `report_store` and `report_validation`, and records `view_cleanup`, `recovery_retry`, and `finalize` when
+those operations occur. Use `telemetry-start`, `telemetry-finish`, `telemetry-close`, and `telemetry-summary` with
+that run ID; report `success`, `failure`, or `timeout` plus a stable reason code.
+
+Telemetry failure is an observation gap only. Telemetry is never a gate input and does not change report validity,
+gate status, or the finalize decision.
+
+### Snapshot diff contract and stable CLI codes
+
+The bound diff is SHA-256 over `/usr/bin/git diff --binary --no-ext-diff --no-textconv --full-index
+<merge-base>..<head-sha>`. The command clears inherited `GIT_` variables and fixes `LC_ALL=C`, `LANG=C`,
+`GIT_PAGER=cat`, `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+`GIT_ATTR_NOSYSTEM=1`, and disables `core.fsmonitor` through the documented command-local config vector.
+
+CLI failures use bounded stable codes, including `USAGE`, `ROUND_NOT_IN_PROGRESS`, `SNAPSHOT_CHANGED`,
+`REPORT_FILE_EXISTS`, `REVIEWER_REPORT_MISSING`, `TEXT_INVALID`, `FILE_UNSAFE`, and telemetry's
+`TELEMETRY_INVALID`, `TELEMETRY_FILE_UNSAFE`, `TELEMETRY_TOO_LARGE`, or `TELEMETRY_CLOCK_ANOMALY`.
+Do not treat any telemetry code as report or gate evidence.
 
 `head_ref`가 도입되기 전에 생성된 terminal FAIL verdict는 다음 round `begin`에서만 현재 named
 branch를 새 snapshot에 기록하며 자동 전환된다. 그런 legacy verdict 자체는 PR을 허용하지 않는다.

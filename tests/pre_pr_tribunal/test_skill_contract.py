@@ -88,7 +88,6 @@ def test_skill_encodes_the_exact_ordered_ten_step_state_machine():
     assert "peer" in steps[5]
     assert "all three" in steps[6] and "terminal" in steps[6]
     assert "malformed" in steps[6] and "non-pass" in steps[6]
-    assert "only after" in steps[7] and "terminal" in steps[7]
     assert "finalize --reviewer-a" in steps[7]
     assert CLI in steps[7]
     assert "no decisions" in steps[7]
@@ -287,20 +286,65 @@ def test_each_reviewer_prompt_is_read_only_self_contained_and_exactly_bounded():
         assert all(mandate in body for mandate in mandates)
 
 
+def test_skill_stores_and_validates_each_terminal_report_before_finalize():
+    steps = numbered_steps(text("SKILL.md"))
+    for token in (
+        "store-report --reviewer",
+        "validate-report --reviewer",
+        "--source stored",
+        "exact bytes",
+        "0600",
+        "current-user-owned",
+        "regular",
+        "non-symlink",
+        "raw_sha256",
+    ):
+        assert token in steps[6] or token in steps[7]
+    assert steps[7].index("validate-report") < steps[7].index("finalize --reviewer-a")
+    assert "do not call `finalize`" in steps[7]
+
+
+def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate():
+    skill = text("SKILL.md")
+    for stage in (
+        "snapshot_preflight",
+        "view_create",
+        "reviewer_dispatch_wait",
+        "reviewer_total",
+        "report_store",
+        "report_validation",
+        "finalize",
+        "view_cleanup",
+        "recovery_retry",
+    ):
+        assert stage in skill
+    assert "telemetry" in skill and "does not change" in skill
+
+
+def test_skill_failure_order_preserves_peer_privacy_and_cleanup():
+    steps = numbered_steps(text("SKILL.md"))
+    failure = steps[6]
+    assert "peer output/status" in failure
+    assert "already-started peer" in failure
+    assert "do not call `finalize`" in failure
+    assert "non-force cleanup" in failure
+    assert failure.index("already-started peer") < failure.index("non-force cleanup")
+
+
 def test_every_report_contract_matches_the_decoded_text_parser_boundary():
     for name in REFERENCES:
         body = text(name)
         for token in (
-            "JSON-decoded string",
-            "Unicode NFC",
-            "General_Category",
-            "`Cc`",
-            "`Cs`",
+            "stdout_excerpt",
+            "stderr_excerpt",
             "LF",
             "TAB",
-            "one physical line",
-            "printable separator",
-            "` | `",
+            "only",
+            "CR",
+            "NUL",
+            "ESC",
+            "do not trim",
+            "do not reserialize",
         ):
             assert token in body, f"{name} omits decoded-text rule: {token}"
     assert "strict parser is authoritative" in text("references/report-schema.md")
@@ -377,6 +421,16 @@ def test_documented_report_and_decision_examples_pass_the_real_strict_parsers():
             snapshot=SNAPSHOT,
         )
         assert parsed.reviewer is reviewer
+
+    execution_report = json_example(schema, "valid-reviewer-b")
+    assert execution_report["executions"][0]["stdout_excerpt"] == "col1\n\t1 passed"
+    parsed_execution = parse_reviewer_report(
+        json.dumps(execution_report).encode(),
+        expected_reviewer=Reviewer.B,
+        expected_round=1,
+        snapshot=SNAPSHOT,
+    )
+    assert parsed_execution.executions[0].stdout_excerpt == "col1\n\t1 passed"
 
     for label in ("valid-fixed-decision", "valid-rebutted-decision"):
         parsed = parse_decisions(
