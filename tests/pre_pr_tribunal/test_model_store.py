@@ -1894,3 +1894,176 @@ def test_cli_help_is_stable_usage_without_stdout(git_repo, arguments):
     assert result.returncode == 2
     assert result.stdout == ""
     assert result.stderr == "PRE_PR_TRIBUNAL:USAGE\n"
+
+
+def run_cli_bytes(git_repo, *arguments, input=b""):
+    cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    return subprocess.run(
+        [sys.executable, str(cli), *arguments],
+        cwd=git_repo,
+        input=input,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_cli_stores_and_validates_exact_report_without_mutating_verdict(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\n"
+    verdict_path = git_repo / ".review/verdict.json"
+    before = verdict_path.read_bytes()
+    stored = run_cli_bytes(git_repo, "store-report", "--reviewer", "A", input=raw)
+    stored_payload = json.loads(stored.stdout)
+    assert stored.returncode == 0 and stored.stderr == b""
+    assert stored_payload == {
+        "reviewer": "A",
+        "round": 1,
+        "status": "stored",
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    validated = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert validated.returncode == 0 and validated.stderr == b""
+    assert json.loads(validated.stdout)["raw_sha256"] == stored_payload["raw_sha256"]
+    assert verdict_path.read_bytes() == before
+    assert (git_repo / ".review/inbox/round-1/A.json").read_bytes() == raw
+
+
+def test_cli_validates_stdin_bytes_and_rejects_invalid_without_mutation(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\n"
+    verdict_path = git_repo / ".review/verdict.json"
+    before = verdict_path.read_bytes()
+    valid = run_cli_bytes(
+        git_repo,
+        "validate-report",
+        "--reviewer",
+        "A",
+        "--source",
+        "stdin",
+        input=raw,
+    )
+    assert valid.returncode == 0 and valid.stderr == b""
+    assert json.loads(valid.stdout) == {
+        "reviewer": "A",
+        "round": 1,
+        "status": "valid",
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    invalid = run_cli_bytes(
+        git_repo,
+        "validate-report",
+        "--reviewer",
+        "A",
+        "--source",
+        "stdin",
+        input=b'{"schema":1',
+    )
+    assert invalid.returncode == 1
+    assert invalid.stdout == b""
+    assert invalid.stderr == b"PRE_PR_TRIBUNAL:JSON_INVALID\n"
+    assert verdict_path.read_bytes() == before
+    assert not (git_repo / ".review/inbox/round-1/A.json").exists()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("store-report", "--reviewer", "D"),
+        ("validate-report", "--reviewer", "A", "--source", "other"),
+        ("validate-report", "--reviewer", "A"),
+    ),
+)
+def test_cli_report_usage_is_bounded_exit_two(git_repo, arguments):
+    result = run_cli_bytes(git_repo, *arguments)
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert result.stderr == b"PRE_PR_TRIBUNAL:USAGE\n"
+
+
+def test_cli_stored_validation_rejects_unsafe_mode_symlink_and_swapped_content(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
+    stored = run_cli_bytes(git_repo, "store-report", "--reviewer", "A", input=raw)
+    assert stored.returncode == 0
+    target = git_repo / ".review/inbox/round-1/A.json"
+    target.chmod(0o644)
+    invalid_mode = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert invalid_mode.returncode == 1
+    assert invalid_mode.stderr == b"PRE_PR_TRIBUNAL:FILE_UNSAFE\n"
+
+    target.chmod(0o600)
+    target.unlink()
+    target.symlink_to(git_repo / "tracked.txt")
+    invalid_link = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert invalid_link.returncode == 1
+    assert invalid_link.stderr == b"PRE_PR_TRIBUNAL:FILE_UNSAFE\n"
+
+    target.unlink()
+    target.write_bytes(raw.replace(b'"reviewer":"A"', b'"reviewer":"B"'))
+    target.chmod(0o600)
+    swapped = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert swapped.returncode == 1
+    assert swapped.stderr == b"PRE_PR_TRIBUNAL:REPORT_REVIEWER_MISMATCH\n"
+
+
+def test_cli_report_stdin_reader_surfaces_oversize_without_truncation(git_repo):
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    oversize = b"{" + b" " * MAX_REPORT_BYTES + b"}"
+    result = run_cli_bytes(git_repo, "store-report", "--reviewer", "A", input=oversize)
+    assert result.returncode == 1
+    assert result.stdout == b""
+    assert result.stderr == b"PRE_PR_TRIBUNAL:REPORT_TOO_LARGE\n"
+    assert not (git_repo / ".review/inbox/round-1/A.json").exists()
+
+
+def test_cli_recovery_flag_replaces_only_explicit_fresh_panel_and_normal_refuses(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    stale = {}
+    fresh = {}
+    for reviewer in "ABC":
+        stale[reviewer] = json.dumps(report(pending.snapshot, reviewer)).encode()
+        fresh[reviewer] = (
+            json.dumps(report(pending.snapshot, reviewer), separators=(",", ":")).encode()
+            + b"\n"
+        )
+        result = run_cli_bytes(
+            git_repo, "store-report", "--reviewer", reviewer, input=stale[reviewer]
+        )
+        assert result.returncode == 0
+    for reviewer in "ABC":
+        result = run_cli_bytes(
+            git_repo,
+            "store-report",
+            "--reviewer",
+            reviewer,
+            "--replace-pending-recovery",
+            input=fresh[reviewer],
+        )
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == {
+            "reviewer": reviewer,
+            "round": 1,
+            "status": "stored",
+            "raw_sha256": hashlib.sha256(fresh[reviewer]).hexdigest(),
+        }
+        normal = run_cli_bytes(
+            git_repo, "store-report", "--reviewer", reviewer, input=fresh[reviewer]
+        )
+        assert normal.returncode == 1
+        assert normal.stderr == b"PRE_PR_TRIBUNAL:REPORT_FILE_EXISTS\n"

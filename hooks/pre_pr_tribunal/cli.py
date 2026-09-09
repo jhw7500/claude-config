@@ -20,9 +20,20 @@ if __package__ in {None, ""}:
         REPORT_TEXT_CONTRACT_VERSION,
         Reviewer,
         TribunalError,
+        validate_report_bytes,
     )
-    from pre_pr_tribunal.git_state import DIFF_RECIPE_VERSION, diff_contract  # type: ignore
-    from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict  # type: ignore
+    from pre_pr_tribunal.git_state import (  # type: ignore
+        DIFF_RECIPE_VERSION,
+        capture_snapshot,
+        diff_contract,
+    )
+    from pre_pr_tribunal.verdict_store import (  # type: ignore
+        begin_round,
+        finalize_round,
+        read_verdict,
+        store_reviewer_report,
+        validate_stored_reviewer_report,
+    )
 else:
     from .model import (
         MAX_COMMAND_TEXT_BYTES,
@@ -34,9 +45,16 @@ else:
         REPORT_TEXT_CONTRACT_VERSION,
         Reviewer,
         TribunalError,
+        validate_report_bytes,
     )
-    from .git_state import DIFF_RECIPE_VERSION, diff_contract
-    from .verdict_store import begin_round, finalize_round, read_verdict
+    from .git_state import DIFF_RECIPE_VERSION, capture_snapshot, diff_contract
+    from .verdict_store import (
+        begin_round,
+        finalize_round,
+        read_verdict,
+        store_reviewer_report,
+        validate_stored_reviewer_report,
+    )
 
 
 class _Parser(argparse.ArgumentParser):
@@ -54,6 +72,12 @@ def _parser() -> argparse.ArgumentParser:
     begin.add_argument("--decisions", type=Path)
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
+    store = commands.add_parser("store-report", add_help=False)
+    store.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
+    store.add_argument("--replace-pending-recovery", action="store_true")
+    validate = commands.add_parser("validate-report", add_help=False)
+    validate.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
+    validate.add_argument("--source", required=True, choices=("stdin", "stored"))
     finalize = commands.add_parser("finalize", add_help=False)
     finalize.add_argument("--reviewer-a", required=True, type=Path)
     finalize.add_argument("--reviewer-b", required=True, type=Path)
@@ -130,6 +154,50 @@ def _context(verdict, reviewer: Reviewer) -> dict[str, object]:
     }
 
 
+def _report_stdin() -> bytes:
+    return sys.stdin.buffer.read(MAX_REPORT_BYTES + 1)
+
+
+def _report_projection(
+    reviewer: Reviewer, round_number: int, status: str, digest: str
+) -> dict[str, object]:
+    if status not in {"stored", "valid"}:
+        raise TribunalError("VERDICT_INVALID")
+    return {
+        "reviewer": reviewer.value,
+        "round": round_number,
+        "status": status,
+        "raw_sha256": digest,
+    }
+
+
+def _require_all_pending(verdict) -> None:
+    if verdict.gate.status.value != "in_progress" or any(
+        item.status != "pending" for item in verdict.reviewers.values()
+    ):
+        raise TribunalError("ROUND_NOT_IN_PROGRESS")
+
+
+def _snapshot_equal(verdict, snapshot) -> bool:
+    return (
+        verdict.repository,
+        verdict.base_ref,
+        verdict.base_sha,
+        verdict.head_ref,
+        verdict.head_sha,
+        verdict.merge_base_sha,
+        verdict.diff_sha256,
+    ) == (
+        snapshot.repository,
+        snapshot.base_ref,
+        snapshot.base_sha,
+        snapshot.head_ref,
+        snapshot.head_sha,
+        snapshot.merge_base_sha,
+        snapshot.diff_sha256,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     cwd = Path.cwd()
@@ -151,6 +219,36 @@ def main(argv: list[str] | None = None) -> int:
             }
         elif arguments.command == "context":
             payload = _context(read_verdict(cwd), Reviewer(arguments.reviewer))
+        elif arguments.command == "store-report":
+            receipt = store_reviewer_report(
+                cwd,
+                reviewer=Reviewer(arguments.reviewer),
+                raw=_report_stdin(),
+                replace_pending_recovery=arguments.replace_pending_recovery,
+            )
+            payload = _report_projection(
+                receipt.reviewer, receipt.round, "stored", receipt.raw_sha256
+            )
+        elif arguments.command == "validate-report":
+            reviewer = Reviewer(arguments.reviewer)
+            if arguments.source == "stored":
+                parsed, digest = validate_stored_reviewer_report(
+                    cwd, reviewer=reviewer
+                )
+                payload = _report_projection(reviewer, parsed.round, "valid", digest)
+            else:
+                verdict = read_verdict(cwd)
+                _require_all_pending(verdict)
+                snapshot = capture_snapshot(cwd, verdict.base_ref)
+                if not _snapshot_equal(verdict, snapshot):
+                    raise TribunalError("SNAPSHOT_CHANGED")
+                _parsed, digest = validate_report_bytes(
+                    _report_stdin(),
+                    expected_reviewer=reviewer,
+                    expected_round=verdict.round,
+                    snapshot=snapshot,
+                )
+                payload = _report_projection(reviewer, verdict.round, "valid", digest)
         elif arguments.command == "finalize":
             verdict = finalize_round(
                 cwd,
