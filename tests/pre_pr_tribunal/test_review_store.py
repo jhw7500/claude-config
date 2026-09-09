@@ -1,3 +1,4 @@
+import errno
 import os
 from pathlib import Path
 import stat
@@ -192,90 +193,75 @@ def test_temporary_write_failure_removes_its_private_temp_inode(
     assert _temporary_artifacts(inbox) == ()
 
 
-def test_atomic_create_preserves_unproven_substituted_publish_on_rejection(
-    git_repo, monkeypatch
+@pytest.mark.parametrize("hold_original", (False, True))
+def test_atomic_create_pins_source_independently_of_temporary_names(
+    git_repo, monkeypatch, hold_original
 ):
-    """A substituted source inode is unsafe but is not ours to delete."""
+    """A mutable staging pathname must never select the report's source inode."""
+    token = "source-substitution"
+    temporary_name = f".tmp.{os.getpid()}.{token}"
     with locked_review(git_repo, create=True) as review_fd:
         inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
         try:
             real_link = os.link
             held_original_fd = -1
+            foreign = git_repo / ".review/inbox" / temporary_name
 
-            def substitute_then_link(
-                source, target, *, src_dir_fd=None, dst_dir_fd=None,
-                follow_symlinks=True,
-            ):
+            def substitute_then_link(source, target, **kwargs):
                 nonlocal held_original_fd
-                held_original_fd = os.open(
-                    source, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=src_dir_fd
-                )
-                os.unlink(source, dir_fd=src_dir_fd)
-                replacement_fd = os.open(
-                    source,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=src_dir_fd,
-                )
-                try:
-                    os.fchmod(replacement_fd, 0o600)
-                    os.write(replacement_fd, b"substituted")
-                finally:
-                    os.close(replacement_fd)
-                return real_link(
-                    source,
-                    target,
-                    src_dir_fd=src_dir_fd,
-                    dst_dir_fd=dst_dir_fd,
-                    follow_symlinks=follow_symlinks,
-                )
+                if hold_original:
+                    held_original_fd = os.open(source, os.O_RDONLY, dir_fd=inbox_fd)
+                if foreign.exists():
+                    foreign.unlink()
+                foreign.write_bytes(b"foreign source")
+                foreign.chmod(0o600)
+                return real_link(source, target, **kwargs)
 
+            monkeypatch.setattr(review_store.secrets, "token_hex", lambda _count: token)
             monkeypatch.setattr(os, "link", substitute_then_link)
-            with pytest.raises(SchemaError, match="^UNSAFE$"):
-                atomic_create_bytes(
-                    inbox_fd, "A.json", b"expected", maximum=1024,
-                    exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
-                )
+            atomic_create_bytes(
+                inbox_fd, "A.json", b"expected", maximum=1024,
+                exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
+            )
         finally:
             if held_original_fd >= 0:
                 os.close(held_original_fd)
             os.close(inbox_fd)
     inbox = git_repo / ".review/inbox"
-    assert (inbox / "A.json").read_bytes() == b"substituted"
-    assert tuple(item.read_bytes() for item in _temporary_artifacts(inbox)) == (
-        b"substituted",
-    )
+    assert (inbox / "A.json").read_bytes() == b"expected"
+    assert foreign.read_bytes() == b"foreign source"
 
 
-def test_temporary_cleanup_failure_surfaces_unsafe_and_retains_evidence(
+def test_replacement_rename_failure_preserves_one_complete_private_staging_link(
     git_repo, monkeypatch
 ):
-    """Ignoring failed cleanup hides residue behind the primary write error."""
+    """A failed rename cannot authorize deleting a mutable staging pathname."""
     with locked_review(git_repo, create=True) as review_fd:
         inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
         try:
-            real_unlink = os.unlink
+            target = git_repo / ".review/inbox/A.json"
+            target.write_bytes(b"keep")
+            target.chmod(0o600)
 
-            def fail_fchmod(*args, **kwargs):
-                raise OSError("injected fchmod failure")
+            def fail_replace(*args, **kwargs):
+                raise OSError("injected rename failure")
 
-            def fail_temp_unlink(name, *args, **kwargs):
-                if str(name).startswith((".tmp.", ".cleanup.")):
-                    raise OSError("injected cleanup failure")
-                return real_unlink(name, *args, **kwargs)
-
-            monkeypatch.setattr(os, "fchmod", fail_fchmod)
-            monkeypatch.setattr(os, "unlink", fail_temp_unlink)
-            with pytest.raises(SchemaError, match="^UNSAFE$"):
+            monkeypatch.setattr(os, "replace", fail_replace)
+            with pytest.raises(SchemaError, match="^VERDICT_WRITE_FAILED$"):
                 atomic_replace_bytes(
                     inbox_fd, "A.json", b"new", maximum=1024,
-                    too_large="TOO_LARGE", unsafe="UNSAFE", exact_mode=0o600,
-                    write_failed="WRITE_FAILED",
+                    too_large="TOO_LARGE", unsafe="VERDICT_FILE_UNSAFE", exact_mode=0o600,
+                    write_failed="VERDICT_WRITE_FAILED",
                 )
         finally:
             os.close(inbox_fd)
-    artifacts = tuple((git_repo / ".review/inbox").glob(".cleanup.*"))
+    assert target.read_bytes() == b"keep"
+    artifacts = _temporary_artifacts(target.parent)
     assert len(artifacts) == 1
+    assert artifacts[0].read_bytes() == b"new"
+    assert stat.S_IMODE(artifacts[0].stat().st_mode) == 0o600
+    assert artifacts[0].stat().st_uid == os.geteuid()
+    assert set(target.parent.iterdir()) == {target, artifacts[0]}
 
 
 def test_atomic_create_preserves_destination_substituted_after_link(
@@ -315,10 +301,10 @@ def test_atomic_create_preserves_destination_substituted_after_link(
     assert _temporary_artifacts(inbox) == ()
 
 
-def test_atomic_create_rolls_back_when_destination_open_fails_after_link(
+def test_atomic_create_preserves_bounded_destination_when_open_fails_after_link(
     git_repo, monkeypatch
 ):
-    """A successful link must be rollback-owned before destination validation."""
+    """Post-link uncertainty must preserve the completed name without unsafe rollback."""
     with locked_review(git_repo, create=True) as review_fd:
         inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
         try:
@@ -350,12 +336,16 @@ def test_atomic_create_rolls_back_when_destination_open_fails_after_link(
         finally:
             os.close(inbox_fd)
     inbox = git_repo / ".review/inbox"
-    assert not (inbox / "A.json").exists()
+    target = inbox / "A.json"
+    assert target.read_bytes() == b"expected"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert target.stat().st_uid == os.geteuid()
+    assert set(inbox.iterdir()) == {target}
     assert _temporary_artifacts(inbox) == ()
 
 
 def test_temporary_name_collision_preserves_unowned_inode(git_repo, monkeypatch):
-    """An O_EXCL collision proves this call never owned the temporary name."""
+    """Exclusive staging publication must preserve an existing foreign name."""
     token = "collision"
     temporary = f".tmp.{os.getpid()}.{token}"
     with locked_review(git_repo, create=True) as review_fd:
@@ -366,13 +356,15 @@ def test_temporary_name_collision_preserves_unowned_inode(git_repo, monkeypatch)
             foreign.chmod(0o600)
             monkeypatch.setattr(review_store.secrets, "token_hex", lambda _count: token)
             with pytest.raises(SchemaError, match="^UNSAFE$"):
-                atomic_create_bytes(
+                atomic_replace_bytes(
                     inbox_fd, "A.json", b"expected", maximum=1024,
-                    exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
+                    too_large="TOO_LARGE", unsafe="UNSAFE", exact_mode=0o600,
+                    write_failed="WRITE_FAILED",
                 )
         finally:
             os.close(inbox_fd)
     assert foreign.read_bytes() == b"foreign temporary"
+    assert set(foreign.parent.iterdir()) == {foreign}
 
 
 @pytest.mark.parametrize("cleanup_stage", ("fstat", "close"))
@@ -402,6 +394,7 @@ def test_temporary_cleanup_descriptor_failures_map_to_unsafe(
                 nonlocal close_failed
                 if cleanup_stage == "close" and not close_failed:
                     close_failed = True
+                    real_close(fd)
                     raise OSError("injected cleanup close failure")
                 return real_close(fd)
 
@@ -418,79 +411,23 @@ def test_temporary_cleanup_descriptor_failures_map_to_unsafe(
             os.close(inbox_fd)
 
 
-def test_atomic_create_source_substitution_without_held_inode_preserves_foreign(
-    git_repo, monkeypatch
-):
-    """Closing the source early lets inode reuse turn a foreign publish into ours."""
-    with locked_review(git_repo, create=True) as review_fd:
-        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
-        try:
-            real_link = os.link
-
-            def substitute_then_link(source, target, **kwargs):
-                os.unlink(source, dir_fd=kwargs["src_dir_fd"])
-                foreign_fd = os.open(
-                    source,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=kwargs["src_dir_fd"],
-                )
-                try:
-                    os.write(foreign_fd, b"foreign source")
-                finally:
-                    os.close(foreign_fd)
-                return real_link(source, target, **kwargs)
-
-            monkeypatch.setattr(os, "link", substitute_then_link)
-            with pytest.raises(SchemaError, match="^UNSAFE$"):
-                atomic_create_bytes(
-                    inbox_fd, "A.json", b"expected", maximum=1024,
-                    exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
-                )
-        finally:
-            os.close(inbox_fd)
-    inbox = git_repo / ".review/inbox"
-    assert (inbox / "A.json").read_bytes() == b"foreign source"
-    assert tuple(item.read_bytes() for item in _temporary_artifacts(inbox)) == (
-        b"foreign source",
-    )
-
-
 def test_cleanup_boundary_substitution_preserves_foreign_name(git_repo, monkeypatch):
     """A name swapped at cleanup must be preserved rather than pathname-unlinked."""
     with locked_review(git_repo, create=True) as review_fd:
         inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
         try:
             real_fsync = os.fsync
-            fsync_calls = 0
 
             def fail_directory_fsync(fd):
-                nonlocal fsync_calls
-                fsync_calls += 1
-                if fsync_calls == 2:
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    target = git_repo / ".review/inbox/A.json"
+                    target.unlink()
+                    target.write_bytes(b"foreign cleanup")
+                    target.chmod(0o600)
                     raise OSError("injected directory fsync failure")
                 return real_fsync(fd)
 
-            def substitute_before_cleanup(*args, **kwargs):
-                source = args[1]
-                if source == "A.json":
-                    os.unlink(source, dir_fd=args[0])
-                    foreign_fd = os.open(
-                        source,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                        0o600,
-                        dir_fd=args[0],
-                    )
-                    try:
-                        os.write(foreign_fd, b"foreign cleanup")
-                    finally:
-                        os.close(foreign_fd)
-                raise OSError("cleanup exchange unavailable")
-
             monkeypatch.setattr(os, "fsync", fail_directory_fsync)
-            monkeypatch.setattr(
-                review_store, "_rename_noreplace", substitute_before_cleanup, raising=False
-            )
             with pytest.raises(SchemaError, match="^UNSAFE$"):
                 atomic_create_bytes(
                     inbox_fd, "A.json", b"expected", maximum=1024,
@@ -517,3 +454,178 @@ def test_atomic_create_rejects_wrong_parent_descriptor_mode_without_publishing(g
     inbox = git_repo / ".review/inbox"
     assert not (inbox / "A.json").exists()
     assert _temporary_artifacts(inbox) == ()
+
+
+def test_atomic_create_preserves_names_substituted_after_cleanup_verification(
+    git_repo, monkeypatch
+):
+    """Deleting a checked quarantine pathname can delete its later replacement."""
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        inbox = git_repo / ".review/inbox"
+        real_close = os.close
+        real_fsync = os.fsync
+        real_unlink = os.unlink
+        substituted = []
+        deletion_requests = []
+
+        def substitute_after_verified_descriptor_close(fd):
+            path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            real_close(fd)
+            if path.parent == inbox and path.name.startswith(".cleanup."):
+                # Reaches this point only after a successful quarantine rename
+                # and its descriptor verification. Anonymous staging eliminates
+                # the mutable cleanup name and therefore this attack boundary.
+                real_unlink(path)
+                path.write_bytes(b"foreign after verification")
+                path.chmod(0o600)
+                substituted.append(path)
+
+        def fail_directory_fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("injected post-publication failure")
+            return real_fsync(fd)
+
+        def record_unlink(name, *args, **kwargs):
+            deletion_requests.append(name)
+            return real_unlink(name, *args, **kwargs)
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(os, "close", substitute_after_verified_descriptor_close)
+                patch.setattr(os, "fsync", fail_directory_fsync)
+                patch.setattr(os, "unlink", record_unlink)
+                with pytest.raises(SchemaError, match="^UNSAFE$"):
+                    atomic_create_bytes(
+                        inbox_fd, "A.json", b"expected", maximum=1024,
+                        exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
+                    )
+        finally:
+            real_close(inbox_fd)
+    for path in substituted:
+        assert path.exists(), "a successfully quarantined name was replaced, then deleted"
+        assert path.read_bytes() == b"foreign after verification"
+    assert deletion_requests == [], "mutable pathnames cannot establish deletion ownership"
+
+
+@pytest.mark.parametrize("reuse_descriptor", (False, True))
+def test_replacement_close_failure_relinquishes_descriptor_once(
+    git_repo, monkeypatch, reuse_descriptor
+):
+    """Retrying a released descriptor changes the code or closes an unrelated file."""
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        target = git_repo / ".review/inbox/A.json"
+        real_close = os.close
+        real_open = os.open
+        owned_fd = -1
+        released_fd = -1
+        unrelated_fd = -1
+        close_attempts = 0
+
+        def record_temporary_open(name, flags, *args, **kwargs):
+            nonlocal owned_fd
+            fd = real_open(name, flags, *args, **kwargs)
+            if flags & os.O_TMPFILE == os.O_TMPFILE or flags & os.O_EXCL:
+                owned_fd = fd
+            return fd
+
+        def fail_replacement_close(fd):
+            nonlocal released_fd, unrelated_fd, close_attempts
+            if fd == released_fd:
+                close_attempts += 1
+                return real_close(fd)
+            if fd == owned_fd:
+                released_fd = fd
+                close_attempts += 1
+                real_close(fd)
+                if reuse_descriptor:
+                    unrelated_fd = os.open("/dev/null", os.O_RDONLY)
+                    assert unrelated_fd == released_fd
+                raise OSError("injected close failure after descriptor release")
+            return real_close(fd)
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(os, "open", record_temporary_open)
+                patch.setattr(os, "close", fail_replacement_close)
+                with pytest.raises(SchemaError) as failure:
+                    atomic_replace_bytes(
+                        inbox_fd, "A.json", b"new", maximum=1024,
+                        too_large="TOO_LARGE", unsafe="VERDICT_FILE_UNSAFE",
+                        write_failed="VERDICT_WRITE_FAILED", exact_mode=0o600,
+                    )
+            assert str(failure.value) == "VERDICT_WRITE_FAILED"
+            assert close_attempts == 1
+            if reuse_descriptor:
+                assert stat.S_ISCHR(os.fstat(unrelated_fd).st_mode)
+            assert target.read_bytes() == b"new"
+        finally:
+            if unrelated_fd >= 0:
+                try:
+                    real_close(unrelated_fd)
+                except OSError:
+                    pass
+            real_close(inbox_fd)
+
+
+@pytest.mark.parametrize("operation", ("create", "replace"))
+def test_anonymous_staging_unsupported_fails_closed_without_named_fallback(
+    git_repo, monkeypatch, operation
+):
+    """A named fallback would reintroduce deletion races on unsupported filesystems."""
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        real_open = os.open
+
+        def reject_anonymous_open(name, flags, *args, **kwargs):
+            if flags & os.O_TMPFILE == os.O_TMPFILE:
+                raise OSError(errno.EOPNOTSUPP, "anonymous staging unavailable")
+            return real_open(name, flags, *args, **kwargs)
+
+        try:
+            monkeypatch.setattr(os, "open", reject_anonymous_open)
+            expected = "UNSAFE" if operation == "create" else "WRITE_FAILED"
+            with pytest.raises(SchemaError, match=f"^{expected}$"):
+                if operation == "create":
+                    atomic_create_bytes(
+                        inbox_fd, "A.json", b"expected", maximum=1024,
+                        exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
+                    )
+                else:
+                    atomic_replace_bytes(
+                        inbox_fd, "A.json", b"expected", maximum=1024,
+                        too_large="TOO_LARGE", unsafe="UNSAFE", exact_mode=0o600,
+                        write_failed="WRITE_FAILED",
+                    )
+        finally:
+            os.close(inbox_fd)
+    assert tuple((git_repo / ".review/inbox").iterdir()) == ()
+
+
+def test_atomic_replace_rejects_substituted_staging_source(git_repo, monkeypatch):
+    """Renaming a substituted staging name must not report successful persistence."""
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        real_replace = os.replace
+
+        def substitute_then_replace(source, target, **kwargs):
+            source_path = git_repo / ".review/inbox" / source
+            source_path.unlink()
+            source_path.write_bytes(b"foreign replacement")
+            source_path.chmod(0o600)
+            return real_replace(source, target, **kwargs)
+
+        try:
+            monkeypatch.setattr(os, "replace", substitute_then_replace)
+            with pytest.raises(SchemaError, match="^UNSAFE$"):
+                atomic_replace_bytes(
+                    inbox_fd, "A.json", b"expected", maximum=1024,
+                    too_large="TOO_LARGE", unsafe="UNSAFE", exact_mode=0o600,
+                    write_failed="WRITE_FAILED",
+                )
+        finally:
+            os.close(inbox_fd)
+    target = git_repo / ".review/inbox/A.json"
+    assert target.read_bytes() == b"foreign replacement"
+    assert set(target.parent.iterdir()) == {target}

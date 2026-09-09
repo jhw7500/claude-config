@@ -874,7 +874,13 @@ def test_verdict_persistence_failure_keeps_write_failure_code(git_repo, monkeypa
         begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
 
     assert verdict_path.read_bytes() == before
-    assert not tuple((git_repo / ".review").glob(".tmp.*"))
+    # A failed rename leaves its complete private staging link for explicit
+    # recovery: pathname rollback cannot safely distinguish later substitution.
+    residue = tuple((git_repo / ".review").glob(".tmp.*"))
+    assert len(residue) == 1
+    assert stat.S_IMODE(residue[0].stat().st_mode) == 0o600
+    assert residue[0].stat().st_uid == os.geteuid()
+    assert json.loads(residue[0].read_bytes())["gate"]["status"] == "in_progress"
 
 
 def test_round_restart_invalidates_stale_reports_before_fresh_reports_pass(git_repo):

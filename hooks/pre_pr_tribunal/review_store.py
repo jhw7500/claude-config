@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-import ctypes
 import fcntl
 import hashlib
 import os
@@ -15,20 +14,6 @@ import subprocess
 from typing import Iterator
 
 from .model import SchemaError
-
-
-_LIBC = ctypes.CDLL(None, use_errno=True)
-_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
-if _RENAMEAT2 is not None:
-    _RENAMEAT2.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    ]
-    _RENAMEAT2.restype = ctypes.c_int
-_RENAME_NOREPLACE = 1
 
 
 def repository_root(cwd: Path) -> Path:
@@ -231,7 +216,6 @@ def read_named_file(
 
 @dataclass
 class _PrivateTemporary:
-    name: str
     fd: int
     info: os.stat_result
 
@@ -251,17 +235,19 @@ def _write_private_temporary(
     exact_mode: int,
     write_failed: str | None = None,
 ) -> _PrivateTemporary:
-    temporary = f".tmp.{os.getpid()}.{secrets.token_hex(8)}"
     fd = -1
-    created = False
     try:
+        anonymous_flag = getattr(os, "O_TMPFILE", 0)
+        if not anonymous_flag:
+            raise OSError("anonymous staging is unavailable")
+        # No pathname exists to substitute or remove on a failed write. Do not
+        # fall back to named staging on filesystems without O_TMPFILE support.
         fd = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            ".",
+            os.O_WRONLY | anonymous_flag | os.O_NOFOLLOW,
             0o600,
             dir_fd=parent_fd,
         )
-        created = True
         os.fstat(fd)
         os.fchmod(fd, exact_mode)
         info = safe_file(fd, unsafe, exact_mode=exact_mode)
@@ -272,14 +258,16 @@ def _write_private_temporary(
                 raise OSError("short write")
             view = view[written:]
         os.fsync(fd)
-        return _PrivateTemporary(temporary, fd, info)
+        return _PrivateTemporary(fd, info)
     except SchemaError:
-        if created:
-            _discard_temporary(parent_fd, temporary, fd, unsafe=unsafe)
+        if fd >= 0:
+            closing_fd, fd = fd, -1
+            _discard_temporary(closing_fd, unsafe=unsafe)
         raise
     except OSError:
-        if created:
-            _discard_temporary(parent_fd, temporary, fd, unsafe=unsafe)
+        if fd >= 0:
+            closing_fd, fd = fd, -1
+            _discard_temporary(closing_fd, unsafe=unsafe)
         raise SchemaError(write_failed or unsafe) from None
 
 
@@ -287,80 +275,64 @@ def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
-def _rename_noreplace(parent_fd: int, source: str, target: str) -> None:
-    if _RENAMEAT2 is None:
-        raise OSError("renameat2 is unavailable")
-    result = _RENAMEAT2(
-        parent_fd,
-        os.fsencode(source),
-        parent_fd,
-        os.fsencode(target),
-        _RENAME_NOREPLACE,
-    )
-    if result != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number))
-
-
-def _remove_owned_name(
-    parent_fd: int,
-    name: str,
-    ownership_fd: int,
-    *,
-    unsafe: str,
-    sync: bool = False,
-) -> None:
+def _discard_temporary(fd: int, *, unsafe: str) -> None:
+    """Release descriptor ownership once; never delete a mutable linked name."""
     try:
-        ownership = os.fstat(ownership_fd)
+        safe_file(fd, unsafe)
     except OSError:
         raise SchemaError(unsafe) from None
-    quarantine = f".cleanup.{os.getpid()}.{secrets.token_hex(8)}"
-    fd = -1
-    try:
-        _rename_noreplace(parent_fd, name, quarantine)
-    except FileNotFoundError:
-        return
-    except OSError:
-        raise SchemaError(unsafe) from None
-    verified = False
-    close_failed = False
-    try:
-        try:
-            fd = os.open(
-                quarantine,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                dir_fd=parent_fd,
-            )
-            current = safe_file(fd, unsafe)
-        except (OSError, SchemaError):
-            current = None
-        verified = current is not None and _same_inode(current, ownership)
-    finally:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                close_failed = True
-    if not verified or close_failed:
-        try:
-            _rename_noreplace(parent_fd, quarantine, name)
-        except OSError:
-            pass
-        raise SchemaError(unsafe)
-    try:
-        os.unlink(quarantine, dir_fd=parent_fd)
-        if sync:
-            os.fsync(parent_fd)
-    except OSError:
-        raise SchemaError(unsafe) from None
-
-
-def _discard_temporary(parent_fd: int, name: str, fd: int, *, unsafe: str) -> None:
-    try:
-        if name:
-            _remove_owned_name(parent_fd, name, fd, unsafe=unsafe)
     finally:
         _close_descriptor(fd, unsafe=unsafe)
+
+
+def _link_descriptor(parent_fd: int, fd: int, name: str) -> None:
+    # Linux's proc descriptor link supports unprivileged O_TMPFILE publication.
+    # Only this process-owned magic link is followed; final names use NOFOLLOW.
+    os.link(
+        f"/proc/self/fd/{fd}",
+        name,
+        src_dir_fd=parent_fd,
+        dst_dir_fd=parent_fd,
+        follow_symlinks=True,
+    )
+
+
+def _verify_publication(
+    parent_fd: int,
+    name: str,
+    expected: os.stat_result,
+    digest: str,
+    *,
+    maximum: int,
+    unsafe: str,
+    exact_mode: int,
+) -> None:
+    fd = -1
+    try:
+        fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
+        )
+        current = safe_file(fd, unsafe, exact_mode=exact_mode)
+        if not _same_inode(current, expected):
+            raise SchemaError(unsafe)
+        actual = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, min(65536, maximum + 1 - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > maximum:
+                raise SchemaError(unsafe)
+            actual.update(chunk)
+        if actual.hexdigest() != digest:
+            raise SchemaError(unsafe)
+    except OSError:
+        raise SchemaError(unsafe) from None
+    finally:
+        if fd >= 0:
+            closing_fd, fd = fd, -1
+            _close_descriptor(closing_fd, unsafe=unsafe)
 
 
 def _existing_target_is_safe(
@@ -392,6 +364,7 @@ def atomic_replace_bytes(
     exact_mode: int = 0o600,
     write_failed: str | None = None,
 ) -> None:
+    """Replace a private file; a failed rename preserves one complete staging link."""
     if len(raw) > maximum:
         raise SchemaError(too_large)
     temporary: _PrivateTemporary | None = None
@@ -410,24 +383,29 @@ def atomic_replace_bytes(
             exact_mode=exact_mode,
             write_failed=write_failed,
         )
-        os.replace(temporary.name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        temporary.name = ""
+        staging = f".tmp.{os.getpid()}.{secrets.token_hex(8)}"
+        try:
+            _link_descriptor(parent_fd, temporary.fd, staging)
+        except FileExistsError:
+            raise SchemaError(unsafe) from None
+        os.replace(staging, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         os.fsync(parent_fd)
-        _close_descriptor(temporary.fd, unsafe=write_failed or unsafe)
+        _verify_publication(
+            parent_fd, name, temporary.info, hashlib.sha256(raw).hexdigest(),
+            maximum=maximum, unsafe=unsafe, exact_mode=exact_mode,
+        )
+        closing_fd = temporary.fd
         temporary = None
+        _close_descriptor(closing_fd, unsafe=write_failed or unsafe)
     except SchemaError:
         raise
     except OSError:
         raise SchemaError(write_failed or unsafe) from None
     finally:
         if temporary:
-            _discard_temporary(parent_fd, temporary.name, temporary.fd, unsafe=unsafe)
-
-
-def _unlink_created_target(
-    parent_fd: int, name: str, published_fd: int, *, unsafe: str
-) -> None:
-    _remove_owned_name(parent_fd, name, published_fd, unsafe=unsafe, sync=True)
+            closing_fd = temporary.fd
+            temporary = None
+            _discard_temporary(closing_fd, unsafe=unsafe)
 
 
 def atomic_create_bytes(
@@ -440,10 +418,15 @@ def atomic_create_bytes(
     unsafe: str,
     exact_mode: int = 0o600,
 ) -> str:
+    """Publish without replacement; post-link uncertainty preserves the final name.
+
+    Linux cannot conditionally unlink a pathname by inode. A failed call leaves
+    at most its one complete private publication, requiring explicit recovery;
+    it must never delete a later substitution while pretending to roll back.
+    """
     if len(raw) > maximum:
         raise SchemaError(unsafe)
     temporary: _PrivateTemporary | None = None
-    published = False
     digest = hashlib.sha256(raw).hexdigest()
     try:
         safe_directory(parent_fd, unsafe)
@@ -453,65 +436,23 @@ def atomic_create_bytes(
             parent_fd, raw, unsafe=unsafe, exact_mode=exact_mode
         )
         try:
-            os.link(
-                temporary.name,
-                name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
+            _link_descriptor(parent_fd, temporary.fd, name)
         except FileExistsError:
             if _existing_target_is_safe(parent_fd, name, unsafe=unsafe):
                 raise SchemaError(exists) from None
             raise SchemaError(unsafe) from None
-        published = True
-        published_fd = -1
-        try:
-            published_fd = os.open(
-                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
-            )
-            candidate = safe_file(published_fd, unsafe, exact_mode=exact_mode)
-        finally:
-            if published_fd >= 0:
-                os.close(published_fd)
-        if not _same_inode(candidate, temporary.info):
-            published = False
-            raise SchemaError(unsafe)
-        _remove_owned_name(parent_fd, temporary.name, temporary.fd, unsafe=unsafe)
-        temporary.name = ""
         os.fsync(parent_fd)
-        fd = -1
-        try:
-            fd = os.open(
-                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
-            )
-            final = safe_file(fd, unsafe, exact_mode=exact_mode)
-            if not published or not _same_inode(final, temporary.info):
-                raise SchemaError(unsafe)
-            chunks: list[bytes] = []
-            size = 0
-            while True:
-                chunk = os.read(fd, min(65536, maximum + 1 - size))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                size += len(chunk)
-                if size > maximum:
-                    raise SchemaError(unsafe)
-            if hashlib.sha256(b"".join(chunks)).hexdigest() != digest:
-                raise SchemaError(unsafe)
-        finally:
-            if fd >= 0:
-                os.close(fd)
+        _verify_publication(
+            parent_fd, name, temporary.info, digest,
+            maximum=maximum, unsafe=unsafe, exact_mode=exact_mode,
+        )
         return digest
     except SchemaError:
-        if published and temporary is not None:
-            _unlink_created_target(parent_fd, name, temporary.fd, unsafe=unsafe)
         raise
     except OSError:
-        if published and temporary is not None:
-            _unlink_created_target(parent_fd, name, temporary.fd, unsafe=unsafe)
         raise SchemaError(unsafe) from None
     finally:
         if temporary:
-            _discard_temporary(parent_fd, temporary.name, temporary.fd, unsafe=unsafe)
+            closing_fd = temporary.fd
+            temporary = None
+            _discard_temporary(closing_fd, unsafe=unsafe)
