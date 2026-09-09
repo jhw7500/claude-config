@@ -157,3 +157,23 @@ unchanged; these are fresh code and contract verification results.
 | `bash -n` on each file in `install.sh hooks/*.sh scripts/*.sh scripts/lib/*.sh`, invoked through `rtk proxy` | Exit 0 |
 | `rtk proxy shellcheck -x -s bash -S error install.sh hooks/*.sh scripts/*.sh scripts/lib/*.sh` | Exit 0 |
 | `rtk proxy git diff --check` | Exit 0 |
+
+## Post-rereview verification
+
+The corrected namespace verification is recorded in implementation commit
+`893f6e6696d326508273178c030188f01fc86e18`. The exact source and test contents
+committed there passed the checks below, including 39 additional cases covering
+wildcard negations, whole-parent ignore patterns, strict NUL records, canonical
+child rechecks, and bounded Git input. The earlier post-review counts remain
+historical; native fixture identities, measurements, and sanitized summaries
+above are unchanged and were not rerun for this correction.
+
+| Verification invocation | Post-rereview result |
+| --- | --- |
+| `rtk proxy python3 -m pytest -q tests/pre_pr_tribunal/test_telemetry.py tests/pre_pr_tribunal/test_git_state.py` | Exit 0; 260 passed, 46.41s |
+| `rtk proxy python3 -m pytest -q tests/pre_pr_tribunal/test_installer.py tests/pre_pr_tribunal/test_install_integration.py tests/pre_pr_tribunal/test_probe_harness.py` | Exit 0; 202 passed, 113.37s |
+| `rtk proxy python3 -m pytest -q tests/pre_pr_tribunal tests/runtime_hook_installer` | Exit 0; 1,262 passed, 233.65s |
+| Full suite with the same workspace-local Python dependency projection | Exit 0; 3,329 passed, 382.87s |
+| `bash -n` on each file in `install.sh hooks/*.sh scripts/*.sh scripts/lib/*.sh`, invoked through `rtk proxy` | Exit 0 |
+| `rtk proxy shellcheck -x -s bash -S error install.sh hooks/*.sh scripts/*.sh scripts/lib/*.sh` | Exit 0 |
+| `rtk proxy git diff --check` | Exit 0 |
