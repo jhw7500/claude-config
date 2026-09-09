@@ -52,6 +52,7 @@ def _atomic_write(review_fd: int, verdict: Verdict) -> None:
         too_large="VERDICT_TOO_LARGE",
         unsafe="VERDICT_FILE_UNSAFE",
         exact_mode=0o600,
+        write_failed="VERDICT_WRITE_FAILED",
     )
 
 

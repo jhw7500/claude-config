@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
@@ -843,6 +844,37 @@ def test_empty_reports_pass_and_round_one_restart_resets_pending(git_repo):
     assert all(
         slot.status == "pending" for slot in read_verdict(git_repo).reviewers.values()
     )
+
+
+def test_round_one_replaces_owner_private_readonly_verdict(git_repo):
+    """Checking a prior verdict's exact mode would reject safe owner-only state."""
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    verdict_path.chmod(0o400)
+
+    restarted = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+
+    assert restarted.gate.status.value == "in_progress"
+    assert stat.S_IMODE(verdict_path.stat().st_mode) == 0o600
+
+
+def test_verdict_persistence_failure_keeps_write_failure_code(git_repo, monkeypatch):
+    """Mapping failed replacement persistence to file-unsafe breaks stable callers."""
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    before = verdict_path.read_bytes()
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("injected replacement failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(SchemaError, match="^VERDICT_WRITE_FAILED$"):
+        begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+    assert verdict_path.read_bytes() == before
+    assert not tuple((git_repo / ".review").glob(".tmp.*"))
 
 
 def test_round_restart_invalidates_stale_reports_before_fresh_reports_pass(git_repo):

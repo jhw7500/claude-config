@@ -214,7 +214,12 @@ def read_named_file(
 
 
 def _write_private_temporary(
-    parent_fd: int, raw: bytes, *, unsafe: str, exact_mode: int
+    parent_fd: int,
+    raw: bytes,
+    *,
+    unsafe: str,
+    exact_mode: int,
+    write_failed: str | None = None,
 ) -> tuple[str, os.stat_result]:
     temporary = f".tmp.{os.getpid()}.{secrets.token_hex(8)}"
     fd = -1
@@ -236,9 +241,11 @@ def _write_private_temporary(
         os.fsync(fd)
         return temporary, info
     except SchemaError:
+        _remove_temporary(parent_fd, temporary)
         raise
     except OSError:
-        raise SchemaError(unsafe) from None
+        _remove_temporary(parent_fd, temporary)
+        raise SchemaError(write_failed or unsafe) from None
     finally:
         if fd >= 0:
             os.close(fd)
@@ -254,7 +261,7 @@ def _remove_temporary(parent_fd: int, temporary: str) -> None:
 
 
 def _existing_target_is_safe(
-    parent_fd: int, name: str, *, unsafe: str, exact_mode: int
+    parent_fd: int, name: str, *, unsafe: str, exact_mode: int | None = None
 ) -> bool:
     try:
         fd = os.open(
@@ -280,17 +287,25 @@ def atomic_replace_bytes(
     too_large: str,
     unsafe: str,
     exact_mode: int = 0o600,
+    write_failed: str | None = None,
 ) -> None:
     if len(raw) > maximum:
         raise SchemaError(too_large)
     temporary = ""
     try:
         safe_directory(parent_fd, unsafe)
-        _existing_target_is_safe(
-            parent_fd, name, unsafe=unsafe, exact_mode=exact_mode
-        )
+        _existing_target_is_safe(parent_fd, name, unsafe=unsafe)
+    except SchemaError:
+        raise
+    except OSError:
+        raise SchemaError(unsafe) from None
+    try:
         temporary, _info = _write_private_temporary(
-            parent_fd, raw, unsafe=unsafe, exact_mode=exact_mode
+            parent_fd,
+            raw,
+            unsafe=unsafe,
+            exact_mode=exact_mode,
+            write_failed=write_failed,
         )
         os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         temporary = ""
@@ -298,18 +313,21 @@ def atomic_replace_bytes(
     except SchemaError:
         raise
     except OSError:
-        raise SchemaError(unsafe) from None
+        raise SchemaError(write_failed or unsafe) from None
     finally:
         if temporary:
             _remove_temporary(parent_fd, temporary)
 
 
 def _unlink_created_target(
-    parent_fd: int, name: str, source: os.stat_result
+    parent_fd: int, name: str, published: os.stat_result
 ) -> None:
     try:
         named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (named.st_dev, named.st_ino) == (source.st_dev, source.st_ino):
+        if (named.st_dev, named.st_ino) == (
+            published.st_dev,
+            published.st_ino,
+        ):
             os.unlink(name, dir_fd=parent_fd)
             os.fsync(parent_fd)
     except OSError:
@@ -330,13 +348,11 @@ def atomic_create_bytes(
         raise SchemaError(unsafe)
     temporary = ""
     source: os.stat_result | None = None
-    published = False
+    published: os.stat_result | None = None
     digest = hashlib.sha256(raw).hexdigest()
     try:
         safe_directory(parent_fd, unsafe)
-        if _existing_target_is_safe(
-            parent_fd, name, unsafe=unsafe, exact_mode=exact_mode
-        ):
+        if _existing_target_is_safe(parent_fd, name, unsafe=unsafe):
             raise SchemaError(exists)
         temporary, source = _write_private_temporary(
             parent_fd, raw, unsafe=unsafe, exact_mode=exact_mode
@@ -350,12 +366,23 @@ def atomic_create_bytes(
                 follow_symlinks=False,
             )
         except FileExistsError:
-            if _existing_target_is_safe(
-                parent_fd, name, unsafe=unsafe, exact_mode=exact_mode
-            ):
+            if _existing_target_is_safe(parent_fd, name, unsafe=unsafe):
                 raise SchemaError(exists) from None
             raise SchemaError(unsafe) from None
-        published = True
+        published_fd = -1
+        try:
+            published_fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
+            )
+            published = safe_file(published_fd, unsafe, exact_mode=exact_mode)
+        finally:
+            if published_fd >= 0:
+                os.close(published_fd)
+        if source is None or (published.st_dev, published.st_ino) != (
+            source.st_dev,
+            source.st_ino,
+        ):
+            raise SchemaError(unsafe)
         os.unlink(temporary, dir_fd=parent_fd)
         temporary = ""
         os.fsync(parent_fd)
@@ -365,9 +392,9 @@ def atomic_create_bytes(
                 name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
             )
             final = safe_file(fd, unsafe, exact_mode=exact_mode)
-            if source is None or (final.st_dev, final.st_ino) != (
-                source.st_dev,
-                source.st_ino,
+            if published is None or (final.st_dev, final.st_ino) != (
+                published.st_dev,
+                published.st_ino,
             ):
                 raise SchemaError(unsafe)
             chunks: list[bytes] = []
@@ -387,12 +414,12 @@ def atomic_create_bytes(
                 os.close(fd)
         return digest
     except SchemaError:
-        if published and source is not None:
-            _unlink_created_target(parent_fd, name, source)
+        if published is not None:
+            _unlink_created_target(parent_fd, name, published)
         raise
     except OSError:
-        if published and source is not None:
-            _unlink_created_target(parent_fd, name, source)
+        if published is not None:
+            _unlink_created_target(parent_fd, name, published)
         raise SchemaError(unsafe) from None
     finally:
         if temporary:
