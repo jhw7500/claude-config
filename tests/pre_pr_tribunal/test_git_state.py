@@ -11,6 +11,7 @@ from pre_pr_tribunal.git_state import (
     GitStateError,
     assert_auto_fix_scope,
     capture_snapshot,
+    diff_contract,
     snapshot_matches,
 )
 from pre_pr_tribunal.verdict_store import begin_round
@@ -123,6 +124,27 @@ def test_digest_hashes_the_exact_documented_binary_diff_bytes(git_repo):
     )
 
     assert snapshot.diff_sha256 == hashlib.sha256(exact_diff).hexdigest()
+
+
+def test_diff_contract_reproduces_snapshot_digest(git_repo):
+    snapshot = capture_snapshot(git_repo, "master")
+    contract = diff_contract(snapshot)
+    assert contract["version"] == 1
+    assert contract["digest"] == "sha256"
+    assert contract["clear_inherited_prefixes"] == ["GIT_"]
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(contract["environment"])
+    exact = subprocess.check_output(
+        [GIT, "-C", str(git_repo), *contract["arguments"]],
+        env=environment,
+    )
+    assert hashlib.sha256(exact).hexdigest() == snapshot.diff_sha256
+    assert not any(
+        "/home/" in value or "/Users/" in value
+        for value in contract["environment"].values()
+    )
 
 
 def test_dirty_detached_and_missing_remote_base_fail_closed(git_repo):

@@ -17,9 +17,11 @@ if __package__ in {None, ""}:
         MAX_FINDINGS_PER_REVIEWER,
         MAX_REPORT_BYTES,
         MAX_VERDICT_BYTES,
+        REPORT_TEXT_CONTRACT_VERSION,
         Reviewer,
         TribunalError,
     )
+    from pre_pr_tribunal.git_state import DIFF_RECIPE_VERSION, diff_contract  # type: ignore
     from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict  # type: ignore
 else:
     from .model import (
@@ -29,9 +31,11 @@ else:
         MAX_FINDINGS_PER_REVIEWER,
         MAX_REPORT_BYTES,
         MAX_VERDICT_BYTES,
+        REPORT_TEXT_CONTRACT_VERSION,
         Reviewer,
         TribunalError,
     )
+    from .git_state import DIFF_RECIPE_VERSION, diff_contract
     from .verdict_store import begin_round, finalize_round, read_verdict
 
 
@@ -95,6 +99,11 @@ def _context(verdict, reviewer: Reviewer) -> dict[str, object]:
         "snapshot": _snapshot(verdict),
         "own_prior_findings": findings,
         "own_decisions": decisions,
+        "contract": {
+            "report_text": REPORT_TEXT_CONTRACT_VERSION,
+            "diff_recipe": DIFF_RECIPE_VERSION,
+        },
+        "diff_contract": diff_contract(verdict.snapshot),
         "limits": {
             "report_bytes": MAX_REPORT_BYTES,
             "verdict_bytes": MAX_VERDICT_BYTES,

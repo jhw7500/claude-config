@@ -28,6 +28,20 @@ MAX_GIT_STDERR_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 30
 GIT_READ_CHUNK_BYTES = 64 * 1024
 GIT_TERMINATION_GRACE_SECONDS = 0.2
+DIFF_RECIPE_VERSION = 1
+DIFF_ARGUMENTS = ("diff", "--binary", "--no-ext-diff", "--no-textconv", "--full-index")
+_SANITIZED_GIT_ENVIRONMENT = {
+    "LC_ALL": "C",
+    "LANG": "C",
+    "GIT_PAGER": "cat",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+    "GIT_CONFIG_VALUE_0": "false",
+}
 
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _DIFF_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -50,21 +64,19 @@ def _git_environment() -> dict[str, str]:
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
-    environment.update(
-        {
-            "LC_ALL": "C",
-            "LANG": "C",
-            "GIT_PAGER": "cat",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "core.fsmonitor",
-            "GIT_CONFIG_VALUE_0": "false",
-        }
-    )
+    environment.update(_SANITIZED_GIT_ENVIRONMENT)
     return environment
+
+
+def diff_contract(snapshot: Snapshot) -> dict[str, object]:
+    revision = f"{snapshot.merge_base_sha}..{snapshot.head_sha}"
+    return {
+        "version": DIFF_RECIPE_VERSION,
+        "digest": "sha256",
+        "arguments": [*DIFF_ARGUMENTS, revision],
+        "clear_inherited_prefixes": ["GIT_"],
+        "environment": dict(_SANITIZED_GIT_ENVIRONMENT),
+    }
 
 
 def _gh_config_environment() -> dict[str, str]:
@@ -560,14 +572,7 @@ def capture_snapshot(
 
     diff = _command_output(
         root,
-        (
-            "diff",
-            "--binary",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--full-index",
-            revision_range,
-        ),
+        (*DIFF_ARGUMENTS, revision_range),
     )
     diff_sha256 = hashlib.sha256(diff).hexdigest()
     if _DIFF_SHA256.fullmatch(diff_sha256) is None:

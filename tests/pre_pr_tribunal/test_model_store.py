@@ -267,6 +267,76 @@ def test_execution_requires_exact_typed_sanitized_evidence(snapshot, change, cod
         )
 
 
+@pytest.mark.parametrize("field", ("stdout_excerpt", "stderr_excerpt"))
+@pytest.mark.parametrize("value", ("first\nsecond", "name\tvalue", "first\n\tsecond"))
+def test_execution_excerpts_accept_only_lf_and_tab(snapshot, field, value):
+    item = execution()
+    item[field] = value
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+    assert getattr(parsed.executions[0], field) == value
+
+
+@pytest.mark.parametrize("control", ("\r", "\x00", "\x1b", "\x7f"))
+def test_execution_excerpts_reject_every_other_cc(snapshot, control):
+    item = execution()
+    item["stdout_excerpt"] = "left" + control + "right"
+    with pytest.raises(SchemaError, match="^TEXT_INVALID$"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize("control", ("\n", "\t"))
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("command", "python3{control}-V"),
+        ("title", "title{control}text"),
+        ("rationale", "rationale{control}text"),
+        ("acceptance_condition", "acceptance{control}condition"),
+        ("statement", "statement{control}text"),
+        ("reason", "reason{control}text"),
+        ("path", "directory{control}/tracked.txt"),
+    ],
+)
+def test_non_excerpt_text_keeps_rejecting_lf_and_tab(snapshot, control, field, value):
+    value = value.format(control=control)
+    item = execution(command=value) if field == "command" else execution()
+    report_value = report(snapshot, "A", executions=[item])
+    if field in {"title", "rationale", "acceptance_condition", "path"}:
+        finding_value = finding()
+        finding_value[field] = value
+        report_value["findings"] = [finding_value]
+    elif field in {"statement", "reason"}:
+        report_value["reviewer"] = "B"
+        item["id"] = "B-R1-E001"
+        report_value["claims"] = [
+            {
+                "id": "B-R1-C001",
+                "statement": "Claim statement",
+                "result": "supported",
+                "execution_ids": ["B-R1-E001"],
+                "reason": "",
+            }
+        ]
+        report_value["claims"][0][field] = value
+    with pytest.raises(SchemaError, match="^(TEXT_INVALID|PATH_INVALID)$"):
+        parse_reviewer_report(
+            json.dumps(report_value).encode(),
+            expected_reviewer=Reviewer.B if field in {"statement", "reason"} else Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -1389,11 +1459,43 @@ def test_cli_json_only_success_and_bounded_domain_error(git_repo):
         capture_output=True,
     )
     context_payload = json.loads(context.stdout)
-    assert (
-        context.returncode == 0
-        and "B" not in json.dumps(context_payload)
-        and "stdout_excerpt" not in json.dumps(context_payload)
+    assert context.returncode == 0
+    assert context_payload["reviewer"] == "A"
+    assert all(
+        item["reviewer"] == "A" for item in context_payload["own_prior_findings"]
     )
+    assert all(
+        item["reviewer"] == "A" for item in context_payload["own_decisions"]
+    )
+    assert "stdout_excerpt" not in json.dumps(context_payload)
+    assert context_payload["contract"] == {"report_text": 2, "diff_recipe": 1}
+    assert context_payload["diff_contract"] == {
+        "version": 1,
+        "digest": "sha256",
+        "arguments": [
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--full-index",
+            context_payload["snapshot"]["merge_base_sha"]
+            + ".."
+            + context_payload["snapshot"]["head_sha"],
+        ],
+        "clear_inherited_prefixes": ["GIT_"],
+        "environment": {
+            "LC_ALL": "C",
+            "LANG": "C",
+            "GIT_PAGER": "cat",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
+        },
+    }
     failed = subprocess.run(
         [
             sys.executable,
