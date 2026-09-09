@@ -2,13 +2,18 @@ import copy
 from dataclasses import FrozenInstanceError
 import json
 import os
+from pathlib import Path
+import shutil
 import stat
+import subprocess
+import sys
 
 import pytest
 
 from pre_pr_tribunal.git_state import capture_snapshot
 from pre_pr_tribunal.model import Reviewer, SchemaError
 from pre_pr_tribunal import review_store
+from pre_pr_tribunal import cli, git_state
 from pre_pr_tribunal.telemetry import (
     TelemetryOutcome, TelemetryStage, bind_run, close_run, create_run,
     finish_span, read_ledger, record_candidate, recover_run, start_span,
@@ -18,6 +23,319 @@ from pre_pr_tribunal.telemetry import (
 
 def NOW():
     return "2026-09-09T00:00:00Z"
+
+
+def run_cli(git_repo, *arguments, input=None):
+    path = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    return subprocess.run(
+        [sys.executable, str(path), *arguments], cwd=git_repo,
+        text=True, input=input, capture_output=True, check=False,
+    )
+
+
+def cli_json(repo, *arguments):
+    result = run_cli(repo, *arguments)
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout.count("\n") == 1
+    return json.loads(result.stdout)
+
+
+BEGIN = ("begin", "--base", "master", "--runtime", "codex", "--round", "1")
+
+
+def test_cli_begin_returns_snapshot_bound_telemetry_run(git_repo):
+    payload = cli_json(git_repo, *BEGIN)
+    run_id = payload["telemetry"]["run_id"]
+    assert payload["telemetry"] == {"status": "active", "run_id": run_id}
+    value = cli_json(git_repo, "telemetry-summary", "--run-id", run_id)
+    assert value == cli_json(git_repo, "telemetry-summary")
+    assert value["binding"]["diff_sha256"] == payload["snapshot"]["diff_sha256"]
+    assert value["stages"]["snapshot_preflight"]["count"] == 1
+    run = read_ledger(git_repo).runs[0]
+    assert run.binding.status == "bound"
+    assert run.spans[0].outcome is TelemetryOutcome.SUCCESS
+
+
+def test_cli_external_lifecycle_shapes(git_repo):
+    run_id = cli_json(git_repo, *BEGIN)["telemetry"]["run_id"]
+    def start(stage, reviewer):
+        return cli_json(git_repo, "telemetry-start", "--run-id", run_id,
+                        "--stage", stage, "--reviewer", reviewer, "--attempt", "1")
+    first = start("view_create", "A")
+    assert first == {"run_id": run_id, "span_id": first["span_id"],
+                     "stage": "view_create", "reviewer": "A", "status": "running"}
+    done = cli_json(git_repo, "telemetry-finish", "--run-id", run_id,
+                    "--span-id", first["span_id"], "--outcome", "success")
+    assert done == {"run_id": run_id, "span_id": first["span_id"],
+                    "status": "success", "duration_ms": done["duration_ms"]}
+    assert type(done["duration_ms"]) is int and done["duration_ms"] >= 0
+    second = start("reviewer_total", "B")
+    timed = cli_json(git_repo, "telemetry-finish", "--run-id", run_id,
+                     "--span-id", second["span_id"], "--outcome", "timeout",
+                     "--reason-code", "REVIEWER_TIMEOUT")
+    assert timed["status"] == "timeout" and timed["duration_ms"] >= 0
+    start("reviewer_total", "C")
+    assert cli_json(git_repo, "telemetry-recover", "--run-id", run_id) == {
+        "run_id": run_id, "recovered_count": 1,
+    }
+    assert cli_json(git_repo, "telemetry-recover", "--run-id", run_id)["recovered_count"] == 0
+    assert cli_json(git_repo, "telemetry-close", "--run-id", run_id,
+                    "--outcome", "incomplete", "--reason-code", "CONTROLLER_INTERRUPTED") == {
+        "run_id": run_id, "status": "incomplete",
+    }
+    run = read_ledger(git_repo).runs[0]
+    assert run.spans[2].reason_code == "REVIEWER_TIMEOUT"
+    assert run.spans[3].outcome is TelemetryOutcome.INCOMPLETE
+
+
+@pytest.mark.parametrize("arguments", (
+    ("telemetry-start", "--stage", "bad", "--attempt", "1"),
+    ("telemetry-start", "--stage", "view_create", "--reviewer", "D", "--attempt", "1"),
+    ("telemetry-start", "--stage", "view_create"),
+    ("telemetry-finish", "--span-id", "1" * 32, "--outcome", "bad"),
+    ("telemetry-close", "--outcome", "bad"),
+    ("telemetry-recover", "--ended-at", "2026-09-09T00:00:00Z"),
+    ("telemetry-summary", "--duration-ms", "1"),
+))
+def test_cli_telemetry_rejects_usage_without_reflecting_input(git_repo, arguments):
+    result = run_cli(git_repo, *arguments, "--run-id", "1" * 32)
+    assert (result.returncode, result.stdout, result.stderr) == (2, "", "PRE_PR_TRIBUNAL:USAGE\n")
+
+
+@pytest.mark.parametrize("arguments", (
+    ("telemetry-summary", "--run-id", "SECRET/path"),
+    ("telemetry-recover", "--run-id", "A" * 32),
+    ("telemetry-close", "--run-id", "1" * 32, "--outcome", "failure", "--reason-code", "bad\nsecret"),
+    ("telemetry-start", "--run-id", "1" * 32, "--stage", "view_create", "--attempt", "0"),
+    ("telemetry-finish", "--run-id", "1" * 32, "--span-id", "bad", "--outcome", "success"),
+))
+def test_cli_telemetry_rejects_invalid_domain(git_repo, arguments):
+    result = run_cli(git_repo, *arguments)
+    assert (result.returncode, result.stdout, result.stderr) == (1, "", "PRE_PR_TRIBUNAL:TELEMETRY_INVALID\n")
+
+
+def invoke_clocked(monkeypatch, capsys, repo, arguments, seconds):
+    monkeypatch.chdir(repo)
+    code = cli.main(list(arguments), wall_clock=lambda: f"2026-09-09T00:00:{seconds:02d}Z",
+                    monotonic_ns=lambda: seconds * 1_000_000_000)
+    result = capsys.readouterr()
+    assert code == 0, result.err
+    assert result.err == ""
+    return json.loads(result.out)
+
+
+@pytest.mark.parametrize("incomplete", (False, True))
+def test_cli_early_detection_uses_actual_validation_failure(git_repo, monkeypatch, capsys, incomplete):
+    call = lambda args, sec: invoke_clocked(monkeypatch, capsys, git_repo, args, sec)
+    run_id = call(BEGIN, 0)["telemetry"]["run_id"]
+    spans = {}
+    for reviewer in "ABC":
+        spans[reviewer] = call(("telemetry-start", "--run-id", run_id,
+            "--stage", "reviewer_total", "--reviewer", reviewer, "--attempt", "1"), 0)["span_id"]
+    validation = call(("telemetry-start", "--run-id", run_id,
+        "--stage", "report_validation", "--reviewer", "A", "--attempt", "1"), 9)["span_id"]
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    invalid = run_cli(git_repo, "validate-report", "--reviewer", "A", "--source", "stdin", input="{")
+    assert (invalid.returncode, invalid.stderr) == (1, "PRE_PR_TRIBUNAL:JSON_INVALID\n")
+    reason = invalid.stderr.strip().split(":")[1]
+    call(("telemetry-finish", "--run-id", run_id, "--span-id", validation,
+          "--outcome", "failure", "--reason-code", reason), 10)
+    for reviewer, second in (("A", 10), ("B", 20), ("C", 30)):
+        if reviewer == "C" and incomplete:
+            call(("telemetry-recover", "--run-id", run_id), second)
+        else:
+            call(("telemetry-finish", "--run-id", run_id, "--span-id", spans[reviewer],
+                  "--outcome", "success"), second)
+    summary = call(("telemetry-summary", "--run-id", run_id), 30)
+    assert summary["early_detection"] == {
+        "reviewer": "A", "reason_code": "JSON_INVALID", "detected_elapsed_ms": 10000,
+        "all_reviewers_terminal_elapsed_ms": None if incomplete else 30000,
+        "wait_all_delay_ms": None if incomplete else 20000,
+    }
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+
+
+def test_cli_candidate_is_bounded_provisional_identity(git_repo, monkeypatch):
+    # Candidate capture must still work with missing base, dirty tree, and hostile inherited Git env.
+    subprocess.run(["/usr/bin/git", "-C", str(git_repo), "update-ref", "-d", "refs/remotes/origin/master"], check=True)
+    (git_repo / "tracked.txt").write_text("dirty")
+    monkeypatch.setenv("GIT_DIR", "/missing")
+    candidate = git_state.capture_telemetry_candidate(git_repo)
+    assert candidate.repository == "jhw7500/claude-config"
+    assert candidate.head_ref == "refs/heads/feature"
+    assert len(candidate.head_sha) == 40
+    with pytest.raises(FrozenInstanceError):
+        candidate.head_ref = "refs/heads/other"
+
+
+def test_cli_begin_replaces_stale_candidate(git_repo, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "capture_telemetry_candidate", lambda cwd:
+        git_state.TelemetryCandidate("other/repo", "refs/heads/old", "1" * 40))
+    payload = invoke_clocked(monkeypatch, capsys, git_repo, BEGIN, 0)
+    binding = read_ledger(git_repo).runs[0].binding
+    assert binding.repository == payload["snapshot"]["repository"]
+    assert binding.head_ref == payload["snapshot"]["head_ref"]
+    assert binding.head_sha == payload["snapshot"]["head_sha"]
+
+
+def test_cli_begin_failure_closes_pending_preflight_with_primary_code(git_repo):
+    result = run_cli(git_repo, "begin", "--base", "missing", "--runtime", "codex", "--round", "1")
+    assert (result.returncode, result.stdout, result.stderr) == (1, "", "PRE_PR_TRIBUNAL:BASE_INVALID\n")
+    run = read_ledger(git_repo).runs[0]
+    assert run.binding.status == "pending"
+    assert run.binding.head_ref == "refs/heads/feature"
+    assert run.outcome is TelemetryOutcome.FAILURE and run.reason_code == "BASE_INVALID"
+    assert run.spans[0].outcome is TelemetryOutcome.FAILURE
+    assert run.spans[0].reason_code == "BASE_INVALID"
+
+
+def corrupt_telemetry(repo, kind):
+    target = ledger_path(repo)
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    if kind == "symlink":
+        outside = repo.parent / (repo.name + "-telemetry-target")
+        outside.write_bytes(b"untouched")
+        target.symlink_to(outside)
+    else:
+        raw = b"{" if kind == "malformed" else b" " * (2 * 1024 * 1024 + 1)
+        if kind == "mode":
+            raw = b'{"schema":1,"runs":[]}'
+        target.write_bytes(raw)
+        target.chmod(0o644 if kind == "mode" else 0o600)
+    return target.read_bytes(), target.lstat()
+
+
+@pytest.mark.parametrize(("kind", "reason"), (
+    ("malformed", "TELEMETRY_INVALID"), ("oversized", "TELEMETRY_TOO_LARGE"),
+    ("symlink", "TELEMETRY_FILE_UNSAFE"), ("mode", "TELEMETRY_FILE_UNSAFE"),
+))
+@pytest.mark.parametrize("invalid_report", (False, True))
+def test_telemetry_cannot_alter_tribunal_result(git_repo, tmp_path, monkeypatch, capsys, kind, reason, invalid_report):
+    # Fixed primary clocks make complete verdict bytes comparable across identical Git copies.
+    original_begin, original_finalize = cli.begin_round, cli.finalize_round
+    monkeypatch.setattr(cli, "begin_round", lambda *a, **kw: original_begin(*a, **kw, now=NOW))
+    monkeypatch.setattr(cli, "finalize_round", lambda *a, **kw: original_finalize(*a, **kw, now=NOW))
+    damaged = tmp_path / "damaged"
+    shutil.copytree(git_repo, damaged)
+    before, metadata = corrupt_telemetry(damaged, kind)
+    def command(repo, args):
+        monkeypatch.chdir(repo)
+        code = cli.main(list(args))
+        captured = capsys.readouterr()
+        return code, captured.out, captured.err
+    results = []
+    for repo in (git_repo, damaged):
+        begun = command(repo, BEGIN)
+        assert begun[0] == 0 and begun[2] == ""
+        value = json.loads(begun[1])
+        if repo == damaged:
+            assert value["telemetry"] == {"status": "unavailable", "reason_code": reason}
+        pending_bytes = (repo / ".review/verdict.json").read_bytes()
+        validation_results = []
+        report_bytes = {}
+        for reviewer in "ABC":
+            raw = json.dumps({"schema": 1, "reviewer": reviewer, "round": 1,
+                "snapshot": {"head_sha": value["snapshot"]["head_sha"], "diff_sha256": value["snapshot"]["diff_sha256"]},
+                "status": "complete", "findings": [], "executions": [], "claims": [], "prior_decisions": []})
+            if invalid_report and reviewer == "A":
+                raw = "{"
+            stored = run_cli(repo, "store-report", "--reviewer", reviewer, input=raw)
+            assert stored.returncode == 0
+            validation_results.append(command(repo, ("validate-report", "--reviewer", reviewer, "--source", "stored")))
+            assert (repo / ".review/verdict.json").read_bytes() == pending_bytes
+            report_bytes[reviewer] = (repo / f".review/inbox/round-1/{reviewer}.json").read_bytes()
+        finalized = command(repo, ("finalize", "--reviewer-a", ".review/inbox/round-1/A.json",
+            "--reviewer-b", ".review/inbox/round-1/B.json", "--reviewer-c", ".review/inbox/round-1/C.json"))
+        gates = []
+        for adapter_name in ("codex_hook.py", "claude_hook.py"):
+            adapter = Path(cli.__file__).with_name(adapter_name)
+            gate = subprocess.run([sys.executable, str(adapter)], cwd=repo, capture_output=True,
+                input=json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": str(repo),
+                    "tool_input": {"command": "PATH=/usr/bin:/bin /usr/bin/gh pr create --base master"}}).encode())
+            assert gate.returncode == 0 and gate.stderr == b""
+            if invalid_report:
+                assert json.loads(gate.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+            else:
+                assert gate.stdout == b""
+            gates.append((gate.returncode, gate.stdout, gate.stderr))
+        results.append((pending_bytes, validation_results, finalized,
+            (repo / ".review/verdict.json").read_bytes(), report_bytes, gates))
+    assert results[0] == results[1]
+    assert results[0][2][0] == (1 if invalid_report else 0)
+    assert results[0][1][0][0] == (1 if invalid_report else 0)
+    assert ledger_path(damaged).read_bytes() == before
+    after = ledger_path(damaged).lstat()
+    # Reads may update atime; persistence must preserve inode, owner, mode and modification times.
+    for name in ("st_ino", "st_uid", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"):
+        assert getattr(after, name) == getattr(metadata, name)
+
+
+@pytest.mark.parametrize("kind", ("malformed", "oversized", "symlink", "mode"))
+def test_cli_bad_telemetry_preserves_primary_begin_failure(git_repo, kind):
+    corrupt_telemetry(git_repo, kind)
+    result = run_cli(git_repo, "begin", "--base", "missing", "--runtime", "codex", "--round", "1")
+    assert (result.returncode, result.stdout, result.stderr) == (1, "", "PRE_PR_TRIBUNAL:BASE_INVALID\n")
+
+
+@pytest.mark.parametrize("kind", ("unignored", "tracked"))
+def test_cli_unignored_telemetry_cannot_make_primary_worktree_dirty(git_repo, tmp_path, monkeypatch, capsys, kind):
+    from pre_pr_tribunal.verdict_store import begin_round
+    if kind == "unignored":
+        (git_repo / ".gitignore").write_text(".review/verdict.json\n.review/lock\n")
+    else:
+        ledger_path(git_repo).parent.mkdir(mode=0o700)
+        ledger_path(git_repo).write_bytes(b'{"schema":1,"runs":[]}')
+        ledger_path(git_repo).chmod(0o600)
+        subprocess.run(["/usr/bin/git", "-C", str(git_repo), "add", "-f", ".review/telemetry.json"], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(git_repo), "commit", "-qam", "telemetry ignore boundary"], check=True)
+    control = tmp_path / "control"
+    shutil.copytree(git_repo, control)
+    expected = begin_round(control, base="master", runtime="codex", round_number=1, now=NOW)
+    monkeypatch.setattr(cli, "begin_round", lambda *a, **kw: begin_round(*a, **kw, now=NOW))
+    result = invoke_clocked(monkeypatch, capsys, git_repo, BEGIN, 0)
+    assert result["snapshot"]["diff_sha256"] == expected.diff_sha256
+    assert (git_repo / ".review/verdict.json").read_bytes() == (control / ".review/verdict.json").read_bytes()
+    assert result["telemetry"] == {
+        "status": "unavailable", "reason_code": "TELEMETRY_FILE_UNSAFE",
+    }
+    if kind == "unignored":
+        assert not ledger_path(git_repo).exists()
+    else:
+        assert ledger_path(git_repo).read_bytes() == b'{"schema":1,"runs":[]}'
+    assert subprocess.check_output(["/usr/bin/git", "-C", str(git_repo), "status", "--porcelain"]) == b""
+
+
+@pytest.mark.parametrize("operation", ("create_run", "start_span", "record_candidate", "bind_run", "finish_span", "close_run"))
+@pytest.mark.parametrize("primary_failure", (False, True))
+def test_cli_telemetry_exception_cannot_replace_primary_result(git_repo, monkeypatch, capsys, operation, primary_failure):
+    from pre_pr_tribunal import telemetry
+    from pre_pr_tribunal.model import TribunalError
+    from pre_pr_tribunal.verdict_store import begin_round
+    original_error = TribunalError("BASE_INVALID")
+    def broken(*args, **kwargs):
+        raise RuntimeError("unbounded private exception /home/private/secret")
+    monkeypatch.setattr(telemetry, operation, broken)
+    if primary_failure:
+        def fail_primary(*args, **kwargs):
+            raise original_error
+        monkeypatch.setattr(cli, "begin_round", fail_primary)
+        with pytest.raises(TribunalError) as captured:
+            cli._begin_with_telemetry(git_repo, cli._parser().parse_args(BEGIN), wall_clock=NOW, monotonic_ns=lambda: 0)
+        assert captured.value is original_error
+    else:
+        monkeypatch.setattr(cli, "begin_round", lambda *a, **kw: begin_round(*a, **kw, now=NOW))
+        result = invoke_clocked(monkeypatch, capsys, git_repo, BEGIN, 0)
+        assert result["gate"]["status"] == "in_progress"
+        assert "unbounded" not in json.dumps(result)
+
+
+def test_cli_finish_clock_anomaly_returns_null_duration(git_repo, monkeypatch, capsys):
+    call = lambda args, sec: invoke_clocked(monkeypatch, capsys, git_repo, args, sec)
+    run_id = call(BEGIN, 0)["telemetry"]["run_id"]
+    span_id = call(("telemetry-start", "--run-id", run_id, "--stage", "finalize", "--attempt", "1"), 10)["span_id"]
+    result = call(("telemetry-finish", "--run-id", run_id, "--span-id", span_id, "--outcome", "success"), 9)
+    assert result == {"run_id": run_id, "span_id": span_id, "status": "clock_anomaly", "duration_ms": None}
 
 
 def new_run(repo, number=1, **kwargs):

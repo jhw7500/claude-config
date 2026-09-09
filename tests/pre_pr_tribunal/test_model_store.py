@@ -1743,7 +1743,8 @@ def test_cli_json_only_success_and_bounded_domain_error(git_repo):
     )
     assert begun.returncode == 0 and begun.stderr == ""
     payload = json.loads(begun.stdout)
-    assert set(payload) == {"schema", "round", "snapshot", "initial_paths", "gate"}
+    assert set(payload) == {"schema", "round", "snapshot", "initial_paths", "gate", "telemetry"}
+    assert payload["telemetry"]["status"] == "active"
     context = subprocess.run(
         [sys.executable, str(cli), "context", "--reviewer", "A"],
         cwd=git_repo,

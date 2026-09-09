@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
+import time
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -25,6 +27,8 @@ if __package__ in {None, ""}:
     from pre_pr_tribunal.git_state import (  # type: ignore
         DIFF_RECIPE_VERSION,
         capture_snapshot,
+        capture_telemetry_candidate,
+        check_telemetry_ignored,
         diff_contract,
     )
     from pre_pr_tribunal.verdict_store import (  # type: ignore
@@ -34,6 +38,7 @@ if __package__ in {None, ""}:
         store_reviewer_report,
         validate_stored_reviewer_report,
     )
+    from pre_pr_tribunal import telemetry  # type: ignore
 else:
     from .model import (
         MAX_COMMAND_TEXT_BYTES,
@@ -47,7 +52,10 @@ else:
         TribunalError,
         validate_report_bytes,
     )
-    from .git_state import DIFF_RECIPE_VERSION, capture_snapshot, diff_contract
+    from .git_state import (
+        DIFF_RECIPE_VERSION, capture_snapshot, capture_telemetry_candidate,
+        check_telemetry_ignored, diff_contract,
+    )
     from .verdict_store import (
         begin_round,
         finalize_round,
@@ -55,6 +63,7 @@ else:
         store_reviewer_report,
         validate_stored_reviewer_report,
     )
+    from . import telemetry
 
 
 class _Parser(argparse.ArgumentParser):
@@ -83,7 +92,126 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--reviewer-b", required=True, type=Path)
     finalize.add_argument("--reviewer-c", required=True, type=Path)
     commands.add_parser("status", add_help=False)
+    start = commands.add_parser("telemetry-start", add_help=False)
+    start.add_argument("--run-id", required=True)
+    start.add_argument("--stage", required=True, choices=tuple(item.value for item in telemetry.TelemetryStage))
+    start.add_argument("--reviewer", choices=("A", "B", "C"))
+    start.add_argument("--attempt", required=True, type=int)
+    for name in ("telemetry-finish", "telemetry-close"):
+        terminal = commands.add_parser(name, add_help=False)
+        terminal.add_argument("--run-id", required=True)
+        if name == "telemetry-finish":
+            terminal.add_argument("--span-id", required=True)
+        terminal.add_argument("--outcome", required=True, choices=tuple(item.value for item in telemetry.TelemetryOutcome))
+        terminal.add_argument("--reason-code")
+    recover = commands.add_parser("telemetry-recover", add_help=False)
+    recover.add_argument("--run-id", required=True)
+    summary = commands.add_parser("telemetry-summary", add_help=False)
+    summary.add_argument("--run-id")
     return parser
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _telemetry_unavailable(error: Exception) -> dict[str, str]:
+    code = error.code if isinstance(error, TribunalError) else None
+    if code not in {"TELEMETRY_INVALID", "TELEMETRY_FILE_UNSAFE", "TELEMETRY_TOO_LARGE", "TELEMETRY_CLOCK_ANOMALY"}:
+        code = "TELEMETRY_INVALID"
+    return {"status": "unavailable", "reason_code": code}
+
+
+def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns):
+    run = span = None
+    try:
+        started_at, started_ns = wall_clock(), monotonic_ns()
+        check_telemetry_ignored(cwd)
+        run = telemetry.create_run(
+            cwd, base_ref=arguments.base, runtime=arguments.runtime,
+            round_number=arguments.round, started_at=started_at,
+            started_monotonic_ns=started_ns,
+        )
+        # Start at entry clocks, including candidate lookup in the observed preflight.
+        span = telemetry.start_span(
+            cwd, run_id=run.run_id, stage=telemetry.TelemetryStage.SNAPSHOT_PREFLIGHT,
+            reviewer=None, attempt=1, started_at=started_at, started_monotonic_ns=started_ns,
+        )
+        candidate = capture_telemetry_candidate(cwd)
+        telemetry.record_candidate(cwd, run_id=run.run_id, repository=candidate.repository,
+                                   head_ref=candidate.head_ref, head_sha=candidate.head_sha)
+        projection = {"status": "active", "run_id": run.run_id}
+    except Exception as error:
+        projection = _telemetry_unavailable(error)
+
+    # Keep the primary transaction outside every telemetry exception handler.
+    try:
+        verdict = begin_round(
+            cwd, base=arguments.base, runtime=arguments.runtime,
+            round_number=arguments.round, decisions_path=arguments.decisions,
+        )
+    except TribunalError as primary_error:
+        try:
+            if run is not None:
+                ended_at, ended_ns = wall_clock(), monotonic_ns()
+                if span is not None:
+                    telemetry.finish_span(
+                        cwd, run_id=run.run_id, span_id=span.span_id,
+                        outcome=telemetry.TelemetryOutcome.FAILURE, reason_code=primary_error.code,
+                        ended_at=ended_at, ended_monotonic_ns=ended_ns,
+                    )
+                telemetry.close_run(cwd, run_id=run.run_id,
+                    outcome=telemetry.TelemetryOutcome.FAILURE, reason_code=primary_error.code,
+                    ended_at=ended_at)
+        except Exception:
+            pass
+        raise
+    try:
+        if run is not None:
+            telemetry.bind_run(cwd, run_id=run.run_id, snapshot=verdict.snapshot)
+            if span is not None:
+                telemetry.finish_span(
+                    cwd, run_id=run.run_id, span_id=span.span_id,
+                    outcome=telemetry.TelemetryOutcome.SUCCESS, reason_code=None,
+                    ended_at=wall_clock(), ended_monotonic_ns=monotonic_ns(),
+                )
+    except Exception as error:
+        projection = _telemetry_unavailable(error)
+    return verdict, projection
+
+
+def _telemetry_command(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns):
+    try:
+        run_id = arguments.run_id
+        check_telemetry_ignored(cwd)
+        if arguments.command == "telemetry-summary":
+            return telemetry.summarize_run(cwd, run_id=run_id)
+        if arguments.command == "telemetry-start":
+            span = telemetry.start_span(
+                cwd, run_id=run_id, stage=telemetry.TelemetryStage(arguments.stage),
+                reviewer=Reviewer(arguments.reviewer) if arguments.reviewer else None,
+                attempt=arguments.attempt, started_at=wall_clock(), started_monotonic_ns=monotonic_ns(),
+            )
+            return {"run_id": run_id, "span_id": span.span_id, "stage": span.stage.value,
+                    "reviewer": span.reviewer.value if span.reviewer else None, "status": "running"}
+        if arguments.command == "telemetry-finish":
+            span = telemetry.finish_span(
+                cwd, run_id=run_id, span_id=arguments.span_id,
+                outcome=telemetry.TelemetryOutcome(arguments.outcome), reason_code=arguments.reason_code,
+                ended_at=wall_clock(), ended_monotonic_ns=monotonic_ns(),
+            )
+            return {"run_id": run_id, "span_id": span.span_id,
+                    "status": span.outcome.value, "duration_ms": span.duration_ms}
+        if arguments.command == "telemetry-recover":
+            recovered = telemetry.recover_run(cwd, run_id=run_id,
+                ended_at=wall_clock(), ended_monotonic_ns=monotonic_ns())
+            return {"run_id": run_id, "recovered_count": recovered}
+        run = telemetry.close_run(cwd, run_id=run_id,
+            outcome=telemetry.TelemetryOutcome(arguments.outcome), reason_code=arguments.reason_code,
+            ended_at=wall_clock())
+        return {"run_id": run_id, "status": run.outcome.value}
+    except Exception as error:
+        raise TribunalError(_telemetry_unavailable(error)["reason_code"]) from None
 
 
 def _snapshot(verdict) -> dict[str, object]:
@@ -198,17 +326,13 @@ def _snapshot_equal(verdict, snapshot) -> bool:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns) -> int:
     arguments = _parser().parse_args(argv)
     cwd = Path.cwd()
     try:
         if arguments.command == "begin":
-            verdict = begin_round(
-                cwd,
-                base=arguments.base,
-                runtime=arguments.runtime,
-                round_number=arguments.round,
-                decisions_path=arguments.decisions,
+            verdict, observation = _begin_with_telemetry(
+                cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns,
             )
             payload = {
                 "schema": 1,
@@ -216,7 +340,10 @@ def main(argv: list[str] | None = None) -> int:
                 "snapshot": _snapshot(verdict),
                 "initial_paths": list(verdict.initial_paths),
                 "gate": verdict.gate.to_json(),
+                "telemetry": observation,
             }
+        elif arguments.command.startswith("telemetry-"):
+            payload = _telemetry_command(cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns)
         elif arguments.command == "context":
             payload = _context(read_verdict(cwd), Reviewer(arguments.reviewer))
         elif arguments.command == "store-report":

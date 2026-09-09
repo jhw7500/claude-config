@@ -1,6 +1,7 @@
 """Deterministic, network-free Git snapshot capture for tribunal reviews."""
 
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import os
@@ -58,6 +59,38 @@ _REMOTE_PATTERNS = (
 
 class GitStateError(TribunalError):
     pass
+
+
+@dataclass(frozen=True)
+class TelemetryCandidate:
+    repository: str
+    head_ref: str
+    head_sha: str
+
+
+def capture_telemetry_candidate(cwd: Path) -> TelemetryCandidate:
+    """Read provisional identity without resolving a base or capturing a diff."""
+    root = _physical_root(_validated_cwd(cwd))
+    head_ref = _one_line_utf8(
+        _command_output(root, ("symbolic-ref", "--quiet", "HEAD"), failure="DETACHED_HEAD"),
+        "GIT_STATE_INVALID",
+    )
+    if not _valid_schema_text(head_ref, 1024):
+        raise GitStateError("GIT_STATE_INVALID")
+    head_sha = _sha(_command_output(root, ("rev-parse", "HEAD")))
+    repository = _repository_from_origin(_command_output(
+        root, ("remote", "get-url", "origin"), failure="REPOSITORY_UNSUPPORTED",
+    ))
+    return TelemetryCandidate(repository, head_ref, head_sha)
+
+
+def check_telemetry_ignored(cwd: Path) -> None:
+    """Refuse observational writes that would dirty tracked or unignored paths."""
+    root = _physical_root(_validated_cwd(cwd))
+    for path in (".review/telemetry.json", ".review/lock"):
+        _command_output(
+            root, ("check-ignore", "-q", "--", path), failure="TELEMETRY_FILE_UNSAFE",
+        )
 
 
 def _git_environment() -> dict[str, str]:
