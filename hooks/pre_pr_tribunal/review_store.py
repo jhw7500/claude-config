@@ -430,7 +430,9 @@ def atomic_create_bytes(
     digest = hashlib.sha256(raw).hexdigest()
     try:
         safe_directory(parent_fd, unsafe)
-        if _existing_target_is_safe(parent_fd, name, unsafe=unsafe):
+        if _existing_target_is_safe(
+            parent_fd, name, unsafe=unsafe, exact_mode=exact_mode
+        ):
             raise SchemaError(exists)
         temporary = _write_private_temporary(
             parent_fd, raw, unsafe=unsafe, exact_mode=exact_mode
@@ -438,7 +440,9 @@ def atomic_create_bytes(
         try:
             _link_descriptor(parent_fd, temporary.fd, name)
         except FileExistsError:
-            if _existing_target_is_safe(parent_fd, name, unsafe=unsafe):
+            if _existing_target_is_safe(
+                parent_fd, name, unsafe=unsafe, exact_mode=exact_mode
+            ):
                 raise SchemaError(exists) from None
             raise SchemaError(unsafe) from None
         os.fsync(parent_fd)

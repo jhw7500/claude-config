@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,6 +27,7 @@ from .model import (
     Verdict,
 )
 from .review_store import (
+    atomic_create_bytes,
     atomic_replace_bytes,
     check_ignored,
     locked_review,
@@ -34,6 +37,14 @@ from .review_store import (
     repository_root,
     safe_file,
 )
+
+
+@dataclass(frozen=True)
+class ReportReceipt:
+    reviewer: Reviewer
+    round: int
+    path: str
+    raw_sha256: str
 
 
 def utc_now() -> str:
@@ -471,13 +482,19 @@ def _read_input(
     maximum: int,
     missing: str,
     path_code: str,
+    exact_mode: int | None = None,
 ) -> bytes:
     relative = f".review/inbox/round-{round_number}/{basename}"
     _expected_input(root, supplied, relative, path_code)
     round_fd = _round_fd(review_fd, round_number, create=False)
     try:
         return read_named_file(
-            round_fd, basename, maximum=maximum, missing=missing, unsafe="FILE_UNSAFE"
+            round_fd,
+            basename,
+            maximum=maximum,
+            missing=missing,
+            unsafe="FILE_UNSAFE",
+            exact_mode=exact_mode,
         )
     finally:
         os.close(round_fd)
@@ -501,6 +518,105 @@ def _snapshot_equal(verdict: Verdict, snapshot: Snapshot) -> bool:
         snapshot.merge_base_sha,
         snapshot.diff_sha256,
     )
+
+
+def _require_all_pending(verdict: Verdict) -> None:
+    if verdict.gate.status is not GateStatus.IN_PROGRESS or any(
+        slot.status != "pending" for slot in verdict.reviewers.values()
+    ):
+        raise SchemaError("ROUND_NOT_IN_PROGRESS")
+
+
+def _validate_report_store_input(reviewer: Reviewer, raw: bytes) -> None:
+    if not isinstance(reviewer, Reviewer) or not isinstance(raw, bytes):
+        raise SchemaError("REPORT_SCHEMA_INVALID")
+    if len(raw) > m.MAX_REPORT_BYTES:
+        raise SchemaError("REPORT_TOO_LARGE")
+
+
+def store_reviewer_report(
+    cwd: Path,
+    *,
+    reviewer: Reviewer,
+    raw: bytes,
+    replace_pending_recovery: bool = False,
+) -> ReportReceipt:
+    """Store exact report bytes at the pending round's only canonical path."""
+    _validate_report_store_input(reviewer, raw)
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        pending = _read_verdict_locked(review_fd)
+        _require_all_pending(pending)
+        round_fd = _round_fd(review_fd, pending.round, create=True)
+        try:
+            name = f"{reviewer.value}.json"
+            if replace_pending_recovery:
+                atomic_replace_bytes(
+                    round_fd,
+                    name,
+                    raw,
+                    maximum=m.MAX_REPORT_BYTES,
+                    too_large="REPORT_TOO_LARGE",
+                    unsafe="FILE_UNSAFE",
+                    exact_mode=0o600,
+                    write_failed="REPORT_WRITE_FAILED",
+                )
+                digest = hashlib.sha256(raw).hexdigest()
+            else:
+                digest = atomic_create_bytes(
+                    round_fd,
+                    name,
+                    raw,
+                    maximum=m.MAX_REPORT_BYTES,
+                    exists="REPORT_FILE_EXISTS",
+                    unsafe="FILE_UNSAFE",
+                    exact_mode=0o600,
+                )
+        finally:
+            os.close(round_fd)
+    return ReportReceipt(
+        reviewer,
+        pending.round,
+        f".review/inbox/round-{pending.round}/{reviewer.value}.json",
+        digest,
+    )
+
+
+def validate_stored_reviewer_report(
+    cwd: Path, *, reviewer: Reviewer
+) -> tuple[ReviewerReport, str]:
+    """Re-open and validate one canonical exact-mode report without mutation."""
+    if not isinstance(reviewer, Reviewer):
+        raise SchemaError("REPORT_SCHEMA_INVALID")
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        pending = _read_verdict_locked(review_fd)
+        _require_all_pending(pending)
+        round_fd = _round_fd(review_fd, pending.round, create=False)
+        try:
+            raw = read_named_file(
+                round_fd,
+                f"{reviewer.value}.json",
+                maximum=m.MAX_REPORT_BYTES,
+                missing="REVIEWER_REPORT_MISSING",
+                unsafe="FILE_UNSAFE",
+                exact_mode=0o600,
+            )
+        finally:
+            os.close(round_fd)
+        snapshot = capture_snapshot(root, pending.base_ref)
+        if not _snapshot_equal(pending, snapshot):
+            raise SchemaError("SNAPSHOT_CHANGED")
+        return m.validate_report_bytes(
+            raw,
+            expected_reviewer=reviewer,
+            expected_round=pending.round,
+            snapshot=snapshot,
+        )
 
 
 def _blockers(verdict: Verdict) -> tuple[m.Finding, ...]:
@@ -696,10 +812,7 @@ def finalize_round(
     check_ignored(root)
     with locked_review(root, create=False) as review_fd:
         pending = _read_verdict_locked(review_fd)
-        if pending.gate.status is not GateStatus.IN_PROGRESS or any(
-            slot.status != "pending" for slot in pending.reviewers.values()
-        ):
-            raise SchemaError("ROUND_NOT_IN_PROGRESS")
+        _require_all_pending(pending)
         snapshot = capture_snapshot(root, pending.base_ref, now=now)
         if not _snapshot_equal(pending, snapshot):
             raise SchemaError("SNAPSHOT_CHANGED")
@@ -714,8 +827,9 @@ def finalize_round(
                 maximum=m.MAX_REPORT_BYTES,
                 missing="REVIEWER_REPORT_MISSING",
                 path_code="REPORT_PATH_INVALID",
+                exact_mode=0o600,
             )
-            reports[key] = m.parse_reviewer_report(
+            reports[key], _raw_sha256 = m.validate_report_bytes(
                 raw,
                 expected_reviewer=Reviewer(key),
                 expected_round=pending.round,

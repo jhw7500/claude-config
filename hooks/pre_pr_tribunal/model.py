@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import json
 import re
 from typing import Mapping, Sequence
@@ -933,6 +934,23 @@ def parse_reviewer_report(
         claims,
         responses,
     )
+
+
+def validate_report_bytes(
+    raw: bytes,
+    *,
+    expected_reviewer: Reviewer,
+    expected_round: int,
+    snapshot: Snapshot,
+) -> tuple[ReviewerReport, str]:
+    """Validate one exact reviewer response and return its raw-byte digest."""
+    report = parse_reviewer_report(
+        raw,
+        expected_reviewer=expected_reviewer,
+        expected_round=expected_round,
+        snapshot=snapshot,
+    )
+    return report, hashlib.sha256(raw).hexdigest()
 
 
 def _blocker_identity(value: object) -> tuple[str, int, Reviewer]:
