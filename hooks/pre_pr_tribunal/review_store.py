@@ -223,6 +223,8 @@ def _write_private_temporary(
 ) -> tuple[str, os.stat_result]:
     temporary = f".tmp.{os.getpid()}.{secrets.token_hex(8)}"
     fd = -1
+    ownership: os.stat_result | None = None
+    created = False
     try:
         fd = os.open(
             temporary,
@@ -230,6 +232,8 @@ def _write_private_temporary(
             0o600,
             dir_fd=parent_fd,
         )
+        created = True
+        ownership = os.fstat(fd)
         os.fchmod(fd, exact_mode)
         info = safe_file(fd, unsafe, exact_mode=exact_mode)
         view = memoryview(raw)
@@ -241,23 +245,55 @@ def _write_private_temporary(
         os.fsync(fd)
         return temporary, info
     except SchemaError:
-        _remove_temporary(parent_fd, temporary)
+        if created:
+            if ownership is None:
+                raise SchemaError(unsafe) from None
+            _remove_owned_name(parent_fd, temporary, ownership, unsafe=unsafe)
         raise
     except OSError:
-        _remove_temporary(parent_fd, temporary)
+        if created:
+            if ownership is None:
+                raise SchemaError(unsafe) from None
+            _remove_owned_name(parent_fd, temporary, ownership, unsafe=unsafe)
         raise SchemaError(write_failed or unsafe) from None
     finally:
         if fd >= 0:
             os.close(fd)
 
 
-def _remove_temporary(parent_fd: int, temporary: str) -> None:
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _remove_owned_name(
+    parent_fd: int,
+    name: str,
+    ownership: os.stat_result,
+    *,
+    unsafe: str,
+    sync: bool = False,
+) -> None:
+    fd = -1
     try:
-        os.unlink(temporary, dir_fd=parent_fd)
+        fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
+        )
     except FileNotFoundError:
-        pass
+        return
     except OSError:
-        pass
+        raise SchemaError(unsafe) from None
+    try:
+        current = os.fstat(fd)
+        if not _same_inode(current, ownership):
+            raise SchemaError(unsafe)
+    finally:
+        os.close(fd)
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+        if sync:
+            os.fsync(parent_fd)
+    except OSError:
+        raise SchemaError(unsafe) from None
 
 
 def _existing_target_is_safe(
@@ -292,6 +328,7 @@ def atomic_replace_bytes(
     if len(raw) > maximum:
         raise SchemaError(too_large)
     temporary = ""
+    temporary_info: os.stat_result | None = None
     try:
         safe_directory(parent_fd, unsafe)
         _existing_target_is_safe(parent_fd, name, unsafe=unsafe)
@@ -300,7 +337,7 @@ def atomic_replace_bytes(
     except OSError:
         raise SchemaError(unsafe) from None
     try:
-        temporary, _info = _write_private_temporary(
+        temporary, temporary_info = _write_private_temporary(
             parent_fd,
             raw,
             unsafe=unsafe,
@@ -316,22 +353,17 @@ def atomic_replace_bytes(
         raise SchemaError(write_failed or unsafe) from None
     finally:
         if temporary:
-            _remove_temporary(parent_fd, temporary)
+            if temporary_info is None:
+                raise SchemaError(unsafe)
+            _remove_owned_name(
+                parent_fd, temporary, temporary_info, unsafe=unsafe
+            )
 
 
 def _unlink_created_target(
-    parent_fd: int, name: str, published: os.stat_result
+    parent_fd: int, name: str, published: os.stat_result, *, unsafe: str
 ) -> None:
-    try:
-        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (named.st_dev, named.st_ino) == (
-            published.st_dev,
-            published.st_ino,
-        ):
-            os.unlink(name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-    except OSError:
-        pass
+    _remove_owned_name(parent_fd, name, published, unsafe=unsafe, sync=True)
 
 
 def atomic_create_bytes(
@@ -369,21 +401,23 @@ def atomic_create_bytes(
             if _existing_target_is_safe(parent_fd, name, unsafe=unsafe):
                 raise SchemaError(exists) from None
             raise SchemaError(unsafe) from None
+        if source is None:
+            raise SchemaError(unsafe)
+        published = source
         published_fd = -1
         try:
             published_fd = os.open(
                 name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
             )
-            published = safe_file(published_fd, unsafe, exact_mode=exact_mode)
+            candidate = safe_file(published_fd, unsafe, exact_mode=exact_mode)
         finally:
             if published_fd >= 0:
                 os.close(published_fd)
-        if source is None or (published.st_dev, published.st_ino) != (
-            source.st_dev,
-            source.st_ino,
-        ):
+        if not _same_inode(candidate, source):
+            published = None
             raise SchemaError(unsafe)
-        os.unlink(temporary, dir_fd=parent_fd)
+        published = candidate
+        _remove_owned_name(parent_fd, temporary, source, unsafe=unsafe)
         temporary = ""
         os.fsync(parent_fd)
         fd = -1
@@ -392,10 +426,7 @@ def atomic_create_bytes(
                 name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
             )
             final = safe_file(fd, unsafe, exact_mode=exact_mode)
-            if published is None or (final.st_dev, final.st_ino) != (
-                published.st_dev,
-                published.st_ino,
-            ):
+            if published is None or not _same_inode(final, published):
                 raise SchemaError(unsafe)
             chunks: list[bytes] = []
             size = 0
@@ -415,12 +446,14 @@ def atomic_create_bytes(
         return digest
     except SchemaError:
         if published is not None:
-            _unlink_created_target(parent_fd, name, published)
+            _unlink_created_target(parent_fd, name, published, unsafe=unsafe)
         raise
     except OSError:
         if published is not None:
-            _unlink_created_target(parent_fd, name, published)
+            _unlink_created_target(parent_fd, name, published, unsafe=unsafe)
         raise SchemaError(unsafe) from None
     finally:
         if temporary:
-            _remove_temporary(parent_fd, temporary)
+            if source is None:
+                raise SchemaError(unsafe)
+            _remove_owned_name(parent_fd, temporary, source, unsafe=unsafe)

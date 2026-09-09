@@ -5,6 +5,7 @@ import stat
 import pytest
 
 from pre_pr_tribunal.model import SchemaError
+import pre_pr_tribunal.review_store as review_store
 from pre_pr_tribunal.review_store import (
     atomic_create_bytes,
     atomic_replace_bytes,
@@ -191,10 +192,10 @@ def test_temporary_write_failure_removes_its_private_temp_inode(
     assert _temporary_artifacts(inbox) == ()
 
 
-def test_atomic_create_removes_verified_substituted_publish_on_rejection(
+def test_atomic_create_preserves_unproven_substituted_publish_on_rejection(
     git_repo, monkeypatch
 ):
-    """A substituted temp inode must not survive as this call's rejected target."""
+    """A substituted source inode is unsafe but is not ours to delete."""
     with locked_review(git_repo, create=True) as review_fd:
         inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
         try:
@@ -240,8 +241,138 @@ def test_atomic_create_removes_verified_substituted_publish_on_rejection(
                 os.close(held_original_fd)
             os.close(inbox_fd)
     inbox = git_repo / ".review/inbox"
+    assert (inbox / "A.json").read_bytes() == b"substituted"
+    assert tuple(item.read_bytes() for item in _temporary_artifacts(inbox)) == (
+        b"substituted",
+    )
+
+
+def test_temporary_cleanup_failure_surfaces_unsafe_and_retains_evidence(
+    git_repo, monkeypatch
+):
+    """Ignoring failed cleanup hides residue behind the primary write error."""
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        try:
+            real_unlink = os.unlink
+
+            def fail_fchmod(*args, **kwargs):
+                raise OSError("injected fchmod failure")
+
+            def fail_temp_unlink(name, *args, **kwargs):
+                if str(name).startswith(".tmp."):
+                    raise OSError("injected cleanup failure")
+                return real_unlink(name, *args, **kwargs)
+
+            monkeypatch.setattr(os, "fchmod", fail_fchmod)
+            monkeypatch.setattr(os, "unlink", fail_temp_unlink)
+            with pytest.raises(SchemaError, match="^UNSAFE$"):
+                atomic_replace_bytes(
+                    inbox_fd, "A.json", b"new", maximum=1024,
+                    too_large="TOO_LARGE", unsafe="UNSAFE", exact_mode=0o600,
+                    write_failed="WRITE_FAILED",
+                )
+        finally:
+            os.close(inbox_fd)
+    artifacts = _temporary_artifacts(git_repo / ".review/inbox")
+    assert len(artifacts) == 1
+
+
+def test_atomic_create_preserves_destination_substituted_after_link(
+    git_repo, monkeypatch
+):
+    """A destination replaced after link is unproven and must not be rollback-deleted."""
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        try:
+            real_link = os.link
+
+            def link_then_substitute(source, target, **kwargs):
+                result = real_link(source, target, **kwargs)
+                os.unlink(target, dir_fd=kwargs["dst_dir_fd"])
+                foreign_fd = os.open(
+                    target,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=kwargs["dst_dir_fd"],
+                )
+                try:
+                    os.write(foreign_fd, b"foreign destination")
+                finally:
+                    os.close(foreign_fd)
+                return result
+
+            monkeypatch.setattr(os, "link", link_then_substitute)
+            with pytest.raises(SchemaError, match="^UNSAFE$"):
+                atomic_create_bytes(
+                    inbox_fd, "A.json", b"expected", maximum=1024,
+                    exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
+                )
+        finally:
+            os.close(inbox_fd)
+    inbox = git_repo / ".review/inbox"
+    assert (inbox / "A.json").read_bytes() == b"foreign destination"
+    assert _temporary_artifacts(inbox) == ()
+
+
+def test_atomic_create_rolls_back_when_destination_open_fails_after_link(
+    git_repo, monkeypatch
+):
+    """A successful link must be rollback-owned before destination validation."""
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        try:
+            real_link = os.link
+            real_open = os.open
+            linked = False
+            destination_open_failed = False
+
+            def record_link(*args, **kwargs):
+                nonlocal linked
+                result = real_link(*args, **kwargs)
+                linked = True
+                return result
+
+            def fail_destination_open(name, flags, *args, **kwargs):
+                nonlocal destination_open_failed
+                if linked and name == "A.json" and not destination_open_failed:
+                    destination_open_failed = True
+                    raise OSError("injected destination open failure")
+                return real_open(name, flags, *args, **kwargs)
+
+            monkeypatch.setattr(os, "link", record_link)
+            monkeypatch.setattr(os, "open", fail_destination_open)
+            with pytest.raises(SchemaError, match="^UNSAFE$"):
+                atomic_create_bytes(
+                    inbox_fd, "A.json", b"expected", maximum=1024,
+                    exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
+                )
+        finally:
+            os.close(inbox_fd)
+    inbox = git_repo / ".review/inbox"
     assert not (inbox / "A.json").exists()
     assert _temporary_artifacts(inbox) == ()
+
+
+def test_temporary_name_collision_preserves_unowned_inode(git_repo, monkeypatch):
+    """An O_EXCL collision proves this call never owned the temporary name."""
+    token = "collision"
+    temporary = f".tmp.{os.getpid()}.{token}"
+    with locked_review(git_repo, create=True) as review_fd:
+        inbox_fd = open_directory(review_fd, "inbox", create=True, code="UNSAFE")
+        try:
+            foreign = git_repo / ".review/inbox" / temporary
+            foreign.write_bytes(b"foreign temporary")
+            foreign.chmod(0o600)
+            monkeypatch.setattr(review_store.secrets, "token_hex", lambda _count: token)
+            with pytest.raises(SchemaError, match="^UNSAFE$"):
+                atomic_create_bytes(
+                    inbox_fd, "A.json", b"expected", maximum=1024,
+                    exists="EXISTS", unsafe="UNSAFE", exact_mode=0o600,
+                )
+        finally:
+            os.close(inbox_fd)
+    assert foreign.read_bytes() == b"foreign temporary"
 
 
 def test_atomic_create_rejects_wrong_parent_descriptor_mode_without_publishing(git_repo):
