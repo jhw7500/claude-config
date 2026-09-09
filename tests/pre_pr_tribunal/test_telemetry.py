@@ -19,6 +19,7 @@ from pre_pr_tribunal.telemetry import (
     finish_span, read_ledger, record_candidate, recover_run, start_span,
     summarize_run,
 )
+from pre_pr_tribunal import telemetry as telemetry_module
 
 
 def NOW():
@@ -87,6 +88,16 @@ def test_cli_external_lifecycle_shapes(git_repo):
     run = read_ledger(git_repo).runs[0]
     assert run.spans[2].reason_code == "REVIEWER_TIMEOUT"
     assert run.spans[3].outcome is TelemetryOutcome.INCOMPLETE
+
+
+def test_production_telemetry_outcome_contract_requires_reason_except_success():
+    assert telemetry_module._status("success", None) is TelemetryOutcome.SUCCESS
+    for outcome in ("failure", "timeout", "incomplete", "clock_anomaly"):
+        assert telemetry_module._status(outcome, "STABLE_REASON") is TelemetryOutcome(outcome)
+        with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
+            telemetry_module._status(outcome, None)
+    with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
+        telemetry_module._status("success", "STABLE_REASON")
 
 
 @pytest.mark.parametrize("arguments", (

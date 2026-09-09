@@ -158,8 +158,35 @@ responses are terminal before any replacement, then replace all three exact byte
 `begin` returns the telemetry run ID and records `snapshot_preflight`. The controller surrounds view creation and
 dispatch/wait with `view_create` and `reviewer_dispatch_wait`, records each terminal reviewer as `reviewer_total`,
 records `report_store` and `report_validation`, and records `view_cleanup`, `recovery_retry`, and `finalize` when
-those operations occur. Use `telemetry-start`, `telemetry-finish`, `telemetry-close`, and `telemetry-summary` with
-that run ID; report `success`, `failure`, or `timeout` plus a stable reason code.
+those operations occur.
+
+<!-- telemetry-command-examples -->
+```bash
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-start --run-id "$RUN_ID" --stage reviewer_total --reviewer A --attempt 1
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome success
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome failure --reason-code REPORT_SCHEMA_INVALID
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome timeout --reason-code REVIEWER_TIMEOUT
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome incomplete --reason-code CONTROLLER_INTERRUPTED
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome clock_anomaly --reason-code TELEMETRY_CLOCK_ANOMALY
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-recover --run-id "$RUN_ID"
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-close --run-id "$RUN_ID" --outcome incomplete --reason-code CONTROLLER_INTERRUPTED
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-summary --run-id "$RUN_ID"
+```
+<!-- telemetry-command-examples-end -->
+
+`telemetry-start` requires the run ID, stage, and positive attempt. `snapshot_preflight` and `finalize` require no
+reviewer; every other stage except `recovery_retry` requires one A/B/C reviewer, and `recovery_retry` may omit it.
+`telemetry-finish` requires the run ID, span ID, outcome, and a stable `--reason-code` for `failure`, `timeout`,
+`incomplete`, or `clock_anomaly`; `success` omits the reason code. `telemetry-close` has the same outcome/reason
+rule without a span ID. `telemetry-recover` and `telemetry-summary` require only the run ID.
+
+`telemetry-start` returns `{run_id, span_id, stage, reviewer, status:"running"}`. `telemetry-finish` returns
+`{run_id, span_id, status, duration_ms}`; `telemetry-recover` returns `{run_id, recovered_count}`; and
+`telemetry-close` returns `{run_id, status}`. `telemetry-summary` returns bounded
+`{schema, binding, reviewers, stages, outcomes, telemetry_incomplete, anomaly_reason_codes, early_detection}`.
+If `begin` cannot create an observation, it returns `{status:"unavailable", reason_code}`; an external telemetry
+command returns its bounded telemetry error. In both cases, retain the primary tribunal result and record the missing
+observation rather than inventing a run or changing a gate result.
 
 Telemetry failure is an observation gap only. Telemetry is never a gate input and does not change report validity,
 gate status, or the finalize decision.

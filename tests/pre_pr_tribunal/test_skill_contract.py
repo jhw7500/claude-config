@@ -2,8 +2,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 
+from pre_pr_tribunal import cli
 from pre_pr_tribunal.model import Reviewer, Snapshot, parse_decisions, parse_reviewer_report
 
 
@@ -388,6 +390,69 @@ def test_pending_recovery_contract_preserves_state_and_reruns_the_complete_panel
         "snapshot changed",
     ):
         assert token.lower() in normalized
+
+
+def test_pending_recovery_replaces_the_complete_fresh_panel_before_validation():
+    skill = text("SKILL.md")
+    recovery = re.search(
+        r"<!-- pending-recovery-contract -->(.*?)"
+        r"<!-- pending-recovery-contract-end -->",
+        skill,
+        re.DOTALL,
+    )
+    assert recovery is not None
+    body = recovery.group(1)
+    replacement = "store-report --reviewer X --replace-pending-recovery"
+    validation = "validate-report --reviewer X --source stored"
+    assert body.index("all three fresh reruns are terminal") < body.index(replacement)
+    assert body.index(replacement) < body.index(validation)
+    assert body.index(validation) < body.index("cleanup succeeds")
+    assert "all three replacement/validation" in body
+    assert "never reuse an earlier peer" in body
+
+    normal = numbered_steps(skill)[6]
+    assert "store-report --reviewer X" in normal
+    assert "--replace-pending-recovery" not in normal
+    assert normal.index("store-report --reviewer X") < normal.index(
+        "validate-report --reviewer X --source stored"
+    )
+
+
+def test_operator_telemetry_command_examples_parse_through_the_cli_contract():
+    operator = (REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8")
+    match = re.search(
+        r"<!-- telemetry-command-examples -->(.*?)"
+        r"<!-- telemetry-command-examples-end -->",
+        operator,
+        re.DOTALL,
+    )
+    assert match is not None
+    commands = [
+        line.strip()
+        for line in match.group(1).splitlines()
+        if line.strip().startswith("/usr/bin/python3")
+    ]
+    parsed = [
+        cli._parser().parse_args(shlex.split(command.removeprefix(CLI).strip()))
+        for command in commands
+    ]
+    by_command = {}
+    for arguments in parsed:
+        by_command.setdefault(arguments.command, []).append(arguments)
+
+    start = by_command["telemetry-start"][0]
+    assert (start.stage, start.reviewer, start.attempt) == ("reviewer_total", "A", 1)
+    assert any(
+        item.outcome == "success" and item.reason_code is None
+        for item in by_command["telemetry-finish"]
+    )
+    for outcome in ("failure", "timeout", "incomplete", "clock_anomaly"):
+        assert any(
+            item.outcome == outcome and item.reason_code is not None
+            for item in (*by_command["telemetry-finish"], *by_command["telemetry-close"])
+        )
+    assert by_command["telemetry-recover"][0].run_id == "$RUN_ID"
+    assert by_command["telemetry-summary"][0].run_id == "$RUN_ID"
 
 
 def test_empirical_reviewer_forbids_unsupported_claims_and_requires_capture_fields():
