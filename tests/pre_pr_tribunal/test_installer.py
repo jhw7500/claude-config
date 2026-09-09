@@ -28,6 +28,7 @@ PACKAGE_NAMES = (
     "model.py",
     "review_store.py",
     "shell_scan.py",
+    "telemetry.py",
     "verdict_store.py",
 )
 SKILL_SOURCE = REPO / "skills/pre-pr-tribunal"
