@@ -2126,3 +2126,44 @@ def test_cli_recovery_flag_replaces_only_explicit_fresh_panel_and_normal_refuses
         )
         assert normal.returncode == 1
         assert normal.stderr == b"PRE_PR_TRIBUNAL:REPORT_FILE_EXISTS\n"
+
+
+@pytest.mark.parametrize(("drift", "code"), (
+    ("dirty", "WORKTREE_DIRTY"),
+    ("committed", "SNAPSHOT_CHANGED"),
+))
+def test_cli_recovery_rejects_snapshot_drift_before_replacing_any_evidence(git_repo, drift, code):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    paths = report_paths(git_repo, pending.snapshot)
+    fresh = {
+        reviewer: json.dumps(report(pending.snapshot, reviewer), separators=(",", ":")).encode() + b"\n"
+        for reviewer in "ABC"
+    }
+    residue = git_repo / ".review/inbox/round-1/.tmp.1234.0123456789abcdef"
+    residue.write_bytes(b"preserve prior private staging evidence")
+    residue.chmod(0o600)
+    protected = (*paths.values(), git_repo / ".review/verdict.json", residue)
+    before = {path: path.read_bytes() for path in protected}
+    metadata = {path: path.lstat() for path in protected}
+    if drift == "dirty":
+        (git_repo / "tracked.txt").write_text("uncommitted snapshot drift\n")
+    else:
+        commit_fix(git_repo)
+
+    for reviewer in "ABC":
+        result = run_cli_bytes(
+            git_repo, "store-report", "--reviewer", reviewer,
+            "--replace-pending-recovery", input=fresh[reviewer],
+        )
+        assert (result.returncode, result.stdout, result.stderr) == (
+            1, b"", f"PRE_PR_TRIBUNAL:{code}\n".encode(),
+        )
+        for path in protected:
+            assert path.read_bytes() == before[path]
+            after = path.lstat()
+            assert stat.S_IMODE(after.st_mode) == 0o600
+            for field in ("st_ino", "st_uid", "st_mode", "st_mtime_ns", "st_ctime_ns"):
+                assert getattr(after, field) == getattr(metadata[path], field)
+        assert list((git_repo / ".review").rglob(".tmp.*")) == [residue]

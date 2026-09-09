@@ -582,6 +582,10 @@ def store_reviewer_report(
     with locked_review(root, create=False) as review_fd:
         pending = _read_verdict_locked(review_fd)
         _require_all_pending(pending)
+        if replace_pending_recovery:
+            snapshot = capture_snapshot(root, pending.base_ref)
+            if not _snapshot_equal(pending, snapshot):
+                raise SchemaError("SNAPSHOT_CHANGED")
         round_fd = _round_fd(
             review_fd,
             pending.round,
