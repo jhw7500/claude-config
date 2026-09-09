@@ -436,8 +436,17 @@ def _round_fd(
     create: bool,
     exact_report_directories: bool = False,
 ) -> int:
+    inbox_code = (
+        "FILE_UNSAFE" if exact_report_directories else "INBOX_DIRECTORY_UNSAFE"
+    )
+    round_code = (
+        "FILE_UNSAFE" if exact_report_directories else "ROUND_DIRECTORY_UNSAFE"
+    )
     inbox_fd = open_directory(
-        review_fd, "inbox", create=create, code="INBOX_DIRECTORY_UNSAFE"
+        review_fd,
+        "inbox",
+        create=create,
+        code=inbox_code,
     )
     try:
         if exact_report_directories:
@@ -446,7 +455,7 @@ def _round_fd(
             inbox_fd,
             f"round-{round_number}",
             create=create,
-            code="ROUND_DIRECTORY_UNSAFE",
+            code=round_code,
         )
         try:
             if exact_report_directories:

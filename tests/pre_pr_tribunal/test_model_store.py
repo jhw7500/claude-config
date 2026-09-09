@@ -872,8 +872,9 @@ def test_store_reviewer_report_preserves_bytes_and_forces_mode(git_repo, mask):
 
 
 @pytest.mark.parametrize("relative", ("inbox", "inbox/round-1"))
+@pytest.mark.parametrize("mode", (0o1700, 0o750))
 def test_store_reviewer_report_rejects_nonexact_existing_report_directory(
-    git_repo, relative
+    git_repo, relative, mode
 ):
     pending = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
@@ -881,8 +882,8 @@ def test_store_reviewer_report_rejects_nonexact_existing_report_directory(
     verdict_path = git_repo / ".review/verdict.json"
     verdict_before = verdict_path.read_bytes()
     directory = git_repo / ".review" / relative
-    directory.chmod(0o1700)
-    assert stat.S_IMODE(directory.stat().st_mode) == 0o1700
+    directory.chmod(mode)
+    assert stat.S_IMODE(directory.stat().st_mode) == mode
 
     with pytest.raises(SchemaError, match="^FILE_UNSAFE$"):
         store_reviewer_report(
