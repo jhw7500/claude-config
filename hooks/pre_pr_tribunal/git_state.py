@@ -85,12 +85,19 @@ def capture_telemetry_candidate(cwd: Path) -> TelemetryCandidate:
 
 
 def check_telemetry_ignored(cwd: Path) -> None:
-    """Refuse observational writes that would dirty tracked or unignored paths."""
+    """Require the entire artifact namespace to be ignored and untracked."""
     root = _physical_root(_validated_cwd(cwd))
-    for path in (".review/telemetry.json", ".review/lock"):
-        _command_output(
-            root, ("check-ignore", "-q", "--", path), failure="TELEMETRY_FILE_UNSAFE",
-        )
+    # Failed atomic replacement may retain a private .tmp.* publication. Only
+    # an ignored directory covers every possible staging name before we write.
+    _command_output(
+        root, ("check-ignore", "-q", "--", ".review/"),
+        failure="TELEMETRY_FILE_UNSAFE",
+    )
+    if _command_output(
+        root, ("ls-files", "-z", "--", ".review"),
+        failure="TELEMETRY_FILE_UNSAFE",
+    ):
+        raise GitStateError("TELEMETRY_FILE_UNSAFE")
 
 
 def _git_environment() -> dict[str, str]:

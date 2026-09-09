@@ -289,16 +289,17 @@ def test_cli_bad_telemetry_preserves_primary_begin_failure(git_repo, kind):
     assert (result.returncode, result.stdout, result.stderr) == (1, "", "PRE_PR_TRIBUNAL:BASE_INVALID\n")
 
 
-@pytest.mark.parametrize("kind", ("unignored", "tracked"))
+@pytest.mark.parametrize("kind", ("unignored", "tracked", "tracked_sibling"))
 def test_cli_unignored_telemetry_cannot_make_primary_worktree_dirty(git_repo, tmp_path, monkeypatch, capsys, kind):
     from pre_pr_tribunal.verdict_store import begin_round
     if kind == "unignored":
         (git_repo / ".gitignore").write_text(".review/verdict.json\n.review/lock\n")
     else:
         ledger_path(git_repo).parent.mkdir(mode=0o700)
-        ledger_path(git_repo).write_bytes(b'{"schema":1,"runs":[]}')
-        ledger_path(git_repo).chmod(0o600)
-        subprocess.run(["/usr/bin/git", "-C", str(git_repo), "add", "-f", ".review/telemetry.json"], check=True)
+        tracked = ledger_path(git_repo) if kind == "tracked" else git_repo / ".review/retained.json"
+        tracked.write_bytes(b'{"schema":1,"runs":[]}')
+        tracked.chmod(0o600)
+        subprocess.run(["/usr/bin/git", "-C", str(git_repo), "add", "-f", str(tracked)], check=True)
     subprocess.run(["/usr/bin/git", "-C", str(git_repo), "commit", "-qam", "telemetry ignore boundary"], check=True)
     control = tmp_path / "control"
     shutil.copytree(git_repo, control)
@@ -310,11 +311,52 @@ def test_cli_unignored_telemetry_cannot_make_primary_worktree_dirty(git_repo, tm
     assert result["telemetry"] == {
         "status": "unavailable", "reason_code": "TELEMETRY_FILE_UNSAFE",
     }
-    if kind == "unignored":
+    if kind != "tracked":
         assert not ledger_path(git_repo).exists()
     else:
         assert ledger_path(git_repo).read_bytes() == b'{"schema":1,"runs":[]}'
     assert subprocess.check_output(["/usr/bin/git", "-C", str(git_repo), "status", "--porcelain"]) == b""
+
+
+def test_cli_individual_ignores_and_failed_rename_cannot_dirty_primary_begin(
+    git_repo, tmp_path, monkeypatch, capsys,
+):
+    from pre_pr_tribunal.verdict_store import begin_round
+
+    (git_repo / ".gitignore").write_text(
+        ".review/verdict.json\n.review/lock\n.review/telemetry.json\n"
+    )
+    subprocess.run(
+        ["/usr/bin/git", "-C", str(git_repo), "commit", "-qam", "individual artifact ignores"],
+        check=True,
+    )
+    control = tmp_path / "without-telemetry"
+    shutil.copytree(git_repo, control)
+    expected = begin_round(control, base="master", runtime="codex", round_number=1, now=NOW)
+    real_replace = review_store.os.replace
+
+    def fail_telemetry_rename(source, destination, **kwargs):
+        if destination == "telemetry.json":
+            raise OSError("injected telemetry rename failure")
+        return real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(review_store.os, "replace", fail_telemetry_rename)
+    monkeypatch.setattr(cli, "begin_round", lambda *a, **kw: begin_round(*a, **kw, now=NOW))
+    result = invoke_clocked(monkeypatch, capsys, git_repo, BEGIN, 0)
+    assert result["snapshot"]["diff_sha256"] == expected.diff_sha256
+    assert result["telemetry"] == {
+        "status": "unavailable", "reason_code": "TELEMETRY_FILE_UNSAFE",
+    }
+    assert (git_repo / ".review/verdict.json").read_bytes() == (control / ".review/verdict.json").read_bytes()
+    assert not ledger_path(git_repo).exists()
+    assert list((git_repo / ".review").glob(".tmp.*")) == []
+    for repo in (control, git_repo):
+        assert subprocess.check_output([
+            "/usr/bin/git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all",
+        ]) == b""
+    assert sorted(path.relative_to(git_repo) for path in (git_repo / ".review").rglob("*")) == sorted(
+        path.relative_to(control) for path in (control / ".review").rglob("*")
+    )
 
 
 @pytest.mark.parametrize("operation", ("create_run", "start_span", "record_candidate", "bind_run", "finish_span", "close_run"))
