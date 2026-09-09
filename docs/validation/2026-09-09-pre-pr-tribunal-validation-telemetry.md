@@ -139,3 +139,21 @@ contracts; the installed probe adds lifecycle and negative-path integration.
 
 Issues #113, #114, #115, and #121 remain excluded: no evidence-bundle, budget,
 selective-rerun, or prompt-experiment behavior was added.
+
+## Post-review verification
+
+After the final review fixes at `bf79876`, `7b6bd68`, and `458312a`, the following
+checks ran against implementation HEAD `458312a5923671cace15453055de6b819608343c`.
+Nine added cases cover the ignored artifact namespace, preservation of pending
+recovery evidence on snapshot drift, and executable telemetry lifecycle commands.
+The native fixture identities, measurements, and sanitized summaries above are
+unchanged; these are fresh code and contract verification results.
+
+| Verification invocation | Post-review result |
+| --- | --- |
+| `rtk proxy python3 -m pytest -q tests/pre_pr_tribunal/test_installer.py tests/pre_pr_tribunal/test_install_integration.py tests/pre_pr_tribunal/test_probe_harness.py` | Exit 0; 202 passed, 112.29s |
+| `rtk proxy python3 -m pytest -q tests/pre_pr_tribunal tests/runtime_hook_installer` | Exit 0; 1,223 passed, 241.01s |
+| Full suite with the same workspace-local Python dependency projection | Exit 0; 3,290 passed, 361.41s |
+| `bash -n` on each file in `install.sh hooks/*.sh scripts/*.sh scripts/lib/*.sh`, invoked through `rtk proxy` | Exit 0 |
+| `rtk proxy shellcheck -x -s bash -S error install.sh hooks/*.sh scripts/*.sh scripts/lib/*.sh` | Exit 0 |
+| `rtk proxy git diff --check` | Exit 0 |
