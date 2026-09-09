@@ -1927,7 +1927,12 @@ def test_cli_stores_and_validates_exact_report_without_mutating_verdict(git_repo
         git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
     )
     assert validated.returncode == 0 and validated.stderr == b""
-    assert json.loads(validated.stdout)["raw_sha256"] == stored_payload["raw_sha256"]
+    assert json.loads(validated.stdout) == {
+        "reviewer": "A",
+        "round": 1,
+        "status": "valid",
+        "raw_sha256": stored_payload["raw_sha256"],
+    }
     assert verdict_path.read_bytes() == before
     assert (git_repo / ".review/inbox/round-1/A.json").read_bytes() == raw
 
@@ -1939,6 +1944,12 @@ def test_cli_validates_stdin_bytes_and_rejects_invalid_without_mutation(git_repo
     raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\n"
     verdict_path = git_repo / ".review/verdict.json"
     before = verdict_path.read_bytes()
+    target = git_repo / ".review/inbox/round-1/A.json"
+    sentinel = b'{"sentinel":true}\n'
+    target.write_bytes(sentinel)
+    target.chmod(0o600)
+    report_before = target.read_bytes()
+    report_mode_before = stat.S_IMODE(target.stat().st_mode)
     valid = run_cli_bytes(
         git_repo,
         "validate-report",
@@ -1968,7 +1979,54 @@ def test_cli_validates_stdin_bytes_and_rejects_invalid_without_mutation(git_repo
     assert invalid.stdout == b""
     assert invalid.stderr == b"PRE_PR_TRIBUNAL:JSON_INVALID\n"
     assert verdict_path.read_bytes() == before
-    assert not (git_repo / ".review/inbox/round-1/A.json").exists()
+    assert target.read_bytes() == report_before
+    assert stat.S_IMODE(target.stat().st_mode) == report_mode_before == 0o600
+
+
+def test_cli_stored_validation_completes_without_reading_open_stdin(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
+    stored = run_cli_bytes(git_repo, "store-report", "--reviewer", "A", input=raw)
+    assert stored.returncode == 0
+
+    cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(cli),
+            "validate-report",
+            "--reviewer",
+            "A",
+            "--source",
+            "stored",
+        ],
+        cwd=git_repo,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        try:
+            returncode = process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            pytest.fail("stored validation read from stdin before completing")
+        stdout, stderr = process.communicate()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+    assert returncode == 0 and stderr == b""
+    assert json.loads(stdout) == {
+        "reviewer": "A",
+        "round": 1,
+        "status": "valid",
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+    }
 
 
 @pytest.mark.parametrize(
