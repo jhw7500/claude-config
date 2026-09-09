@@ -61,6 +61,10 @@ Pass 경로는 exact command-local `PATH=/usr/bin:/bin`과 literal `/usr/bin/gh`
 loader override는 `COMMAND_AMBIGUOUS`로 차단된다. 인식 범위에는 Bash `builtin command`/
 `builtin exec`와 `chrt`, `ionice`, `nice`, `nohup`, `setsid`, `stdbuf`, `sudo`, `taskset`,
 `timeout` 실행 래퍼가 포함된다.
+상속된 harness sentinel `GIT_EDITOR=true`만 target-neutral 예외로 허용하며 다른 값과
+command-local `GIT_EDITOR` 할당은 계속 차단한다. Bounded scanner reason은
+`[PRE-PR-TRIBUNAL:COMMAND_AMBIGUOUS:<REASON>]`에 포함되지만 명령 원문과 환경 값은
+반사하지 않는다.
 
 이 gate는 Claude/Codex shell hook에 보이는 direct `gh pr create`만 다룬다. GitHub UI에서의 PR
 생성, `gh api`, shell alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가

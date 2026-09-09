@@ -87,7 +87,10 @@ fi
 설치기는 Claude의 `Bash` matcher와 Codex의 matcherless `PreToolUse` group을 한 transaction으로
 추가한다. 관련 없는 command와 current pass verdict에 결합된 direct PR command에는 adapter가 아무
 decision도 출력하지 않는다. direct 후보가 모호하거나 현재 verdict가 없거나 안전하지 않으면
-`[PRE-PR-TRIBUNAL:<CODE>]` reason이 포함된 deny를 출력한다.
+`[PRE-PR-TRIBUNAL:<CODE>]` reason이 포함된 deny를 출력한다. Scanner가 계산한 모호성
+사유가 bounded identifier이면 `COMMAND_AMBIGUOUS` marker는
+`[PRE-PR-TRIBUNAL:COMMAND_AMBIGUOUS:<REASON>]` 형식으로 확장된다. 명령 원문이나
+환경변수 값은 출력하지 않는다.
 
 Pass 경로의 canonical command는 `PATH=/usr/bin:/bin /usr/bin/gh pr create --base <verdict-base>` 한 개다. Literal base가
 verdict와 정확히 같아야 하며 `GH_REPO`/repo/head override, 다른 command segment, command
@@ -98,8 +101,9 @@ operand option, `pr`과 `create` 사이의 `gh` global option이 포함된다. �
 backslash가 제거되어 `gh`가 되는 이름도 후보이며, GNU split-string `\c` 종료 문법은
 `COMMAND_AMBIGUOUS`로 fail closed한다. Official `gh pr new` alias, Bash `coproc` candidate와
 bound candidate 앞의 dynamic simple-command/`env` assignment도 ambiguous다. Inherited
-`GH_HOST=github.com`과 격리된 `GH_CONFIG_DIR`는 target을 바꾸지 않으므로 허용하지만 다른
-inherited host, `GH_REPO`, target에 영향을 주는 Git execution environment는 거부한다.
+`GH_HOST=github.com`, 격리된 `GH_CONFIG_DIR`, harness sentinel인 exact `GIT_EDITOR=true`는
+target을 바꾸지 않으므로 허용하지만 다른 `GIT_EDITOR` 값, inherited host, `GH_REPO`,
+target에 영향을 주는 Git execution environment는 거부한다.
 System/global/local/worktree scope의 effective `remote.<name>.gh-resolved=base` marker는
 없거나 origin을 가리키는 exact marker 하나만 허용하며, 다른 default repository는
 `REPOSITORY_UNSUPPORTED`다.

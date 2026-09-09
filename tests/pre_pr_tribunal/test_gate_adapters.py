@@ -719,6 +719,16 @@ def test_passing_verdict_rejects_unbound_target(git_repo: Path, command: str):
     assert decision.code is GateCode.COMMAND_AMBIGUOUS
 
 
+def test_bound_target_override_reason_survives_gate_decision(git_repo: Path):
+    _passing_verdict(git_repo)
+
+    decision = evaluate_gate(git_repo, BOUND_COMMAND + " --head topic")
+
+    assert decision.block is True
+    assert decision.code is GateCode.COMMAND_AMBIGUOUS
+    assert decision.reason == "TARGET_OVERRIDE"
+
+
 @pytest.mark.parametrize(
     "command",
     (
@@ -899,6 +909,7 @@ def test_passing_verdict_rejects_inherited_target_override(
     (
         ("GH_HOST", "github.com"),
         ("GH_CONFIG_DIR", "/isolated/gh-config"),
+        ("GIT_EDITOR", "true"),
         ("GIT_PAGER", "cat"),
         ("GIT_OPTIONAL_LOCKS", "0"),
     ),
@@ -916,6 +927,22 @@ def test_passing_verdict_allows_inherited_non_target_runtime_config(
 
     assert decision.block is False
     assert decision.code is GateCode.PASS
+
+
+@pytest.mark.parametrize("value", ("", "vim", "/tmp/editor-canary"))
+def test_passing_verdict_rejects_untrusted_inherited_git_editor(
+    git_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+):
+    _passing_verdict(git_repo)
+    monkeypatch.setenv("GIT_EDITOR", value)
+
+    decision = evaluate_gate(git_repo, BOUND_COMMAND)
+
+    assert decision.block is True
+    assert decision.code is GateCode.COMMAND_AMBIGUOUS
+    assert decision.reason == "TARGET_ENVIRONMENT"
 
 
 @pytest.mark.parametrize(
@@ -999,6 +1026,39 @@ def test_ambiguous_command_denies_without_reading_state(
     assert result.returncode == 0 and result.stderr == ""
     assert "COMMAND_AMBIGUOUS" in result.stdout
     assert "TRIBUNAL_REQUIRED" not in result.stdout
+
+
+def test_adapter_reports_bounded_reason_without_reflecting_command(
+    installed_package: Path, git_repo: Path
+):
+    _passing_verdict(git_repo)
+    canary = "private-head-canary"
+    command = BOUND_COMMAND + f" --head {canary}"
+
+    result = run_adapter(
+        installed_package,
+        "codex_hook.py",
+        payload(git_repo, command, camel=True, tool="exec_command"),
+        git_repo,
+    )
+
+    decoded = json.loads(result.stdout)
+    reason = decoded["hookSpecificOutput"]["permissionDecisionReason"]
+    assert result.returncode == 0 and result.stderr == ""
+    assert "[PRE-PR-TRIBUNAL:COMMAND_AMBIGUOUS:TARGET_OVERRIDE]" in reason
+    assert "명령 형태" in reason
+    assert "pre-pr-tribunal Skill을 다시 실행" not in reason
+    assert canary not in reason
+
+
+def test_deny_output_does_not_reflect_unbounded_reason():
+    canary = "PRIVATE_REASON_CANARY_" + "X" * 80
+
+    output = hook_common.deny_output(GateCode.COMMAND_AMBIGUOUS, canary)
+
+    reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+    assert canary not in reason
+    assert "[PRE-PR-TRIBUNAL:COMMAND_AMBIGUOUS]" in reason
 
 
 @pytest.mark.parametrize(
