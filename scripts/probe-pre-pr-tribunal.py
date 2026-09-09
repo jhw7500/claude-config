@@ -1334,27 +1334,42 @@ def _remove_review(repo: Path) -> None:
         shutil.rmtree(review)
 
 
+def _tribunal_cli(
+    cli: Path, repo: Path, home: Path, *arguments: str, raw: bytes = b""
+) -> dict[str, object]:
+    """Use the installed CLI, preserving stdin bytes and bounded domain failures."""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(cli), *arguments], cwd=repo,
+            env=_internal_env(home), input=raw, capture_output=True,
+            timeout=INTERNAL_TIMEOUT_SECONDS, check=False,
+        )
+        if len(result.stdout) > HOOK_OUTPUT_LIMIT_BYTES or len(result.stderr) > 128:
+            raise ProbeFailure("SETUP_FAILED")
+        if result.returncode:
+            prefix = b"PRE_PR_TRIBUNAL:"
+            code = result.stderr.removeprefix(prefix).removesuffix(b"\n")
+            if (result.stderr == prefix + code + b"\n" and 0 < len(code) <= 64
+                    and all(byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for byte in code)):
+                raise ProbeFailure(code.decode("ascii"))
+            raise ProbeFailure("SETUP_FAILED")
+        payload = json.loads(result.stdout)
+        if result.stderr or not isinstance(payload, dict):
+            raise ProbeFailure("SETUP_FAILED")
+        return payload
+    except subprocess.TimeoutExpired:
+        raise ProbeFailure("TIMEOUT") from None
+    except (OSError, ValueError):
+        raise ProbeFailure("SETUP_FAILED") from None
+
+
 def _create_pass_verdict(
     cli: Path, repo: Path, home: Path, runtime: str
-) -> None:
-    environment = _internal_env(home)
-    begin = _run_internal(
-        [
-            sys.executable,
-            str(cli),
-            "begin",
-            "--base",
-            "master",
-            "--runtime",
-            runtime,
-            "--round",
-            "1",
-        ],
-        cwd=repo,
-        env=environment,
-    )
+) -> dict[str, object]:
+    """Exercise the installed lifecycle with synthetic reports, not reviewer timings."""
+    payload = _tribunal_cli(cli, repo, home, "begin", "--base", "master",
+                            "--runtime", runtime, "--round", "1")
     try:
-        payload = json.loads(begin.stdout.decode("utf-8", "strict"))
         snapshot = payload["snapshot"]
         head_sha = snapshot["head_sha"]
         diff_sha256 = snapshot["diff_sha256"]
@@ -1367,7 +1382,45 @@ def _create_pass_verdict(
             raise ValueError
     except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         raise ProbeFailure("SETUP_FAILED") from None
-    report_paths: list[Path] = []
+    observation = payload.get("telemetry", {})
+    run_id = observation.get("run_id")
+    gaps = []
+
+    def telemetry(command, *arguments):
+        if run_id is None:
+            return {}
+        try:
+            return _tribunal_cli(cli, repo, home, command, "--run-id", run_id, *arguments)
+        except ProbeFailure as error:
+            gaps.append(error.code)
+            return {}
+
+    def start(stage, reviewer=None):
+        dimension = ("--reviewer", reviewer) if reviewer else ()
+        return telemetry("telemetry-start", "--stage", stage, *dimension,
+                         "--attempt", "1").get("span_id")
+
+    def finish(span, error=None):
+        if span is not None:
+            outcome = "timeout" if error == "TIMEOUT" else "failure" if error else "success"
+            reason = ("--reason-code", error) if error else ()
+            telemetry("telemetry-finish", "--span-id", span, "--outcome", outcome, *reason)
+
+    def measured(stage, reviewer, operation):
+        span = start(stage, reviewer)
+        try:
+            result = operation()
+        except ProbeFailure as error:
+            finish(span, error.code)
+            raise
+        finish(span)
+        return result
+
+    # These totals cover synthetic report production only; no runtime is dispatched.
+    totals = {reviewer: start("reviewer_total", reviewer) for reviewer in "ABC"}
+    receipts = {}
+    report_sizes = {}
+    failure = None
     for reviewer in "ABC":
         report = {
             "schema": 1,
@@ -1380,26 +1433,61 @@ def _create_pass_verdict(
             "claims": [],
             "prior_decisions": [],
         }
-        path = repo / f".review/inbox/round-1/{reviewer}.json"
-        if path.exists():
-            path.unlink()
-        _write(path, json.dumps(report, separators=(",", ":")) + "\n", 0o600)
-        report_paths.append(path)
-    _run_internal(
-        [
-            sys.executable,
-            str(cli),
-            "finalize",
-            "--reviewer-a",
-            str(report_paths[0]),
-            "--reviewer-b",
-            str(report_paths[1]),
-            "--reviewer-c",
-            str(report_paths[2]),
-        ],
-        cwd=repo,
-        env=environment,
-    )
+        raw = (json.dumps(report, separators=(",", ":")) + "\n").encode("utf-8")
+        report_sizes[reviewer] = len(raw)
+        finish(totals[reviewer])
+        try:
+            receipt = measured("report_store", reviewer, lambda: _tribunal_cli(
+                cli, repo, home, "store-report", "--reviewer", reviewer, raw=raw))
+            if receipt.get("raw_sha256") != hashlib.sha256(raw).hexdigest():
+                raise ProbeFailure("REPORT_BYTES_MISMATCH")
+            receipts[reviewer] = receipt["raw_sha256"]
+            valid = measured("report_validation", reviewer, lambda: _tribunal_cli(
+                cli, repo, home, "validate-report", "--reviewer", reviewer, "--source", "stored"))
+            if valid.get("raw_sha256") != receipts[reviewer]:
+                raise ProbeFailure("REPORT_BYTES_MISMATCH")
+        except ProbeFailure as error:
+            failure = failure or error
+
+    def finalize():
+        for reviewer in "ABC":
+            valid = _tribunal_cli(cli, repo, home, "validate-report", "--reviewer",
+                                  reviewer, "--source", "stored")
+            if valid.get("raw_sha256") != receipts[reviewer]:
+                raise ProbeFailure("REPORT_BYTES_MISMATCH")
+        # Check all files independently immediately before the finalizer subprocess.
+        for reviewer in "ABC":
+            path = repo / f".review/inbox/round-1/{reviewer}.json"
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            except OSError:
+                raise ProbeFailure("FILE_UNSAFE") from None
+            try:
+                metadata = os.fstat(descriptor)
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                        or stat.S_IMODE(metadata.st_mode) != 0o600):
+                    raise ProbeFailure("FILE_UNSAFE")
+                raw = os.read(descriptor, report_sizes[reviewer] + 1)
+                if hashlib.sha256(raw).hexdigest() != receipts[reviewer]:
+                    raise ProbeFailure("REPORT_BYTES_MISMATCH")
+            finally:
+                os.close(descriptor)
+        return _tribunal_cli(cli, repo, home, "finalize",
+            "--reviewer-a", ".review/inbox/round-1/A.json",
+            "--reviewer-b", ".review/inbox/round-1/B.json",
+            "--reviewer-c", ".review/inbox/round-1/C.json")
+
+    if failure is None:
+        try:
+            measured("finalize", None, finalize)
+        except ProbeFailure as error:
+            failure = error
+    reason = ("--reason-code", failure.code) if failure else ()
+    telemetry("telemetry-close", "--outcome", "failure" if failure else "success", *reason)
+    summary = telemetry("telemetry-summary")
+    if failure is not None:
+        raise failure
+    return {"begin": payload, "telemetry_summary": summary, "telemetry_gaps": gaps}
 
 
 def _runtime_argv(
@@ -1797,7 +1885,10 @@ def _probe_runtime(
     ):
         _remove_review(repo)
         if phase == "pass":
-            _create_pass_verdict(cli, repo, home, runtime)
+            try:
+                _create_pass_verdict(cli, repo, home, runtime)
+            except ProbeFailure:
+                raise ProbeFailure("SETUP_FAILED") from None
         evidence_dir, hook_log, gh_log = _make_phase_logs(
             work_dir, runtime, phase
         )
