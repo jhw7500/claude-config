@@ -13,23 +13,20 @@ import time
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from pre_pr_tribunal.model import (  # type: ignore
-        MAX_COMMAND_TEXT_BYTES,
-        MAX_EVIDENCE_TEXT_BYTES,
-        MAX_EXECUTIONS_PER_REVIEWER,
-        MAX_FINDINGS_PER_REVIEWER,
         MAX_REPORT_BYTES,
-        MAX_VERDICT_BYTES,
-        REPORT_TEXT_CONTRACT_VERSION,
         Reviewer,
         TribunalError,
         validate_report_bytes,
     )
     from pre_pr_tribunal.git_state import (  # type: ignore
-        DIFF_RECIPE_VERSION,
         capture_snapshot,
         capture_telemetry_candidate,
         check_telemetry_ignored,
-        diff_contract,
+    )
+    from pre_pr_tribunal.review_context import (  # type: ignore
+        reviewer_context_body,
+        reviewer_context_envelope,
+        snapshot_projection,
     )
     from pre_pr_tribunal.verdict_store import (  # type: ignore
         begin_round,
@@ -41,20 +38,16 @@ if __package__ in {None, ""}:
     from pre_pr_tribunal import telemetry  # type: ignore
 else:
     from .model import (
-        MAX_COMMAND_TEXT_BYTES,
-        MAX_EVIDENCE_TEXT_BYTES,
-        MAX_EXECUTIONS_PER_REVIEWER,
-        MAX_FINDINGS_PER_REVIEWER,
         MAX_REPORT_BYTES,
-        MAX_VERDICT_BYTES,
-        REPORT_TEXT_CONTRACT_VERSION,
         Reviewer,
         TribunalError,
         validate_report_bytes,
     )
     from .git_state import (
-        DIFF_RECIPE_VERSION, capture_snapshot, capture_telemetry_candidate,
-        check_telemetry_ignored, diff_contract,
+        capture_snapshot, capture_telemetry_candidate, check_telemetry_ignored,
+    )
+    from .review_context import (
+        reviewer_context_body, reviewer_context_envelope, snapshot_projection,
     )
     from .verdict_store import (
         begin_round,
@@ -214,71 +207,12 @@ def _telemetry_command(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=time.
         raise TribunalError(_telemetry_unavailable(error)["reason_code"]) from None
 
 
-def _snapshot(verdict) -> dict[str, object]:
-    return {
-        "repository": verdict.repository,
-        "base": {"ref": verdict.base_ref, "sha": verdict.base_sha},
-        "head_ref": verdict.head_ref,
-        "head_sha": verdict.head_sha,
-        "merge_base_sha": verdict.merge_base_sha,
-        "diff_sha256": verdict.diff_sha256,
-    }
-
-
 def _status(verdict) -> dict[str, object]:
     return {
         "round": verdict.round,
         "gate_status": verdict.gate.status.value,
         "blocking_count": verdict.gate.blocking_count,
         "verdict_path": ".review/verdict.json",
-    }
-
-
-def _context_decision(decision) -> dict[str, object]:
-    return {
-        "id": decision.id,
-        "finding_ref": {
-            "round": decision.finding_round,
-            "id": decision.finding_id,
-            "reviewer": decision.reviewer.value,
-        },
-        "disposition": decision.disposition,
-        "rationale": decision.rationale,
-    }
-
-
-def _context(verdict, reviewer: Reviewer) -> dict[str, object]:
-    findings = [
-        dict(item)
-        for summary in verdict.history
-        for item in summary.blocking_findings
-        if item["reviewer"] == reviewer.value
-    ]
-    decisions = [
-        _context_decision(item)
-        for item in verdict.decisions
-        if item.reviewer is reviewer
-    ]
-    return {
-        "schema": 1,
-        "round": verdict.round,
-        "reviewer": reviewer.value,
-        "snapshot": _snapshot(verdict),
-        "own_prior_findings": findings,
-        "own_decisions": decisions,
-        "contract": {
-            "report_text": REPORT_TEXT_CONTRACT_VERSION,
-            "diff_recipe": DIFF_RECIPE_VERSION,
-        },
-        "diff_contract": diff_contract(verdict.snapshot),
-        "limits": {
-            "report_bytes": MAX_REPORT_BYTES,
-            "verdict_bytes": MAX_VERDICT_BYTES,
-            "evidence_text_bytes": MAX_EVIDENCE_TEXT_BYTES,
-            "command_text_bytes": MAX_COMMAND_TEXT_BYTES,
-            "findings": MAX_FINDINGS_PER_REVIEWER,
-            "executions": MAX_EXECUTIONS_PER_REVIEWER,
-        },
     }
 
 
@@ -337,7 +271,7 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
             payload = {
                 "schema": 1,
                 "round": verdict.round,
-                "snapshot": _snapshot(verdict),
+                "snapshot": snapshot_projection(verdict),
                 "initial_paths": list(verdict.initial_paths),
                 "gate": verdict.gate.to_json(),
                 "telemetry": observation,
@@ -345,7 +279,13 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
         elif arguments.command.startswith("telemetry-"):
             payload = _telemetry_command(cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns)
         elif arguments.command == "context":
-            payload = _context(read_verdict(cwd), Reviewer(arguments.reviewer))
+            verdict = read_verdict(cwd)
+            reviewer = Reviewer(arguments.reviewer)
+            payload = (
+                reviewer_context_body(verdict, reviewer)
+                if verdict.schema == 1
+                else reviewer_context_envelope(verdict, reviewer)
+            )
         elif arguments.command == "store-report":
             receipt = store_reviewer_report(
                 cwd,

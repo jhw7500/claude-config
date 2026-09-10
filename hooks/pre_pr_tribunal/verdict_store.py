@@ -34,6 +34,7 @@ from .model import (
     Snapshot,
     Verdict,
 )
+from .review_context import current_contract_binding
 from .review_store import (
     atomic_create_bytes,
     atomic_replace_bytes,
@@ -458,12 +459,6 @@ def _parse_contract(value: object) -> ContractBinding:
         m._integer(obj["diff_recipe"], "VERDICT_INVALID", minimum=1),
         m._integer(obj["verdict_schema"], "VERDICT_INVALID", minimum=1),
     )
-    if contract != ContractBinding(
-        m.REPORT_TEXT_CONTRACT_VERSION,
-        DIFF_RECIPE_VERSION,
-        m.VERDICT_SCHEMA_VERSION,
-    ):
-        raise SchemaError("VERDICT_INVALID")
     return contract
 
 

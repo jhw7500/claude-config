@@ -26,6 +26,7 @@ PACKAGE_NAMES = (
     "git_state.py",
     "hook_common.py",
     "model.py",
+    "review_context.py",
     "review_store.py",
     "shell_scan.py",
     "telemetry.py",
