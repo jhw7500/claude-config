@@ -1796,6 +1796,88 @@ def test_empty_reports_pass_and_round_one_restart_resets_pending(git_repo):
     )
 
 
+@pytest.mark.parametrize("reviewer", "ABC")
+@pytest.mark.parametrize("failure", ("malformed", "operational"))
+def test_pass_restart_can_record_another_failure(git_repo, reviewer, failure):
+    from pre_pr_tribunal.verdict_store import record_reviewer_failure
+    first = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    with pytest.raises(SchemaError, match="^JSON_INVALID$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer(reviewer), raw=b"{", now=NOW)
+    report_paths(git_repo, first.snapshot)
+    assert finalize_round(git_repo, now=NOW).gate.status.value == "pass"
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    if failure == "malformed":
+        with pytest.raises(SchemaError, match="^JSON_INVALID$"):
+            submit_reviewer_report(git_repo, reviewer=Reviewer(reviewer), raw=b"new invalid", now=NOW)
+    else:
+        record_reviewer_failure(git_repo, reviewer=Reviewer(reviewer), reason_code="REVIEWER_TIMEOUT")
+    slot = read_verdict(git_repo).reviewers[reviewer]
+    assert slot.attempt_count == 1
+    assert slot.last_error == ("JSON_INVALID" if failure == "malformed" else "REVIEWER_TIMEOUT")
+
+
+@pytest.mark.parametrize("last_round", (2, 3))
+def test_later_pass_can_reuse_every_round_attempt_namespace(git_repo, last_round):
+    from pre_pr_tribunal.verdict_store import record_reviewer_failure
+    for cycle in range(2):
+        decisions_path = None
+        for round_number in range(1, last_round + 1):
+            pending = begin_round(
+                git_repo, base="master", runtime="codex", round_number=round_number,
+                decisions_path=decisions_path, now=NOW,
+            )
+            for key in "ABC":
+                assert pending.reviewers[key].attempt_count == 0
+                record_reviewer_failure(git_repo, reviewer=Reviewer(key), reason_code="REVIEWER_TIMEOUT")
+            findings = [finding(f"A-R{round_number}-001")] if round_number < last_round else []
+            prior = [{"decision_id": f"D-R{round_number - 1}-A-001", "outcome": "accepted",
+                      "replacement_finding_id": None}] if round_number > 1 else []
+            report_paths(git_repo, pending.snapshot, round_number=round_number,
+                         overrides={"A": {"findings": findings, "prior_decisions": prior}})
+            final = finalize_round(git_repo, now=NOW)
+            assert all(slot.receipt.attempt == slot.attempt_count == 2 for slot in final.reviewers.values())
+            if round_number < last_round:
+                assert final.gate.status.value == "fail"
+                commit_fix(git_repo)
+                value = {"id": f"D-R{round_number}-A-001",
+                         "finding_ref": {"round": round_number, "id": f"A-R{round_number}-001", "reviewer": "A"},
+                         "disposition": "fixed", "rationale": "Covered by regression test.",
+                         "executions": [execution(f"D-R{round_number}-E001")]}
+                decisions_path = write_json(git_repo / f".review/inbox/round-{round_number}/decisions.json", [value])
+        assert final.gate.status.value == "pass"
+
+
+def test_restart_rejects_unknown_attempt_target_before_changing_verdict_or_reports(git_repo):
+    from pre_pr_tribunal.verdict_store import record_reviewer_failure
+    pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    record_reviewer_failure(git_repo, reviewer=Reviewer.A, reason_code="REVIEWER_TIMEOUT")
+    paths = report_paths(git_repo, pending.snapshot)
+    finalize_round(git_repo, now=NOW)
+    unknown = git_repo / ".review/attempts/round-1/unknown"
+    unknown.write_bytes(b"must remain")
+    unknown.chmod(0o600)
+    protected = [*paths.values(), git_repo / ".review/verdict.json", unknown,
+                 git_repo / ".review/attempts/round-1/A/attempt-1.meta.json"]
+    before = {path: path.read_bytes() for path in protected}
+    with pytest.raises(SchemaError, match="^ATTEMPT_EVIDENCE_UNSAFE$"):
+        begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert {path: path.read_bytes() for path in protected} == before
+
+
+@pytest.mark.parametrize("evidence_round", (1, 2, 3))
+def test_initial_begin_preserves_unexpected_attempt_evidence_without_verdict(git_repo, evidence_round):
+    from pre_pr_tribunal.attempt_store import append_attempt_evidence
+    from pre_pr_tribunal.review_store import locked_review
+    with locked_review(git_repo, create=True) as review_fd:
+        evidence = append_attempt_evidence(review_fd, round_number=evidence_round, reviewer=Reviewer.C,
+                                           sequence=1, raw=b"{", reason_code="JSON_INVALID")
+    path = git_repo / evidence.raw_path
+    with pytest.raises(SchemaError, match="^ATTEMPT_EVIDENCE_UNSAFE$"):
+        begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert path.read_bytes() == b"{"
+    assert not (git_repo / ".review/verdict.json").exists()
+
+
 def test_round_one_replaces_owner_private_readonly_verdict(git_repo):
     """Checking a prior verdict's exact mode would reject safe owner-only state."""
     pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)

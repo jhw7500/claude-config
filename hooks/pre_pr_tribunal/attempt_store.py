@@ -151,6 +151,68 @@ def _rotate_attempt(parent_fd: int, sequence: int, reviewer: Reviewer, round_num
         os.fsync(parent_fd)
 
 
+def _existing_private_directory(parent_fd: int, name: str, stack: ExitStack) -> int | None:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    stack.callback(os.close, fd)
+    safe_directory(fd, _UNSAFE)
+    if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+        raise SchemaError(_UNSAFE)
+    return fd
+
+
+def reset_round_attempt_evidence(
+    review_fd: int, *, round_number: int, allow_reset: bool,
+) -> None:
+    """Reset a reused round namespace only after a validated terminal transition.
+
+    Caller holds the review lock. Prevalidate all complete ABC records before
+    removing any known file; unknown/partial evidence requires explicit recovery.
+    An initial begin without a stored verdict cannot authorize existing evidence
+    deletion. Empty/missing namespaces are safe, and directories stay in place.
+    """
+    if (
+        type(round_number) is not int or not 1 <= round_number <= 3
+        or type(allow_reset) is not bool
+    ):
+        raise SchemaError(_UNSAFE)
+    try:
+        safe_directory(review_fd, _UNSAFE)
+        with ExitStack() as stack:
+            attempts_fd = _existing_private_directory(review_fd, "attempts", stack)
+            if attempts_fd is None:
+                return
+            round_fd = _existing_private_directory(attempts_fd, f"round-{round_number}", stack)
+            if round_fd is None:
+                return
+            with os.scandir(round_fd) as entries:
+                for entry in entries:
+                    if entry.name not in {"A", "B", "C"}:
+                        raise SchemaError(_UNSAFE)
+            files: list[tuple[int, str, int]] = []
+            slot_fds = []
+            for reviewer in Reviewer:
+                slot_fd = _existing_private_directory(round_fd, reviewer.value, stack)
+                if slot_fd is None:
+                    continue
+                slot_fds.append(slot_fd)
+                for sequence in _existing_attempts(slot_fd, reviewer, round_number):
+                    record = _verified_attempt(slot_fd, sequence, reviewer, round_number, stack)
+                    files.extend((slot_fd, name, fd) for name, fd in reversed(tuple(record.items())))
+            if files and not allow_reset:
+                raise SchemaError(_UNSAFE)
+            for slot_fd, name, fd in files:
+                safe_directory(slot_fd, _UNSAFE)
+                _verify_named(slot_fd, name, fd)
+                os.unlink(name, dir_fd=slot_fd)
+            for slot_fd in slot_fds:
+                os.fsync(slot_fd)
+    except (OSError, ValueError, SchemaError):
+        raise SchemaError(_UNSAFE) from None
+
+
 def append_attempt_evidence(
     review_fd: int, *, round_number: int, reviewer: Reviewer, sequence: int,
     reason_code: str, raw: bytes | None,

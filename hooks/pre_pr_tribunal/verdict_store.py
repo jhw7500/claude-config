@@ -26,6 +26,7 @@ from .attempt_store import (
     REPORT_RETRYABLE_CODES,
     append_attempt_evidence,
     preserve_legacy_report,
+    reset_round_attempt_evidence,
 )
 from .model import (
     ContractBinding,
@@ -1158,6 +1159,12 @@ def begin_round(
                 raise SchemaError("FIXED_HEAD_UNCHANGED")
             initial_paths = tuple(previous.initial_paths)
             history = tuple((*previous.history, _summary(previous))[-2:])
+        # Without a terminal predecessor, no old fixed namespace has proven
+        # completion. Check all three before a future transition could reuse one.
+        for target_round in ((round_number,) if stored is not None else (1, 2, 3)):
+            reset_round_attempt_evidence(
+                review_fd, round_number=target_round, allow_reset=stored is not None,
+            )
         _invalidate_round_inputs(review_fd, round_number)
         pending = _new_v2_pending(
             snapshot, runtime=runtime, initial_paths=initial_paths,

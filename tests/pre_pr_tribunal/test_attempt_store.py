@@ -120,6 +120,61 @@ def test_legacy_attempt_recovery_refuses_unproven_or_different_evidence(git_repo
         assert raw_path.is_symlink() if damage == "symlink" else raw_path.exists()
 
 
+def test_reset_round_attempts_removes_only_verified_target_round(git_repo):
+    from pre_pr_tribunal import attempt_store
+    with locked_review(git_repo, create=True) as review_fd:
+        for reviewer in Reviewer:
+            append(review_fd, reviewer=reviewer)
+            append(review_fd, reviewer=reviewer, sequence=2, raw=None, reason_code="REVIEWER_TIMEOUT")
+        other = attempt_store.append_attempt_evidence(
+            review_fd, round_number=2, reviewer=Reviewer.A, sequence=1,
+            raw=b"other", reason_code="JSON_INVALID",
+        )
+        attempt_store.reset_round_attempt_evidence(review_fd, round_number=1, allow_reset=True)
+        for key in "ABC":
+            assert list((git_repo / f".review/attempts/round-1/{key}").iterdir()) == []
+        assert (git_repo / other.raw_path).read_bytes() == b"other"
+        append(review_fd, reviewer=Reviewer.A, raw=b"new attempt one")
+        assert (git_repo / ".review/attempts/round-1/A/attempt-1.raw").read_bytes() == b"new attempt one"
+
+
+@pytest.mark.parametrize("damage", ("unknown_slot", "unknown_file", "partial", "mode", "digest", "symlink", "owner"))
+def test_reset_round_attempts_prescans_all_slots_before_removal(git_repo, monkeypatch, damage):
+    from pre_pr_tribunal import attempt_store
+    with locked_review(git_repo, create=True) as review_fd:
+        first = append(review_fd, reviewer=Reviewer.A)
+        last = append(review_fd, reviewer=Reviewer.C)
+        victim = git_repo / last.raw_path
+        if damage == "unknown_slot":
+            victim.parent.parent.joinpath("unknown").mkdir(mode=0o700)
+        elif damage == "unknown_file":
+            victim.parent.joinpath("unknown").write_bytes(b"keep")
+        elif damage == "partial":
+            (git_repo / last.metadata_path).unlink()
+        elif damage == "mode":
+            victim.chmod(0o644)
+        elif damage == "digest":
+            victim.write_bytes(b"changed")
+        elif damage == "symlink":
+            victim.unlink()
+            victim.symlink_to(git_repo / "tracked.txt")
+        else:
+            inode = victim.stat().st_ino
+            original = os.fstat
+            def wrong_owner(fd):
+                info = original(fd)
+                if info.st_ino == inode:
+                    fields = list(info)
+                    fields[4] = info.st_uid + 1
+                    return os.stat_result(fields)
+                return info
+            monkeypatch.setattr(os, "fstat", wrong_owner)
+        with pytest.raises(SchemaError, match="^ATTEMPT_EVIDENCE_UNSAFE$"):
+            attempt_store.reset_round_attempt_evidence(review_fd, round_number=1, allow_reset=True)
+        assert (git_repo / first.raw_path).read_bytes() == b'{"schema":1\r'
+        assert (git_repo / first.metadata_path).exists()
+
+
 @pytest.mark.parametrize("kind", ("symlink", "fifo", "mode", "owner", "metadata", "digest"))
 @pytest.mark.parametrize("suffix", ("raw", "meta.json"))
 def test_rotation_rejects_unproven_pair_without_unlinking(git_repo, monkeypatch, kind, suffix):
