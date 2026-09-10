@@ -191,17 +191,27 @@ Set `verification_cwd` to the intended absolute isolated checkout and
 `verification_log` to a fresh private log file's absolute path. Substitute the
 project's real test command. This captures execution, not a semantic PASS
 verdict; inspect the full log and expected/actual checks afterward.
+Keep the log outside runner-managed cleanup paths. Log validation or readback
+failure returns 125 with `capture_error`; `verifier_exit` still reports the
+target status. Otherwise the wrapper returns the target status. These checks
+detect missing/invalid logs, not same-user tampering or in-place truncation.
 
 ```bash
 (
     cd -- "$verification_cwd" || exit
+    export -n verification_log
     if bash tests/check.sh >"$verification_log" 2>&1; then
         verification_rc=0
     else
         verification_rc=$?
     fi
     printf 'log=%s verifier_exit=%s\n' "$verification_log" "$verification_rc"
-    tail -n 30 -- "$verification_log"
+    if [[ ! -f "$verification_log" || -L "$verification_log" ||
+          ! -O "$verification_log" || ! -r "$verification_log" ]] ||
+       ! tail -n 30 -- "$verification_log"; then
+        printf 'capture_error=raw_log_unavailable verifier_exit=%s\n' "$verification_rc" >&2
+        exit 125
+    fi
     exit "$verification_rc"
 )
 ```
