@@ -84,8 +84,8 @@ one-sided gate. When you run a control arm (feature present) beside a mutation
 arm (feature removed or reverted), an unexpected result in EITHER arm is a
 finding:
 
-- **Mutation arm green** → this indicts your harness, not the subject. The test
-  cannot detect the thing it claims to test.
+- **Mutation arm green for a claimed change detector** → this indicts your
+  harness, not the subject. The test cannot detect the change it claims to test.
 - **Control arm red while the mutation arm behaves as expected** → this is
   evidence about your harness or your usage of the API before it is evidence
   about the subject. Diagnose the harness before you conclude "this can't be
@@ -94,6 +94,12 @@ finding:
 
 Reading only the arm you expected to pass discards half the instrument's
 diagnostic value.
+
+**Name the test's claim before interpreting its arms.** A change detector
+must distinguish old from new behavior. A preservation guard checks an
+invariant that should hold in both; keep useful guards and report their count
+separately, not as evidence that the new behavior was detected. A suite with
+only preservation guards has not yet demonstrated the change.
 
 **Probing a third-party extension point?** Exercise every declared variant of
 it — the argument-taking form and the no-argument form, each registration shape
@@ -153,6 +159,58 @@ suffixes of one another.
 
 ## superpowers:verification-before-completion
 
+### Adds to The Gate Function — bind the run to its inputs
+
+For a baseline or completion test, keep a run record: **input identity, absolute
+cwd, command, expected scope/count, actual passed/failed/skipped counts, target
+exit status, raw-log location, and claim limits**. Use the runner's structured
+report or actual assertions, not a count of arbitrary PASS strings; a tool
+without test counts needs its own success evidence.
+
+Before launch, identify what the command actually reads: a literal revision
+plus relevant dirty source, fixtures, and configuration digests. A commit SHA
+alone does not describe uncommitted inputs. Record only relevant, non-secret
+identity evidence, not environment or credential dumps.
+
+While the run is active, do not edit its inputs. Finish it before editing, or
+take a quiescent snapshot into a separate checkout/copy and keep writers away
+from that snapshot before continuing edits elsewhere. For a pre-change
+baseline, pin the pre-change inputs, not the edited candidate. A worktree or
+commit name does not itself prevent writes. An observed input change
+invalidates baseline/regression attribution; equal start/end digests do not
+exclude an intervening change and restore.
+
+Gate directory entry before the runner. Capture the target process's exit
+status before formatting output; retain the raw log and read the actual
+summary as well. A pipeline-wide status is not necessarily the target status.
+The existing Instrument Check below governs skipped or unexecuted checks.
+
+### Bash capture example
+
+Set `verification_cwd` to the intended absolute isolated checkout and
+`verification_log` to a fresh private log file's absolute path. Substitute the
+project's real test command. This captures execution, not a semantic PASS
+verdict; inspect the full log and expected/actual checks afterward.
+
+```bash
+(
+    cd -- "$verification_cwd" || exit
+    if bash tests/check.sh >"$verification_log" 2>&1; then
+        verification_rc=0
+    else
+        verification_rc=$?
+    fi
+    printf 'log=%s verifier_exit=%s\n' "$verification_log" "$verification_rc"
+    tail -n 30 -- "$verification_log"
+    exit "$verification_rc"
+)
+```
+
+`cd target && setup; test` does not gate the test: the semicolon allows it to
+run from the old directory after a failed `cd`. Keep the exit guard even when
+the happy-path directory exists. This procedure grants no permission to
+modify a shared checkout, reset production, install, or publish.
+
 ### New section — The Instrument Check
 
 A "good" result — pass, clean, blocked, absent, none found — is evidence only
@@ -164,8 +222,9 @@ Ask before reporting it:
 
 - **Negative assertions** ("blocked", "rejected", "no leak") need a positive
   control — see the pattern below.
-- **Revert/mutation pairs** are two-sided. Read both arms: a mutation arm that
-  stays green indicts the harness, not the subject.
+- **Revert/mutation pairs** are two-sided. Read both arms: a claimed change
+  detector that stays green on mutation leaves that change unproved. Report
+  preservation guards separately; their pass in both arms is expected.
 - **Absence** is scoped to the channels you actually searched. Enumerate where
   the system persists output (logs, build artifacts, check-run output, API,
   attachments) before promoting "I did not find it" to "it does not exist" — a
