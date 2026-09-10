@@ -743,6 +743,45 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
     assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "pass"
 
 
+@pytest.mark.parametrize("inconsistency", ("digest", "attempt", "boolean_attempt"))
+def test_installed_probe_rejects_submit_receipt_status_inconsistency(
+    tmp_path, monkeypatch, inconsistency,
+):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    run = subprocess.run
+
+    def inconsistent_submit(argv, **kwargs):
+        if (
+            len(argv) > 4
+            and argv[1] == str(cli)
+            and argv[2:5] == ["submit-report", "--reviewer", "A"]
+        ):
+            original = kwargs["input"]
+            if inconsistency == "digest":
+                kwargs = {**kwargs, "input": original + b" "}
+            result = run(argv, **kwargs)
+            payload = json.loads(result.stdout)
+            if inconsistency == "digest":
+                payload["raw_sha256"] = hashlib.sha256(original).hexdigest()
+            elif inconsistency == "attempt":
+                payload["attempt"] += 1
+            else:
+                payload["attempt"] = True
+            return subprocess.CompletedProcess(
+                result.args,
+                result.returncode,
+                (json.dumps(payload, separators=(",", ":")) + "\n").encode(),
+                result.stderr,
+            )
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", inconsistent_submit)
+
+    with pytest.raises(module.ProbeFailure, match="^REPORT_RECEIPT_MISMATCH$"):
+        module._create_pass_verdict(cli, repo, home, "codex")
+    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "in_progress"
+
+
 def test_installed_probe_preserves_valid_peers_when_c_retries(tmp_path):
     module, home, repo, cli = _installed_lifecycle(tmp_path)
     attempts = {"A": 0, "B": 0, "C": 0}

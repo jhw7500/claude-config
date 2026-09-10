@@ -1474,6 +1474,7 @@ def _create_pass_verdict(
         return result
 
     failure = None
+    submitted_receipts: dict[str, dict[str, object]] = {}
     reviewers = status.get("reviewers")
     if not isinstance(reviewers, dict) or set(reviewers) != set("ABC"):
         raise ProbeFailure("SETUP_FAILED")
@@ -1503,6 +1504,7 @@ def _create_pass_verdict(
                 ))
                 if receipt.get("raw_sha256") != hashlib.sha256(raw).hexdigest():
                     raise ProbeFailure("REPORT_BYTES_MISMATCH")
+                submitted_receipts[reviewer] = receipt
             except ProbeFailure as error:
                 finish(total, error.code)
                 local_attempts += 1
@@ -1532,11 +1534,27 @@ def _create_pass_verdict(
             count = slot.get("attempt_count")
             if not isinstance(count, int) or isinstance(count, bool) or count < 1:
                 raise ProbeFailure("SETUP_FAILED")
+            submitted = submitted_receipts.get(reviewer)
+            if submitted is not None:
+                submitted_attempt = submitted.get("attempt")
+                if (
+                    not isinstance(submitted_attempt, int)
+                    or isinstance(submitted_attempt, bool)
+                    or submitted_attempt < 1
+                    or submitted_attempt != count
+                    or submitted.get("raw_sha256") != slot.get("raw_sha256")
+                ):
+                    raise ProbeFailure("REPORT_RECEIPT_MISMATCH")
+            expected_digest = (
+                submitted.get("raw_sha256")
+                if submitted is not None
+                else slot.get("raw_sha256")
+            )
             valid = measured("report_validation", reviewer, count, lambda: _tribunal_cli(
                 cli, repo, home, "validate-report", "--reviewer", reviewer,
                 "--source", "stored",
             ))
-            if valid.get("raw_sha256") != slot.get("raw_sha256"):
+            if valid.get("raw_sha256") != expected_digest:
                 raise ProbeFailure("REPORT_BYTES_MISMATCH")
         return _tribunal_cli(cli, repo, home, "finalize")
 
