@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -142,6 +143,12 @@ def test_build_plan_installs_one_shared_package_two_hooks_and_two_skill_links(in
         home / ".codex/skills/pre-pr-tribunal",
     }
     assert all(by_path[package / name].mode == 0o600 for name in PACKAGE_NAMES)
+    assert {"attempt_store.py", "review_context.py"}.issubset(PACKAGE_NAMES)
+    for name in PACKAGE_NAMES:
+        source = REPO / "hooks/pre_pr_tribunal" / name
+        assert hashlib.sha256(by_path[package / name].data).digest() == hashlib.sha256(
+            source.read_bytes()
+        ).digest()
     claude = json.loads(by_path[home / ".claude/settings.json"].data)
     codex = json.loads(by_path[home / ".codex/hooks.json"].data)
     assert _managed(claude["hooks"]["PreToolUse"], CLAUDE_COMMAND) == [

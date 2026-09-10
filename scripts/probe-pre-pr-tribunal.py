@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 
 SCHEMA_VERSION = 2
@@ -1363,26 +1363,83 @@ def _tribunal_cli(
         raise ProbeFailure("SETUP_FAILED") from None
 
 
-def _create_pass_verdict(
-    cli: Path, repo: Path, home: Path, runtime: str
-) -> dict[str, object]:
-    """Exercise the installed lifecycle with synthetic reports, not reviewer timings."""
-    payload = _tribunal_cli(cli, repo, home, "begin", "--base", "master",
-                            "--runtime", runtime, "--round", "1")
+def _synthetic_report_bytes(
+    reviewer: str, attempt: int, snapshot: Mapping[str, object]
+) -> bytes:
+    """Build one deterministic empty report for an installed pending slot."""
     try:
-        snapshot = payload["snapshot"]
         head_sha = snapshot["head_sha"]
         diff_sha256 = snapshot["diff_sha256"]
-        if not (
-            isinstance(head_sha, str)
-            and len(head_sha) == 40
-            and isinstance(diff_sha256, str)
-            and len(diff_sha256) == 64
+        if (
+            reviewer not in "ABC"
+            or len(reviewer) != 1
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt < 1
+            or not isinstance(head_sha, str)
+            or len(head_sha) != 40
+            or not isinstance(diff_sha256, str)
+            or len(diff_sha256) != 64
         ):
             raise ValueError
-    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+    except (KeyError, TypeError, ValueError):
         raise ProbeFailure("SETUP_FAILED") from None
+    report = {
+        "schema": 1,
+        "reviewer": reviewer,
+        "round": 1,
+        "snapshot": {"head_sha": head_sha, "diff_sha256": diff_sha256},
+        "status": "complete",
+        "findings": [],
+        "executions": [],
+        "claims": [],
+        "prior_decisions": [],
+    }
+    return (json.dumps(report, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+_REPORT_RETRYABLE_CODES = frozenset((
+    "BEHAVIOR_EVIDENCE_REQUIRED", "CLAIM_EVIDENCE_REQUIRED",
+    "CLAIM_ID_DUPLICATE", "CLAIM_SCHEMA_INVALID", "EVIDENCE_SECRET_DETECTED",
+    "EXECUTION_ID_DUPLICATE", "EXECUTION_ID_INVALID",
+    "EXECUTION_REFERENCE_INVALID", "EXECUTION_SCHEMA_INVALID",
+    "FINDING_ID_DUPLICATE", "FINDING_ID_INVALID",
+    "FINDING_REVIEWER_MISMATCH", "JSON_DUPLICATE_KEY", "JSON_INVALID",
+    "PATH_INVALID", "PRIOR_DECISION_RESPONSE_INVALID",
+    "REPLACEMENT_FINDING_REQUIRED", "REPORT_NOT_TERMINAL",
+    "REPORT_REVIEWER_MISMATCH", "REPORT_ROUND_MISMATCH",
+    "REPORT_SCHEMA_INVALID", "REPORT_SNAPSHOT_MISMATCH", "REPORT_TOO_LARGE",
+    "TEXT_INVALID", "TEXT_TOO_LARGE",
+))
+
+
+def _create_pass_verdict(
+    cli: Path,
+    repo: Path,
+    home: Path,
+    runtime: str,
+    *,
+    report_factory: Callable[[str, int, Mapping[str, object]], bytes]
+    = _synthetic_report_bytes,
+) -> dict[str, object]:
+    """Exercise installed selective recovery with synthetic reviewer reports."""
+    payload: dict[str, object] = {}
+    try:
+        status = _tribunal_cli(cli, repo, home, "status")
+    except ProbeFailure as error:
+        if error.code not in {"REVIEW_DIRECTORY_UNSAFE", "VERDICT_MISSING"}:
+            raise
+        payload = _tribunal_cli(cli, repo, home, "begin", "--base", "master",
+                                "--runtime", runtime, "--round", "1")
+        status = _tribunal_cli(cli, repo, home, "status")
+    if status.get("verdict_schema") == 1:
+        _tribunal_cli(cli, repo, home, "migrate-legacy-pending")
+        status = _tribunal_cli(cli, repo, home, "status")
+    if status.get("verdict_schema") != 2:
+        raise ProbeFailure("SETUP_FAILED")
     observation = payload.get("telemetry", {})
+    if not isinstance(observation, dict):
+        raise ProbeFailure("SETUP_FAILED")
     run_id = observation.get("run_id")
     gaps = []
 
@@ -1395,10 +1452,10 @@ def _create_pass_verdict(
             gaps.append(error.code)
             return {}
 
-    def start(stage, reviewer=None):
+    def start(stage, reviewer=None, attempt=1):
         dimension = ("--reviewer", reviewer) if reviewer else ()
         return telemetry("telemetry-start", "--stage", stage, *dimension,
-                         "--attempt", "1").get("span_id")
+                         "--attempt", str(attempt)).get("span_id")
 
     def finish(span, error=None):
         if span is not None:
@@ -1406,8 +1463,8 @@ def _create_pass_verdict(
             reason = ("--reason-code", error) if error else ()
             telemetry("telemetry-finish", "--span-id", span, "--outcome", outcome, *reason)
 
-    def measured(stage, reviewer, operation):
-        span = start(stage, reviewer)
+    def measured(stage, reviewer, attempt, operation):
+        span = start(stage, reviewer, attempt)
         try:
             result = operation()
         except ProbeFailure as error:
@@ -1416,70 +1473,76 @@ def _create_pass_verdict(
         finish(span)
         return result
 
-    # These totals cover synthetic report production only; no runtime is dispatched.
-    totals = {reviewer: start("reviewer_total", reviewer) for reviewer in "ABC"}
-    receipts = {}
-    report_sizes = {}
     failure = None
+    reviewers = status.get("reviewers")
+    if not isinstance(reviewers, dict) or set(reviewers) != set("ABC"):
+        raise ProbeFailure("SETUP_FAILED")
     for reviewer in "ABC":
-        report = {
-            "schema": 1,
-            "reviewer": reviewer,
-            "round": 1,
-            "snapshot": {"head_sha": head_sha, "diff_sha256": diff_sha256},
-            "status": "complete",
-            "findings": [],
-            "executions": [],
-            "claims": [],
-            "prior_decisions": [],
-        }
-        raw = (json.dumps(report, separators=(",", ":")) + "\n").encode("utf-8")
-        report_sizes[reviewer] = len(raw)
-        finish(totals[reviewer])
-        try:
-            receipt = measured("report_store", reviewer, lambda: _tribunal_cli(
-                cli, repo, home, "store-report", "--reviewer", reviewer, raw=raw))
-            if receipt.get("raw_sha256") != hashlib.sha256(raw).hexdigest():
-                raise ProbeFailure("REPORT_BYTES_MISMATCH")
-            receipts[reviewer] = receipt["raw_sha256"]
-            valid = measured("report_validation", reviewer, lambda: _tribunal_cli(
-                cli, repo, home, "validate-report", "--reviewer", reviewer, "--source", "stored"))
-            if valid.get("raw_sha256") != receipts[reviewer]:
-                raise ProbeFailure("REPORT_BYTES_MISMATCH")
-        except ProbeFailure as error:
-            failure = failure or error
+        slot = reviewers.get(reviewer)
+        if not isinstance(slot, dict) or slot.get("state") not in {"pending", "sealed"}:
+            raise ProbeFailure("SETUP_FAILED")
+        if slot["state"] == "sealed":
+            continue
+        local_attempts = 0
+        while local_attempts < 3:
+            count = slot.get("attempt_count")
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise ProbeFailure("SETUP_FAILED")
+            attempt = count + 1
+            context = _tribunal_cli(cli, repo, home, "context", "--reviewer", reviewer)
+            snapshot = context.get("snapshot")
+            if not isinstance(snapshot, dict):
+                raise ProbeFailure("SETUP_FAILED")
+            total = start("reviewer_total", reviewer, attempt)
+            try:
+                raw = report_factory(reviewer, attempt, snapshot)
+                if not isinstance(raw, bytes):
+                    raise ProbeFailure("SETUP_FAILED")
+                receipt = measured("report_store", reviewer, attempt, lambda: _tribunal_cli(
+                    cli, repo, home, "submit-report", "--reviewer", reviewer, raw=raw,
+                ))
+                if receipt.get("raw_sha256") != hashlib.sha256(raw).hexdigest():
+                    raise ProbeFailure("REPORT_BYTES_MISMATCH")
+            except ProbeFailure as error:
+                finish(total, error.code)
+                local_attempts += 1
+                if error.code not in _REPORT_RETRYABLE_CODES or local_attempts >= 3:
+                    failure = error
+                    break
+                status = _tribunal_cli(cli, repo, home, "status")
+                reviewers = status.get("reviewers")
+                slot = reviewers.get(reviewer) if isinstance(reviewers, dict) else None
+                if not isinstance(slot, dict) or slot.get("state") != "pending":
+                    raise ProbeFailure("SETUP_FAILED")
+                continue
+            finish(total)
+            break
+        if failure is not None:
+            break
 
     def finalize():
+        current = _tribunal_cli(cli, repo, home, "status")
+        current_reviewers = current.get("reviewers")
+        if not isinstance(current_reviewers, dict) or set(current_reviewers) != set("ABC"):
+            raise ProbeFailure("SETUP_FAILED")
         for reviewer in "ABC":
-            valid = _tribunal_cli(cli, repo, home, "validate-report", "--reviewer",
-                                  reviewer, "--source", "stored")
-            if valid.get("raw_sha256") != receipts[reviewer]:
+            slot = current_reviewers.get(reviewer)
+            if not isinstance(slot, dict) or slot.get("state") != "sealed":
+                raise ProbeFailure("SETUP_FAILED")
+            count = slot.get("attempt_count")
+            if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+                raise ProbeFailure("SETUP_FAILED")
+            valid = measured("report_validation", reviewer, count, lambda: _tribunal_cli(
+                cli, repo, home, "validate-report", "--reviewer", reviewer,
+                "--source", "stored",
+            ))
+            if valid.get("raw_sha256") != slot.get("raw_sha256"):
                 raise ProbeFailure("REPORT_BYTES_MISMATCH")
-        # Check all files independently immediately before the finalizer subprocess.
-        for reviewer in "ABC":
-            path = repo / f".review/inbox/round-1/{reviewer}.json"
-            try:
-                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-            except OSError:
-                raise ProbeFailure("FILE_UNSAFE") from None
-            try:
-                metadata = os.fstat(descriptor)
-                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
-                        or stat.S_IMODE(metadata.st_mode) != 0o600):
-                    raise ProbeFailure("FILE_UNSAFE")
-                raw = os.read(descriptor, report_sizes[reviewer] + 1)
-                if hashlib.sha256(raw).hexdigest() != receipts[reviewer]:
-                    raise ProbeFailure("REPORT_BYTES_MISMATCH")
-            finally:
-                os.close(descriptor)
-        return _tribunal_cli(cli, repo, home, "finalize",
-            "--reviewer-a", ".review/inbox/round-1/A.json",
-            "--reviewer-b", ".review/inbox/round-1/B.json",
-            "--reviewer-c", ".review/inbox/round-1/C.json")
+        return _tribunal_cli(cli, repo, home, "finalize")
 
     if failure is None:
         try:
-            measured("finalize", None, finalize)
+            status = measured("finalize", None, 1, finalize)
         except ProbeFailure as error:
             failure = error
     reason = ("--reason-code", failure.code) if failure else ()
@@ -1487,7 +1550,12 @@ def _create_pass_verdict(
     summary = telemetry("telemetry-summary")
     if failure is not None:
         raise failure
-    return {"begin": payload, "telemetry_summary": summary, "telemetry_gaps": gaps}
+    return {
+        "begin": payload,
+        "status": status,
+        "telemetry_summary": summary,
+        "telemetry_gaps": gaps,
+    }
 
 
 def _runtime_argv(

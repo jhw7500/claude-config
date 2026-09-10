@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -143,11 +144,15 @@ def test_full_install_keeps_task_nudge_and_tribunal_hooks_coexisting_once(home):
     source_names = sorted(path.name for path in (REPO / "hooks/pre_pr_tribunal").glob("*.py"))
     installed = home / ".local/share/claude-config/pre_pr_tribunal"
     assert sorted(path.name for path in installed.iterdir()) == source_names
+    assert {"attempt_store.py", "review_context.py"}.issubset(source_names)
     for name in source_names:
         target = installed / name
         assert target.is_file() and not target.is_symlink()
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
         assert target.read_bytes() == (REPO / "hooks/pre_pr_tribunal" / name).read_bytes()
+        assert hashlib.sha256(target.read_bytes()).digest() == hashlib.sha256(
+            (REPO / "hooks/pre_pr_tribunal" / name).read_bytes()
+        ).digest()
 
     for relative in SKILL_TARGETS:
         target = home / relative

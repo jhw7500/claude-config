@@ -13,3 +13,6 @@ skill-observations/
 
 # pre-PR tribunal verdict와 reviewer evidence는 local state다.
 .review/
+
+# Private Project Control handoff state.
+/.ai/handoff.md

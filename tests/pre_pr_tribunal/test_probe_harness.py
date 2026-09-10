@@ -693,7 +693,7 @@ def _installed_lifecycle(tmp_path):
 
 
 @pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
-def test_installed_probe_stores_validates_and_finalizes_exact_reports(tmp_path, monkeypatch, mask):
+def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path, monkeypatch, mask):
     module, home, repo, cli = _installed_lifecycle(tmp_path)
     run = subprocess.run
     captured = {}
@@ -702,13 +702,13 @@ def test_installed_probe_stores_validates_and_finalizes_exact_reports(tmp_path, 
 
     def observe(argv, **kwargs):
         if len(argv) > 2 and argv[1] == str(cli):
-            if argv[2] == "store-report":
+            if argv[2] == "submit-report":
                 captured[argv[4]] = kwargs["input"]
             elif argv[2] == "validate-report":
                 validations.append(argv[4])
             elif argv[2] == "finalize":
                 # Every separate pre-final stored validation must have completed.
-                assert validations == list("ABCABC")
+                assert validations == list("ABC")
                 for reviewer in "ABC":
                     target = repo / f".review/inbox/round-1/{reviewer}.json"
                     metadata = target.lstat()
@@ -718,7 +718,7 @@ def test_installed_probe_stores_validates_and_finalizes_exact_reports(tmp_path, 
                     assert target.read_bytes() == captured[reviewer]
                 finalizations.append(True)
         result = run(argv, **kwargs)
-        if len(argv) > 2 and argv[1] == str(cli) and argv[2] in {"store-report", "validate-report"}:
+        if len(argv) > 2 and argv[1] == str(cli) and argv[2] in {"submit-report", "validate-report"}:
             assert json.loads(result.stdout)["raw_sha256"] == hashlib.sha256(captured[argv[4]]).hexdigest()
         return result
 
@@ -729,6 +729,8 @@ def test_installed_probe_stores_validates_and_finalizes_exact_reports(tmp_path, 
     finally:
         os.umask(previous)
     assert len(finalizations) == 1
+    assert result["status"]["gate_status"] == "pass"
+    assert result["status"]["verdict_schema"] == 2
     summary = result["telemetry_summary"]
     assert summary["binding"]["diff_sha256"] == result["begin"]["snapshot"]["diff_sha256"]
     assert summary["stages"]["report_store"]["count"] == 3
@@ -741,59 +743,123 @@ def test_installed_probe_stores_validates_and_finalizes_exact_reports(tmp_path, 
     assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "pass"
 
 
-def test_installed_probe_invalid_a_preserves_cr_and_detects_before_peers(tmp_path, monkeypatch):
+def test_installed_probe_preserves_valid_peers_when_c_retries(tmp_path):
     module, home, repo, cli = _installed_lifecycle(tmp_path)
-    dumps, run = json.dumps, subprocess.run
-    captured = {}
-    finalizations = []
-    clock_ns = 1_000_000_000
-    detected_ns = None
+    attempts = {"A": 0, "B": 0, "C": 0}
 
-    def invalid_a(value, *args, **kwargs):
-        if isinstance(value, dict) and value.get("reviewer") == "A" and "executions" in value:
-            value["executions"] = [{
-                "id": "A-R1-E001", "truncated": False,
-                "command": "printf check", "exit_code": 0,
-                "stdout_excerpt": "left\rright", "stderr_excerpt": "",
-                "capture_sha256": "1" * 64,
+    def report_factory(reviewer, attempt, snapshot):
+        attempts[reviewer] += 1
+        if reviewer == "C" and attempt == 1:
+            return b'{"schema":1'
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=report_factory,
+    )
+
+    assert attempts == {"A": 1, "B": 1, "C": 2}
+    assert result["status"]["gate_status"] == "pass"
+    assert result["status"]["reviewers"]["A"]["attempt_count"] == 1
+    assert result["status"]["reviewers"]["C"]["attempt_count"] == 2
+
+
+def test_installed_probe_resumes_only_pending_c_and_reuses_native_sealed_peers(tmp_path):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    exhausted = []
+
+    def exhaust_c(reviewer, attempt, snapshot):
+        if reviewer == "C":
+            exhausted.append(attempt)
+            return b'{"schema":1'
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    with pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
+        module._create_pass_verdict(
+            cli, repo, home, "codex", report_factory=exhaust_c,
+        )
+    assert exhausted == [1, 2, 3]
+    before = {
+        reviewer: (repo / f".review/inbox/round-1/{reviewer}.json").read_bytes()
+        for reviewer in "AB"
+    }
+    called = []
+
+    def c_only(reviewer, attempt, snapshot):
+        called.append((reviewer, attempt))
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=c_only,
+    )
+
+    assert called == [("C", 4)]
+    assert {
+        reviewer: (repo / f".review/inbox/round-1/{reviewer}.json").read_bytes()
+        for reviewer in "AB"
+    } == before
+    assert result["status"]["gate_status"] == "pass"
+
+
+def test_installed_probe_migrates_unproven_legacy_reports_and_runs_all_slots(tmp_path):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    begun = module._tribunal_cli(
+        cli, repo, home, "begin", "--base", "master", "--runtime", "codex",
+        "--round", "1",
+    )
+    verdict_path = repo / ".review/verdict.json"
+    verdict = json.loads(verdict_path.read_bytes())
+    verdict["schema"] = 1
+    verdict.pop("contract")
+    verdict["reviewers"] = {reviewer: {"status": "pending"} for reviewer in "ABC"}
+    verdict_path.write_bytes(json.dumps(verdict, separators=(",", ":")).encode())
+    verdict_path.chmod(0o600)
+    legacy = {}
+    for reviewer in "AB":
+        raw = module._synthetic_report_bytes(reviewer, 1, begun["snapshot"])
+        legacy[reviewer] = raw
+        module._tribunal_cli(
+            cli, repo, home, "store-report", "--reviewer", reviewer, raw=raw,
+        )
+    called = []
+
+    def regenerated(reviewer, attempt, snapshot):
+        called.append((reviewer, attempt))
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=regenerated,
+    )
+
+    assert called == [("A", 2), ("B", 2), ("C", 1)]
+    for reviewer in "AB":
+        assert (
+            repo / f".review/attempts/round-1/{reviewer}/attempt-1.raw"
+        ).read_bytes() == legacy[reviewer]
+    assert result["status"]["gate_status"] == "pass"
+
+
+def test_installed_probe_seals_blocker_and_finalizes_fail(tmp_path):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+
+    def blocker(reviewer, attempt, snapshot):
+        report = json.loads(module._synthetic_report_bytes(reviewer, attempt, snapshot))
+        if reviewer == "A":
+            report["findings"] = [{
+                "id": "A-R1-001", "reviewer": "A", "severity": "HIGH",
+                "title": "Blocking canary finding",
+                "rationale": "The installed finalizer must preserve blockers.",
+                "path": "tracked.txt", "line": 1, "execution_ids": [],
+                "acceptance_condition": "The gate remains failed.",
             }]
-        raw = dumps(value, *args, **kwargs)
-        if isinstance(value, dict) and value.get("reviewer") == "A" and "executions" in value:
-            captured["A"] = (raw + "\n").encode()
-        return raw
+        return (json.dumps(report, separators=(",", ":")) + "\n").encode()
 
-    def controlled_cli(argv, **kwargs):
-        nonlocal clock_ns, detected_ns
-        if len(argv) > 2 and argv[1] == str(cli):
-            if argv[2] == "finalize":
-                finalizations.append(True)
-            if argv[2] == "telemetry-finish":
-                ledger = json.loads((repo / ".review/telemetry.json").read_bytes())
-                span = next(s for s in ledger["runs"][0]["spans"] if s["span_id"] == argv[6])
-                if span["stage"] == "report_validation" and span["reviewer"] == "A":
-                    detected_ns = clock_ns
-                if span["stage"] == "reviewer_total" and span["reviewer"] == "C" and detected_ns is not None:
-                    clock_ns = detected_ns + 20_000_000_000
-            # Inject only the existing CLI clocks; parser, filesystem and subprocess are real.
-            driver = "import runpy,sys; m=runpy.run_path(sys.argv[1]); raise SystemExit(m['main'](sys.argv[3:],wall_clock=lambda:'2026-09-09T00:00:00Z',monotonic_ns=lambda:int(sys.argv[2])))"
-            argv = [sys.executable, "-c", driver, str(cli), str(clock_ns), *argv[2:]]
-        return run(argv, **kwargs)
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=blocker,
+    )
 
-    monkeypatch.setattr(module.json, "dumps", invalid_a)
-    monkeypatch.setattr(module.subprocess, "run", controlled_cli)
-    with pytest.raises(module.ProbeFailure, match="^TEXT_INVALID$"):
-        module._create_pass_verdict(cli, repo, home, "codex")
-    assert finalizations == []
-    target = repo / ".review/inbox/round-1/A.json"
-    assert target.read_bytes() == captured["A"]
-    assert stat.S_IMODE(target.lstat().st_mode) == 0o600
-    summary = json.loads(run([sys.executable, str(cli), "telemetry-summary"], cwd=repo,
-                             env=module._internal_env(home), capture_output=True).stdout)
-    assert summary["early_detection"]["reason_code"] == "TEXT_INVALID"
-    assert summary["early_detection"]["wait_all_delay_ms"] == 20000
-    assert summary["stages"]["report_validation"]["count"] == 3
-    assert "finalize" not in summary["stages"]
-    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "in_progress"
+    assert result["status"]["gate_status"] == "fail"
+    assert result["status"]["blocking_count"] == 1
+    assert result["status"]["reviewers"]["A"]["state"] == "sealed"
 
 
 @pytest.mark.parametrize("tamper", ("digest", "mode", "symlink"))
@@ -811,7 +877,7 @@ def test_installed_probe_rechecks_each_report_immediately_before_finalize(tmp_pa
                 finalizations.append(True)
             if argv[2] == "validate-report":
                 validations += 1
-                if validations == 6:
+                if validations == 3:
                     target = repo / ".review/inbox/round-1/A.json"
                     if tamper == "digest":
                         target.write_bytes(target.read_bytes() + b" ")
@@ -827,7 +893,7 @@ def test_installed_probe_rechecks_each_report_immediately_before_finalize(tmp_pa
     expected = "REPORT_BYTES_MISMATCH" if tamper == "digest" else "FILE_UNSAFE"
     with pytest.raises(module.ProbeFailure, match=f"^{expected}$"):
         module._create_pass_verdict(cli, repo, home, "codex")
-    assert finalizations == []
+    assert finalizations == [True]
     assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "in_progress"
 
 
@@ -847,6 +913,32 @@ def test_installed_probe_telemetry_failure_does_not_block_valid_reports(tmp_path
     assert set(result["telemetry_gaps"]) == {"TELEMETRY_INVALID"}
     assert (repo / ".review/telemetry.json").read_bytes() == b"{broken"
     assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "pass"
+
+
+def test_installed_probe_returns_contract_drift_for_wrong_installed_contract(tmp_path, monkeypatch):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    run = subprocess.run
+
+    def drift_after_begin(argv, **kwargs):
+        result = run(argv, **kwargs)
+        if len(argv) > 2 and argv[1] == str(cli) and argv[2] == "begin":
+            context = cli.with_name("review_context.py")
+            source = context.read_text(encoding="utf-8")
+            context.write_text(
+                source.replace(
+                    "report_text=REPORT_TEXT_CONTRACT_VERSION,",
+                    "report_text=REPORT_TEXT_CONTRACT_VERSION + 1,",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            context.chmod(0o600)
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", drift_after_begin)
+
+    with pytest.raises(module.ProbeFailure, match="^CONTRACT_DRIFT$"):
+        module._create_pass_verdict(cli, repo, home, "codex")
 
 
 def test_runtime_prompt_requires_literal_unwrapped_canary_command(tmp_path):
