@@ -81,13 +81,16 @@ above).
    `.claude/worktrees/`, a temporary clone), warn the user and re-anchor
    on the stable project path first — state written to an ephemeral
    checkout is lost at teardown.
-2. Scan OPEN observations and active principles; hold them in awareness,
+2. Scan unresolved observations (including OPEN and STAGED) and active principles; hold them in awareness,
    don't surface unprompted.
 3. Read `skill-observations/last-review-date.txt`. The value carries the
-   truth: a date = when the last review actually ran; `never` = no review
-   has run yet. A missing file is abnormal (step 1 creates it) — recreate
-   it with `never`, don't invent a date. If the value is `never` or older
-   than 7 days AND there are OPEN observations: in an interactive session,
+   date of the last writable single-source review. A successful source-specific
+   receipt in the configured scheduler's REVIEW.md can provide a newer review
+   time for a read-only multi-source run; require the exact canonical source
+   path and completed classification, not merely CLI exit 0. Do not rewrite the
+   source marker from that receipt. A missing file is abnormal (step 1 creates
+   it) — recreate it with `never`, don't invent a date. If no verified review is
+   known, or it is older than 7 days AND unresolved observations remain: in an interactive session,
    offer the review in one line ("the observation backlog hasn't been
    reviewed [in N days / yet] — run it now, or carry on with your task?")
    and proceed with the user's task unless they opt in; never gate their
@@ -339,6 +342,16 @@ personal preferences. Default to open-source when it could go either way,
 stripping specifics. The boundary is also a confidentiality boundary. Full
 requirements (attribution, licensing, structure): `references/skill-authoring.md`.
 
+## Staging and installation state
+
+`STAGED (YYYY-MM-DD) — <bundle path>; installation pending` means an
+improvement was prepared but is not installed. It remains unresolved and must
+stay visible in the review queue. A validated bundle alone never earns
+`ACTIONED`. Use `ACTIONED (YYYY-MM-DD)` only after an authorized installation
+and a read-back of the live skill confirm the intended change. Report staged
+and installed counts separately; retain pending bundles until installed or
+explicitly declined.
+
 ## Archival on Write
 
 On every log write, first move already-resolved entries to
@@ -351,7 +364,7 @@ the active log until the next day, no matter which session resolved them:
 the grace period lives in the file, never in session memory, so it holds
 across parallel and subsequent sessions. A resolved entry with no readable
 date gets today's date added instead of being archived. The active log
-keeps its header, status key, all OPEN entries, and the same-day-resolved
+keeps its header, status key, all unresolved entries (including STAGED), and the same-day-resolved
 ones.
 
 Archival is a read-filter-rewrite — the highest-risk mutation the log
@@ -368,8 +381,9 @@ the live pre-write count minus exactly the number of archived entries.
 
 Observations captured during task-oriented work.
 
-**Status key:** OPEN = not yet actioned | ACTIONED (YYYY-MM-DD) = skill
-updated/created | DECLINED (YYYY-MM-DD) = user decided not to pursue —
+**Status key:** OPEN = not yet prepared | STAGED (YYYY-MM-DD) = prepared,
+installation pending | ACTIONED (YYYY-MM-DD) = installed and verified |
+DECLINED (YYYY-MM-DD) = user decided not to pursue —
 resolved statuses always carry their resolution date
 
 ---
