@@ -35,6 +35,7 @@ from pre_pr_tribunal.verdict_store import (
     store_reviewer_report,
     validate_stored_reviewer_report,
 )
+from pre_pr_tribunal.review_context import context_sha256, current_contract_binding
 
 
 def NOW():
@@ -116,6 +117,310 @@ def report_paths(repo, snapshot, *, round_number=1, overrides=None):
             repo / f".review/inbox/round-{round_number}/{reviewer}.json", value
         )
     return result
+
+
+def write_v2_pending(git_repo):
+    legacy = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    pending = _new_v2_pending(
+        legacy.snapshot, runtime="codex", initial_paths=legacy.initial_paths,
+        round_number=1, decisions=(), history=(), contract=current_contract_binding(),
+    )
+    write_json(git_repo / ".review/verdict.json", pending.to_json())
+    return read_verdict(git_repo)
+
+
+def submit_reviewer_report(*args, **kwargs):
+    from pre_pr_tribunal.verdict_store import submit_reviewer_report as submit
+    return submit(*args, **kwargs)
+
+
+def record_reviewer_failure(*args, **kwargs):
+    from pre_pr_tribunal.verdict_store import record_reviewer_failure as record
+    return record(*args, **kwargs)
+
+
+@pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
+def test_submit_valid_report_seals_only_its_slot(git_repo, mask):
+    pending = write_v2_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\r\n"
+    previous = os.umask(mask)
+    try:
+        receipt = submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    finally:
+        os.umask(previous)
+    stored = read_verdict(git_repo)
+    assert stored.reviewers["A"].status == "sealed"
+    assert stored.reviewers["B"] == pending.reviewers["B"]
+    assert stored.reviewers["C"] == pending.reviewers["C"]
+    assert stored.reviewers["A"].receipt == receipt
+    assert stored.reviewers["A"].attempt_count == receipt.attempt == 1
+    assert receipt.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert receipt.context_sha256 == context_sha256(pending, Reviewer.A)
+    assert receipt.report_contract_version == REPORT_TEXT_CONTRACT_VERSION
+    assert receipt.provenance == "native_submit"
+    target = git_repo / ".review/inbox/round-1/A.json"
+    assert target.read_bytes() == raw
+    assert stat.S_IMODE(target.lstat().st_mode) == 0o600
+    assert target.lstat().st_uid == os.geteuid()
+
+
+@pytest.mark.parametrize(("raw", "code"), (
+    (b'{"schema":1', "JSON_INVALID"),
+    (b'{"schema":1,"schema":1}', "JSON_DUPLICATE_KEY"),
+    (b"x" * (MAX_REPORT_BYTES + 1), "REPORT_TOO_LARGE"),
+), ids=("malformed", "duplicate", "oversize"))
+def test_submit_malformed_report_records_attempt_without_touching_peers(git_repo, raw, code):
+    pending = write_v2_pending(git_repo)
+    with pytest.raises(SchemaError, match=f"^{code}$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.C, raw=raw, now=NOW)
+    stored = read_verdict(git_repo)
+    assert stored.reviewers["C"].attempt_count == 1
+    assert stored.reviewers["C"].last_error == code
+    assert all(stored.reviewers[key].status == "pending" for key in "ABC")
+    assert stored.reviewers["A"] == pending.reviewers["A"]
+    assert stored.reviewers["B"] == pending.reviewers["B"]
+    assert not (git_repo / ".review/inbox/round-1/C.json").exists()
+    assert (git_repo / ".review/attempts/round-1/C/attempt-1.raw").read_bytes() == raw
+
+
+def test_record_timeout_changes_only_pending_slot(git_repo):
+    pending = write_v2_pending(git_repo)
+    slot = record_reviewer_failure(git_repo, reviewer=Reviewer.B, reason_code="REVIEWER_TIMEOUT")
+    assert slot.attempt_count == 1 and slot.last_error == "REVIEWER_TIMEOUT"
+    stored = read_verdict(git_repo)
+    assert stored.reviewers["B"] == slot
+    assert stored.reviewers["A"] == pending.reviewers["A"]
+    assert stored.reviewers["C"] == pending.reviewers["C"]
+
+
+def test_submit_after_failure_clears_error_and_preserves_peer_context(git_repo):
+    pending = write_v2_pending(git_repo)
+    digest = context_sha256(pending, Reviewer.C)
+    record_reviewer_failure(git_repo, reviewer=Reviewer.C, reason_code="REVIEWER_FAILED")
+    submit_reviewer_report(git_repo, reviewer=Reviewer.A,
+                           raw=json.dumps(report(pending.snapshot, "A")).encode(), now=NOW)
+    receipt = submit_reviewer_report(git_repo, reviewer=Reviewer.C,
+                                    raw=json.dumps(report(pending.snapshot, "C")).encode(), now=NOW)
+    slot = read_verdict(git_repo).reviewers["C"]
+    assert slot.last_error is None
+    assert receipt.attempt == slot.attempt_count == 2
+    assert receipt.context_sha256 == digest
+
+
+def test_submit_blocker_containing_report_seals(git_repo):
+    pending = write_v2_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A", findings=(finding(),))).encode()
+    submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    stored = read_verdict(git_repo)
+    assert stored.reviewers["A"].status == "sealed"
+    assert stored.reviewers["A"].report.findings[0].severity.value == "HIGH"
+    assert stored.gate.status.value == "in_progress"
+
+
+@pytest.mark.parametrize("operation", ("submit", "failure"))
+def test_sealed_slot_rejects_report_or_reviewer_failure_without_mutation(git_repo, operation):
+    pending = write_v2_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A")).encode()
+    submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    before = verdict_path.read_bytes()
+    with pytest.raises(SchemaError, match="^REVIEWER_SLOT_SEALED$"):
+        if operation == "submit":
+            submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=b"replacement", now=NOW)
+        else:
+            record_reviewer_failure(git_repo, reviewer=Reviewer.A, reason_code="REVIEWER_TIMEOUT")
+    assert verdict_path.read_bytes() == before
+    assert (git_repo / ".review/inbox/round-1/A.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("operation", ("submit", "failure"))
+@pytest.mark.parametrize("drift", ("contract", "snapshot"))
+def test_submit_and_reviewer_failure_drift_preserve_all_bytes(git_repo, operation, drift):
+    pending = write_v2_pending(git_repo)
+    if drift == "contract":
+        pending = replace(pending, contract=replace(pending.contract, report_text=99))
+        write_json(git_repo / ".review/verdict.json", pending.to_json())
+        code = "CONTRACT_DRIFT"
+    else:
+        commit_fix(git_repo)
+        code = "SNAPSHOT_CHANGED"
+    verdict_path = git_repo / ".review/verdict.json"
+    before = verdict_path.read_bytes()
+    with pytest.raises(SchemaError, match=f"^{code}$"):
+        if operation == "submit":
+            submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=b"invalid", now=NOW)
+        else:
+            record_reviewer_failure(git_repo, reviewer=Reviewer.A, reason_code="REVIEWER_TIMEOUT")
+    assert verdict_path.read_bytes() == before
+    assert not (git_repo / ".review/attempts").exists()
+
+
+@pytest.mark.parametrize("replacement", (b"invalid", b"x" * (MAX_REPORT_BYTES + 2), None),
+                         ids=("malformed", "oversize", "valid"))
+def test_submit_report_published_before_verdict_failure_is_sealed_without_replacement(
+    git_repo, monkeypatch, replacement
+):
+    from pre_pr_tribunal import verdict_store
+
+    pending = write_v2_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A", findings=(finding(),))).encode() + b"\n"
+    if replacement is None:
+        replacement = json.dumps(report(pending.snapshot, "A")).encode()
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with monkeypatch.context() as patch:
+        def fail_verdict(*args, **kwargs):
+            raise SchemaError("VERDICT_WRITE_FAILED")
+        patch.setattr(verdict_store, "_atomic_write", fail_verdict)
+        with pytest.raises(SchemaError, match="^VERDICT_WRITE_FAILED$"):
+            submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    target = git_repo / ".review/inbox/round-1/A.json"
+    assert target.read_bytes() == raw
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    receipt = submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=replacement, now=NOW)
+    assert target.read_bytes() == raw
+    assert receipt.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert receipt.attempt == 1
+    assert read_verdict(git_repo).reviewers["A"].report.findings[0].severity.value == "HIGH"
+
+
+@pytest.mark.parametrize("kind", ("invalid", "symlink", "fifo", "mode", "owner"))
+def test_submit_never_overwrites_invalid_or_unsafe_canonical(git_repo, monkeypatch, kind):
+    pending = write_v2_pending(git_repo)
+    target = git_repo / ".review/inbox/round-1/A.json"
+    raw = json.dumps(report(pending.snapshot, "A")).encode()
+    if kind == "symlink":
+        target.symlink_to(git_repo / "tracked.txt")
+    elif kind == "fifo":
+        os.mkfifo(target, 0o600)
+    else:
+        target.write_bytes(b"invalid" if kind == "invalid" else raw)
+        target.chmod(0o644 if kind == "mode" else 0o600)
+    if kind == "owner":
+        inode = target.stat().st_ino
+        real_fstat = os.fstat
+        def wrong_owner(fd):
+            info = real_fstat(fd)
+            if info.st_ino == inode:
+                fields = list(info)
+                fields[4] += 1
+                return os.stat_result(fields)
+            return info
+        monkeypatch.setattr(os, "fstat", wrong_owner)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    code = "JSON_INVALID" if kind == "invalid" else "FILE_UNSAFE"
+    with pytest.raises(SchemaError, match=f"^{code}$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert not (git_repo / ".review/attempts").exists()
+    if kind == "invalid":
+        assert target.read_bytes() == b"invalid"
+
+
+@pytest.mark.parametrize("code", ("JSON_INVALID", "FILE_UNSAFE", "REPORT_WRITE_FAILED", "unknown"))
+def test_reviewer_failure_rejects_non_operational_reasons(git_repo, code):
+    write_v2_pending(git_repo)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with pytest.raises(SchemaError, match="^REVIEWER_FAILURE_INVALID$"):
+        record_reviewer_failure(git_repo, reviewer=Reviewer.A, reason_code=code)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert not (git_repo / ".review/attempts").exists()
+
+
+def test_submit_non_retryable_parser_error_does_not_record_failure(git_repo):
+    pending = write_v2_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A", findings=[finding()] * 129)).encode()
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with pytest.raises(SchemaError, match="^FINDING_LIMIT_EXCEEDED$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert not (git_repo / ".review/attempts").exists()
+
+
+def test_submit_accepts_cumulative_attempts_after_three_failures(git_repo):
+    pending = write_v2_pending(git_repo)
+    for _ in range(5):
+        record_reviewer_failure(git_repo, reviewer=Reviewer.C, reason_code="REVIEWER_TIMEOUT")
+    assert read_verdict(git_repo).reviewers["C"].attempt_count == 5
+    directory = git_repo / ".review/attempts/round-1/C"
+    assert {path.name for path in directory.iterdir()} == {
+        "attempt-3.meta.json", "attempt-4.meta.json", "attempt-5.meta.json",
+    }
+    receipt = submit_reviewer_report(git_repo, reviewer=Reviewer.C,
+                                    raw=json.dumps(report(pending.snapshot, "C")).encode(), now=NOW)
+    slot = read_verdict(git_repo).reviewers["C"]
+    assert slot.attempt_count == receipt.attempt == 6
+    assert slot.receipt == receipt
+    assert slot.status == "sealed"
+
+
+def test_v2_pending_cumulative_attempt_count_roundtrips_above_three(git_repo):
+    pending = write_v2_pending(git_repo)
+    pending = replace(pending, reviewers={**pending.reviewers,
+        "C": ReviewerSlot("pending", attempt_count=5, last_error="REVIEWER_TIMEOUT")})
+    write_json(git_repo / ".review/verdict.json", pending.to_json())
+    assert read_verdict(git_repo).reviewers["C"].attempt_count == 5
+
+
+def test_submit_unbounded_raw_input_preserves_verdict_without_evidence(git_repo):
+    write_v2_pending(git_repo)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with pytest.raises(SchemaError, match="^REPORT_TOO_LARGE$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.C,
+                               raw=b"x" * (MAX_REPORT_BYTES + 2), now=NOW)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert not (git_repo / ".review/attempts").exists()
+    assert not (git_repo / ".review/inbox/round-1/C.json").exists()
+
+
+def test_submit_report_write_failure_is_not_a_retryable_attempt(git_repo, monkeypatch):
+    pending = write_v2_pending(git_repo)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    raw = json.dumps(report(pending.snapshot, "A")).encode()
+
+    def fail_write(*args, **kwargs):
+        raise OSError("injected report write failure")
+
+    monkeypatch.setattr(os, "write", fail_write)
+    with pytest.raises(SchemaError, match="^REPORT_WRITE_FAILED$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert not (git_repo / ".review/attempts").exists()
+    assert not (git_repo / ".review/inbox/round-1/A.json").exists()
+
+
+def test_submit_evidence_write_failure_preserves_all_slots(git_repo, monkeypatch):
+    write_v2_pending(git_repo)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+
+    def fail_write(*args, **kwargs):
+        raise OSError("injected evidence write failure")
+
+    monkeypatch.setattr(os, "write", fail_write)
+    with pytest.raises(SchemaError, match="^ATTEMPT_EVIDENCE_UNSAFE$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=b"invalid", now=NOW)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert not (git_repo / ".review/inbox/round-1/A.json").exists()
+
+
+def test_reviewer_failure_verdict_publication_failure_preserves_prior_verdict_and_evidence(
+    git_repo, monkeypatch
+):
+    write_v2_pending(git_repo)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("injected verdict rename failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(SchemaError, match="^VERDICT_WRITE_FAILED$"):
+        record_reviewer_failure(git_repo, reviewer=Reviewer.B, reason_code="REVIEWER_TIMEOUT")
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert json.loads((git_repo / ".review/attempts/round-1/B/attempt-1.meta.json").read_bytes()) == {
+        "attempt": 1, "raw_sha256": None, "reason_code": "REVIEWER_TIMEOUT",
+        "reviewer": "B", "round": 1,
+    }
 
 
 def commit_fix(repo):

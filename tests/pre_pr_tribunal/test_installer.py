@@ -19,6 +19,7 @@ CODEX_COMMAND = (
 )
 PACKAGE_NAMES = (
     "__init__.py",
+    "attempt_store.py",
     "claude_hook.py",
     "cli.py",
     "codex_hook.py",

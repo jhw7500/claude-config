@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -19,6 +19,12 @@ from .git_state import (
     capture_snapshot,
 )
 from . import model as m
+from .attempt_store import (
+    MAX_ATTEMPT_RAW_BYTES,
+    OPERATIONAL_FAILURE_CODES,
+    REPORT_RETRYABLE_CODES,
+    append_attempt_evidence,
+)
 from .model import (
     ContractBinding,
     Decision,
@@ -34,7 +40,7 @@ from .model import (
     Snapshot,
     Verdict,
 )
-from .review_context import current_contract_binding
+from .review_context import context_sha256, current_contract_binding
 from .review_store import (
     atomic_create_bytes,
     atomic_replace_bytes,
@@ -494,7 +500,7 @@ def _parse_v2_receipt(
         obj["report_contract_version"], "VERDICT_INVALID", minimum=1
     )
     attempt = m._integer(
-        obj["attempt"], "VERDICT_INVALID", minimum=1, maximum=3
+        obj["attempt"], "VERDICT_INVALID", minimum=1
     )
     provenance = obj["provenance"]
     if (
@@ -532,7 +538,7 @@ def _parse_verdict_v2(data: dict[str, object]) -> Verdict:
         )
         slot = m._object(raw_slot, expected_keys, "VERDICT_INVALID")
         attempt_count = m._integer(
-            slot["attempt_count"], "VERDICT_INVALID", minimum=0, maximum=3
+            slot["attempt_count"], "VERDICT_INVALID", minimum=0
         )
         last_error = slot["last_error"]
         if last_error is not None:
@@ -784,6 +790,122 @@ def _validate_report_store_input(reviewer: Reviewer, raw: bytes) -> None:
         raise SchemaError("REPORT_SCHEMA_INVALID")
     if len(raw) > m.MAX_REPORT_BYTES:
         raise SchemaError("REPORT_TOO_LARGE")
+
+
+def _pending_slot_snapshot(
+    root: Path, pending: Verdict, reviewer: Reviewer, *, now: Callable[[], str]
+) -> Snapshot:
+    require_v2_in_progress(pending)
+    if pending.contract != current_contract_binding():
+        raise SchemaError("CONTRACT_DRIFT")
+    if pending.reviewers[reviewer.value].status != "pending":
+        raise SchemaError("REVIEWER_SLOT_SEALED")
+    snapshot = capture_snapshot(root, pending.base_ref, now=now)
+    if not _snapshot_equal(pending, snapshot):
+        raise SchemaError("SNAPSHOT_CHANGED")
+    return snapshot
+
+
+def _record_failure_locked(
+    review_fd: int, pending: Verdict, reviewer: Reviewer, reason_code: str,
+    raw: bytes | None,
+) -> ReviewerSlot:
+    slot = ReviewerSlot(
+        "pending", attempt_count=pending.reviewers[reviewer.value].attempt_count + 1,
+        last_error=reason_code,
+    )
+    append_attempt_evidence(
+        review_fd, round_number=pending.round, reviewer=reviewer,
+        sequence=slot.attempt_count, reason_code=reason_code, raw=raw,
+    )
+    _atomic_write(review_fd, replace(
+        pending, reviewers={**pending.reviewers, reviewer.value: slot},
+    ))
+    return slot
+
+
+def submit_reviewer_report(
+    cwd: Path, *, reviewer: Reviewer, raw: bytes, now: Callable[[], str] = utc_now,
+) -> ReportReceipt:
+    """Validate exact bytes, publish the canonical report, and seal one v2 slot."""
+    if not isinstance(reviewer, Reviewer) or not isinstance(raw, bytes):
+        raise SchemaError("REPORT_SCHEMA_INVALID")
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        pending = _read_verdict_locked(review_fd)
+        snapshot = _pending_slot_snapshot(root, pending, reviewer, now=now)
+        context_digest = context_sha256(pending, reviewer)
+        round_fd = _round_fd(
+            review_fd, pending.round, create=True, exact_report_directories=True,
+        )
+        try:
+            name = f"{reviewer.value}.json"
+            try:
+                existing = read_named_file(
+                    round_fd, name, maximum=m.MAX_REPORT_BYTES,
+                    missing="REVIEWER_REPORT_MISSING", unsafe="FILE_UNSAFE", exact_mode=0o600,
+                )
+            except SchemaError as error:
+                if error.code != "REVIEWER_REPORT_MISSING":
+                    raise
+                existing = None
+            if existing is not None:
+                # A canonical publication can precede a failed verdict write.
+                # Its validation is an integrity boundary, outside retry handling.
+                parsed, digest = m.validate_report_bytes(
+                    existing, expected_reviewer=reviewer, expected_round=pending.round,
+                    snapshot=snapshot,
+                )
+            else:
+                if len(raw) > MAX_ATTEMPT_RAW_BYTES:
+                    raise SchemaError("REPORT_TOO_LARGE")
+                try:
+                    parsed, digest = m.validate_report_bytes(
+                        raw, expected_reviewer=reviewer, expected_round=pending.round,
+                        snapshot=snapshot,
+                    )
+                except SchemaError as error:
+                    if error.code in REPORT_RETRYABLE_CODES:
+                        _record_failure_locked(review_fd, pending, reviewer, error.code, raw)
+                    raise
+                atomic_create_bytes(
+                    round_fd, name, raw, maximum=m.MAX_REPORT_BYTES,
+                    exists="REPORT_FILE_EXISTS", unsafe="FILE_UNSAFE", exact_mode=0o600,
+                    write_failed="REPORT_WRITE_FAILED",
+                )
+        finally:
+            os.close(round_fd)
+        attempt = pending.reviewers[reviewer.value].attempt_count + 1
+        receipt = ReportReceipt(
+            reviewer, pending.round, f".review/inbox/round-{pending.round}/{reviewer.value}.json",
+            digest, context_digest, m.REPORT_TEXT_CONTRACT_VERSION, attempt, "native_submit",
+        )
+        slot = ReviewerSlot("sealed", parsed, receipt, attempt_count=attempt)
+        _atomic_write(review_fd, replace(
+            pending, reviewers={**pending.reviewers, reviewer.value: slot},
+        ))
+        return receipt
+
+
+def record_reviewer_failure(
+    cwd: Path, *, reviewer: Reviewer, reason_code: str,
+) -> ReviewerSlot:
+    """Persist one bounded operational failure for a still-pending v2 slot."""
+    if (
+        not isinstance(reviewer, Reviewer)
+        or not isinstance(reason_code, str)
+        or reason_code not in OPERATIONAL_FAILURE_CODES
+    ):
+        raise SchemaError("REVIEWER_FAILURE_INVALID")
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        pending = _read_verdict_locked(review_fd)
+        _pending_slot_snapshot(root, pending, reviewer, now=utc_now)
+        return _record_failure_locked(review_fd, pending, reviewer, reason_code, None)
 
 
 def store_reviewer_report(

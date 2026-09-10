@@ -291,7 +291,6 @@ class ReviewerSlot:
             not isinstance(self.attempt_count, int)
             or isinstance(self.attempt_count, bool)
             or self.attempt_count < 0
-            or self.attempt_count > 3
             or (
                 self.last_error is not None
                 and (not isinstance(self.last_error, str) or not self.last_error)
@@ -326,7 +325,6 @@ class ReviewerSlot:
             or not isinstance(receipt.attempt, int)
             or isinstance(receipt.attempt, bool)
             or receipt.attempt < 1
-            or receipt.attempt > 3
             or receipt.attempt != self.attempt_count
             or receipt.provenance not in RECEIPT_PROVENANCE
             or self.last_error is not None

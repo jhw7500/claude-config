@@ -629,3 +629,18 @@ def test_atomic_replace_rejects_substituted_staging_source(git_repo, monkeypatch
     target = git_repo / ".review/inbox/A.json"
     assert target.read_bytes() == b"foreign replacement"
     assert set(target.parent.iterdir()) == {target}
+def test_atomic_create_reports_publication_io_failure_separately_from_unsafe(
+    git_repo, monkeypatch
+):
+    with locked_review(git_repo, create=True) as review_fd:
+        def fail_write(*args, **kwargs):
+            raise OSError("injected write failure")
+
+        monkeypatch.setattr(os, "write", fail_write)
+        with pytest.raises(SchemaError, match="^REPORT_WRITE_FAILED$"):
+            atomic_create_bytes(
+                review_fd, "A.json", b"expected", maximum=1024,
+                exists="REPORT_FILE_EXISTS", unsafe="FILE_UNSAFE",
+                exact_mode=0o600, write_failed="REPORT_WRITE_FAILED",
+            )
+    assert not (git_repo / ".review/A.json").exists()

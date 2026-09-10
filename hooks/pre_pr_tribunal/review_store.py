@@ -417,6 +417,7 @@ def atomic_create_bytes(
     exists: str,
     unsafe: str,
     exact_mode: int = 0o600,
+    write_failed: str | None = None,
 ) -> str:
     """Publish without replacement; post-link uncertainty preserves the final name.
 
@@ -435,7 +436,8 @@ def atomic_create_bytes(
         ):
             raise SchemaError(exists)
         temporary = _write_private_temporary(
-            parent_fd, raw, unsafe=unsafe, exact_mode=exact_mode
+            parent_fd, raw, unsafe=unsafe, exact_mode=exact_mode,
+            write_failed=write_failed,
         )
         try:
             _link_descriptor(parent_fd, temporary.fd, name)
@@ -454,7 +456,7 @@ def atomic_create_bytes(
     except SchemaError:
         raise
     except OSError:
-        raise SchemaError(unsafe) from None
+        raise SchemaError(write_failed or unsafe) from None
     finally:
         if temporary:
             closing_fd = temporary.fd
