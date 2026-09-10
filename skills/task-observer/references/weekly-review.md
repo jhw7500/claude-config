@@ -1,6 +1,6 @@
 # Comprehensive Review (scheduled or fallback)
 
-Cross-checks all OPEN observations against all skills, propagates
+Cross-checks all unresolved observations against all skills, propagates
 cross-cutting principles, and applies improvements that don't need user
 input. Two modes:
 
@@ -9,10 +9,11 @@ input. Two modes:
   present and applies non-escalated observations autonomously.
 - **In-session 7-day fallback:** pending at session start when BOTH are
   true: no scheduled review is registered (or none succeeded in 7+ days),
-  AND `skill-observations/last-review-date.txt` contains `never` or a date
-  more than 7 days old (a missing file is recreated with `never` — see
-  Session Start steps 1 and 3; the file's value is authoritative, a date
-  means a review actually ran). In an interactive session a pending
+  AND neither `skill-observations/last-review-date.txt` nor a verified
+  source-specific scheduled REVIEW.md receipt establishes a review within
+  7 days (a missing marker is recreated with `never` — see Session Start
+  steps 1 and 3). A source absent from or skipped in a report is not reviewed.
+  In an interactive session a pending
   fallback surfaces as a one-line offer and runs only if the user opts in
   (SKILL.md, Session Start step 3) — it never gates the user's task.
 
@@ -55,7 +56,7 @@ generator.
 
 **Step 0 — recommend scheduled setup (fallback mode only).** Ordering
 guard: run Step 1's no-observations short-circuit FIRST — if there are no
-OPEN observations and no outstanding principles, skip Step 0 entirely and
+unresolved observations and no outstanding principles, skip Step 0 entirely and
 just update the timestamp. A brand-new install must never get a setup
 prompt before it has done any work. Otherwise: check
 `skill-observations/scheduled-review-decline.txt`: if under 30 days old and
@@ -84,26 +85,37 @@ this environment → skip silently.
 Archival on Write in SKILL.md). Read the observation log.
 
 Build the work queue from the structural identifiers, not from a status
-filter. The OPEN set is defined as: **status is literally OPEN, OR the
-observation has no Status line at all.** Concretely:
+filter. The unresolved set includes OPEN, STAGED, missing, blank, and
+unrecognised statuses; only ACTIONED and DECLINED are resolved. Concretely:
 
 1. Enumerate all `### Observation N:` headers first — this is the
    authoritative list of entries in the log.
 2. For each header, classify the entry's status by looking for a
    `**Status:**` line within its body. Treat a missing, blank, or any
    non-ACTIONED / non-DECLINED status as OPEN.
-3. Never derive the work queue from a `grep '**Status:** OPEN'` alone.
+3. A `STAGED` entry is unresolved. Check its referenced bundle against the
+   current live skill and source observation. If it is still valid, report it
+   as pending installation without generating another copy. If either changed,
+   reassess the delta from the current live file. Never infer installation from
+   a previous review's completion message or an `ACTIONED` label alone.
+4. Never derive the work queue from a `grep '**Status:** OPEN'` alone.
    Derive it from the header list minus the resolved (ACTIONED /
    DECLINED) entries. A grep on an optional field silently drops every
    entry missing that field — the review then confidently reports a
    clean log while a backlog of untriaged observations is skipped.
+
+**Legacy staging reconciliation:** if an old ACTIONED entry has a staging-only
+report/bundle and the intended delta is absent from the current live skill,
+include it as installation-pending in this review. Record the contradictory
+source status explicitly; do not silently treat the label as installation proof.
+In multi-source mode, correct the review's classification, not the raw log.
 
 **Reconciliation guard:** before proceeding, assert that
 `count(### Observation headers) == count(status-classified entries)`.
 If the counts differ, the delta is statusless entries — surface and
 triage them (as OPEN) rather than proceeding as if the log were clean.
 
-Also read all active cross-cutting principles. If there are no OPEN
+Also read all active cross-cutting principles. If there are no unresolved
 observations and no outstanding principles: report "no open observations
 or outstanding principles", update the timestamp, and stop.
 
@@ -116,7 +128,7 @@ them to a complementary user-owned `{system-skill}-extras` skill containing
 only the delta, creating it if needed and noting the pairing in
 configuration.
 
-**Step 3 — cross-check observations.** Evaluate every OPEN observation
+**Step 3 — cross-check observations.** Evaluate every unresolved observation
 against every skill — not just the skill named in its header; Principles
 often generalise. Build skill → [relevant observations]. Interactive:
 present all of it and await approval. Autonomous: apply the approval policy
@@ -132,15 +144,18 @@ structure, voice, and attribution; place new rules where they logically
 live. Follow the editing rules in `references/skill-authoring.md` (live
 file as base, staging, diff-before-overwrite).
 
-**Step 6 — mark ACTIONED.** Update each applied observation's status:
-`ACTIONED (YYYY-MM-DD) — Applied to [skill-name] (weekly review)`. The
-date immediately after the status word is load-bearing: archival is gated
-on it (entries archive only when it's before today), so a dateless mark
-breaks the cross-session grace period. Do NOT archive same-session — the
-next log write on a later day archives them.
+**Step 6 — mark STAGED.** After validating the delivered bundle, record:
+`STAGED (YYYY-MM-DD) — <bundle path>; installation pending`.
+The scheduled review creates drafts, so it reports zero newly installed
+observations. `ACTIONED (YYYY-MM-DD)` is reserved for a separate authorized
+installation followed by read-back verification of the live skill. STAGED
+entries remain unresolved and are not archived. When source logs are read-only,
+record this status in the review report alongside the source path and literal
+observation ID; keep the source entry OPEN and state that it is unchanged.
 
 **Step 7 — timestamp.** Write today's date to
-`skill-observations/last-review-date.txt`.
+`skill-observations/last-review-date.txt` for a writable single-source review.
+For a read-only multi-source review, use the report rules below instead.
 
 **Step 8 — deliver and summarise.** Stage updated skills (see Delivery
 below), then present:
@@ -148,18 +163,39 @@ below), then present:
 ```
 ## Weekly Skill Review Complete — [date]
 
-Updated skills ([N] observations, [N] principles applied):
+Staged skills ([N] observations prepared, installation pending):
 
 **[skill-name]** — [1-sentence change summary]; observations #[N], #[N]
 
-### Observations Actioned
+### Observations Staged
 [numbers and titles]
+
+### Installed and verified
+0 in this scheduled staging run
 
 ### Skipped (needs manual review)
 [items with reasons]
 ```
 
-Wait for the user to acknowledge before other work.
+In interactive mode, wait for the user to acknowledge before other work.
+Scheduled mode delivers the report and exits; it does not wait for an absent user.
+
+## Read-only multi-source review
+
+When the launcher supplies several source workspaces, deduplicate by canonical
+path and key every observation by `(source log path, literal observation ID)`.
+The same number in two projects is not the same observation. Read every active
+source and its principles. Never move, archive, rewrite, or timestamp these raw
+logs: another session may be appending, and sensitive-directory writes may be
+blocked. This overrides source mutations in Steps 1, 6, and 7.
+
+Use the launcher's unique output directory for full skill bundles and REVIEW.md.
+Before preparing updates, consult previous reports for still-pending bundles
+and compare them with the current live skill and observation. Record each source's
+header count, classified count, review time, read failures/skips, and pending
+bundle references. Record STAGED statuses in the report only; explicitly state
+that the original OPEN statuses and per-source timestamps remain unchanged.
+An unreadable source is an incomplete review, never an empty or clean queue.
 
 ## Constraints
 
@@ -196,6 +232,7 @@ after. When seeding staged
 copies from the read-only mount, `chmod -R u+w` the staged path first —
 the mount's read-only mode travels with the copy, for directories as
 well as files. Do not edit skill files in place — nothing goes live
-until the user installs it. **Keep-two rule:** for any skill, keep only
-the two most recent date directories under `skill-updates/`; delete
-older ones.
+until the user installs it. **Keep-two rule:** retain every pending bundle,
+regardless of age. Among bundles confirmed installed or explicitly declined,
+keep the two most recent per skill; older resolved bundles are cleanup
+candidates. Never delete an unresolved bundle to meet a retention count.
