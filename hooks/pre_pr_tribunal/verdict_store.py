@@ -3,17 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import secrets
 import stat
-import subprocess
-from typing import Iterator
 
 from .git_state import GitStateError, assert_auto_fix_scope, capture_snapshot
 from . import model as m
@@ -30,254 +27,45 @@ from .model import (
     Snapshot,
     Verdict,
 )
+from .review_store import (
+    atomic_create_bytes,
+    atomic_replace_bytes,
+    check_ignored,
+    locked_review,
+    open_directory,
+    preflight_review_directory,
+    read_named_file,
+    repository_root,
+    safe_file,
+)
+
+
+@dataclass(frozen=True)
+class ReportReceipt:
+    reviewer: Reviewer
+    round: int
+    path: str
+    raw_sha256: str
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _repository_root(cwd: Path) -> Path:
-    try:
-        raw = os.fspath(cwd)
-        result = subprocess.run(
-            ["/usr/bin/git", "-C", raw, "rev-parse", "--show-toplevel"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-        if result.returncode != 0 or len(result.stdout) > 16 * 1024:
-            raise SchemaError("NOT_GIT_REPOSITORY")
-        root = Path(result.stdout.decode("utf-8", "strict").rstrip("\n")).resolve(
-            strict=True
-        )
-        physical = Path(raw).resolve(strict=True)
-        if not physical.is_relative_to(root):
-            raise SchemaError("NOT_GIT_REPOSITORY")
-        return root
-    except SchemaError:
-        raise
-    except (OSError, UnicodeError, subprocess.SubprocessError, ValueError):
-        raise SchemaError("NOT_GIT_REPOSITORY") from None
-
-
-def _check_ignored(root: Path) -> None:
-    try:
-        result = subprocess.run(
-            [
-                "/usr/bin/git",
-                "-C",
-                str(root),
-                "check-ignore",
-                "-q",
-                "--",
-                ".review/verdict.json",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        raise SchemaError("VERDICT_NOT_IGNORED") from None
-    if result.returncode != 0:
-        raise SchemaError("VERDICT_NOT_IGNORED")
-
-
-def _preflight_review_directory(root: Path) -> None:
-    root_fd = -1
-    review_fd = -1
-    try:
-        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            review_fd = os.open(
-                ".review",
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=root_fd,
-            )
-        except FileNotFoundError:
-            return
-        except OSError:
-            raise SchemaError("REVIEW_DIRECTORY_UNSAFE") from None
-        _safe_directory(review_fd, "REVIEW_DIRECTORY_UNSAFE")
-    finally:
-        for fd in (review_fd, root_fd):
-            if fd >= 0:
-                os.close(fd)
-
-
-def _safe_directory(fd: int, code: str) -> None:
-    info = os.fstat(fd)
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != os.geteuid()
-        or info.st_mode & 0o077
-    ):
-        raise SchemaError(code)
-
-
-def _safe_file(fd: int, code: str) -> os.stat_result:
-    info = os.fstat(fd)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.geteuid()
-        or info.st_mode & 0o077
-    ):
-        raise SchemaError(code)
-    return info
-
-
-def _open_directory(parent_fd: int, name: str, *, create: bool, code: str) -> int:
-    created = False
-    if create:
-        try:
-            os.mkdir(name, 0o700, dir_fd=parent_fd)
-            created = True
-        except FileExistsError:
-            pass
-        except OSError:
-            raise SchemaError(code) from None
-    try:
-        fd = os.open(
-            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd
-        )
-    except OSError:
-        raise SchemaError(code) from None
-    try:
-        if created:
-            os.fchmod(fd, 0o700)
-        _safe_directory(fd, code)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
-@contextmanager
-def _locked_review(root: Path, *, create: bool) -> Iterator[int]:
-    root_fd = -1
-    review_fd = -1
-    lock_fd = -1
-    try:
-        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        root_info = os.fstat(root_fd)
-        if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.geteuid():
-            raise SchemaError("REPOSITORY_DIRECTORY_UNSAFE")
-        review_fd = _open_directory(
-            root_fd, ".review", create=create, code="REVIEW_DIRECTORY_UNSAFE"
-        )
-        flags = os.O_RDWR | os.O_NOFOLLOW
-        if create:
-            flags |= os.O_CREAT
-        try:
-            lock_fd = os.open("lock", flags, 0o600, dir_fd=review_fd)
-            _safe_file(lock_fd, "LOCK_FILE_UNSAFE")
-            os.fchmod(lock_fd, 0o600)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SchemaError("STORE_LOCKED") from None
-        except SchemaError:
-            raise
-        except OSError:
-            raise SchemaError("LOCK_FILE_UNSAFE") from None
-        yield review_fd
-    finally:
-        for fd in (lock_fd, review_fd, root_fd):
-            if fd >= 0:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-
-
-def _read_named_file(
-    parent_fd: int, name: str, *, maximum: int, missing: str, unsafe: str
-) -> bytes:
-    try:
-        fd = os.open(
-            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
-        )
-    except FileNotFoundError:
-        raise SchemaError(missing) from None
-    except OSError:
-        raise SchemaError(unsafe) from None
-    try:
-        info = _safe_file(fd, unsafe)
-        if info.st_size > maximum:
-            raise SchemaError("FILE_TOO_LARGE")
-        chunks: list[bytes] = []
-        size = 0
-        while True:
-            chunk = os.read(fd, min(65536, maximum + 1 - size))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-            if size > maximum:
-                raise SchemaError("FILE_TOO_LARGE")
-        return b"".join(chunks)
-    finally:
-        os.close(fd)
-
-
 def _atomic_write(review_fd: int, verdict: Verdict) -> None:
     raw = json.dumps(
         verdict.to_json(), ensure_ascii=False, separators=(",", ":"), sort_keys=False
     ).encode("utf-8")
-    if len(raw) > m.MAX_VERDICT_BYTES:
-        raise SchemaError("VERDICT_TOO_LARGE")
-    temporary = f".verdict.tmp.{os.getpid()}.{secrets.token_hex(8)}"
-    fd = -1
-    try:
-        try:
-            existing_fd = os.open(
-                "verdict.json",
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                dir_fd=review_fd,
-            )
-        except FileNotFoundError:
-            existing_fd = -1
-        except OSError:
-            raise SchemaError("VERDICT_FILE_UNSAFE") from None
-        if existing_fd >= 0:
-            try:
-                _safe_file(existing_fd, "VERDICT_FILE_UNSAFE")
-            finally:
-                os.close(existing_fd)
-        fd = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=review_fd,
-        )
-        os.fchmod(fd, 0o600)
-        _safe_file(fd, "VERDICT_FILE_UNSAFE")
-        view = memoryview(raw)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError("short write")
-            view = view[written:]
-        os.fsync(fd)
-        os.close(fd)
-        fd = -1
-        os.replace(
-            temporary, "verdict.json", src_dir_fd=review_fd, dst_dir_fd=review_fd
-        )
-        os.fsync(review_fd)
-    except SchemaError:
-        raise
-    except OSError:
-        raise SchemaError("VERDICT_WRITE_FAILED") from None
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(temporary, dir_fd=review_fd)
-        except OSError:
-            pass
+    atomic_replace_bytes(
+        review_fd,
+        "verdict.json",
+        raw,
+        maximum=m.MAX_VERDICT_BYTES,
+        too_large="VERDICT_TOO_LARGE",
+        unsafe="VERDICT_FILE_UNSAFE",
+        exact_mode=0o600,
+        write_failed="VERDICT_WRITE_FAILED",
+    )
 
 
 def _parse_history(value: object) -> tuple[RoundSummary, ...]:
@@ -593,7 +381,7 @@ def _parse_verdict(raw: bytes) -> Verdict:
 
 
 def _read_verdict_locked(review_fd: int) -> Verdict:
-    raw = _read_named_file(
+    raw = read_named_file(
         review_fd,
         "verdict.json",
         maximum=m.MAX_VERDICT_BYTES,
@@ -633,17 +421,49 @@ def _expected_input(root: Path, supplied: Path, relative: str, code: str) -> Non
         raise SchemaError(code)
 
 
-def _round_fd(review_fd: int, round_number: int, *, create: bool) -> int:
-    inbox_fd = _open_directory(
-        review_fd, "inbox", create=create, code="INBOX_DIRECTORY_UNSAFE"
+def _exact_report_directory(fd: int) -> None:
+    try:
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+            raise SchemaError("FILE_UNSAFE")
+    except OSError:
+        raise SchemaError("FILE_UNSAFE") from None
+
+
+def _round_fd(
+    review_fd: int,
+    round_number: int,
+    *,
+    create: bool,
+    exact_report_directories: bool = False,
+) -> int:
+    inbox_code = (
+        "FILE_UNSAFE" if exact_report_directories else "INBOX_DIRECTORY_UNSAFE"
+    )
+    round_code = (
+        "FILE_UNSAFE" if exact_report_directories else "ROUND_DIRECTORY_UNSAFE"
+    )
+    inbox_fd = open_directory(
+        review_fd,
+        "inbox",
+        create=create,
+        code=inbox_code,
     )
     try:
-        return _open_directory(
+        if exact_report_directories:
+            _exact_report_directory(inbox_fd)
+        round_fd = open_directory(
             inbox_fd,
             f"round-{round_number}",
             create=create,
-            code="ROUND_DIRECTORY_UNSAFE",
+            code=round_code,
         )
+        try:
+            if exact_report_directories:
+                _exact_report_directory(round_fd)
+            return round_fd
+        except BaseException:
+            os.close(round_fd)
+            raise
     finally:
         os.close(inbox_fd)
 
@@ -664,7 +484,7 @@ def _invalidate_round_inputs(review_fd: int, round_number: int) -> None:
             except OSError:
                 raise SchemaError("FILE_UNSAFE") from None
             try:
-                opened = _safe_file(file_fd, "FILE_UNSAFE")
+                opened = safe_file(file_fd, "FILE_UNSAFE")
                 named = os.stat(basename, dir_fd=round_fd, follow_symlinks=False)
                 if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
                     raise SchemaError("FILE_UNSAFE")
@@ -695,13 +515,19 @@ def _read_input(
     maximum: int,
     missing: str,
     path_code: str,
+    exact_mode: int | None = None,
 ) -> bytes:
     relative = f".review/inbox/round-{round_number}/{basename}"
     _expected_input(root, supplied, relative, path_code)
     round_fd = _round_fd(review_fd, round_number, create=False)
     try:
-        return _read_named_file(
-            round_fd, basename, maximum=maximum, missing=missing, unsafe="FILE_UNSAFE"
+        return read_named_file(
+            round_fd,
+            basename,
+            maximum=maximum,
+            missing=missing,
+            unsafe="FILE_UNSAFE",
+            exact_mode=exact_mode,
         )
     finally:
         os.close(round_fd)
@@ -725,6 +551,114 @@ def _snapshot_equal(verdict: Verdict, snapshot: Snapshot) -> bool:
         snapshot.merge_base_sha,
         snapshot.diff_sha256,
     )
+
+
+def _require_all_pending(verdict: Verdict) -> None:
+    if verdict.gate.status is not GateStatus.IN_PROGRESS or any(
+        slot.status != "pending" for slot in verdict.reviewers.values()
+    ):
+        raise SchemaError("ROUND_NOT_IN_PROGRESS")
+
+
+def _validate_report_store_input(reviewer: Reviewer, raw: bytes) -> None:
+    if not isinstance(reviewer, Reviewer) or not isinstance(raw, bytes):
+        raise SchemaError("REPORT_SCHEMA_INVALID")
+    if len(raw) > m.MAX_REPORT_BYTES:
+        raise SchemaError("REPORT_TOO_LARGE")
+
+
+def store_reviewer_report(
+    cwd: Path,
+    *,
+    reviewer: Reviewer,
+    raw: bytes,
+    replace_pending_recovery: bool = False,
+) -> ReportReceipt:
+    """Store exact report bytes at the pending round's only canonical path."""
+    _validate_report_store_input(reviewer, raw)
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        pending = _read_verdict_locked(review_fd)
+        _require_all_pending(pending)
+        if replace_pending_recovery:
+            snapshot = capture_snapshot(root, pending.base_ref)
+            if not _snapshot_equal(pending, snapshot):
+                raise SchemaError("SNAPSHOT_CHANGED")
+        round_fd = _round_fd(
+            review_fd,
+            pending.round,
+            create=True,
+            exact_report_directories=True,
+        )
+        try:
+            name = f"{reviewer.value}.json"
+            if replace_pending_recovery:
+                atomic_replace_bytes(
+                    round_fd,
+                    name,
+                    raw,
+                    maximum=m.MAX_REPORT_BYTES,
+                    too_large="REPORT_TOO_LARGE",
+                    unsafe="FILE_UNSAFE",
+                    exact_mode=0o600,
+                    write_failed="REPORT_WRITE_FAILED",
+                )
+                digest = hashlib.sha256(raw).hexdigest()
+            else:
+                digest = atomic_create_bytes(
+                    round_fd,
+                    name,
+                    raw,
+                    maximum=m.MAX_REPORT_BYTES,
+                    exists="REPORT_FILE_EXISTS",
+                    unsafe="FILE_UNSAFE",
+                    exact_mode=0o600,
+                )
+        finally:
+            os.close(round_fd)
+    return ReportReceipt(
+        reviewer,
+        pending.round,
+        f".review/inbox/round-{pending.round}/{reviewer.value}.json",
+        digest,
+    )
+
+
+def validate_stored_reviewer_report(
+    cwd: Path, *, reviewer: Reviewer
+) -> tuple[ReviewerReport, str]:
+    """Re-open and validate one canonical exact-mode report without mutation."""
+    if not isinstance(reviewer, Reviewer):
+        raise SchemaError("REPORT_SCHEMA_INVALID")
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        pending = _read_verdict_locked(review_fd)
+        _require_all_pending(pending)
+        round_fd = _round_fd(review_fd, pending.round, create=False)
+        try:
+            raw = read_named_file(
+                round_fd,
+                f"{reviewer.value}.json",
+                maximum=m.MAX_REPORT_BYTES,
+                missing="REVIEWER_REPORT_MISSING",
+                unsafe="FILE_UNSAFE",
+                exact_mode=0o600,
+            )
+        finally:
+            os.close(round_fd)
+        snapshot = capture_snapshot(root, pending.base_ref)
+        if not _snapshot_equal(pending, snapshot):
+            raise SchemaError("SNAPSHOT_CHANGED")
+        return m.validate_report_bytes(
+            raw,
+            expected_reviewer=reviewer,
+            expected_round=pending.round,
+            snapshot=snapshot,
+        )
 
 
 def _blockers(verdict: Verdict) -> tuple[m.Finding, ...]:
@@ -780,10 +714,10 @@ def begin_round(
         )
     if runtime not in {"claude", "codex"}:
         raise SchemaError("RUNTIME_INVALID")
-    root = _repository_root(cwd)
-    _preflight_review_directory(root)
-    _check_ignored(root)
-    with _locked_review(root, create=True) as review_fd:
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=True) as review_fd:
         stored = _read_optional_verdict_locked(review_fd)
         previous: Verdict | None = None
         if round_number == 1:
@@ -915,15 +849,12 @@ def finalize_round(
         "C",
     }:
         raise SchemaError("REVIEWER_REPORT_MISSING")
-    root = _repository_root(cwd)
-    _preflight_review_directory(root)
-    _check_ignored(root)
-    with _locked_review(root, create=False) as review_fd:
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
         pending = _read_verdict_locked(review_fd)
-        if pending.gate.status is not GateStatus.IN_PROGRESS or any(
-            slot.status != "pending" for slot in pending.reviewers.values()
-        ):
-            raise SchemaError("ROUND_NOT_IN_PROGRESS")
+        _require_all_pending(pending)
         snapshot = capture_snapshot(root, pending.base_ref, now=now)
         if not _snapshot_equal(pending, snapshot):
             raise SchemaError("SNAPSHOT_CHANGED")
@@ -938,8 +869,9 @@ def finalize_round(
                 maximum=m.MAX_REPORT_BYTES,
                 missing="REVIEWER_REPORT_MISSING",
                 path_code="REPORT_PATH_INVALID",
+                exact_mode=0o600,
             )
-            reports[key] = m.parse_reviewer_report(
+            reports[key], _raw_sha256 = m.validate_report_bytes(
                 raw,
                 expected_reviewer=Reviewer(key),
                 expected_round=pending.round,
@@ -976,8 +908,8 @@ def finalize_round(
 
 
 def read_verdict(cwd: Path) -> Verdict:
-    root = _repository_root(cwd)
-    _preflight_review_directory(root)
-    _check_ignored(root)
-    with _locked_review(root, create=False) as review_fd:
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
         return _read_verdict_locked(review_fd)

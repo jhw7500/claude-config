@@ -1,6 +1,7 @@
 """Deterministic, network-free Git snapshot capture for tribunal reviews."""
 
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import os
@@ -25,9 +26,24 @@ from .model import (
 GIT = "/usr/bin/git"
 MAX_GIT_STDOUT_BYTES = 32 * 1024 * 1024
 MAX_GIT_STDERR_BYTES = 64 * 1024
+MAX_GIT_STDIN_BYTES = 4096
 GIT_TIMEOUT_SECONDS = 30
 GIT_READ_CHUNK_BYTES = 64 * 1024
 GIT_TERMINATION_GRACE_SECONDS = 0.2
+DIFF_RECIPE_VERSION = 1
+DIFF_ARGUMENTS = ("diff", "--binary", "--no-ext-diff", "--no-textconv", "--full-index")
+_SANITIZED_GIT_ENVIRONMENT = {
+    "LC_ALL": "C",
+    "LANG": "C",
+    "GIT_PAGER": "cat",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+    "GIT_CONFIG_VALUE_0": "false",
+}
 
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _DIFF_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -46,25 +62,82 @@ class GitStateError(TribunalError):
     pass
 
 
+@dataclass(frozen=True)
+class TelemetryCandidate:
+    repository: str
+    head_ref: str
+    head_sha: str
+
+
+def capture_telemetry_candidate(cwd: Path) -> TelemetryCandidate:
+    """Read provisional identity without resolving a base or capturing a diff."""
+    root = _physical_root(_validated_cwd(cwd))
+    head_ref = _one_line_utf8(
+        _command_output(root, ("symbolic-ref", "--quiet", "HEAD"), failure="DETACHED_HEAD"),
+        "GIT_STATE_INVALID",
+    )
+    if not _valid_schema_text(head_ref, 1024):
+        raise GitStateError("GIT_STATE_INVALID")
+    head_sha = _sha(_command_output(root, ("rev-parse", "HEAD")))
+    repository = _repository_from_origin(_command_output(
+        root, ("remote", "get-url", "origin"), failure="REPOSITORY_UNSUPPORTED",
+    ))
+    return TelemetryCandidate(repository, head_ref, head_sha)
+
+
+def check_telemetry_ignored(cwd: Path) -> None:
+    """Require the entire artifact namespace to be ignored and untracked."""
+    root = _physical_root(_validated_cwd(cwd))
+    # A trailing slash also matches .review/*, whose children can be negated.
+    # Prove an exact whole-parent exclusion instead: Git cannot reinclude any
+    # child beneath it, including staging links retained after failed rename.
+    try:
+        proof = _run_git_with_environment(
+            root, ("check-ignore", "-z", "-v", "--no-index", "--stdin"),
+            _git_environment(), input_bytes=b".review/\x00",
+        )
+    except GitStateError:
+        raise GitStateError("TELEMETRY_FILE_UNSAFE") from None
+    fields = proof.stdout.split(b"\x00")
+    if (
+        proof.returncode != 0
+        or proof.stderr
+        or len(fields) != 5
+        or not fields[0]
+        or re.fullmatch(rb"[1-9][0-9]*", fields[1]) is None
+        or fields[2] not in {b".review/", b"/.review/", b".review", b"/.review"}
+        or fields[3:] != [b".review/", b""]
+    ):
+        raise GitStateError("TELEMETRY_FILE_UNSAFE")
+    for path in (".review/telemetry.json", ".review/lock"):
+        _command_output(
+            root, ("check-ignore", "-q", "--", path),
+            failure="TELEMETRY_FILE_UNSAFE",
+        )
+    if _command_output(
+        root, ("ls-files", "-z", "--", ".review"),
+        failure="TELEMETRY_FILE_UNSAFE",
+    ):
+        raise GitStateError("TELEMETRY_FILE_UNSAFE")
+
+
 def _git_environment() -> dict[str, str]:
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
-    environment.update(
-        {
-            "LC_ALL": "C",
-            "LANG": "C",
-            "GIT_PAGER": "cat",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "core.fsmonitor",
-            "GIT_CONFIG_VALUE_0": "false",
-        }
-    )
+    environment.update(_SANITIZED_GIT_ENVIRONMENT)
     return environment
+
+
+def diff_contract(snapshot: Snapshot) -> dict[str, object]:
+    revision = f"{snapshot.merge_base_sha}..{snapshot.head_sha}"
+    return {
+        "version": DIFF_RECIPE_VERSION,
+        "digest": "sha256",
+        "arguments": [*DIFF_ARGUMENTS, revision],
+        "clear_inherited_prefixes": ["GIT_"],
+        "environment": dict(_SANITIZED_GIT_ENVIRONMENT),
+    }
 
 
 def _gh_config_environment() -> dict[str, str]:
@@ -115,8 +188,13 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def _run_git_with_environment(
-    cwd: Path, arguments: Sequence[str], environment: dict[str, str]
+    cwd: Path, arguments: Sequence[str], environment: dict[str, str],
+    *, input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    if input_bytes is not None and (
+        not isinstance(input_bytes, bytes) or len(input_bytes) > MAX_GIT_STDIN_BYTES
+    ):
+        raise GitStateError("GIT_COMMAND_FAILED")
     argv = [GIT, "-C", str(cwd), *arguments]
     try:
         selector = selectors.DefaultSelector()
@@ -128,7 +206,7 @@ def _run_git_with_environment(
         process = subprocess.Popen(
             argv,
             shell=False,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if input_bytes is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
@@ -136,6 +214,17 @@ def _run_git_with_environment(
         )
         if process.stdout is None or process.stderr is None:
             raise RuntimeError("missing Git capture pipe")
+        if input_bytes is not None:
+            if process.stdin is None:
+                raise RuntimeError("missing Git input pipe")
+            try:
+                # One bounded, nonblocking write; an unread input cannot stall
+                # the existing output limits and process-group timeout path.
+                os.set_blocking(process.stdin.fileno(), False)
+                if os.write(process.stdin.fileno(), input_bytes) != len(input_bytes):
+                    raise RuntimeError("incomplete Git input")
+            finally:
+                process.stdin.close()
         stdout = bytearray()
         stderr = bytearray()
         selector.register(
@@ -560,14 +649,7 @@ def capture_snapshot(
 
     diff = _command_output(
         root,
-        (
-            "diff",
-            "--binary",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--full-index",
-            revision_range,
-        ),
+        (*DIFF_ARGUMENTS, revision_range),
     )
     diff_sha256 = hashlib.sha256(diff).hexdigest()
     if _DIFF_SHA256.fullmatch(diff_sha256) is None:

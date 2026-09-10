@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -12,6 +13,7 @@ from pathlib import Path
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import textwrap
@@ -678,6 +680,173 @@ def _load_probe_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _installed_lifecycle(tmp_path):
+    module = _load_probe_module()
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    repo = tmp_path / "repo"
+    module._create_probe_repo(repo, home)
+    cli = module._install(REPO, home, repo)
+    return module, home, repo, cli
+
+
+@pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
+def test_installed_probe_stores_validates_and_finalizes_exact_reports(tmp_path, monkeypatch, mask):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    run = subprocess.run
+    captured = {}
+    validations = []
+    finalizations = []
+
+    def observe(argv, **kwargs):
+        if len(argv) > 2 and argv[1] == str(cli):
+            if argv[2] == "store-report":
+                captured[argv[4]] = kwargs["input"]
+            elif argv[2] == "validate-report":
+                validations.append(argv[4])
+            elif argv[2] == "finalize":
+                # Every separate pre-final stored validation must have completed.
+                assert validations == list("ABCABC")
+                for reviewer in "ABC":
+                    target = repo / f".review/inbox/round-1/{reviewer}.json"
+                    metadata = target.lstat()
+                    assert stat.S_ISREG(metadata.st_mode)
+                    assert metadata.st_uid == os.geteuid()
+                    assert stat.S_IMODE(metadata.st_mode) == 0o600
+                    assert target.read_bytes() == captured[reviewer]
+                finalizations.append(True)
+        result = run(argv, **kwargs)
+        if len(argv) > 2 and argv[1] == str(cli) and argv[2] in {"store-report", "validate-report"}:
+            assert json.loads(result.stdout)["raw_sha256"] == hashlib.sha256(captured[argv[4]]).hexdigest()
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", observe)
+    previous = os.umask(mask)
+    try:
+        result = module._create_pass_verdict(cli, repo, home, "codex")
+    finally:
+        os.umask(previous)
+    assert len(finalizations) == 1
+    summary = result["telemetry_summary"]
+    assert summary["binding"]["diff_sha256"] == result["begin"]["snapshot"]["diff_sha256"]
+    assert summary["stages"]["report_store"]["count"] == 3
+    assert summary["stages"]["report_validation"]["count"] == 3
+    assert summary["stages"]["finalize"]["count"] == 1
+    assert summary["outcomes"]["failure"] == 0
+    ledger = json.loads((repo / ".review/telemetry.json").read_bytes())
+    assert all(span["status"] != "running" for span in ledger["runs"][0]["spans"])
+    assert ledger["runs"][0]["status"] == "success"
+    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "pass"
+
+
+def test_installed_probe_invalid_a_preserves_cr_and_detects_before_peers(tmp_path, monkeypatch):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    dumps, run = json.dumps, subprocess.run
+    captured = {}
+    finalizations = []
+    clock_ns = 1_000_000_000
+    detected_ns = None
+
+    def invalid_a(value, *args, **kwargs):
+        if isinstance(value, dict) and value.get("reviewer") == "A" and "executions" in value:
+            value["executions"] = [{
+                "id": "A-R1-E001", "truncated": False,
+                "command": "printf check", "exit_code": 0,
+                "stdout_excerpt": "left\rright", "stderr_excerpt": "",
+                "capture_sha256": "1" * 64,
+            }]
+        raw = dumps(value, *args, **kwargs)
+        if isinstance(value, dict) and value.get("reviewer") == "A" and "executions" in value:
+            captured["A"] = (raw + "\n").encode()
+        return raw
+
+    def controlled_cli(argv, **kwargs):
+        nonlocal clock_ns, detected_ns
+        if len(argv) > 2 and argv[1] == str(cli):
+            if argv[2] == "finalize":
+                finalizations.append(True)
+            if argv[2] == "telemetry-finish":
+                ledger = json.loads((repo / ".review/telemetry.json").read_bytes())
+                span = next(s for s in ledger["runs"][0]["spans"] if s["span_id"] == argv[6])
+                if span["stage"] == "report_validation" and span["reviewer"] == "A":
+                    detected_ns = clock_ns
+                if span["stage"] == "reviewer_total" and span["reviewer"] == "C" and detected_ns is not None:
+                    clock_ns = detected_ns + 20_000_000_000
+            # Inject only the existing CLI clocks; parser, filesystem and subprocess are real.
+            driver = "import runpy,sys; m=runpy.run_path(sys.argv[1]); raise SystemExit(m['main'](sys.argv[3:],wall_clock=lambda:'2026-09-09T00:00:00Z',monotonic_ns=lambda:int(sys.argv[2])))"
+            argv = [sys.executable, "-c", driver, str(cli), str(clock_ns), *argv[2:]]
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(module.json, "dumps", invalid_a)
+    monkeypatch.setattr(module.subprocess, "run", controlled_cli)
+    with pytest.raises(module.ProbeFailure, match="^TEXT_INVALID$"):
+        module._create_pass_verdict(cli, repo, home, "codex")
+    assert finalizations == []
+    target = repo / ".review/inbox/round-1/A.json"
+    assert target.read_bytes() == captured["A"]
+    assert stat.S_IMODE(target.lstat().st_mode) == 0o600
+    summary = json.loads(run([sys.executable, str(cli), "telemetry-summary"], cwd=repo,
+                             env=module._internal_env(home), capture_output=True).stdout)
+    assert summary["early_detection"]["reason_code"] == "TEXT_INVALID"
+    assert summary["early_detection"]["wait_all_delay_ms"] == 20000
+    assert summary["stages"]["report_validation"]["count"] == 3
+    assert "finalize" not in summary["stages"]
+    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "in_progress"
+
+
+@pytest.mark.parametrize("tamper", ("digest", "mode", "symlink"))
+def test_installed_probe_rechecks_each_report_immediately_before_finalize(tmp_path, monkeypatch, tamper):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    run = subprocess.run
+    validations = 0
+    finalizations = []
+
+    def change_after_validation(argv, **kwargs):
+        nonlocal validations
+        result = run(argv, **kwargs)
+        if len(argv) > 2 and argv[1] == str(cli):
+            if argv[2] == "finalize":
+                finalizations.append(True)
+            if argv[2] == "validate-report":
+                validations += 1
+                if validations == 6:
+                    target = repo / ".review/inbox/round-1/A.json"
+                    if tamper == "digest":
+                        target.write_bytes(target.read_bytes() + b" ")
+                    elif tamper == "mode":
+                        target.chmod(0o644)
+                    else:
+                        original = target.with_suffix(".original")
+                        target.rename(original)
+                        target.symlink_to(original.name)
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", change_after_validation)
+    expected = "REPORT_BYTES_MISMATCH" if tamper == "digest" else "FILE_UNSAFE"
+    with pytest.raises(module.ProbeFailure, match=f"^{expected}$"):
+        module._create_pass_verdict(cli, repo, home, "codex")
+    assert finalizations == []
+    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "in_progress"
+
+
+def test_installed_probe_telemetry_failure_does_not_block_valid_reports(tmp_path, monkeypatch):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    run = subprocess.run
+
+    def corrupt_telemetry(argv, **kwargs):
+        result = run(argv, **kwargs)
+        if len(argv) > 2 and argv[1] == str(cli) and argv[2] == "begin":
+            (repo / ".review/telemetry.json").write_bytes(b"{broken")
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", corrupt_telemetry)
+    result = module._create_pass_verdict(cli, repo, home, "codex")
+    assert result["telemetry_summary"] == {}
+    assert set(result["telemetry_gaps"]) == {"TELEMETRY_INVALID"}
+    assert (repo / ".review/telemetry.json").read_bytes() == b"{broken"
+    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "pass"
 
 
 def test_runtime_prompt_requires_literal_unwrapped_canary_command(tmp_path):

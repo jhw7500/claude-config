@@ -52,7 +52,9 @@ PACKAGE_NAMES = (
     "git_state.py",
     "hook_common.py",
     "model.py",
+    "review_store.py",
     "shell_scan.py",
+    "telemetry.py",
     "verdict_store.py",
 )
 CLAUDE_MATCHER = "Bash"

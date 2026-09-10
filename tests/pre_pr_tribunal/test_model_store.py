@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
@@ -16,8 +17,15 @@ from pre_pr_tribunal.model import (
     SchemaError,
     parse_decisions,
     parse_reviewer_report,
+    validate_report_bytes,
 )
-from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict
+from pre_pr_tribunal.verdict_store import (
+    begin_round,
+    finalize_round,
+    read_verdict,
+    store_reviewer_report,
+    validate_stored_reviewer_report,
+)
 
 
 def NOW():
@@ -199,6 +207,66 @@ def test_report_requires_exact_identity_and_terminal_status(snapshot, mutation, 
         )
 
 
+def test_validate_report_bytes_returns_parser_result_and_raw_digest(snapshot):
+    raw = json.dumps(report(snapshot, "A"), separators=(",", ":")).encode() + b"\n"
+
+    parsed, digest = validate_report_bytes(
+        raw,
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+
+    assert parsed == parse_reviewer_report(
+        raw, expected_reviewer=Reviewer.A, expected_round=1, snapshot=snapshot
+    )
+    assert digest == hashlib.sha256(raw).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("malformed", "JSON_INVALID"),
+        ("text", "TEXT_INVALID"),
+        ("reviewer", "REPORT_REVIEWER_MISMATCH"),
+        ("round", "REPORT_ROUND_MISMATCH"),
+        ("snapshot", "REPORT_SNAPSHOT_MISMATCH"),
+    ],
+)
+def test_validate_report_bytes_raises_the_same_parser_code(snapshot, mutation, code):
+    reviewer = Reviewer.A
+    round_number = 1
+    if mutation == "malformed":
+        raw = b'{"schema":1'
+    else:
+        value = report(snapshot, "A")
+        if mutation == "text":
+            invalid = finding()
+            invalid["title"] = "bad\x00title"
+            value["findings"] = [invalid]
+        elif mutation == "reviewer":
+            value["reviewer"] = "B"
+        elif mutation == "round":
+            value["round"] = 2
+        else:
+            value["snapshot"]["head_sha"] = "0" * 40
+        raw = json.dumps(value).encode()
+    with pytest.raises(SchemaError, match=f"^{code}$"):
+        parse_reviewer_report(
+            raw,
+            expected_reviewer=reviewer,
+            expected_round=round_number,
+            snapshot=snapshot,
+        )
+    with pytest.raises(SchemaError, match=f"^{code}$"):
+        validate_report_bytes(
+            raw,
+            expected_reviewer=reviewer,
+            expected_round=round_number,
+            snapshot=snapshot,
+        )
+
+
 @pytest.mark.parametrize(
     ("change", "code"),
     [
@@ -262,6 +330,76 @@ def test_execution_requires_exact_typed_sanitized_evidence(snapshot, change, cod
         parse_reviewer_report(
             json.dumps(value).encode(),
             expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize("field", ("stdout_excerpt", "stderr_excerpt"))
+@pytest.mark.parametrize("value", ("first\nsecond", "name\tvalue", "first\n\tsecond"))
+def test_execution_excerpts_accept_only_lf_and_tab(snapshot, field, value):
+    item = execution()
+    item[field] = value
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+    assert getattr(parsed.executions[0], field) == value
+
+
+@pytest.mark.parametrize("control", ("\r", "\x00", "\x1b", "\x7f"))
+def test_execution_excerpts_reject_every_other_cc(snapshot, control):
+    item = execution()
+    item["stdout_excerpt"] = "left" + control + "right"
+    with pytest.raises(SchemaError, match="^TEXT_INVALID$"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize("control", ("\n", "\t"))
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("command", "python3{control}-V"),
+        ("title", "title{control}text"),
+        ("rationale", "rationale{control}text"),
+        ("acceptance_condition", "acceptance{control}condition"),
+        ("statement", "statement{control}text"),
+        ("reason", "reason{control}text"),
+        ("path", "directory{control}/tracked.txt"),
+    ],
+)
+def test_non_excerpt_text_keeps_rejecting_lf_and_tab(snapshot, control, field, value):
+    value = value.format(control=control)
+    item = execution(command=value) if field == "command" else execution()
+    report_value = report(snapshot, "A", executions=[item])
+    if field in {"title", "rationale", "acceptance_condition", "path"}:
+        finding_value = finding()
+        finding_value[field] = value
+        report_value["findings"] = [finding_value]
+    elif field in {"statement", "reason"}:
+        report_value["reviewer"] = "B"
+        item["id"] = "B-R1-E001"
+        report_value["claims"] = [
+            {
+                "id": "B-R1-C001",
+                "statement": "Claim statement",
+                "result": "supported",
+                "execution_ids": ["B-R1-E001"],
+                "reason": "",
+            }
+        ]
+        report_value["claims"][0][field] = value
+    with pytest.raises(SchemaError, match="^(TEXT_INVALID|PATH_INVALID)$"):
+        parse_reviewer_report(
+            json.dumps(report_value).encode(),
+            expected_reviewer=Reviewer.B if field in {"statement", "reason"} else Reviewer.A,
             expected_round=1,
             snapshot=snapshot,
         )
@@ -712,6 +850,143 @@ def test_begin_writes_in_progress_and_finalize_requires_all_reviewers(git_repo):
         )
 
 
+@pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
+def test_store_reviewer_report_preserves_bytes_and_forces_mode(git_repo, mask):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\n"
+    previous = os.umask(mask)
+    try:
+        receipt = store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+    finally:
+        os.umask(previous)
+
+    target = git_repo / ".review/inbox/round-1/A.json"
+    assert target.read_bytes() == raw
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert receipt.reviewer is Reviewer.A
+    assert receipt.round == 1
+    assert receipt.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert receipt.path == ".review/inbox/round-1/A.json"
+
+
+@pytest.mark.parametrize("relative", ("inbox", "inbox/round-1"))
+@pytest.mark.parametrize("mode", (0o1700, 0o750))
+def test_store_reviewer_report_rejects_nonexact_existing_report_directory(
+    git_repo, relative, mode
+):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    verdict_path = git_repo / ".review/verdict.json"
+    verdict_before = verdict_path.read_bytes()
+    directory = git_repo / ".review" / relative
+    directory.chmod(mode)
+    assert stat.S_IMODE(directory.stat().st_mode) == mode
+
+    with pytest.raises(SchemaError, match="^FILE_UNSAFE$"):
+        store_reviewer_report(
+            git_repo,
+            reviewer=Reviewer.A,
+            raw=json.dumps(report(pending.snapshot, "A")).encode(),
+        )
+
+    assert verdict_path.read_bytes() == verdict_before
+    assert not (git_repo / ".review/inbox/round-1/A.json").exists()
+
+
+def test_store_reviewer_report_preserves_invalid_bytes_and_never_overwrites(git_repo):
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    verdict_before = verdict_path.read_bytes()
+    raw = b'{"schema":1'
+
+    store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+    target = git_repo / ".review/inbox/round-1/A.json"
+    assert target.read_bytes() == raw
+    assert verdict_path.read_bytes() == verdict_before
+    with pytest.raises(SchemaError, match="^REPORT_FILE_EXISTS$"):
+        store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=b"new response")
+    assert target.read_bytes() == raw
+    assert verdict_path.read_bytes() == verdict_before
+
+
+@pytest.mark.parametrize("kind", ("symlink", "fifo", "readonly"))
+def test_store_reviewer_report_rejects_unsafe_existing_target(git_repo, kind):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    target = git_repo / ".review/inbox/round-1/A.json"
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    if kind == "symlink":
+        target.symlink_to(git_repo / "tracked.txt")
+    elif kind == "fifo":
+        os.mkfifo(target, 0o600)
+    else:
+        target.write_bytes(b"previous")
+        target.chmod(0o400)
+
+    with pytest.raises(SchemaError, match="^FILE_UNSAFE$"):
+        store_reviewer_report(
+            git_repo,
+            reviewer=Reviewer.A,
+            raw=json.dumps(report(pending.snapshot, "A")).encode(),
+        )
+
+
+def test_explicit_full_panel_recovery_replace_preserves_each_new_response_exactly(
+    git_repo,
+):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    stale = {
+        Reviewer(key): json.dumps(report(pending.snapshot, key)).encode()
+        for key in "ABC"
+    }
+    fresh = {
+        Reviewer(key): json.dumps(report(pending.snapshot, key), separators=(",", ":")).encode()
+        + b"\n"
+        for key in "ABC"
+    }
+    verdict_path = git_repo / ".review/verdict.json"
+    for reviewer, raw in stale.items():
+        store_reviewer_report(git_repo, reviewer=reviewer, raw=raw)
+
+    for reviewer, raw in fresh.items():
+        verdict_before = verdict_path.read_bytes()
+        receipt = store_reviewer_report(
+            git_repo,
+            reviewer=reviewer,
+            raw=raw,
+            replace_pending_recovery=True,
+        )
+        target = git_repo / f".review/inbox/round-1/{reviewer.value}.json"
+        assert target.read_bytes() == raw
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        assert receipt.raw_sha256 == hashlib.sha256(raw).hexdigest()
+        assert verdict_path.read_bytes() == verdict_before
+
+
+def test_validate_stored_reviewer_report_is_snapshot_bound_and_does_not_mutate(
+    git_repo,
+):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
+    verdict_path = git_repo / ".review/verdict.json"
+    verdict_before = verdict_path.read_bytes()
+    store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+
+    parsed, digest = validate_stored_reviewer_report(git_repo, reviewer=Reviewer.A)
+
+    assert parsed.reviewer is Reviewer.A
+    assert digest == hashlib.sha256(raw).hexdigest()
+    assert verdict_path.read_bytes() == verdict_before
+
+
 @pytest.mark.parametrize("control", ("\n", "\t"), ids=("lf", "tab"))
 def test_pending_round_recovers_from_invalid_text_with_a_fresh_complete_panel(
     git_repo, control
@@ -775,6 +1050,43 @@ def test_empty_reports_pass_and_round_one_restart_resets_pending(git_repo):
     )
 
 
+def test_round_one_replaces_owner_private_readonly_verdict(git_repo):
+    """Checking a prior verdict's exact mode would reject safe owner-only state."""
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    verdict_path.chmod(0o400)
+
+    restarted = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+
+    assert restarted.gate.status.value == "in_progress"
+    assert stat.S_IMODE(verdict_path.stat().st_mode) == 0o600
+
+
+def test_verdict_persistence_failure_keeps_write_failure_code(git_repo, monkeypatch):
+    """Mapping failed replacement persistence to file-unsafe breaks stable callers."""
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    before = verdict_path.read_bytes()
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("injected replacement failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(SchemaError, match="^VERDICT_WRITE_FAILED$"):
+        begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+    assert verdict_path.read_bytes() == before
+    # A failed rename leaves its complete private staging link for explicit
+    # recovery: pathname rollback cannot safely distinguish later substitution.
+    residue = tuple((git_repo / ".review").glob(".tmp.*"))
+    assert len(residue) == 1
+    assert stat.S_IMODE(residue[0].stat().st_mode) == 0o600
+    assert residue[0].stat().st_uid == os.geteuid()
+    assert json.loads(residue[0].read_bytes())["gate"]["status"] == "in_progress"
+
+
 def test_round_restart_invalidates_stale_reports_before_fresh_reports_pass(git_repo):
     first = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
@@ -811,6 +1123,9 @@ def test_finalize_rejects_report_path_alias_snapshot_drift_and_nonprivate_file(
     with pytest.raises(SchemaError, match="REPORT_PATH_INVALID"):
         finalize_round(git_repo, reviewer_paths={**paths, "A": alias}, now=NOW)
     paths["A"].chmod(0o644)
+    with pytest.raises(SchemaError, match="FILE_UNSAFE"):
+        finalize_round(git_repo, reviewer_paths=paths, now=NOW)
+    paths["A"].chmod(0o400)
     with pytest.raises(SchemaError, match="FILE_UNSAFE"):
         finalize_round(git_repo, reviewer_paths=paths, now=NOW)
     paths["A"].chmod(0o600)
@@ -1361,6 +1676,53 @@ def test_round_three_failure_rejects_round_one_with_exhaustion(git_repo):
         begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
 
 
+def test_cli_later_round_context_omits_own_decision_executions(git_repo):
+    first = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo, first.snapshot, overrides={"A": {"findings": [finding()]}}
+        ),
+        now=NOW,
+    )
+    commit_fix(git_repo)
+    decisions_path = write_json(
+        git_repo / ".review/inbox/round-1/decisions.json", [decision()]
+    )
+    begin_round(
+        git_repo,
+        base="master",
+        runtime="codex",
+        round_number=2,
+        decisions_path=decisions_path,
+        now=NOW,
+    )
+
+    cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    context = subprocess.run(
+        [sys.executable, str(cli), "context", "--reviewer", "A"],
+        cwd=git_repo,
+        text=True,
+        capture_output=True,
+    )
+
+    assert context.returncode == 0 and context.stderr == ""
+    payload = json.loads(context.stdout)
+    assert payload["own_decisions"] == [
+        {
+            "id": "D-R1-A-001",
+            "finding_ref": {"round": 1, "id": "A-R1-001", "reviewer": "A"},
+            "disposition": "fixed",
+            "rationale": "The failure is now covered by an independent test.",
+        }
+    ]
+    assert "executions" not in json.dumps(payload["own_decisions"])
+    assert "python3 -m pytest -q" not in json.dumps(payload)
+    assert "1 passed" not in json.dumps(payload)
+
+
 def test_cli_json_only_success_and_bounded_domain_error(git_repo):
     cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
     begun = subprocess.run(
@@ -1381,7 +1743,8 @@ def test_cli_json_only_success_and_bounded_domain_error(git_repo):
     )
     assert begun.returncode == 0 and begun.stderr == ""
     payload = json.loads(begun.stdout)
-    assert set(payload) == {"schema", "round", "snapshot", "initial_paths", "gate"}
+    assert set(payload) == {"schema", "round", "snapshot", "initial_paths", "gate", "telemetry"}
+    assert payload["telemetry"]["status"] == "active"
     context = subprocess.run(
         [sys.executable, str(cli), "context", "--reviewer", "A"],
         cwd=git_repo,
@@ -1389,11 +1752,43 @@ def test_cli_json_only_success_and_bounded_domain_error(git_repo):
         capture_output=True,
     )
     context_payload = json.loads(context.stdout)
-    assert (
-        context.returncode == 0
-        and "B" not in json.dumps(context_payload)
-        and "stdout_excerpt" not in json.dumps(context_payload)
+    assert context.returncode == 0
+    assert context_payload["reviewer"] == "A"
+    assert all(
+        item["reviewer"] == "A" for item in context_payload["own_prior_findings"]
     )
+    assert all(
+        item["reviewer"] == "A" for item in context_payload["own_decisions"]
+    )
+    assert "stdout_excerpt" not in json.dumps(context_payload)
+    assert context_payload["contract"] == {"report_text": 2, "diff_recipe": 1}
+    assert context_payload["diff_contract"] == {
+        "version": 1,
+        "digest": "sha256",
+        "arguments": [
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--full-index",
+            context_payload["snapshot"]["merge_base_sha"]
+            + ".."
+            + context_payload["snapshot"]["head_sha"],
+        ],
+        "clear_inherited_prefixes": ["GIT_"],
+        "environment": {
+            "LC_ALL": "C",
+            "LANG": "C",
+            "GIT_PAGER": "cat",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
+        },
+    }
     failed = subprocess.run(
         [
             sys.executable,
@@ -1500,3 +1895,275 @@ def test_cli_help_is_stable_usage_without_stdout(git_repo, arguments):
     assert result.returncode == 2
     assert result.stdout == ""
     assert result.stderr == "PRE_PR_TRIBUNAL:USAGE\n"
+
+
+def run_cli_bytes(git_repo, *arguments, input=b""):
+    cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    return subprocess.run(
+        [sys.executable, str(cli), *arguments],
+        cwd=git_repo,
+        input=input,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_cli_stores_and_validates_exact_report_without_mutating_verdict(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\n"
+    verdict_path = git_repo / ".review/verdict.json"
+    before = verdict_path.read_bytes()
+    stored = run_cli_bytes(git_repo, "store-report", "--reviewer", "A", input=raw)
+    stored_payload = json.loads(stored.stdout)
+    assert stored.returncode == 0 and stored.stderr == b""
+    assert stored_payload == {
+        "reviewer": "A",
+        "round": 1,
+        "status": "stored",
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    validated = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert validated.returncode == 0 and validated.stderr == b""
+    assert json.loads(validated.stdout) == {
+        "reviewer": "A",
+        "round": 1,
+        "status": "valid",
+        "raw_sha256": stored_payload["raw_sha256"],
+    }
+    assert verdict_path.read_bytes() == before
+    assert (git_repo / ".review/inbox/round-1/A.json").read_bytes() == raw
+
+
+def test_cli_validates_stdin_bytes_and_rejects_invalid_without_mutation(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\n"
+    verdict_path = git_repo / ".review/verdict.json"
+    before = verdict_path.read_bytes()
+    target = git_repo / ".review/inbox/round-1/A.json"
+    sentinel = b'{"sentinel":true}\n'
+    target.write_bytes(sentinel)
+    target.chmod(0o600)
+    report_before = target.read_bytes()
+    report_mode_before = stat.S_IMODE(target.stat().st_mode)
+    valid = run_cli_bytes(
+        git_repo,
+        "validate-report",
+        "--reviewer",
+        "A",
+        "--source",
+        "stdin",
+        input=raw,
+    )
+    assert valid.returncode == 0 and valid.stderr == b""
+    assert json.loads(valid.stdout) == {
+        "reviewer": "A",
+        "round": 1,
+        "status": "valid",
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    invalid = run_cli_bytes(
+        git_repo,
+        "validate-report",
+        "--reviewer",
+        "A",
+        "--source",
+        "stdin",
+        input=b'{"schema":1',
+    )
+    assert invalid.returncode == 1
+    assert invalid.stdout == b""
+    assert invalid.stderr == b"PRE_PR_TRIBUNAL:JSON_INVALID\n"
+    assert verdict_path.read_bytes() == before
+    assert target.read_bytes() == report_before
+    assert stat.S_IMODE(target.stat().st_mode) == report_mode_before == 0o600
+
+
+def test_cli_stored_validation_completes_without_reading_open_stdin(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
+    stored = run_cli_bytes(git_repo, "store-report", "--reviewer", "A", input=raw)
+    assert stored.returncode == 0
+
+    cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(cli),
+            "validate-report",
+            "--reviewer",
+            "A",
+            "--source",
+            "stored",
+        ],
+        cwd=git_repo,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        try:
+            returncode = process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            pytest.fail("stored validation read from stdin before completing")
+        stdout, stderr = process.communicate()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+    assert returncode == 0 and stderr == b""
+    assert json.loads(stdout) == {
+        "reviewer": "A",
+        "round": 1,
+        "status": "valid",
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("store-report", "--reviewer", "D"),
+        ("validate-report", "--reviewer", "A", "--source", "other"),
+        ("validate-report", "--reviewer", "A"),
+    ),
+)
+def test_cli_report_usage_is_bounded_exit_two(git_repo, arguments):
+    result = run_cli_bytes(git_repo, *arguments)
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert result.stderr == b"PRE_PR_TRIBUNAL:USAGE\n"
+
+
+def test_cli_stored_validation_rejects_unsafe_mode_symlink_and_swapped_content(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
+    stored = run_cli_bytes(git_repo, "store-report", "--reviewer", "A", input=raw)
+    assert stored.returncode == 0
+    target = git_repo / ".review/inbox/round-1/A.json"
+    target.chmod(0o644)
+    invalid_mode = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert invalid_mode.returncode == 1
+    assert invalid_mode.stderr == b"PRE_PR_TRIBUNAL:FILE_UNSAFE\n"
+
+    target.chmod(0o600)
+    target.unlink()
+    target.symlink_to(git_repo / "tracked.txt")
+    invalid_link = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert invalid_link.returncode == 1
+    assert invalid_link.stderr == b"PRE_PR_TRIBUNAL:FILE_UNSAFE\n"
+
+    target.unlink()
+    target.write_bytes(raw.replace(b'"reviewer":"A"', b'"reviewer":"B"'))
+    target.chmod(0o600)
+    swapped = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert swapped.returncode == 1
+    assert swapped.stderr == b"PRE_PR_TRIBUNAL:REPORT_REVIEWER_MISMATCH\n"
+
+
+def test_cli_report_stdin_reader_surfaces_oversize_without_truncation(git_repo):
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    oversize = b"{" + b" " * MAX_REPORT_BYTES + b"}"
+    result = run_cli_bytes(git_repo, "store-report", "--reviewer", "A", input=oversize)
+    assert result.returncode == 1
+    assert result.stdout == b""
+    assert result.stderr == b"PRE_PR_TRIBUNAL:REPORT_TOO_LARGE\n"
+    assert not (git_repo / ".review/inbox/round-1/A.json").exists()
+
+
+def test_cli_recovery_flag_replaces_only_explicit_fresh_panel_and_normal_refuses(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    stale = {}
+    fresh = {}
+    for reviewer in "ABC":
+        stale[reviewer] = json.dumps(report(pending.snapshot, reviewer)).encode()
+        fresh[reviewer] = (
+            json.dumps(report(pending.snapshot, reviewer), separators=(",", ":")).encode()
+            + b"\n"
+        )
+        result = run_cli_bytes(
+            git_repo, "store-report", "--reviewer", reviewer, input=stale[reviewer]
+        )
+        assert result.returncode == 0
+    for reviewer in "ABC":
+        result = run_cli_bytes(
+            git_repo,
+            "store-report",
+            "--reviewer",
+            reviewer,
+            "--replace-pending-recovery",
+            input=fresh[reviewer],
+        )
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == {
+            "reviewer": reviewer,
+            "round": 1,
+            "status": "stored",
+            "raw_sha256": hashlib.sha256(fresh[reviewer]).hexdigest(),
+        }
+        normal = run_cli_bytes(
+            git_repo, "store-report", "--reviewer", reviewer, input=fresh[reviewer]
+        )
+        assert normal.returncode == 1
+        assert normal.stderr == b"PRE_PR_TRIBUNAL:REPORT_FILE_EXISTS\n"
+
+
+@pytest.mark.parametrize(("drift", "code"), (
+    ("dirty", "WORKTREE_DIRTY"),
+    ("committed", "SNAPSHOT_CHANGED"),
+))
+def test_cli_recovery_rejects_snapshot_drift_before_replacing_any_evidence(git_repo, drift, code):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    paths = report_paths(git_repo, pending.snapshot)
+    fresh = {
+        reviewer: json.dumps(report(pending.snapshot, reviewer), separators=(",", ":")).encode() + b"\n"
+        for reviewer in "ABC"
+    }
+    residue = git_repo / ".review/inbox/round-1/.tmp.1234.0123456789abcdef"
+    residue.write_bytes(b"preserve prior private staging evidence")
+    residue.chmod(0o600)
+    protected = (*paths.values(), git_repo / ".review/verdict.json", residue)
+    before = {path: path.read_bytes() for path in protected}
+    metadata = {path: path.lstat() for path in protected}
+    if drift == "dirty":
+        (git_repo / "tracked.txt").write_text("uncommitted snapshot drift\n")
+    else:
+        commit_fix(git_repo)
+
+    for reviewer in "ABC":
+        result = run_cli_bytes(
+            git_repo, "store-report", "--reviewer", reviewer,
+            "--replace-pending-recovery", input=fresh[reviewer],
+        )
+        assert (result.returncode, result.stdout, result.stderr) == (
+            1, b"", f"PRE_PR_TRIBUNAL:{code}\n".encode(),
+        )
+        for path in protected:
+            assert path.read_bytes() == before[path]
+            after = path.lstat()
+            assert stat.S_IMODE(after.st_mode) == 0o600
+            for field in ("st_ino", "st_uid", "st_mode", "st_mtime_ns", "st_ctime_ns"):
+                assert getattr(after, field) == getattr(metadata[path], field)
+        assert list((git_repo / ".review").rglob(".tmp.*")) == [residue]

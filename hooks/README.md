@@ -130,9 +130,90 @@ deny reason code와 기본 복구는 다음과 같다.
 `finalize`가 reviewer report의 `TEXT_INVALID` 같은 schema 오류로 멈췄지만 verdict가 여전히
 `in_progress`라면, 기존 verdict를 reset하거나 `.review`를 지우지 않는다. 같은 bound snapshot과
 clean 상태를 확인한 뒤 fresh detached view에서 A/B/C 전원을 다시 실행한다. 기존 C가 valid였더라도
-재사용하지 않고, 세 reviewer의 exact 새 terminal JSON으로 inbox 세 파일을 교체한 다음 같은 round를
-`finalize`한다. JSON-decoded string은 NFC여야 하고 Unicode `Cc`/`Cs`를 포함할 수 없으므로 LF/TAB은
-escape로 표현해도 invalid다. Snapshot이 달라졌으면 이 pending 복구를 중단하고 사용자 판단을 받는다.
+재사용하지 않고, 세 reviewer의 fresh exact terminal JSON을 모두 받은 뒤에만 inbox 세 파일을 모두
+교체한 다음 같은 round를 `finalize`한다. JSON-decoded string은 NFC여야 한다. Physical unescaped
+newline은 invalid JSON이지만 JSON escape가 decode한 LF/TAB은 `stdout_excerpt`와 `stderr_excerpt`에서만
+허용된다. CR, NUL, ESC, DEL, other `Cc`, all `Cs`, secret, absolute home path는 invalid다. Snapshot이
+달라졌으면 이 pending 복구를 중단하고 사용자 판단을 받는다.
+
+### Reviewer report handoff and validation
+
+The controller handles each terminal response privately: it never sends one reviewer's output or validation status
+to another reviewer. Pipe the exact response bytes directly to `store-report --reviewer A|B|C`; do not trim,
+parse-and-re-emit, or reserialize them. The receipt returns `raw_sha256`. Immediately validate the stored file with
+`validate-report --reviewer A|B|C --source stored` and retain the matching digest. `validate-report --source stdin`
+is available only to validate supplied input without writing it; it is not a replacement for stored validation.
+
+Before the unchanged three-path `finalize`, validate each stored A/B/C report again and compare each `raw_sha256`
+with its store receipt. Immediately before that call, check every inbox report is a current-user-owned, regular,
+non-symlink file with exact mode `0600`. A missing, mismatched, unsafe, malformed, timed-out, or invalid report is
+non-pass: wait for already-started reviewers, attempt non-force detached-view cleanup, and do not call `finalize`.
+
+Pending recovery requires explicit user intervention and a fresh complete A/B/C panel. Wait until all three fresh
+responses are terminal before any replacement, then replace all three exact byte inputs with
+`store-report --reviewer X --replace-pending-recovery`; never reuse a prior-round artifact or one valid peer.
+
+### Telemetry is observational
+
+`begin` returns the telemetry run ID and records `snapshot_preflight`. Telemetry requires the whole `.review/`
+namespace to be ignored and untracked, including possible private staging artifacts; individual file ignore rules
+make telemetry unavailable without changing the primary `begin` result. The controller starts `reviewer_dispatch_wait`
+before dispatch, finishes it at runtime acceptance, and starts `reviewer_total` at acceptance through the terminal
+response. If acceptance is unavailable, both spans start before dispatch and finish at the terminal response;
+dispatch is `incomplete` with `RUNTIME_SIGNAL_UNAVAILABLE`, and total retains the actual dispatch-to-terminal duration.
+Do not invent a 0ms acceptance interval. Other spans surround their operations: `view_create`, `report_store`,
+`report_validation`, `view_cleanup`, `recovery_retry`, and pre-final checks through `finalize`.
+
+<!-- telemetry-command-examples -->
+```bash
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-start --run-id "$RUN_ID" --stage reviewer_total --reviewer A --attempt 1
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome success
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome failure --reason-code REPORT_SCHEMA_INVALID
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome timeout --reason-code REVIEWER_TIMEOUT
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome incomplete --reason-code CONTROLLER_INTERRUPTED
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome clock_anomaly --reason-code TELEMETRY_CLOCK_ANOMALY
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-recover --run-id "$RUN_ID"
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-close --run-id "$RUN_ID" --outcome incomplete --reason-code CONTROLLER_INTERRUPTED
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-summary --run-id "$RUN_ID"
+```
+<!-- telemetry-command-examples-end -->
+
+`telemetry-start` requires the run ID, stage, and positive attempt. `snapshot_preflight` and `finalize` require no
+reviewer; every other stage except `recovery_retry` requires one A/B/C reviewer, and `recovery_retry` may omit it.
+`telemetry-finish` requires the run ID, span ID, outcome, and a stable `--reason-code` for `failure`, `timeout`,
+`incomplete`, or `clock_anomaly`; `success` omits the reason code. `telemetry-close` has the same outcome/reason
+rule without a span ID. `telemetry-recover` and `telemetry-summary` require only the run ID.
+
+`telemetry-start` returns `{run_id, span_id, stage, reviewer, status:"running"}`. `telemetry-finish` returns
+`{run_id, span_id, status, duration_ms}`; `telemetry-recover` returns `{run_id, recovered_count}`; and
+`telemetry-close` returns `{run_id, status}`. `telemetry-summary` returns bounded
+`{schema, binding, reviewers, stages, outcomes, telemetry_incomplete, anomaly_reason_codes, early_detection}`.
+If `begin` cannot create an observation, it returns `{status:"unavailable", reason_code}`; an external telemetry
+command returns its bounded telemetry error. In both cases, retain the primary tribunal result and record the missing
+observation rather than inventing a run or changing a gate result.
+
+Attempts start at 1 per run/stage/reviewer and increase for repeated operations. Before every terminal success or
+failure exit, finish observed spans, recover any remaining running spans with `telemetry-recover`, and call
+`telemetry-close` with the primary outcome after the required peer wait and non-force cleanup. Close each round
+before beginning another. On resumed interruption, recover the known running run before a new `recovery_retry`
+attempt. A previously closed or unavailable run remains an observation gap during pending report recovery;
+never reopen it or call `begin` solely for telemetry. The canonical Skill's telemetry lifecycle tables define the
+executable event/command order for both runtimes.
+
+Telemetry failure is an observation gap only. Telemetry is never a gate input and does not change report validity,
+gate status, or the finalize decision.
+
+### Snapshot diff contract and stable CLI codes
+
+The bound diff is SHA-256 over `/usr/bin/git diff --binary --no-ext-diff --no-textconv --full-index
+<merge-base>..<head-sha>`. The command clears inherited `GIT_` variables and fixes `LC_ALL=C`, `LANG=C`,
+`GIT_PAGER=cat`, `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+`GIT_ATTR_NOSYSTEM=1`, and disables `core.fsmonitor` through the documented command-local config vector.
+
+CLI failures use bounded stable codes, including `USAGE`, `ROUND_NOT_IN_PROGRESS`, `SNAPSHOT_CHANGED`,
+`REPORT_FILE_EXISTS`, `REVIEWER_REPORT_MISSING`, `TEXT_INVALID`, `FILE_UNSAFE`, and telemetry's
+`TELEMETRY_INVALID`, `TELEMETRY_FILE_UNSAFE`, `TELEMETRY_TOO_LARGE`, or `TELEMETRY_CLOCK_ANOMALY`.
+Do not treat any telemetry code as report or gate evidence.
 
 `head_ref`가 도입되기 전에 생성된 terminal FAIL verdict는 다음 round `begin`에서만 현재 named
 branch를 새 snapshot에 기록하며 자동 전환된다. 그런 legacy verdict 자체는 PR을 허용하지 않는다.

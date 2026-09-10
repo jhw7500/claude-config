@@ -26,7 +26,9 @@ PACKAGE_NAMES = (
     "git_state.py",
     "hook_common.py",
     "model.py",
+    "review_store.py",
     "shell_scan.py",
+    "telemetry.py",
     "verdict_store.py",
 )
 SKILL_SOURCE = REPO / "skills/pre-pr-tribunal"

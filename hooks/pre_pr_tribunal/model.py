@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import json
 import re
 from typing import Mapping, Sequence
@@ -12,6 +13,7 @@ from urllib.parse import urlsplit
 
 
 SCHEMA_VERSION = 1
+REPORT_TEXT_CONTRACT_VERSION = 2
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -37,6 +39,7 @@ _SECRET = re.compile(
 _HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>]+")
 _HTTP_URL_START = re.compile(r"https?://", re.IGNORECASE)
 _SHELL_CONTROL = frozenset(";|&()<>`")
+_EXCERPT_CONTROLS = frozenset(("\n", "\t"))
 _MAX_SHELL_NESTING = 64
 
 
@@ -602,11 +605,24 @@ def _contains_home_path(text: str) -> bool:
     return False
 
 
-def _evidence(value: object) -> str:
-    text = _text(value, MAX_EVIDENCE_TEXT_BYTES, allow_empty=True)
-    if _SECRET.search(text) or _contains_home_path(text):
+def _execution_excerpt(value: object) -> str:
+    if not isinstance(value, str):
+        raise SchemaError("TEXT_INVALID")
+    try:
+        size = len(value.encode("utf-8", "strict"))
+    except UnicodeEncodeError:
+        raise SchemaError("TEXT_INVALID") from None
+    if size > MAX_EVIDENCE_TEXT_BYTES:
+        raise SchemaError("TEXT_TOO_LARGE")
+    if unicodedata.normalize("NFC", value) != value or any(
+        unicodedata.category(character) in {"Cc", "Cs"}
+        and character not in _EXCERPT_CONTROLS
+        for character in value
+    ):
+        raise SchemaError("TEXT_INVALID")
+    if _SECRET.search(value) or _contains_home_path(value):
         raise SchemaError("EVIDENCE_SECRET_DETECTED")
-    return text
+    return value
 
 
 def _command(value: object) -> str:
@@ -684,8 +700,8 @@ def _parse_execution(
     exit_code = _integer(
         obj["exit_code"], "EXECUTION_SCHEMA_INVALID", minimum=-255, maximum=255
     )
-    stdout = _evidence(obj["stdout_excerpt"])
-    stderr = _evidence(obj["stderr_excerpt"])
+    stdout = _execution_excerpt(obj["stdout_excerpt"])
+    stderr = _execution_excerpt(obj["stderr_excerpt"])
     capture = obj["capture_sha256"]
     if not isinstance(capture, str) or _SHA256.fullmatch(capture) is None:
         raise SchemaError("EXECUTION_SCHEMA_INVALID")
@@ -918,6 +934,23 @@ def parse_reviewer_report(
         claims,
         responses,
     )
+
+
+def validate_report_bytes(
+    raw: bytes,
+    *,
+    expected_reviewer: Reviewer,
+    expected_round: int,
+    snapshot: Snapshot,
+) -> tuple[ReviewerReport, str]:
+    """Validate one exact reviewer response and return its raw-byte digest."""
+    report = parse_reviewer_report(
+        raw,
+        expected_reviewer=expected_reviewer,
+        expected_round=expected_round,
+        snapshot=snapshot,
+    )
+    return report, hashlib.sha256(raw).hexdigest()
 
 
 def _blocker_identity(value: object) -> tuple[str, int, Reviewer]:
