@@ -7,13 +7,50 @@ Date: 2026-09-10
 - Original master base: `df1285dbb7655717af3d60c7fc098715a29203dd`
 - Prior full-suite implementation HEAD: `e37694d39fcf50233d8f6437d236a150b70401fe`
 - Receipt-binding fix HEAD: `520e505295be7e96cb92057dcd339dd78a5fd4a2`
+- Final reviewed and full-suite-tested implementation HEAD: `a5d045e8f26d7c7fff6aca7ba5b834ad3e81840e`
 - The root controller rechecked `e37694d39fcf50233d8f6437d236a150b70401fe` unchanged and the tracked worktree clean immediately after that full run. The 3517-test result below does not prove the later receipt-binding fix.
 - Evidence is committed separately after testing; the evidence commit itself is not represented as tested implementation code.
 - All installed canaries used pytest-created temporary homes and repositories with the probe's masked environment and process containment.
 - The user's real installed runtime, runtime configuration, credentials, and #109 `.review` state were untouched. No install, PR, push, claim, or remote reviewer operation was performed.
 - Evidence is sanitized: it contains no credentials, absolute home paths, raw reviewer reports, or telemetry bodies.
 
-## Focused verification
+## Final reviewed implementation verification
+
+The root controller verified the exact HEAD `a5d045e8f26d7c7fff6aca7ba5b834ad3e81840e` before and after the final full run, with clean post-run status. All results in this section apply to that frozen implementation; this later evidence-only document commit is not represented as the tested code SHA.
+
+| Command | Result |
+| --- | --- |
+| `rtk proxy .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q --junitxml=.superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/final-reviewed-pytest.xml` | 3543 passed in 429.34s (0:07:09); exit 0; JUnit errors 0, failures 0, skipped 0 |
+| `rtk proxy .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m py_compile hooks/pre_pr_tribunal/*.py scripts/install-pre-pr-tribunal.py scripts/probe-pre-pr-tribunal.py` | Exit 0 |
+| `rtk git diff --check df1285dbb7655717af3d60c7fc098715a29203dd HEAD` | Exit 0 |
+| `rtk git merge-base --is-ancestor fae27ef988f199eccc777022f3252f3872719c8a HEAD` | Exit 0 |
+
+The same full-run JUnit artifact includes 1460 `tests.pre_pr_tribunal` cases (summed testcase time 286.839s) and 16 `tests.runtime_hook_installer` cases (summed testcase time 0.417s). These are included-group counts and testcase-time sums, not additional test executions or wall-clock durations.
+
+The final broad source review at `5a60252` returned two Important findings and one Minor finding. The one batched fix at `a5d045e` received scoped re-review approval: all three findings addressed, no new breakage or deferred items. This implementation review is not an actual pre-PR tribunal verdict.
+
+| Finding | Final behavior |
+| --- | --- |
+| Missing pre-seal reviewer-local decision closure | Submission validates the role's responses and replacement references before publication/sealing. Corrected fresh content can retry that pending role; sealed peers stay intact. Finalization retains full closure revalidation. Invalid existing canonical orphans remain hard integrity stops outside fresh-input retry handling. |
+| Incomplete report-content allowlist | Finding schema, bounded finding/execution/claim count limits, missing decision responses, and invalid replacement references enter the exact bounded evidence and same-role retry path. Legacy migration preserves invalid content and leaves every role pending. Byte/count limits and state/storage/snapshot/contract/ownership/digest integrity checks remain enforced. |
+| Replacement/resume view bookkeeping | Both allocation paths explicitly repeat step 5's immediate `CREATED_VIEWS` registration, bound-HEAD/clean/absent-`.review` checks before dispatch, and started-handle tracking. |
+
+## Final batched fix RED/GREEN evidence
+
+The initial selected RED run had 22 failures and 6 passes. Six native content cases first failed in fixture setup because the HIGH B peer lacked required execution evidence; those setup failures are not product RED. After correcting the fixture, all six independently failed because the pending failure count remained 0. The other 16 original failures directly reproduced missing pre-seal validation, legacy migration aborts, and installed C retry aborts.
+
+| Phase | Command | Result |
+| --- | --- | --- |
+| Initial RED | `rtk proxy .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q tests/pre_pr_tribunal/test_model_store.py tests/pre_pr_tribunal/test_probe_harness.py -k 'bounded_content_errors or only_originating_reviewer or orphan_content_error or valid_peers_when_c_retries' --tb=short` | 22 failed, 6 passed, 465 deselected in 22.85s; six setup failures qualified above |
+| Native content RED after fixture correction | `rtk proxy .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q tests/pre_pr_tribunal/test_model_store.py -k 'bounded_content_errors and False' --tb=short` | 6 failed, 360 deselected in 1.11s; actual cumulative attempt count 0 instead of 1 |
+| Combined GREEN | Same command as initial RED, after the fix | 28 passed, 465 deselected in 27.91s |
+| Existing installed integrity/recovery canaries | `rtk proxy .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py -k 'submit_receipt_status_inconsistency or resumes_only_pending or migrates_unproven or seals_blocker or rechecks_each_report or telemetry_failure or contract_drift' --tb=short` | 11 passed, 116 deselected in 30.11s |
+| Covering suites | `rtk proxy .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q tests/pre_pr_tribunal/test_model_store.py tests/pre_pr_tribunal/test_attempt_store.py tests/pre_pr_tribunal/test_review_context.py tests/pre_pr_tribunal/test_skill_contract.py --tb=short` | 439 passed, 1 failed in 66.17s; the only failure was a case-sensitive documentation marker |
+| Covering documentation correction | `rtk proxy .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q tests/pre_pr_tribunal/test_skill_contract.py --tb=short` | 30 passed in 2.64s after restoring `Then dispatch` |
+
+The full 3543-pass result above covers the final documentation correction and all runtime/test changes. Fresh malformed reports remain pending with exact evidence; corrected same-role submission succeeds at cumulative attempt 2. Existing orphan content/closure failures preserve canonical bytes, verdict, and counters without creating fresh failure evidence. The installed canaries dispatch A/B once and retry only C for malformed finding schemas and all three bounded count failures.
+
+## Historical focused verification
 
 | Command | Stable result |
 | --- | --- |
@@ -22,9 +59,9 @@ Date: 2026-09-10
 | `rtk .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py` | 120 passed in 128.12s |
 | `rtk .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py -k 'resumes_only_pending_c_and_reuses_native_sealed_peers'` | 1 passed, 119 deselected in 3.83s |
 
-## Frozen-HEAD final verification
+## Historical full-suite verification
 
-These full-run results apply specifically to the pre-fix implementation HEAD `e37694d39fcf50233d8f6437d236a150b70401fe`. A fresh root-owned full run at the final reviewed code state is pending.
+These earlier full-run results apply specifically to the pre-fix implementation HEAD `e37694d39fcf50233d8f6437d236a150b70401fe`. They are historical evidence, not proof of the later closure/content-policy fix; final reviewed-code evidence appears above.
 
 | Command | Result |
 | --- | --- |
@@ -36,6 +73,8 @@ These full-run results apply specifically to the pre-fix implementation HEAD `e3
 The full repository run is also the final coverage of `tests/pre_pr_tribunal` and `tests/runtime_hook_installer`; it was intentionally not duplicated as an immediately preceding aggregate directory run.
 
 The JUnit artifact from that single full run contains 1434 `tests.pre_pr_tribunal` cases (summed testcase time 228.025s) and 16 `tests.runtime_hook_installer` cases (summed testcase time 0.433s). These are included-group counts and testcase-time sums, not separate executions or wall-clock durations.
+
+The subsequent root run at unchanged `5a6025265675f2c6bdfc907d8096f7e901fb92b1` passed 3520 tests in 391.11s (0:06:31), exit 0, with JUnit errors/failures/skips all 0. Its command was `rtk proxy .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q --junitxml=.superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/final-fix1-pytest.xml`. This also predates the final closure/content-policy correction and is not relabeled as its validation.
 
 ## Receipt-binding fix verification
 
@@ -101,10 +140,12 @@ Each ruling below retains the controller's reason and explicit cost/tradeoff so 
 21. Ruling: At Task8, commit tested implementation before the validation-evidence document, then commit evidence separately. The document names the exact tested code HEAD/base, not an impossible self-referential final documentation commit — wrong choice adds one small evidence commit, but avoids claiming an untested or circular SHA as the tested implementation.
 22. Ruling: Root will execute the final full repository suite once at Task8's frozen implementation HEAD; this run also covers complete tribunal/runtime-hook suites, with directory counts from its result artifact. Do not separately repeat both full focused directories immediately before the full suite. The implementer still runs new/changed probe/installer tests for GREEN — wrong choice may require richer result grouping, but avoids the user's explicitly unwanted redundant broad checks.
 23. Ruling: Task8 may add only the root-anchored /.ai/handoff.md ignore entry for the already-identified generated private Project Control sidecar. Preserve its bytes, do not ignore the directory broadly or weaken dirty-worktree checks — wrong choice hides that one local path from default git status, but avoids discarding/publishing private handoff data or permanently blocking review on generated context.
+24. Ruling: Validate each fresh report's reviewer-local decision responses and replacement references before canonical publication and irreversible sealing, then retain the full finalization closure recheck. Missing/invalid reviewer-local closure is bounded report-content failure, not a reason to seal an unrecoverable slot; existing orphan validation stays outside fresh-input retry handling — the original plan kept terminal validation without adapting the earlier acceptance boundary — wrong choice adds local validation and fixture changes, but prevents a permanently unfinalizable round without permitting sealed-report replacement or peer exposure.
+25. Ruling: Include finding-schema and bounded finding/execution/claim count-limit failures, plus missing decision responses and invalid replacement references, in the explicit report-content retry/evidence policy across runtime, probe and guide. Keep byte/count limits enforced and storage/state/contract/snapshot/ownership/digest integrity failures hard — the sample allowlist and exclusion fixture contradicted the broader malformed-report recovery contract — wrong choice broadens which rejected bounded input gets retained and retried, but evidence remains size/retention limited and valid blocker reports are never replaced.
 
 ## Limitations and next gates
 
 - The canaries use deterministic synthetic reports; they validate installed storage, state transitions, contract binding, authentication, and warning behavior, not reviewer-model quality.
 - The Task 7 consumer check covers one fresh post-edit response across five scenarios and is not a statistical reliability claim.
-- The 3517-test full run and its compile/diff evidence apply to pre-fix HEAD `e37694d39fcf50233d8f6437d236a150b70401fe`; fix HEAD `520e505295be7e96cb92057dcd339dd78a5fd4a2` currently has the focused 8-test proof above. Root owns fresh final full verification after review.
+- Historical results apply only to their named commits. The final reviewed implementation `a5d045e8f26d7c7fff6aca7ba5b834ad3e81840e` has the fresh 3543-test full result above; the later evidence-only commit is not a circular tested-code claim.
 - This validation does not recover #109, install the branch, create or merge a PR, or assert that an actual pre-PR tribunal has passed. Those remain separate review and authorization gates.
