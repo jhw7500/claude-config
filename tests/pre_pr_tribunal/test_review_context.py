@@ -8,10 +8,12 @@ import sys
 import pytest
 
 from pre_pr_tribunal.model import (
+    Decision,
     REPORT_TEXT_CONTRACT_VERSION,
     ReportReceipt,
     Reviewer,
     ReviewerSlot,
+    RoundSummary,
     SchemaError,
     parse_reviewer_report,
 )
@@ -82,6 +84,42 @@ def _sealed_slot(verdict, reviewer):
     )
 
 
+def _with_mixed_prior_reviewer_data(verdict):
+    findings = tuple(
+        {
+            "id": f"{reviewer}-R1-001",
+            "reviewer": reviewer,
+            "severity": "HIGH",
+        }
+        for reviewer in "ABC"
+    )
+    decisions = tuple(
+        Decision(
+            id=f"D-R1-{reviewer}-001",
+            finding_round=1,
+            finding_id=f"{reviewer}-R1-001",
+            reviewer=Reviewer(reviewer),
+            disposition="fixed",
+            rationale=f"{reviewer} remediation is covered.",
+            executions=(),
+        )
+        for reviewer in "ABC"
+    )
+    return replace(
+        verdict,
+        history=(
+            RoundSummary(
+                round=1,
+                head_sha=verdict.head_sha,
+                diff_sha256=verdict.diff_sha256,
+                blocking_findings=findings,
+                decision_outcomes=(),
+            ),
+        ),
+        decisions=decisions,
+    )
+
+
 def test_context_digest_is_over_canonical_body_and_is_stable(git_repo):
     pending_verdict = _v2_pending(git_repo)
     body = reviewer_context_body(pending_verdict, Reviewer.A)
@@ -97,7 +135,7 @@ def test_context_digest_is_over_canonical_body_and_is_stable(git_repo):
 
 
 def test_sealing_peer_does_not_change_pending_reviewer_context(git_repo):
-    pending_verdict = _v2_pending(git_repo)
+    pending_verdict = _with_mixed_prior_reviewer_data(_v2_pending(git_repo))
     before = context_sha256(pending_verdict, Reviewer.C)
     changed = replace(
         pending_verdict,
@@ -109,10 +147,31 @@ def test_sealing_peer_does_not_change_pending_reviewer_context(git_repo):
     assert context_sha256(changed, Reviewer.C) == before
     body = reviewer_context_body(changed, Reviewer.C)
     assert "reviewers" not in body
-    assert all(item["reviewer"] == "C" for item in body["own_prior_findings"])
-    assert all(
-        item["finding_ref"]["reviewer"] == "C" for item in body["own_decisions"]
+    assert body["own_prior_findings"] == [
+        {"id": "C-R1-001", "reviewer": "C", "severity": "HIGH"}
+    ]
+    assert body["own_decisions"] == [
+        {
+            "id": "D-R1-C-001",
+            "finding_ref": {"round": 1, "id": "C-R1-001", "reviewer": "C"},
+            "disposition": "fixed",
+            "rationale": "C remediation is covered.",
+        }
+    ]
+
+
+def test_context_rejects_sealed_reviewer_slot(git_repo):
+    pending_verdict = _v2_pending(git_repo)
+    sealed = replace(
+        pending_verdict,
+        reviewers={
+            **pending_verdict.reviewers,
+            "A": _sealed_slot(pending_verdict, Reviewer.A),
+        },
     )
+
+    with pytest.raises(SchemaError, match="^REVIEWER_SLOT_SEALED$"):
+        reviewer_context_envelope(sealed, Reviewer.A)
 
 
 def test_context_rejects_installed_contract_drift(git_repo):
