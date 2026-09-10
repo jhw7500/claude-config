@@ -5,8 +5,9 @@ Date: 2026-09-10
 ## Revisions and safety boundary
 
 - Original master base: `df1285dbb7655717af3d60c7fc098715a29203dd`
-- Tested implementation HEAD: `e37694d39fcf50233d8f6437d236a150b70401fe`
-- The root controller rechecked that HEAD unchanged and the tracked worktree clean immediately after the full run.
+- Prior full-suite implementation HEAD: `e37694d39fcf50233d8f6437d236a150b70401fe`
+- Receipt-binding fix HEAD: `520e505295be7e96cb92057dcd339dd78a5fd4a2`
+- The root controller rechecked `e37694d39fcf50233d8f6437d236a150b70401fe` unchanged and the tracked worktree clean immediately after that full run. The 3517-test result below does not prove the later receipt-binding fix.
 - Evidence is committed separately after testing; the evidence commit itself is not represented as tested implementation code.
 - All installed canaries used pytest-created temporary homes and repositories with the probe's masked environment and process containment.
 - The user's real installed runtime, runtime configuration, credentials, and #109 `.review` state were untouched. No install, PR, push, claim, or remote reviewer operation was performed.
@@ -23,16 +24,28 @@ Date: 2026-09-10
 
 ## Frozen-HEAD final verification
 
+These full-run results apply specifically to the pre-fix implementation HEAD `e37694d39fcf50233d8f6437d236a150b70401fe`. A fresh root-owned full run at the final reviewed code state is pending.
+
 | Command | Result |
 | --- | --- |
 | `rtk proxy .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q --junitxml=.superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/final-pytest.xml` | 3517 passed in 351.15s (0:05:51); exit 0; JUnit errors 0, failures 0, skipped 0 |
-| `rtk .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m py_compile hooks/pre_pr_tribunal/*.py scripts/install-pre-pr-tribunal.py scripts/probe-pre-pr-tribunal.py` | Exit 0 |
+| `rtk proxy .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m py_compile hooks/pre_pr_tribunal/*.py scripts/install-pre-pr-tribunal.py scripts/probe-pre-pr-tribunal.py` | Exit 0 |
 | `rtk git diff --check df1285dbb7655717af3d60c7fc098715a29203dd HEAD` | Exit 0; no whitespace errors |
 | `rtk git merge-base --is-ancestor fae27ef988f199eccc777022f3252f3872719c8a HEAD` | Exit 0; #109 dependency is present in ancestry |
 
 The full repository run is also the final coverage of `tests/pre_pr_tribunal` and `tests/runtime_hook_installer`; it was intentionally not duplicated as an immediately preceding aggregate directory run.
 
 The JUnit artifact from that single full run contains 1434 `tests.pre_pr_tribunal` cases (summed testcase time 228.025s) and 16 `tests.runtime_hook_installer` cases (summed testcase time 0.433s). These are included-group counts and testcase-time sums, not separate executions or wall-clock durations.
+
+## Receipt-binding fix verification
+
+| Phase | Command | Result |
+| --- | --- | --- |
+| RED: digest and numeric attempt divergence | `rtk .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py -k 'submit_receipt_status_inconsistency'` | 2 failed, 120 deselected in 5.63s; both incorrectly finalized before the fix |
+| RED: boolean attempt divergence | `rtk .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py -k 'submit_receipt_status_inconsistency and boolean_attempt'` | 1 failed, 122 deselected in 5.28s; `True` incorrectly matched attempt 1 before strict typing |
+| GREEN at `520e505295be7e96cb92057dcd339dd78a5fd4a2` | `rtk .superpowers/sdd/2026-09-10-pre-pr-tribunal-slot-recovery/test-venv/bin/python -m pytest -q tests/pre_pr_tribunal/test_probe_harness.py -k 'submit_receipt_status_inconsistency or submits_validates_and_finalizes_exact_reports or preserves_valid_peers_when_c_retries or resumes_only_pending_c_and_reuses_native_sealed_peers'` | 8 passed, 115 deselected in 25.78s |
+
+The fix retains each new transient submit receipt, requires a strict positive non-boolean integer attempt, compares its digest and attempt directly with final status, and validates stored bytes against that same retained digest. It does not change the installed runtime API.
 
 ## Installed canary outcomes
 
@@ -46,6 +59,7 @@ The JUnit artifact from that single full run contains 1434 `tests.pre_pr_tribuna
 | Sealed byte, mode, or symlink tamper after stored validation | Installed authenticated finalize rejected each case with stable `REPORT_BYTES_MISMATCH` or `FILE_UNSAFE`; verdict stayed in progress. |
 | Corrupt telemetry ledger | Primary native lifecycle still returned PASS; bounded warning projection reported `TELEMETRY_INVALID`; corrupt telemetry body was not emitted. |
 | Installed contract mismatch | The next pending-slot context operation returned stable `CONTRACT_DRIFT`; no false success was claimed. |
+| Submit receipt/status inconsistency | Digest, numeric-attempt, and boolean-attempt divergence returned stable `REPORT_RECEIPT_MISMATCH` before finalize at fix HEAD `520e505295be7e96cb92057dcd339dd78a5fd4a2`. |
 | Deterministic package rollout | Every planned and installed Python source digest matched its source digest; `attempt_store.py` and `review_context.py` were explicitly present. |
 
 ## Task 7 consuming-agent behavior evidence
@@ -92,4 +106,5 @@ Each ruling below retains the controller's reason and explicit cost/tradeoff so 
 
 - The canaries use deterministic synthetic reports; they validate installed storage, state transitions, contract binding, authentication, and warning behavior, not reviewer-model quality.
 - The Task 7 consumer check covers one fresh post-edit response across five scenarios and is not a statistical reliability claim.
+- The 3517-test full run and its compile/diff evidence apply to pre-fix HEAD `e37694d39fcf50233d8f6437d236a150b70401fe`; fix HEAD `520e505295be7e96cb92057dcd339dd78a5fd4a2` currently has the focused 8-test proof above. Root owns fresh final full verification after review.
 - This validation does not recover #109, install the branch, create or merge a PR, or assert that an actual pre-PR tribunal has passed. Those remain separate review and authorization gates.
