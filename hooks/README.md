@@ -149,8 +149,13 @@ one byte is not the full oversized response evidence; preserve that complete rej
 A valid submit returns a sealed receipt with `raw_sha256`, `context_sha256`, `report_contract_version`, `attempt`,
 and `provenance`. Validate it immediately with `validate-report --reviewer A|B|C --source stored`. A valid HIGH or
 CRITICAL report stays sealed and contributes to final blocker aggregation. For a format rejection such as
-`JSON_INVALID`, `REPORT_TOO_LARGE`, or `TEXT_INVALID`, keep the verified detached view and send a complete format-only
-retry to the same handle. For a supported terminal dispatch/process/timeout failure, use only
+`JSON_INVALID`, `REPORT_TOO_LARGE`, `TEXT_INVALID`, `FINDING_SCHEMA_INVALID`, or bounded
+`FINDING_LIMIT_EXCEEDED`/`EXECUTION_LIMIT_EXCEEDED`/`CLAIM_LIMIT_EXCEEDED`, keep the verified detached view and send a complete format-only
+retry to the same handle. Fresh reports must also satisfy reviewer-local decision closure before sealing;
+`PRIOR_DECISION_RESPONSE_MISSING`/`PRIOR_DECISION_RESPONSE_INVALID` and
+`REPLACEMENT_FINDING_REQUIRED`/`REPLACEMENT_FINDING_INVALID` follow that same bounded content path.
+Finalization rechecks all-slot closure. Existing canonical-orphan failures remain integrity stops, outside
+fresh-input retry handling. For a supported terminal dispatch/process/timeout failure, use only
 `record-failure --reviewer X --reason DISPATCH_FAILED|REVIEWER_FAILED|REVIEWER_TIMEOUT`, then dispatch a fresh
 same-role replacement. A wait API expiring while its handle remains running is not a reviewer timeout: continue that
 handle without recording failure, duplicating the reviewer, or cleaning its view.

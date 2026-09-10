@@ -861,6 +861,7 @@ def submit_reviewer_report(
                     existing, expected_reviewer=reviewer, expected_round=pending.round,
                     snapshot=snapshot,
                 )
+                _validate_reviewer_closure(pending, parsed)
             else:
                 if len(raw) > MAX_ATTEMPT_RAW_BYTES:
                     raise SchemaError("REPORT_TOO_LARGE")
@@ -869,6 +870,7 @@ def submit_reviewer_report(
                         raw, expected_reviewer=reviewer, expected_round=pending.round,
                         snapshot=snapshot,
                     )
+                    _validate_reviewer_closure(pending, parsed)
                 except SchemaError as error:
                     if error.code in REPORT_RETRYABLE_CODES:
                         _record_failure_locked(review_fd, pending, reviewer, error.code, raw)
@@ -1189,37 +1191,45 @@ def begin_round(
         return pending
 
 
+def _validate_reviewer_closure(
+    verdict: Verdict, report: ReviewerReport, *, seen_replacements: set[str] | None = None,
+) -> None:
+    """Check only this role's responses before accepting its immutable report."""
+    decisions = {
+        item.id: item for item in verdict.decisions if item.reviewer is report.reviewer
+    }
+    responses = {item.decision_id: item for item in report.prior_decisions}
+    if set(responses) != set(decisions):
+        if not set(decisions).issubset(responses):
+            raise SchemaError("PRIOR_DECISION_RESPONSE_MISSING")
+        raise SchemaError("PRIOR_DECISION_RESPONSE_INVALID")
+    if seen_replacements is None:
+        seen_replacements = set()
+    findings = {item.id: item for item in report.findings}
+    for response in responses.values():
+        decision = decisions[response.decision_id]
+        if response.outcome == "accepted":
+            continue
+        replacement = response.replacement_finding_id
+        if replacement is None:
+            raise SchemaError("REPLACEMENT_FINDING_REQUIRED")
+        finding = findings.get(replacement)
+        if (
+            finding is None
+            or finding.severity not in {Severity.CRITICAL, Severity.HIGH}
+            or replacement == decision.finding_id
+            or replacement in seen_replacements
+        ):
+            raise SchemaError("REPLACEMENT_FINDING_INVALID")
+        seen_replacements.add(replacement)
+
+
 def _validate_closure(verdict: Verdict, reports: Mapping[str, ReviewerReport]) -> None:
-    decisions = {item.id: item for item in verdict.decisions}
     seen_replacements: set[str] = set()
     for reviewer in "ABC":
-        responses = {
-            item.decision_id: item for item in reports[reviewer].prior_decisions
-        }
-        expected = {
-            item.id for item in decisions.values() if item.reviewer.value == reviewer
-        }
-        if set(responses) != expected:
-            if not expected.issubset(responses):
-                raise SchemaError("PRIOR_DECISION_RESPONSE_MISSING")
-            raise SchemaError("PRIOR_DECISION_RESPONSE_INVALID")
-        findings = {item.id: item for item in reports[reviewer].findings}
-        for response in responses.values():
-            decision = decisions[response.decision_id]
-            if response.outcome == "accepted":
-                continue
-            replacement = response.replacement_finding_id
-            if replacement is None:
-                raise SchemaError("REPLACEMENT_FINDING_REQUIRED")
-            finding = findings.get(replacement)
-            if (
-                finding is None
-                or finding.severity not in {Severity.CRITICAL, Severity.HIGH}
-                or replacement == decision.finding_id
-                or replacement in seen_replacements
-            ):
-                raise SchemaError("REPLACEMENT_FINDING_INVALID")
-            seen_replacements.add(replacement)
+        _validate_reviewer_closure(
+            verdict, reports[reviewer], seen_replacements=seen_replacements,
+        )
     if verdict.round == 1 and any(
         report.prior_decisions for report in reports.values()
     ):

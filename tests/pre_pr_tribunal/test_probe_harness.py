@@ -782,14 +782,22 @@ def test_installed_probe_rejects_submit_receipt_status_inconsistency(
     assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "in_progress"
 
 
-def test_installed_probe_preserves_valid_peers_when_c_retries(tmp_path):
+@pytest.mark.parametrize(("field", "values"), (
+    (None, None), ("findings", [{}]), ("findings", [{}] * 129),
+    ("executions", [{}] * 129), ("claims", [{}] * 129),
+))
+def test_installed_probe_preserves_valid_peers_when_c_retries(tmp_path, field, values):
     module, home, repo, cli = _installed_lifecycle(tmp_path)
     attempts = {"A": 0, "B": 0, "C": 0}
 
     def report_factory(reviewer, attempt, snapshot):
         attempts[reviewer] += 1
         if reviewer == "C" and attempt == 1:
-            return b'{"schema":1'
+            if field is None:
+                return b'{"schema":1'
+            invalid = json.loads(module._synthetic_report_bytes(reviewer, attempt, snapshot))
+            invalid[field] = values
+            return json.dumps(invalid).encode()
         return module._synthetic_report_bytes(reviewer, attempt, snapshot)
 
     result = module._create_pass_verdict(

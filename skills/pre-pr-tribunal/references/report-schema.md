@@ -80,6 +80,8 @@ The exact controller command shapes are below. `submit-report` reads exact repor
 
 `JSON_INVALID`, `REPORT_TOO_LARGE`, `TEXT_INVALID`, `REPORT_SCHEMA_INVALID`, `REPORT_REVIEWER_MISMATCH`, `REPORT_ROUND_MISMATCH`, `REPORT_SNAPSHOT_MISMATCH`, and `REPORT_NOT_TERMINAL` describe rejected report content. Preserve the full original response in a controller-private current-user-owned regular non-symlink exact-`0600` file, independent of ambient `umask`; do not trim, reserialize, repair, or silently truncate it. A format-only retry stays on the same reviewer handle when that handle can accept a follow-up.
 
+Bounded content failures also include `FINDING_SCHEMA_INVALID`, `FINDING_LIMIT_EXCEEDED`, `EXECUTION_LIMIT_EXCEEDED`, `CLAIM_LIMIT_EXCEEDED`, `PRIOR_DECISION_RESPONSE_MISSING`, `PRIOR_DECISION_RESPONSE_INVALID`, `REPLACEMENT_FINDING_REQUIRED`, and `REPLACEMENT_FINDING_INVALID`. Fresh submission checks the reviewer's own decision responses and replacement references before canonical publication and sealing. Rejected content remains pending with exact bounded failure evidence; corrected same-role submission leaves sealed peers unchanged. Finalization repeats the full closure validation. Count/byte limits remain enforced, and invalid existing canonical orphans remain hard integrity failures outside fresh-input retry handling.
+
 ### Operational failures
 
 Only true terminal `DISPATCH_FAILED`, `REVIEWER_FAILED`, and `REVIEWER_TIMEOUT` belong to `record-failure`. A wait-interface timeout with a still-running reviewer handle is not terminal: continue the same handle without recording failure, dispatching a replacement, or cleaning its view. Automatic request limits are controller-local per invocation; persisted `attempt_count` remains cumulative.

@@ -590,12 +590,68 @@ def test_reviewer_failure_rejects_non_operational_reasons(git_repo, code):
     assert not (git_repo / ".review/attempts").exists()
 
 
-def test_submit_non_retryable_parser_error_does_not_record_failure(git_repo):
+@pytest.mark.parametrize(("fields", "code"), (
+    ({"findings": [{}]}, "FINDING_SCHEMA_INVALID"),
+    ({"findings": [finding(severity="unknown")]}, "FINDING_SCHEMA_INVALID"),
+    ({"findings": [{**finding(), "line": -1}]}, "FINDING_SCHEMA_INVALID"),
+    ({"findings": [finding()] * 129}, "FINDING_LIMIT_EXCEEDED"),
+    ({"executions": [{}] * 129}, "EXECUTION_LIMIT_EXCEEDED"),
+    ({"claims": [{}] * 129}, "CLAIM_LIMIT_EXCEEDED"),
+))
+@pytest.mark.parametrize("legacy", (False, True))
+def test_bounded_content_errors_preserve_exact_evidence_and_pending_slot(git_repo, fields, code, legacy):
+    from pre_pr_tribunal import verdict_store
+
+    pending = legacy_pending(git_repo) if legacy else write_v2_pending(git_repo)
+    peer_raw = json.dumps(report(pending.snapshot, "B", findings=[
+        finding("B-R1-001", reviewer="B", execution_ids=["B-R1-E001"])],
+        executions=[execution("B-R1-E001")])).encode()
+    if legacy:
+        store_reviewer_report(git_repo, reviewer=Reviewer.B, raw=peer_raw)
+    else:
+        submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=peer_raw, now=NOW)
+    peer = read_verdict(git_repo).reviewers["B"]
+    raw = json.dumps(report(pending.snapshot, "A", **fields)).encode() + b" \n"
+    if legacy:
+        store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+        verdict_store.migrate_legacy_pending_round(git_repo)
+    else:
+        with pytest.raises(SchemaError, match=f"^{code}$"):
+            submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    loaded = read_verdict(git_repo)
+    assert loaded.reviewers["A"].status == "pending"
+    assert loaded.reviewers["A"].attempt_count == 1
+    assert loaded.reviewers["A"].last_error == code
+    evidence = git_repo / ".review/attempts/round-1/A/attempt-1.raw"
+    assert evidence.read_bytes() == raw
+    assert stat.S_ISREG(evidence.lstat().st_mode)
+    assert evidence.lstat().st_uid == os.geteuid()
+    assert stat.S_IMODE(evidence.lstat().st_mode) == 0o600
+    metadata = json.loads(evidence.with_name("attempt-1.meta.json").read_bytes())
+    assert metadata["raw_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert not (git_repo / ".review/inbox/round-1/A.json").exists()
+    if legacy:
+        assert all(slot.status == "pending" for slot in loaded.reviewers.values())
+        assert (git_repo / ".review/attempts/round-1/B/attempt-1.raw").read_bytes() == peer_raw
+    else:
+        assert loaded.reviewers["B"] == peer
+        assert (git_repo / ".review/inbox/round-1/B.json").read_bytes() == peer_raw
+    receipt = submit_reviewer_report(git_repo, reviewer=Reviewer.A,
+        raw=json.dumps(report(pending.snapshot, "A")).encode(), now=NOW)
+    assert receipt.attempt == 2
+
+
+def test_submit_orphan_content_error_is_integrity_stop_without_failure_evidence(git_repo):
     pending = write_v2_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=[finding()] * 129)).encode()
+    target = git_repo / ".review/inbox/round-1/A.json"
+    target.write_bytes(raw)
+    target.chmod(0o600)
     before = (git_repo / ".review/verdict.json").read_bytes()
     with pytest.raises(SchemaError, match="^FINDING_LIMIT_EXCEEDED$"):
-        submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+        submit_reviewer_report(git_repo, reviewer=Reviewer.A,
+            raw=json.dumps(report(pending.snapshot, "A")).encode(), now=NOW)
+    assert target.read_bytes() == raw
     assert (git_repo / ".review/verdict.json").read_bytes() == before
     assert not (git_repo / ".review/attempts").exists()
 
@@ -2317,6 +2373,10 @@ def test_two_round_originating_reviewer_closure_and_round_limit(git_repo):
     ("owner_payload", "code"),
     [
         ([], "PRIOR_DECISION_RESPONSE_MISSING"),
+        ([{"decision_id": "D-R1-B-001", "outcome": "accepted",
+           "replacement_finding_id": None}], "PRIOR_DECISION_RESPONSE_MISSING"),
+        ([{"decision_id": "D-R1-A-001", "outcome": "reissued",
+           "replacement_finding_id": "A-R2-001"}], "REPLACEMENT_FINDING_INVALID"),
         (
             [
                 {
@@ -2339,7 +2399,8 @@ def test_two_round_originating_reviewer_closure_and_round_limit(git_repo):
         ),
     ],
 )
-def test_only_originating_reviewer_can_close_decision(git_repo, owner_payload, code):
+@pytest.mark.parametrize("orphan", (False, True))
+def test_only_originating_reviewer_can_close_decision(git_repo, owner_payload, code, orphan):
     first = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
@@ -2360,14 +2421,41 @@ def test_only_originating_reviewer_can_close_decision(git_repo, owner_payload, c
         decisions_path=dpath,
         now=NOW,
     )
-    with pytest.raises(SchemaError, match=code):
-        paths = report_paths(
-            git_repo,
-            second.snapshot,
-            round_number=2,
-            overrides={"A": {"prior_decisions": owner_payload}},
-        )
-        finalize_round(git_repo, reviewer_paths=paths, now=NOW)
+    for key in "BC":
+        submit_reviewer_report(git_repo, reviewer=Reviewer(key),
+            raw=json.dumps(report(second.snapshot, key, round_number=2)).encode(), now=NOW)
+    peers = read_verdict(git_repo).reviewers
+    peer_bytes = {key: (git_repo / f".review/inbox/round-2/{key}.json").read_bytes()
+                  for key in "BC"}
+    raw = json.dumps(report(second.snapshot, "A", round_number=2,
+                            prior_decisions=owner_payload)).encode() + b" \n"
+    target = git_repo / ".review/inbox/round-2/A.json"
+    if orphan:
+        target.write_bytes(raw)
+        target.chmod(0o600)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with pytest.raises(SchemaError, match=f"^{code}$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    loaded = read_verdict(git_repo)
+    assert loaded.reviewers["A"].status == "pending"
+    assert all(loaded.reviewers[key] == peers[key] for key in "BC")
+    assert all((git_repo / f".review/inbox/round-2/{key}.json").read_bytes() == peer_bytes[key]
+               for key in "BC")
+    if orphan:
+        assert target.read_bytes() == raw
+        assert (git_repo / ".review/verdict.json").read_bytes() == before
+        assert not (git_repo / ".review/attempts/round-2/A").exists()
+        return
+    assert not target.exists()
+    assert loaded.reviewers["A"].attempt_count == 1
+    assert loaded.reviewers["A"].last_error == code
+    assert (git_repo / ".review/attempts/round-2/A/attempt-1.raw").read_bytes() == raw
+    corrected = report(second.snapshot, "A", round_number=2, prior_decisions=[{
+        "decision_id": "D-R1-A-001", "outcome": "accepted", "replacement_finding_id": None}])
+    receipt = submit_reviewer_report(git_repo, reviewer=Reviewer.A,
+                                    raw=json.dumps(corrected).encode(), now=NOW)
+    assert receipt.attempt == 2
+    assert finalize_round(git_repo, now=NOW).gate.status.value == "pass"
 
 
 def test_fixed_decision_requires_changed_head_and_paths_stay_within_round_one(git_repo):
