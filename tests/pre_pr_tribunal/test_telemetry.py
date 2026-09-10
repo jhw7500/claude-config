@@ -1,5 +1,6 @@
 import copy
 from dataclasses import FrozenInstanceError
+import io
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,6 @@ from pre_pr_tribunal.telemetry import (
     summarize_run,
 )
 from pre_pr_tribunal import telemetry as telemetry_module
-from pre_pr_tribunal.verdict_store import submit_reviewer_report
 
 
 def NOW():
@@ -274,10 +274,15 @@ def test_telemetry_cannot_alter_tribunal_result(git_repo, tmp_path, monkeypatch,
     damaged = tmp_path / "damaged"
     shutil.copytree(git_repo, damaged)
     before, metadata = corrupt_telemetry(damaged, kind)
-    def command(repo, args):
-        monkeypatch.chdir(repo)
-        code = cli.main(list(args))
-        captured = capsys.readouterr()
+    def command(repo, args, report_raw=None):
+        with monkeypatch.context() as invocation:
+            invocation.chdir(repo)
+            if report_raw is not None:
+                invocation.setattr(
+                    sys, "stdin", io.TextIOWrapper(io.BytesIO(report_raw), encoding="utf-8")
+                )
+            code = cli.main(list(args))
+            captured = capsys.readouterr()
         return code, captured.out, captured.err
     results = []
     for repo in (git_repo, damaged):
@@ -295,17 +300,21 @@ def test_telemetry_cannot_alter_tribunal_result(git_repo, tmp_path, monkeypatch,
                 "status": "complete", "findings": [], "executions": [], "claims": [], "prior_decisions": []})
             if invalid_report and reviewer == "A":
                 raw = "{"
-            try:
-                receipt = submit_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=raw.encode(), now=NOW)
-            except SchemaError as error:
-                validation_results.append((1, "", error.code))
+            submitted = command(
+                repo, ("submit-report", "--reviewer", reviewer), raw.encode()
+            )
+            if submitted[0] != 0:
+                validation_results.append(
+                    (submitted[0], submitted[1], submitted[2].strip().split(":")[1])
+                )
                 path = repo / f".review/attempts/round-1/{reviewer}/attempt-1.raw"
             else:
-                validation_results.append((0, receipt.raw_sha256, ""))
+                validation_results.append(
+                    (submitted[0], json.loads(submitted[1])["raw_sha256"], submitted[2])
+                )
                 path = repo / f".review/inbox/round-1/{reviewer}.json"
             report_bytes[reviewer] = path.read_bytes()
-        finalized = command(repo, ("finalize", "--reviewer-a", ".review/inbox/round-1/A.json",
-            "--reviewer-b", ".review/inbox/round-1/B.json", "--reviewer-c", ".review/inbox/round-1/C.json"))
+        finalized = command(repo, ("finalize",))
         gates = []
         for adapter_name in ("codex_hook.py", "claude_hook.py"):
             adapter = Path(cli.__file__).with_name(adapter_name)

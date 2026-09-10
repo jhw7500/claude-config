@@ -982,9 +982,26 @@ def validate_stored_reviewer_report(
     preflight_review_directory(root)
     check_ignored(root)
     with locked_review(root, create=False) as review_fd:
-        pending = _read_verdict_locked(review_fd)
-        _require_all_pending(pending)
-        round_fd = _round_fd(review_fd, pending.round, create=False)
+        verdict = _read_verdict_locked(review_fd)
+        if verdict.schema == m.SCHEMA_VERSION:
+            _require_all_pending(verdict)
+        elif verdict.schema == m.VERDICT_SCHEMA_VERSION:
+            if verdict.contract != current_contract_binding():
+                raise SchemaError("CONTRACT_DRIFT")
+            slot = verdict.reviewers[reviewer.value]
+            if slot.status == "pending" and verdict.gate.status is not GateStatus.IN_PROGRESS:
+                raise SchemaError("ROUND_NOT_IN_PROGRESS")
+        else:
+            raise SchemaError("VERDICT_INVALID")
+        snapshot = capture_snapshot(root, verdict.base_ref)
+        if not _snapshot_equal(verdict, snapshot):
+            raise SchemaError("SNAPSHOT_CHANGED")
+        if verdict.schema == m.VERDICT_SCHEMA_VERSION and slot.status == "sealed":
+            parsed = _read_sealed_report(review_fd, verdict, reviewer)
+            if slot.receipt is None:
+                raise SchemaError("VERDICT_INVALID")
+            return parsed, slot.receipt.raw_sha256
+        round_fd = _round_fd(review_fd, verdict.round, create=False)
         try:
             raw = read_named_file(
                 round_fd,
@@ -996,13 +1013,10 @@ def validate_stored_reviewer_report(
             )
         finally:
             os.close(round_fd)
-        snapshot = capture_snapshot(root, pending.base_ref)
-        if not _snapshot_equal(pending, snapshot):
-            raise SchemaError("SNAPSHOT_CHANGED")
         return m.validate_report_bytes(
             raw,
             expected_reviewer=reviewer,
-            expected_round=pending.round,
+            expected_round=verdict.round,
             snapshot=snapshot,
         )
 

@@ -2691,8 +2691,13 @@ def test_cli_finalize_and_status_emit_only_bounded_projections(git_repo):
         "gate_status": "pass",
         "blocking_count": 0,
         "verdict_path": ".review/verdict.json",
+        "verdict_schema": 2,
     }
-    assert json.loads(finalized.stdout) == expected and finalized.stderr == ""
+    finalized_payload = json.loads(finalized.stdout)
+    assert {key: finalized_payload[key] for key in expected} == expected
+    assert set(finalized_payload) == {*expected, "reviewers"}
+    assert all(slot["state"] == "sealed" for slot in finalized_payload["reviewers"].values())
+    assert finalized.stderr == ""
     status = subprocess.run(
         [sys.executable, str(cli), "status"],
         cwd=git_repo,
@@ -2700,7 +2705,7 @@ def test_cli_finalize_and_status_emit_only_bounded_projections(git_repo):
         capture_output=True,
         check=True,
     )
-    assert json.loads(status.stdout) == expected and status.stderr == ""
+    assert json.loads(status.stdout) == finalized_payload and status.stderr == ""
     assert "findings" not in status.stdout and "executions" not in status.stdout
 
 
@@ -3002,3 +3007,321 @@ def test_cli_recovery_rejects_snapshot_drift_before_replacing_any_evidence(git_r
             for field in ("st_ino", "st_uid", "st_mode", "st_mtime_ns", "st_ctime_ns"):
                 assert getattr(after, field) == getattr(metadata[path], field)
         assert list((git_repo / ".review").rglob(".tmp.*")) == [residue]
+
+
+def test_cli_submit_seals_one_slot_and_status_exposes_no_report_body(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = (
+        json.dumps(
+            report(pending.snapshot, "A", findings=[finding()]),
+            separators=(",", ":"),
+        ).encode()
+        + b"\r\n"
+    )
+
+    submitted = run_cli_bytes(
+        git_repo, "submit-report", "--reviewer", "A", input=raw
+    )
+
+    assert submitted.returncode == 0 and submitted.stderr == b""
+    assert json.loads(submitted.stdout) == {
+        "reviewer": "A",
+        "round": 1,
+        "state": "sealed",
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "context_sha256": context_sha256(pending, Reviewer.A),
+        "report_contract_version": REPORT_TEXT_CONTRACT_VERSION,
+        "attempt": 1,
+        "provenance": "native_submit",
+    }
+    assert submitted.stdout.count(b"\n") == 1
+    assert len(submitted.stdout) < 1024
+    assert (git_repo / ".review/inbox/round-1/A.json").read_bytes() == raw
+    status_result = run_cli_bytes(git_repo, "status")
+    status = json.loads(status_result.stdout)
+    assert status_result.returncode == 0 and status_result.stderr == b""
+    assert status["verdict_schema"] == 2
+    assert status["reviewers"] == {
+        "A": {
+            "state": "sealed",
+            "attempt_count": 1,
+            "last_error": None,
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            "context_sha256": context_sha256(pending, Reviewer.A),
+            "report_contract_version": REPORT_TEXT_CONTRACT_VERSION,
+            "provenance": "native_submit",
+        },
+        "B": {"state": "pending", "attempt_count": 0, "last_error": None},
+        "C": {"state": "pending", "attempt_count": 0, "last_error": None},
+    }
+    assert status_result.stdout.count(b"\n") == 1
+    assert len(status_result.stdout) < 2048
+    assert b"findings" not in status_result.stdout
+    assert b"Incorrect boundary" not in status_result.stdout
+
+
+def test_cli_submit_parser_failure_updates_only_requested_slot(git_repo):
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    before = read_verdict(git_repo)
+
+    failed = run_cli_bytes(
+        git_repo, "submit-report", "--reviewer", "B", input=b'{"schema":1'
+    )
+
+    assert (failed.returncode, failed.stdout, failed.stderr) == (
+        1,
+        b"",
+        b"PRE_PR_TRIBUNAL:JSON_INVALID\n",
+    )
+    assert len(failed.stderr) < 128
+    status = json.loads(run_cli_bytes(git_repo, "status").stdout)
+    assert status["reviewers"] == {
+        "A": {"state": "pending", "attempt_count": 0, "last_error": None},
+        "B": {
+            "state": "pending",
+            "attempt_count": 1,
+            "last_error": "JSON_INVALID",
+        },
+        "C": {"state": "pending", "attempt_count": 0, "last_error": None},
+    }
+    assert read_verdict(git_repo).reviewers["A"] == before.reviewers["A"]
+    assert read_verdict(git_repo).reviewers["C"] == before.reviewers["C"]
+
+
+def test_cli_record_failure_returns_exact_cumulative_pending_projection(git_repo):
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+    first = run_cli_bytes(
+        git_repo,
+        "record-failure",
+        "--reviewer",
+        "C",
+        "--reason",
+        "DISPATCH_FAILED",
+    )
+    second = run_cli_bytes(
+        git_repo,
+        "record-failure",
+        "--reviewer",
+        "C",
+        "--reason",
+        "REVIEWER_TIMEOUT",
+    )
+
+    assert json.loads(first.stdout) == {
+        "state": "pending",
+        "attempt_count": 1,
+        "last_error": "DISPATCH_FAILED",
+    }
+    assert json.loads(second.stdout) == {
+        "state": "pending",
+        "attempt_count": 2,
+        "last_error": "REVIEWER_TIMEOUT",
+    }
+    for result in (first, second):
+        assert result.returncode == 0 and result.stderr == b""
+        assert result.stdout.count(b"\n") == 1
+        assert len(result.stdout) < 256
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("submit-report", "--reviewer", "D"),
+        ("submit-report",),
+        ("record-failure", "--reviewer", "A", "--reason", "JSON_INVALID"),
+        ("record-failure", "--reviewer", "D", "--reason", "REVIEWER_FAILED"),
+        ("record-failure", "--reviewer", "A"),
+        ("migrate-legacy-pending", "--reviewer", "A"),
+    ),
+)
+def test_cli_selective_recovery_usage_is_exact_bounded_exit_two(git_repo, arguments):
+    result = run_cli_bytes(git_repo, *arguments)
+    assert (result.returncode, result.stdout, result.stderr) == (
+        2,
+        b"",
+        b"PRE_PR_TRIBUNAL:USAGE\n",
+    )
+
+
+def test_cli_context_rejects_a_sealed_slot_but_keeps_peers_available(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
+    assert run_cli_bytes(
+        git_repo, "submit-report", "--reviewer", "A", input=raw
+    ).returncode == 0
+
+    sealed = run_cli_bytes(git_repo, "context", "--reviewer", "A")
+    peer = run_cli_bytes(git_repo, "context", "--reviewer", "B")
+
+    assert (sealed.returncode, sealed.stdout, sealed.stderr) == (
+        1,
+        b"",
+        b"PRE_PR_TRIBUNAL:REVIEWER_SLOT_SEALED\n",
+    )
+    assert peer.returncode == 0 and json.loads(peer.stdout)["reviewer"] == "B"
+    assert len(peer.stdout) <= MAX_REPORT_BYTES
+
+
+def test_cli_migrate_legacy_pending_reports_all_three_stable_states(git_repo):
+    pending = legacy_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
+    store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+    store_reviewer_report(git_repo, reviewer=Reviewer.B, raw=b'{"schema":1')
+
+    migrated = run_cli_bytes(git_repo, "migrate-legacy-pending")
+
+    assert migrated.returncode == 0 and migrated.stderr == b""
+    assert json.loads(migrated.stdout) == {
+        "round": 1,
+        "reviewers": {
+            "A": "pending:LEGACY_PROVENANCE_UNAVAILABLE",
+            "B": "pending:JSON_INVALID",
+            "C": "pending:REVIEWER_REPORT_MISSING",
+        },
+    }
+    assert migrated.stdout.count(b"\n") == 1
+    assert len(migrated.stdout) < 512
+
+
+def test_cli_status_discriminates_all_pending_v1_from_v2(git_repo):
+    native = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    native_status = json.loads(run_cli_bytes(git_repo, "status").stdout)
+    legacy = replace(
+        native,
+        schema=1,
+        contract=None,
+        reviewers={key: ReviewerSlot("pending") for key in "ABC"},
+    )
+    write_json(git_repo / ".review/verdict.json", legacy.to_json())
+    legacy_status = json.loads(run_cli_bytes(git_repo, "status").stdout)
+
+    assert native_status["verdict_schema"] == 2
+    assert native_status["reviewers"] == {
+        key: {"state": "pending", "attempt_count": 0, "last_error": None}
+        for key in "ABC"
+    }
+    assert legacy_status == {
+        "round": 1,
+        "gate_status": "in_progress",
+        "blocking_count": 0,
+        "verdict_path": ".review/verdict.json",
+        "verdict_schema": 1,
+    }
+
+
+def test_cli_finalize_without_paths_authenticates_all_sealed_reports(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    for reviewer in "ABC":
+        raw = json.dumps(
+            report(pending.snapshot, reviewer), separators=(",", ":")
+        ).encode()
+        assert run_cli_bytes(
+            git_repo, "submit-report", "--reviewer", reviewer, input=raw
+        ).returncode == 0
+
+    finalized = run_cli_bytes(git_repo, "finalize")
+
+    assert finalized.returncode == 0 and finalized.stderr == b""
+    payload = json.loads(finalized.stdout)
+    assert payload["gate_status"] == "pass"
+    assert payload["verdict_schema"] == 2
+    assert all(slot["state"] == "sealed" for slot in payload["reviewers"].values())
+    assert finalized.stdout.count(b"\n") == 1
+    assert len(finalized.stdout) < 4096
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("--reviewer-a", ".review/inbox/round-1/A.json"),
+        (
+            "--reviewer-a",
+            ".review/inbox/round-1/A.json",
+            "--reviewer-b",
+            ".review/inbox/round-1/B.json",
+        ),
+    ),
+)
+def test_cli_finalize_rejects_partial_legacy_path_sets_as_usage(git_repo, arguments):
+    result = run_cli_bytes(git_repo, "finalize", *arguments)
+    assert (result.returncode, result.stdout, result.stderr) == (
+        2,
+        b"",
+        b"PRE_PR_TRIBUNAL:USAGE\n",
+    )
+
+
+def test_cli_validate_stored_supports_pending_orphan_and_sealed_receipt(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
+    target = git_repo / ".review/inbox/round-1/A.json"
+    target.write_bytes(raw)
+    target.chmod(0o600)
+
+    pending_validation = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert json.loads(pending_validation.stdout)["raw_sha256"] == hashlib.sha256(raw).hexdigest()
+    target.unlink()
+    submitted = run_cli_bytes(
+        git_repo, "submit-report", "--reviewer", "A", input=raw
+    )
+    assert submitted.returncode == 0
+    sealed_validation = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert sealed_validation.returncode == 0 and sealed_validation.stderr == b""
+    assert json.loads(sealed_validation.stdout) == {
+        "reviewer": "A",
+        "round": 1,
+        "status": "valid",
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    target.write_bytes(raw + b" ")
+    drifted = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "A", "--source", "stored"
+    )
+    assert (drifted.returncode, drifted.stdout, drifted.stderr) == (
+        1,
+        b"",
+        b"PRE_PR_TRIBUNAL:REPORT_BYTES_MISMATCH\n",
+    )
+
+
+def test_cli_store_report_rejects_v2_before_touching_canonical(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    target = git_repo / ".review/inbox/round-1/A.json"
+    sentinel = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
+    target.write_bytes(sentinel)
+    target.chmod(0o600)
+    verdict_before = (git_repo / ".review/verdict.json").read_bytes()
+
+    result = run_cli_bytes(
+        git_repo,
+        "store-report",
+        "--reviewer",
+        "A",
+        "--replace-pending-recovery",
+        input=b"replacement",
+    )
+
+    assert (result.returncode, result.stdout, result.stderr) == (
+        1,
+        b"",
+        b"PRE_PR_TRIBUNAL:LEGACY_COMMAND_NOT_ALLOWED\n",
+    )
+    assert target.read_bytes() == sentinel
+    assert (git_repo / ".review/verdict.json").read_bytes() == verdict_before

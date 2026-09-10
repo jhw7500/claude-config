@@ -31,8 +31,11 @@ if __package__ in {None, ""}:
     from pre_pr_tribunal.verdict_store import (  # type: ignore
         begin_round,
         finalize_round,
+        migrate_legacy_pending_round,
         read_verdict,
+        record_reviewer_failure,
         store_reviewer_report,
+        submit_reviewer_report,
         validate_stored_reviewer_report,
     )
     from pre_pr_tribunal import telemetry  # type: ignore
@@ -52,8 +55,11 @@ else:
     from .verdict_store import (
         begin_round,
         finalize_round,
+        migrate_legacy_pending_round,
         read_verdict,
+        record_reviewer_failure,
         store_reviewer_report,
+        submit_reviewer_report,
         validate_stored_reviewer_report,
     )
     from . import telemetry
@@ -74,6 +80,16 @@ def _parser() -> argparse.ArgumentParser:
     begin.add_argument("--decisions", type=Path)
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
+    submit = commands.add_parser("submit-report", add_help=False)
+    submit.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
+    failure = commands.add_parser("record-failure", add_help=False)
+    failure.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
+    failure.add_argument(
+        "--reason",
+        required=True,
+        choices=("DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"),
+    )
+    commands.add_parser("migrate-legacy-pending", add_help=False)
     store = commands.add_parser("store-report", add_help=False)
     store.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     store.add_argument("--replace-pending-recovery", action="store_true")
@@ -81,9 +97,9 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     validate.add_argument("--source", required=True, choices=("stdin", "stored"))
     finalize = commands.add_parser("finalize", add_help=False)
-    finalize.add_argument("--reviewer-a", required=True, type=Path)
-    finalize.add_argument("--reviewer-b", required=True, type=Path)
-    finalize.add_argument("--reviewer-c", required=True, type=Path)
+    finalize.add_argument("--reviewer-a", type=Path)
+    finalize.add_argument("--reviewer-b", type=Path)
+    finalize.add_argument("--reviewer-c", type=Path)
     commands.add_parser("status", add_help=False)
     start = commands.add_parser("telemetry-start", add_help=False)
     start.add_argument("--run-id", required=True)
@@ -208,12 +224,35 @@ def _telemetry_command(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=time.
 
 
 def _status(verdict) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "round": verdict.round,
         "gate_status": verdict.gate.status.value,
         "blocking_count": verdict.gate.blocking_count,
         "verdict_path": ".review/verdict.json",
+        "verdict_schema": verdict.schema,
     }
+    if verdict.schema == 2:
+        reviewers = {}
+        for key in "ABC":
+            slot = verdict.reviewers[key]
+            projected = {
+                "state": slot.status,
+                "attempt_count": slot.attempt_count,
+                "last_error": slot.last_error,
+            }
+            if slot.status == "sealed":
+                receipt = slot.receipt
+                if receipt is None:
+                    raise TribunalError("VERDICT_INVALID")
+                projected.update(
+                    raw_sha256=receipt.raw_sha256,
+                    context_sha256=receipt.context_sha256,
+                    report_contract_version=receipt.report_contract_version,
+                    provenance=receipt.provenance,
+                )
+            reviewers[key] = projected
+        payload["reviewers"] = reviewers
+    return payload
 
 
 def _report_stdin() -> bytes:
@@ -261,7 +300,18 @@ def _snapshot_equal(verdict, snapshot) -> bool:
 
 
 def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns) -> int:
-    arguments = _parser().parse_args(argv)
+    parser = _parser()
+    arguments = parser.parse_args(argv)
+    if arguments.command == "finalize":
+        supplied = (
+            arguments.reviewer_a,
+            arguments.reviewer_b,
+            arguments.reviewer_c,
+        )
+        if any(path is not None for path in supplied) and not all(
+            path is not None for path in supplied
+        ):
+            parser.error("all reviewer paths must be supplied together")
     cwd = Path.cwd()
     try:
         if arguments.command == "begin":
@@ -286,6 +336,39 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 if verdict.schema == 1
                 else reviewer_context_envelope(verdict, reviewer)
             )
+        elif arguments.command == "submit-report":
+            receipt = submit_reviewer_report(
+                cwd,
+                reviewer=Reviewer(arguments.reviewer),
+                raw=_report_stdin(),
+            )
+            payload = {
+                "reviewer": receipt.reviewer.value,
+                "round": receipt.round,
+                "state": "sealed",
+                "raw_sha256": receipt.raw_sha256,
+                "context_sha256": receipt.context_sha256,
+                "report_contract_version": receipt.report_contract_version,
+                "attempt": receipt.attempt,
+                "provenance": receipt.provenance,
+            }
+        elif arguments.command == "record-failure":
+            slot = record_reviewer_failure(
+                cwd,
+                reviewer=Reviewer(arguments.reviewer),
+                reason_code=arguments.reason,
+            )
+            payload = {
+                "state": slot.status,
+                "attempt_count": slot.attempt_count,
+                "last_error": slot.last_error,
+            }
+        elif arguments.command == "migrate-legacy-pending":
+            migrated = migrate_legacy_pending_round(cwd)
+            payload = {
+                "round": migrated.round,
+                "reviewers": dict(migrated.reviewers),
+            }
         elif arguments.command == "store-report":
             receipt = store_reviewer_report(
                 cwd,
@@ -317,13 +400,16 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 )
                 payload = _report_projection(reviewer, verdict.round, "valid", digest)
         elif arguments.command == "finalize":
-            verdict = finalize_round(
-                cwd,
-                reviewer_paths={
+            reviewer_paths = None
+            if arguments.reviewer_a is not None:
+                reviewer_paths = {
                     "A": arguments.reviewer_a,
                     "B": arguments.reviewer_b,
                     "C": arguments.reviewer_c,
-                },
+                }
+            verdict = finalize_round(
+                cwd,
+                reviewer_paths=reviewer_paths,
             )
             payload = _status(verdict)
         else:
