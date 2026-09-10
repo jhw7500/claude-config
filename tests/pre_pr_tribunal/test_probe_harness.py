@@ -458,16 +458,97 @@ def _start_probe(
 
 
 def _wait_for(
-    path: Path, process: subprocess.Popen[str], *, timeout: float = 15.0
+    path: Path,
+    process: subprocess.Popen[str],
+    *,
+    timeout: float = 15.0,
+    expected_lines: int | None = None,
 ) -> None:
+    def ready() -> bool:
+        if expected_lines is None:
+            return path.exists()
+        try:
+            content = path.read_text(encoding="ascii")
+        except FileNotFoundError:
+            return False
+        return content.endswith("\n") and len(content.splitlines()) == expected_lines
+
     deadline = time.monotonic() + timeout
-    while not path.exists() and process.poll() is None:
+    while not ready() and process.poll() is None:
         if time.monotonic() >= deadline:
             process.kill()
             process.communicate(timeout=5)
-            pytest.fail(f"probe did not create {path.name}")
+            pytest.fail(f"probe did not prepare {path.name}")
         time.sleep(0.02)
-    assert path.exists()
+    assert ready(), f"probe exited before {path.name} was ready"
+
+
+@pytest.fixture
+def waiting_process():
+    process = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("initial", [None, "", "123\n", "123\n4", "123\n456\n"])
+def test_wait_for_pid_file_waits_for_complete_lines(
+    tmp_path, monkeypatch, waiting_process, initial
+):
+    pid_file = tmp_path / "runtime-pids"
+    if initial is not None:
+        pid_file.write_text(initial, encoding="ascii")
+
+    def finish_write(_interval):
+        pid_file.write_text("123\n456\n", encoding="ascii")
+
+    monkeypatch.setattr(time, "sleep", finish_write)
+
+    _wait_for(pid_file, waiting_process, expected_lines=2)
+
+    assert pid_file.read_text(encoding="ascii") == "123\n456\n"
+
+
+@pytest.mark.parametrize("initial", ["", "123\n4"])
+def test_wait_for_pid_file_times_out_on_incomplete_lines(
+    tmp_path, waiting_process, initial
+):
+    pid_file = tmp_path / "runtime-pids"
+    pid_file.write_text(initial, encoding="ascii")
+
+    with pytest.raises(pytest.fail.Exception):
+        _wait_for(pid_file, waiting_process, expected_lines=2, timeout=0)
+
+    assert waiting_process.poll() is not None
+
+
+def test_wait_for_pid_file_rejects_incomplete_lines_after_process_exit(
+    tmp_path, waiting_process
+):
+    pid_file = tmp_path / "runtime-pids"
+    pid_file.write_text("123\n4", encoding="ascii")
+    waiting_process.communicate(timeout=5)
+
+    with pytest.raises(AssertionError):
+        _wait_for(pid_file, waiting_process, expected_lines=2)
+
+
+def test_wait_for_default_still_accepts_empty_marker(tmp_path, waiting_process):
+    marker = tmp_path / "ready"
+    marker.touch()
+
+    _wait_for(marker, waiting_process, timeout=0)
+
+    assert marker.stat().st_size == 0
 
 
 def _pidfd_ready(handle: ProcessHandle, timeout: float) -> bool:
@@ -860,6 +941,34 @@ def test_installed_probe_preserves_valid_peers_when_c_retries(tmp_path, field, v
     assert result["status"]["gate_status"] == "pass"
     assert result["status"]["reviewers"]["A"]["attempt_count"] == 1
     assert result["status"]["reviewers"]["C"]["attempt_count"] == 2
+
+
+@pytest.mark.parametrize("runtime", ("claude", "codex"))
+def test_installed_probe_keeps_submit_failure_detection_after_successful_retry(tmp_path, runtime):
+    """A successful retry/finalize must not hide the original rejected submission."""
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+
+    def reject_b_once(reviewer, attempt, snapshot):
+        if reviewer == "B" and attempt == 1:
+            return b'{"schema":1'
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, runtime, report_factory=reject_b_once,
+    )
+    assert result["status"]["gate_status"] == "pass"
+    assert {role: slot["attempt_count"] for role, slot in result["status"]["reviewers"].items()} == {
+        "A": 1, "B": 2, "C": 1,
+    }
+    summary = result["telemetry_summary"]
+    detected = summary["early_detection"]
+    assert detected is not None
+    assert (detected["reviewer"], detected["reason_code"]) == ("B", "JSON_INVALID")
+    assert 0 <= detected["detected_elapsed_ms"] <= detected["all_reviewers_terminal_elapsed_ms"]
+    assert detected["wait_all_delay_ms"] >= 0
+    assert summary["binding"]["diff_sha256"] == result["begin"]["snapshot"]["diff_sha256"]
+    assert (repo / ".review/attempts/round-1/B/attempt-1.raw").read_bytes() == b'{"schema":1'
+
 
 
 def test_installed_probe_resumes_only_pending_c_and_reuses_native_sealed_peers(tmp_path):
@@ -2234,7 +2343,7 @@ def test_default_signal_semantics_leave_no_runtime_or_credential_copy(
     pid_file = work_dir / "tmp/runtime-pids"
     handles: list[ProcessHandle] = []
     try:
-        _wait_for(pid_file, process)
+        _wait_for(pid_file, process, expected_lines=2)
         assert len(pid_file.read_text().splitlines()) == 2
         handles = _open_descendant_pidfds(process.pid)
         assert len(handles) >= 2
@@ -2283,7 +2392,7 @@ def test_timeout_leaves_no_runtime_or_credential_copy(
     pid_file = work_dir / "tmp/runtime-pids"
     handles: list[ProcessHandle] = []
     try:
-        _wait_for(pid_file, process)
+        _wait_for(pid_file, process, expected_lines=2)
         assert len(pid_file.read_text().splitlines()) == 2
         handles = _open_descendant_pidfds(process.pid)
         assert len(handles) >= 2

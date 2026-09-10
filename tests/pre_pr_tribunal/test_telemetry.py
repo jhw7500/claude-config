@@ -211,6 +211,72 @@ def test_cli_early_detection_uses_actual_validation_failure(git_repo, monkeypatc
     assert (git_repo / ".review/verdict.json").read_bytes() == before
 
 
+@pytest.mark.parametrize("reviewer", ("A", "B", "C"))
+@pytest.mark.parametrize("reason", ("JSON_INVALID", "TEXT_INVALID"))
+def test_cli_early_detection_includes_rejected_v2_submission(
+    git_repo, monkeypatch, capsys, reviewer, reason,
+):
+    """Dropping report_store failures must lose an actual submit-report rejection."""
+    call = lambda args, sec: invoke_clocked(monkeypatch, capsys, git_repo, args, sec)
+    begun = call(BEGIN, 0)
+    run_id = begun["telemetry"]["run_id"]
+    totals = {
+        role: call(("telemetry-start", "--run-id", run_id,
+                    "--stage", "reviewer_total", "--reviewer", role, "--attempt", "1"), 0)["span_id"]
+        for role in "ABC"
+    }
+    raw = "{"
+    if reason == "TEXT_INVALID":
+        raw = json.dumps({
+            "schema": 1, "reviewer": reviewer, "round": 1,
+            "snapshot": {
+                "head_sha": begun["snapshot"]["head_sha"],
+                "diff_sha256": begun["snapshot"]["diff_sha256"],
+            },
+            "status": "complete", "executions": [], "claims": [], "prior_decisions": [],
+            "findings": [{
+                "id": f"{reviewer}-R1-001", "reviewer": reviewer, "severity": "LOW",
+                "title": "invalid\x00title", "rationale": "Invalid report text.",
+                "path": "tracked.txt", "line": 1, "execution_ids": [],
+                "acceptance_condition": "Reject the invalid text.",
+            }],
+        })
+    store = call(("telemetry-start", "--run-id", run_id, "--stage", "report_store",
+                  "--reviewer", reviewer, "--attempt", "1"), 9)["span_id"]
+    rejected = run_cli(git_repo, "submit-report", "--reviewer", reviewer, input=raw)
+    assert (rejected.returncode, rejected.stdout, rejected.stderr) == (
+        1, "", f"PRE_PR_TRIBUNAL:{reason}\n",
+    )
+    verdict_path = git_repo / ".review/verdict.json"
+    after_rejection = verdict_path.read_bytes()
+    verdict = json.loads(after_rejection)
+    assert verdict["gate"]["status"] == "in_progress"
+    assert all(slot["state"] == "pending" for slot in verdict["reviewers"].values())
+    assert verdict["reviewers"][reviewer]["attempt_count"] == 1
+    evidence = git_repo / f".review/attempts/round-1/{reviewer}/attempt-1.raw"
+    assert evidence.read_bytes() == raw.encode()
+    call(("telemetry-finish", "--run-id", run_id, "--span-id", store,
+          "--outcome", "failure", "--reason-code", reason), 10)
+
+    # Detect the rejection while peers are still running, without inventing their finish times.
+    assert call(("telemetry-summary", "--run-id", run_id), 10)["early_detection"] == {
+        "reviewer": reviewer, "reason_code": reason, "detected_elapsed_ms": 10000,
+        "all_reviewers_terminal_elapsed_ms": None, "wait_all_delay_ms": None,
+    }
+    blocked = run_cli(git_repo, "finalize")
+    assert (blocked.returncode, blocked.stderr) == (1, "PRE_PR_TRIBUNAL:ROUND_NOT_READY\n")
+    for role, second in (("A", 10), ("B", 20), ("C", 30)):
+        call(("telemetry-finish", "--run-id", run_id, "--span-id", totals[role],
+              "--outcome", "success"), second)
+    assert call(("telemetry-summary", "--run-id", run_id), 30)["early_detection"] == {
+        "reviewer": reviewer, "reason_code": reason, "detected_elapsed_ms": 10000,
+        "all_reviewers_terminal_elapsed_ms": 30000, "wait_all_delay_ms": 20000,
+    }
+    assert verdict_path.read_bytes() == after_rejection
+    assert evidence.read_bytes() == raw.encode()
+
+
+
 def test_cli_candidate_is_bounded_provisional_identity(git_repo, monkeypatch):
     # Candidate capture must still work with missing base, dirty tree, and hostile inherited Git env.
     subprocess.run(["/usr/bin/git", "-C", str(git_repo), "update-ref", "-d", "refs/remotes/origin/master"], check=True)
@@ -935,8 +1001,65 @@ def test_close_rejects_running_spans_and_preserves_terminal_data(git_repo):
     assert closed.outcome is TelemetryOutcome.SUCCESS
 
 
+@pytest.mark.parametrize("first_stage", (
+    TelemetryStage.REPORT_STORE, TelemetryStage.REPORT_VALIDATION,
+))
+def test_early_detection_preserves_first_report_failure_across_retries(git_repo, first_stage):
+    """Choosing only one report stage, list order, or the latest retry loses the first error."""
+    run = new_run(git_repo)
+    later_stage = (
+        TelemetryStage.REPORT_VALIDATION
+        if first_stage is TelemetryStage.REPORT_STORE else TelemetryStage.REPORT_STORE
+    )
+    for stage, reviewer, attempt, second, reason in (
+        (later_stage, Reviewer.B, 1, 20, "REPORT_SCHEMA_INVALID"),
+        (first_stage, Reviewer.A, 1, 10, "JSON_INVALID"),
+        (TelemetryStage.REPORT_STORE, Reviewer.A, 2, 25, "TEXT_INVALID"),
+    ):
+        span = start_span(
+            git_repo, run_id=run.run_id, stage=stage, reviewer=reviewer, attempt=attempt,
+            started_at=NOW(), started_monotonic_ns=1,
+        )
+        finish_span(
+            git_repo, run_id=run.run_id, span_id=span.span_id,
+            outcome=TelemetryOutcome.FAILURE, reason_code=reason,
+            ended_at=f"2026-09-09T00:00:{second:02d}Z",
+            ended_monotonic_ns=second * 1_000_000_000 + 1,
+        )
+    before = ledger_path(git_repo).read_bytes()
+    assert summarize_run(git_repo)["early_detection"] == {
+        "reviewer": "A", "reason_code": "JSON_INVALID", "detected_elapsed_ms": 10000,
+        "all_reviewers_terminal_elapsed_ms": None, "wait_all_delay_ms": None,
+    }
+    assert ledger_path(git_repo).read_bytes() == before
+
+
+@pytest.mark.parametrize(("stage", "outcome", "reason"), (
+    (TelemetryStage.REPORT_STORE, TelemetryOutcome.SUCCESS, None),
+    (TelemetryStage.REPORT_STORE, TelemetryOutcome.TIMEOUT, "REVIEWER_TIMEOUT"),
+    (TelemetryStage.REPORT_STORE, TelemetryOutcome.INCOMPLETE, "CONTROLLER_INTERRUPTED"),
+    (TelemetryStage.REPORT_STORE, TelemetryOutcome.CLOCK_ANOMALY, "TELEMETRY_CLOCK_ANOMALY"),
+    (TelemetryStage.REVIEWER_TOTAL, TelemetryOutcome.FAILURE, "JSON_INVALID"),
+))
+def test_early_detection_ignores_nonfailures_and_nonreport_stages(git_repo, stage, outcome, reason):
+    """Including successful/uncertain stores or unrelated failures creates false detections."""
+    run = new_run(git_repo)
+    span = start_span(
+        git_repo, run_id=run.run_id, stage=stage, reviewer=Reviewer.A, attempt=1,
+        started_at=NOW(), started_monotonic_ns=1,
+    )
+    finish_span(
+        git_repo, run_id=run.run_id, span_id=span.span_id,
+        outcome=outcome, reason_code=reason,
+        ended_at="2026-09-09T00:00:10Z", ended_monotonic_ns=10_000_000_001,
+    )
+    assert summarize_run(git_repo)["early_detection"] is None
+
+
+
+@pytest.mark.parametrize("stage", (TelemetryStage.REPORT_VALIDATION, TelemetryStage.REPORT_STORE))
 @pytest.mark.parametrize("last_outcome", (TelemetryOutcome.SUCCESS, TelemetryOutcome.INCOMPLETE, TelemetryOutcome.CLOCK_ANOMALY, None))
-def test_early_detection_requires_all_three_usable_terminal_milestones(git_repo, last_outcome):
+def test_early_detection_requires_all_three_usable_terminal_milestones(git_repo, stage, last_outcome):
     run = new_run(git_repo)
     for reviewer, seconds in ((Reviewer.A, 5), (Reviewer.B, 20), (Reviewer.C, 30)):
         span = start_span(git_repo, run_id=run.run_id, stage=TelemetryStage.REVIEWER_TOTAL,
@@ -946,7 +1069,7 @@ def test_early_detection_requires_all_three_usable_terminal_milestones(git_repo,
             finish_span(git_repo, run_id=run.run_id, span_id=span.span_id, outcome=outcome,
                         reason_code=None if outcome is TelemetryOutcome.SUCCESS else "CONTROLLER_INTERRUPTED",
                         ended_at=f"2026-09-09T00:00:{seconds:02d}Z", ended_monotonic_ns=seconds * 1_000_000_000 + 1)
-    validation = start_span(git_repo, run_id=run.run_id, stage=TelemetryStage.REPORT_VALIDATION,
+    validation = start_span(git_repo, run_id=run.run_id, stage=stage,
                             reviewer=Reviewer.A, attempt=1, started_at=NOW(), started_monotonic_ns=1)
     finish_span(git_repo, run_id=run.run_id, span_id=validation.span_id,
                 outcome=TelemetryOutcome.FAILURE, reason_code="REPORT_SCHEMA_INVALID",

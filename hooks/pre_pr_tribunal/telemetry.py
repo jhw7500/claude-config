@@ -554,7 +554,12 @@ def _elapsed(run: TelemetryRun, span: TelemetrySpan) -> int | None:
 
 
 def _early_detection(run: TelemetryRun) -> dict[str, object] | None:
-    failures = [item for item in run.spans if item.stage is TelemetryStage.REPORT_VALIDATION and item.outcome is TelemetryOutcome.FAILURE]
+    # v2 submit-report validates before publication inside the report_store span.
+    failures = [
+        item for item in run.spans
+        if item.stage in (TelemetryStage.REPORT_STORE, TelemetryStage.REPORT_VALIDATION)
+        and item.outcome is TelemetryOutcome.FAILURE
+    ]
     if not failures:
         return None
     failed = min(failures, key=lambda item: item.ended_monotonic_ns)
