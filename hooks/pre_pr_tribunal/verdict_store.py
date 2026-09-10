@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -12,12 +12,19 @@ from pathlib import Path
 import re
 import stat
 
-from .git_state import GitStateError, assert_auto_fix_scope, capture_snapshot
+from .git_state import (
+    DIFF_RECIPE_VERSION,
+    GitStateError,
+    assert_auto_fix_scope,
+    capture_snapshot,
+)
 from . import model as m
 from .model import (
+    ContractBinding,
     Decision,
     GateStatus,
     GateSummary,
+    ReportReceipt,
     Reviewer,
     ReviewerReport,
     ReviewerSlot,
@@ -38,14 +45,6 @@ from .review_store import (
     repository_root,
     safe_file,
 )
-
-
-@dataclass(frozen=True)
-class ReportReceipt:
-    reviewer: Reviewer
-    round: int
-    path: str
-    raw_sha256: str
 
 
 def utc_now() -> str:
@@ -185,12 +184,28 @@ def _parse_history(value: object) -> tuple[RoundSummary, ...]:
     return tuple(result)
 
 
-def _parse_verdict(raw: bytes) -> Verdict:
-    data = m._load_json(raw, limit=m.MAX_VERDICT_BYTES, too_large="VERDICT_TOO_LARGE")
-    if isinstance(data, dict):
-        schema = data.get("schema")
-        if isinstance(schema, int) and not isinstance(schema, bool) and schema != 1:
-            raise SchemaError("VERDICT_SCHEMA_UNSUPPORTED")
+@dataclass(frozen=True)
+class _VerdictFields:
+    schema: int
+    repository: str
+    base_ref: str
+    base_sha: str
+    head_ref: str
+    head_sha: str
+    merge_base_sha: str
+    diff_sha256: str
+    initial_paths: tuple[str, ...]
+    round: int
+    producer_runtime: str
+    reviewers: dict[str, object]
+    decisions: tuple[Decision, ...]
+    history: tuple[RoundSummary, ...]
+    gate: GateSummary
+    created_at: str
+    snapshot: Snapshot
+
+
+def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFields:
     verdict_keys = {
         "schema",
         "repository",
@@ -208,28 +223,31 @@ def _parse_verdict(raw: bytes) -> Verdict:
         "gate",
         "created_at",
     }
-    if not isinstance(data, dict) or set(data) not in {
-        frozenset(verdict_keys),
-        frozenset(verdict_keys - {"head_ref"}),
-    }:
+    if schema == m.VERDICT_SCHEMA_VERSION:
+        verdict_keys.add("contract")
+        valid_shapes = {frozenset(verdict_keys)}
+    else:
+        valid_shapes = {
+            frozenset(verdict_keys),
+            frozenset(verdict_keys - {"head_ref"}),
+        }
+    if set(data) not in valid_shapes or data["schema"] != schema:
         raise SchemaError("VERDICT_INVALID")
-    obj = data
-    if obj["schema"] != 1 or isinstance(obj["schema"], bool):
-        raise SchemaError("VERDICT_INVALID")
-    repository = m._text(obj["repository"], 256)
+
+    repository = m._text(data["repository"], 256)
     if (
         re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]+", repository)
         is None
     ):
         raise SchemaError("VERDICT_INVALID")
-    base = m._object(obj["base"], {"ref", "sha"}, "VERDICT_INVALID")
+    base = m._object(data["base"], {"ref", "sha"}, "VERDICT_INVALID")
     base_ref = m._text(base["ref"], 256)
-    head_ref = m._head_ref(obj["head_ref"]) if "head_ref" in obj else ""
+    head_ref = m._head_ref(data["head_ref"]) if "head_ref" in data else ""
     base_sha, head_sha, merge_base_sha, digest = (
         base["sha"],
-        obj["head_sha"],
-        obj["merge_base_sha"],
-        obj["diff_sha256"],
+        data["head_sha"],
+        data["merge_base_sha"],
+        data["diff_sha256"],
     )
     if (
         any(
@@ -243,25 +261,56 @@ def _parse_verdict(raw: bytes) -> Verdict:
     initial_paths = tuple(
         m._path(item)
         for item in m._array(
-            obj["initial_paths"], m.MAX_INITIAL_PATHS, "VERDICT_INVALID"
+            data["initial_paths"], m.MAX_INITIAL_PATHS, "VERDICT_INVALID"
         )
     )
     if len(initial_paths) != len(set(initial_paths)):
         raise SchemaError("VERDICT_INVALID")
-    round_number = m._integer(obj["round"], "VERDICT_INVALID", minimum=1, maximum=3)
-    runtime = obj["producer_runtime"]
+    round_number = m._integer(
+        data["round"], "VERDICT_INVALID", minimum=1, maximum=3
+    )
+    runtime = data["producer_runtime"]
     if not isinstance(runtime, str) or runtime not in {"claude", "codex"}:
         raise SchemaError("VERDICT_INVALID")
-    created_at = m._text(obj["created_at"], 64)
+    created_at = m._text(data["created_at"], 64)
     try:
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", created_at) is None:
             raise ValueError
         datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
         raise SchemaError("VERDICT_INVALID") from None
-    reviewers_obj = m._object(obj["reviewers"], {"A", "B", "C"}, "VERDICT_INVALID")
+
+    reviewers = m._object(data["reviewers"], {"A", "B", "C"}, "VERDICT_INVALID")
+    history = _parse_history(data["history"])
+    if tuple(item.round for item in history) != tuple(range(1, round_number)):
+        raise SchemaError("VERDICT_INVALID")
+    prior_ids = tuple(
+        item["id"] for item in (history[-1].blocking_findings if history else ())
+    )
+    decisions = m.parse_decisions(
+        json.dumps(data["decisions"], ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        ),
+        prior_blockers=prior_ids,
+    )
+    if round_number == 1 and decisions:
+        raise SchemaError("VERDICT_INVALID")
+    if any(item.disposition == "fixed" for item in decisions) and (
+        not history or head_sha == history[-1].head_sha
+    ):
+        raise SchemaError("FIXED_HEAD_UNCHANGED")
+    gate_obj = m._object(
+        data["gate"], {"status", "blocking_count"}, "VERDICT_INVALID"
+    )
+    status = m._enum(GateStatus, gate_obj["status"], "VERDICT_INVALID")
+    count = m._integer(
+        gate_obj["blocking_count"],
+        "VERDICT_INVALID",
+        minimum=0,
+        maximum=m.MAX_FINDINGS_PER_REVIEWER * 3,
+    )
     snapshot = Snapshot(
-        1,
+        m.SCHEMA_VERSION,
         repository,
         base_ref,
         base_sha,
@@ -273,85 +322,8 @@ def _parse_verdict(raw: bytes) -> Verdict:
         initial_paths,
         created_at,
     )
-    reviewers: dict[str, ReviewerSlot] = {}
-    for key in "ABC":
-        slot = reviewers_obj[key]
-        if (
-            isinstance(slot, dict)
-            and set(slot) == {"status"}
-            and slot["status"] == "pending"
-        ):
-            reviewers[key] = ReviewerSlot("pending")
-            continue
-        completed = m._object(
-            slot,
-            {"status", "findings", "executions", "claims", "prior_decisions"},
-            "VERDICT_INVALID",
-        )
-        report_value = {
-            "schema": 1,
-            "reviewer": key,
-            "round": round_number,
-            "snapshot": {"head_sha": head_sha, "diff_sha256": digest},
-            **completed,
-        }
-        encoded = json.dumps(
-            report_value, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
-        report = m.parse_reviewer_report(
-            encoded,
-            expected_reviewer=Reviewer(key),
-            expected_round=round_number,
-            snapshot=snapshot,
-        )
-        reviewers[key] = ReviewerSlot("complete", report)
-    history = _parse_history(obj["history"])
-    if tuple(item.round for item in history) != tuple(range(1, round_number)):
-        raise SchemaError("VERDICT_INVALID")
-    prior_ids = tuple(
-        item["id"] for item in (history[-1].blocking_findings if history else ())
-    )
-    decisions = m.parse_decisions(
-        json.dumps(obj["decisions"], ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        ),
-        prior_blockers=prior_ids,
-    )
-    if round_number == 1 and decisions:
-        raise SchemaError("VERDICT_INVALID")
-    gate_obj = m._object(obj["gate"], {"status", "blocking_count"}, "VERDICT_INVALID")
-    status = m._enum(GateStatus, gate_obj["status"], "VERDICT_INVALID")
-    count = m._integer(
-        gate_obj["blocking_count"],
-        "VERDICT_INVALID",
-        minimum=0,
-        maximum=m.MAX_FINDINGS_PER_REVIEWER * 3,
-    )
-    pending_count = sum(slot.status == "pending" for slot in reviewers.values())
-    if pending_count not in {0, 3}:
-        raise SchemaError("VERDICT_INVALID")
-    complete = pending_count == 0
-    if (status is GateStatus.IN_PROGRESS) != (not complete):
-        raise SchemaError("VERDICT_INVALID")
-    actual = sum(
-        1
-        for slot in reviewers.values()
-        if slot.report
-        for finding in slot.report.findings
-        if finding.severity in {Severity.CRITICAL, Severity.HIGH}
-    )
-    if status is GateStatus.IN_PROGRESS and count != 0:
-        raise SchemaError("VERDICT_INVALID")
-    if status is not GateStatus.IN_PROGRESS and count != actual:
-        raise SchemaError("VERDICT_INVALID")
-    if (status is GateStatus.PASS) != (complete and count == 0):
-        raise SchemaError("VERDICT_INVALID")
-    if any(item.disposition == "fixed" for item in decisions) and (
-        not history or head_sha == history[-1].head_sha
-    ):
-        raise SchemaError("FIXED_HEAD_UNCHANGED")
-    verdict = Verdict(
-        1,
+    return _VerdictFields(
+        schema,
         repository,
         base_ref,
         base_sha,
@@ -367,17 +339,258 @@ def _parse_verdict(raw: bytes) -> Verdict:
         history,
         GateSummary(status, count),
         created_at,
+        snapshot,
     )
+
+
+def _parse_embedded_report(
+    value: object, *, reviewer: str, fields: _VerdictFields
+) -> ReviewerReport:
+    completed = m._object(
+        value,
+        {"status", "findings", "executions", "claims", "prior_decisions"},
+        "VERDICT_INVALID",
+    )
+    report_value = {
+        "schema": m.SCHEMA_VERSION,
+        "reviewer": reviewer,
+        "round": fields.round,
+        "snapshot": {
+            "head_sha": fields.head_sha,
+            "diff_sha256": fields.diff_sha256,
+        },
+        **completed,
+    }
+    return m.parse_reviewer_report(
+        json.dumps(
+            report_value, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8"),
+        expected_reviewer=Reviewer(reviewer),
+        expected_round=fields.round,
+        snapshot=fields.snapshot,
+    )
+
+
+def _blocking_count(reviewers: Mapping[str, ReviewerSlot]) -> int:
+    return sum(
+        1
+        for slot in reviewers.values()
+        if slot.report is not None
+        for finding in slot.report.findings
+        if finding.severity in {Severity.CRITICAL, Severity.HIGH}
+    )
+
+
+def _verdict_from_fields(
+    fields: _VerdictFields,
+    reviewers: Mapping[str, ReviewerSlot],
+    *,
+    contract: ContractBinding | None = None,
+) -> Verdict:
+    return Verdict(
+        fields.schema,
+        fields.repository,
+        fields.base_ref,
+        fields.base_sha,
+        fields.head_ref,
+        fields.head_sha,
+        fields.merge_base_sha,
+        fields.diff_sha256,
+        fields.initial_paths,
+        fields.round,
+        fields.producer_runtime,
+        reviewers,
+        fields.decisions,
+        fields.history,
+        fields.gate,
+        fields.created_at,
+        contract,
+    )
+
+
+def _parse_verdict_v1(data: dict[str, object]) -> Verdict:
+    fields = _parse_verdict_fields(data, schema=m.SCHEMA_VERSION)
+    reviewers: dict[str, ReviewerSlot] = {}
+    for key in "ABC":
+        slot = fields.reviewers[key]
+        if (
+            isinstance(slot, dict)
+            and set(slot) == {"status"}
+            and slot["status"] == "pending"
+        ):
+            reviewers[key] = ReviewerSlot("pending")
+        else:
+            reviewers[key] = ReviewerSlot(
+                "complete", _parse_embedded_report(slot, reviewer=key, fields=fields)
+            )
+    pending_count = sum(slot.status == "pending" for slot in reviewers.values())
+    if pending_count not in {0, 3}:
+        raise SchemaError("VERDICT_INVALID")
+    complete = pending_count == 0
+    status = fields.gate.status
+    count = fields.gate.blocking_count
+    if (status is GateStatus.IN_PROGRESS) != (not complete):
+        raise SchemaError("VERDICT_INVALID")
+    actual = _blocking_count(reviewers)
+    if status is GateStatus.IN_PROGRESS and count != 0:
+        raise SchemaError("VERDICT_INVALID")
+    if status is not GateStatus.IN_PROGRESS and count != actual:
+        raise SchemaError("VERDICT_INVALID")
+    if (status is GateStatus.PASS) != (complete and count == 0):
+        raise SchemaError("VERDICT_INVALID")
+    verdict = _verdict_from_fields(fields, reviewers)
     if complete:
         _validate_closure(
             verdict,
-            {
-                key: reviewers[key].report
-                for key in "ABC"
-                if reviewers[key].report is not None
-            },
+            {key: reviewers[key].report for key in "ABC"},
         )
     return verdict
+
+
+def _parse_contract(value: object) -> ContractBinding:
+    obj = m._object(
+        value,
+        {"report_text", "diff_recipe", "verdict_schema"},
+        "VERDICT_INVALID",
+    )
+    contract = ContractBinding(
+        m._integer(obj["report_text"], "VERDICT_INVALID", minimum=1),
+        m._integer(obj["diff_recipe"], "VERDICT_INVALID", minimum=1),
+        m._integer(obj["verdict_schema"], "VERDICT_INVALID", minimum=1),
+    )
+    if contract != ContractBinding(
+        m.REPORT_TEXT_CONTRACT_VERSION,
+        DIFF_RECIPE_VERSION,
+        m.VERDICT_SCHEMA_VERSION,
+    ):
+        raise SchemaError("VERDICT_INVALID")
+    return contract
+
+
+def _parse_v2_receipt(
+    value: object,
+    *,
+    reviewer: str,
+    fields: _VerdictFields,
+    contract: ContractBinding,
+    attempt_count: int,
+) -> ReportReceipt:
+    obj = m._object(
+        value,
+        {
+            "raw_sha256",
+            "context_sha256",
+            "report_contract_version",
+            "attempt",
+            "provenance",
+        },
+        "VERDICT_INVALID",
+    )
+    raw_sha256 = obj["raw_sha256"]
+    context_sha256 = obj["context_sha256"]
+    if (
+        not isinstance(raw_sha256, str)
+        or m._SHA256.fullmatch(raw_sha256) is None
+        or not isinstance(context_sha256, str)
+        or m._SHA256.fullmatch(context_sha256) is None
+    ):
+        raise SchemaError("VERDICT_INVALID")
+    report_contract_version = m._integer(
+        obj["report_contract_version"], "VERDICT_INVALID", minimum=1
+    )
+    attempt = m._integer(
+        obj["attempt"], "VERDICT_INVALID", minimum=1, maximum=3
+    )
+    provenance = obj["provenance"]
+    if (
+        report_contract_version != contract.report_text
+        or attempt != attempt_count
+        or not isinstance(provenance, str)
+        or provenance not in m.RECEIPT_PROVENANCE
+    ):
+        raise SchemaError("VERDICT_INVALID")
+    return ReportReceipt(
+        Reviewer(reviewer),
+        fields.round,
+        f".review/inbox/round-{fields.round}/{reviewer}.json",
+        raw_sha256,
+        context_sha256,
+        report_contract_version,
+        attempt,
+        provenance,
+    )
+
+
+def _parse_verdict_v2(data: dict[str, object]) -> Verdict:
+    fields = _parse_verdict_fields(data, schema=m.VERDICT_SCHEMA_VERSION)
+    contract = _parse_contract(data["contract"])
+    reviewers: dict[str, ReviewerSlot] = {}
+    for key in "ABC":
+        raw_slot = fields.reviewers[key]
+        if not isinstance(raw_slot, dict):
+            raise SchemaError("VERDICT_INVALID")
+        state = raw_slot.get("state")
+        expected_keys = (
+            {"state", "attempt_count", "last_error"}
+            if state == "pending"
+            else {"state", "report", "receipt", "attempt_count", "last_error"}
+        )
+        slot = m._object(raw_slot, expected_keys, "VERDICT_INVALID")
+        attempt_count = m._integer(
+            slot["attempt_count"], "VERDICT_INVALID", minimum=0, maximum=3
+        )
+        last_error = slot["last_error"]
+        if last_error is not None:
+            last_error = m._text(last_error, 128)
+        if state == "pending":
+            reviewers[key] = ReviewerSlot(
+                "pending", attempt_count=attempt_count, last_error=last_error
+            )
+            continue
+        if state != "sealed" or attempt_count < 1 or last_error is not None:
+            raise SchemaError("VERDICT_INVALID")
+        report = _parse_embedded_report(slot["report"], reviewer=key, fields=fields)
+        receipt = _parse_v2_receipt(
+            slot["receipt"],
+            reviewer=key,
+            fields=fields,
+            contract=contract,
+            attempt_count=attempt_count,
+        )
+        reviewers[key] = ReviewerSlot(
+            "sealed", report, receipt, attempt_count, None
+        )
+
+    status = fields.gate.status
+    count = fields.gate.blocking_count
+    all_sealed = all(slot.status == "sealed" for slot in reviewers.values())
+    if status is GateStatus.IN_PROGRESS:
+        if count != 0:
+            raise SchemaError("VERDICT_INVALID")
+    else:
+        actual = _blocking_count(reviewers)
+        if not all_sealed or count != actual:
+            raise SchemaError("VERDICT_INVALID")
+        if (status is GateStatus.PASS) != (count == 0):
+            raise SchemaError("VERDICT_INVALID")
+    verdict = _verdict_from_fields(fields, reviewers, contract=contract)
+    if status is not GateStatus.IN_PROGRESS:
+        _validate_closure(
+            verdict,
+            {key: reviewers[key].report for key in "ABC"},
+        )
+    return verdict
+
+
+def _parse_verdict(raw: bytes) -> Verdict:
+    data = m._load_json(raw, limit=m.MAX_VERDICT_BYTES, too_large="VERDICT_TOO_LARGE")
+    if not isinstance(data, dict) or type(data.get("schema")) is not int:
+        raise SchemaError("VERDICT_INVALID")
+    if data["schema"] == m.SCHEMA_VERSION:
+        return _parse_verdict_v1(data)
+    if data["schema"] == m.VERDICT_SCHEMA_VERSION:
+        return _parse_verdict_v2(data)
+    raise SchemaError("VERDICT_SCHEMA_UNSUPPORTED")
 
 
 def _read_verdict_locked(review_fd: int) -> Verdict:
@@ -560,6 +773,17 @@ def _require_all_pending(verdict: Verdict) -> None:
         raise SchemaError("ROUND_NOT_IN_PROGRESS")
 
 
+def require_v2_in_progress(verdict: Verdict) -> Verdict:
+    if verdict.schema == m.SCHEMA_VERSION:
+        raise SchemaError("LEGACY_ADOPTION_REQUIRED")
+    if (
+        verdict.schema != m.VERDICT_SCHEMA_VERSION
+        or verdict.gate.status is not GateStatus.IN_PROGRESS
+    ):
+        raise SchemaError("ROUND_NOT_IN_PROGRESS")
+    return verdict
+
+
 def _validate_report_store_input(reviewer: Reviewer, raw: bytes) -> None:
     if not isinstance(reviewer, Reviewer) or not isinstance(raw, bytes):
         raise SchemaError("REPORT_SCHEMA_INVALID")
@@ -691,6 +915,37 @@ def _summary(verdict: Verdict) -> RoundSummary:
     )
     return RoundSummary(
         verdict.round, verdict.head_sha, verdict.diff_sha256, blockers, outcomes
+    )
+
+
+def _new_v2_pending(
+    snapshot: Snapshot,
+    *,
+    runtime: str,
+    initial_paths: Sequence[str],
+    round_number: int,
+    decisions: Sequence[Decision],
+    history: Sequence[RoundSummary],
+    contract: ContractBinding,
+) -> Verdict:
+    return Verdict(
+        m.VERDICT_SCHEMA_VERSION,
+        snapshot.repository,
+        snapshot.base_ref,
+        snapshot.base_sha,
+        snapshot.head_ref,
+        snapshot.head_sha,
+        snapshot.merge_base_sha,
+        snapshot.diff_sha256,
+        tuple(initial_paths),
+        round_number,
+        runtime,
+        {key: ReviewerSlot("pending") for key in "ABC"},
+        tuple(decisions),
+        tuple(history),
+        GateSummary(GateStatus.IN_PROGRESS, 0),
+        snapshot.created_at,
+        contract,
     )
 
 

@@ -1,4 +1,5 @@
 import fcntl
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -9,20 +10,28 @@ import sys
 
 import pytest
 
-from pre_pr_tribunal.git_state import capture_snapshot
+from pre_pr_tribunal.git_state import DIFF_RECIPE_VERSION, capture_snapshot
 from pre_pr_tribunal.model import (
+    SCHEMA_VERSION,
+    VERDICT_SCHEMA_VERSION,
+    ContractBinding,
     MAX_EVIDENCE_TEXT_BYTES,
     MAX_REPORT_BYTES,
+    REPORT_TEXT_CONTRACT_VERSION,
+    ReportReceipt,
     Reviewer,
+    ReviewerSlot,
     SchemaError,
     parse_decisions,
     parse_reviewer_report,
     validate_report_bytes,
 )
 from pre_pr_tribunal.verdict_store import (
+    _new_v2_pending,
     begin_round,
     finalize_round,
     read_verdict,
+    require_v2_in_progress,
     store_reviewer_report,
     validate_stored_reviewer_report,
 )
@@ -848,6 +857,177 @@ def test_begin_writes_in_progress_and_finalize_requires_all_reviewers(git_repo):
             reviewer_paths={"A": git_repo / ".review/inbox/round-1/A.json"},
             now=NOW,
         )
+
+
+def test_verdict_schema_two_does_not_change_report_or_snapshot_schema(git_repo):
+    legacy = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    pending = _new_v2_pending(
+        legacy.snapshot,
+        runtime="codex",
+        initial_paths=legacy.initial_paths,
+        round_number=1,
+        decisions=(),
+        history=(),
+        contract=ContractBinding(
+            REPORT_TEXT_CONTRACT_VERSION, DIFF_RECIPE_VERSION, 2
+        ),
+    )
+    assert pending.schema == VERDICT_SCHEMA_VERSION == 2
+    assert pending.snapshot.schema == SCHEMA_VERSION == 1
+    assert all(slot.status == "pending" for slot in pending.reviewers.values())
+    assert pending.contract.to_json() == {
+        "report_text": REPORT_TEXT_CONTRACT_VERSION,
+        "diff_recipe": DIFF_RECIPE_VERSION,
+        "verdict_schema": 2,
+    }
+    assert pending.to_json()["reviewers"]["A"] == {
+        "state": "pending",
+        "attempt_count": 0,
+        "last_error": None,
+    }
+
+
+def _schema_two_mixed_verdict(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    raw = json.dumps(report(pending.snapshot, "A")).encode()
+    parsed_report = parse_reviewer_report(
+        raw,
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=pending.snapshot,
+    )
+    sealed = replace(
+        pending,
+        schema=VERDICT_SCHEMA_VERSION,
+        contract=ContractBinding(
+            REPORT_TEXT_CONTRACT_VERSION, DIFF_RECIPE_VERSION, 2
+        ),
+        reviewers={
+            "A": ReviewerSlot(
+                "sealed",
+                report=parsed_report,
+                receipt=ReportReceipt(
+                    reviewer=Reviewer.A,
+                    round=1,
+                    path=".review/inbox/round-1/A.json",
+                    raw_sha256=hashlib.sha256(raw).hexdigest(),
+                    context_sha256="2" * 64,
+                    report_contract_version=REPORT_TEXT_CONTRACT_VERSION,
+                    attempt=1,
+                    provenance="native_submit",
+                ),
+                attempt_count=1,
+            ),
+            "B": ReviewerSlot("pending", attempt_count=1, last_error="JSON_INVALID"),
+            "C": ReviewerSlot("pending"),
+        },
+    )
+    return sealed
+
+
+def test_schema_two_parser_accepts_mixed_pending_and_sealed_slots(git_repo):
+    sealed = _schema_two_mixed_verdict(git_repo)
+    verdict_path = write_json(git_repo / ".review/verdict.json", sealed.to_json())
+    verdict_path.chmod(0o600)
+    parsed = read_verdict(git_repo)
+    assert parsed.reviewers["A"].status == "sealed"
+    assert parsed.reviewers["B"].last_error == "JSON_INVALID"
+    assert parsed.reviewers["A"].receipt == sealed.reviewers["A"].receipt
+    assert sealed.to_json()["reviewers"]["A"]["receipt"] == {
+        "raw_sha256": sealed.reviewers["A"].receipt.raw_sha256,
+        "context_sha256": "2" * 64,
+        "report_contract_version": REPORT_TEXT_CONTRACT_VERSION,
+        "attempt": 1,
+        "provenance": "native_submit",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "sealed_without_report",
+        "sealed_without_receipt",
+        "pending_with_report",
+        "invalid_provenance",
+        "attempt_below_one",
+        "attempt_count_mismatch",
+        "pass_with_pending",
+        "fail_with_pending",
+        "in_progress_with_blocker",
+    ),
+)
+def test_schema_two_parser_rejects_invalid_slot_and_gate_shapes(git_repo, mutation):
+    payload = _schema_two_mixed_verdict(git_repo).to_json()
+    if mutation == "sealed_without_report":
+        del payload["reviewers"]["A"]["report"]
+    elif mutation == "sealed_without_receipt":
+        del payload["reviewers"]["A"]["receipt"]
+    elif mutation == "pending_with_report":
+        payload["reviewers"]["B"]["report"] = payload["reviewers"]["A"]["report"]
+    elif mutation == "invalid_provenance":
+        payload["reviewers"]["A"]["receipt"]["provenance"] = "manual"
+    elif mutation == "attempt_below_one":
+        payload["reviewers"]["A"]["receipt"]["attempt"] = 0
+    elif mutation == "attempt_count_mismatch":
+        payload["reviewers"]["A"]["attempt_count"] = 2
+    elif mutation == "pass_with_pending":
+        payload["gate"]["status"] = "pass"
+    elif mutation == "fail_with_pending":
+        payload["gate"].update(status="fail", blocking_count=1)
+    else:
+        payload["gate"]["blocking_count"] = 1
+    write_json(git_repo / ".review/verdict.json", payload)
+    with pytest.raises(SchemaError, match="^VERDICT_INVALID$"):
+        read_verdict(git_repo)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("reviewer", Reviewer.B),
+        ("round", 2),
+        ("round", True),
+        ("path", ".review/inbox/round-1/B.json"),
+    ),
+)
+def test_schema_two_projection_rejects_receipt_binding_mismatch(
+    git_repo, field, value
+):
+    verdict = _schema_two_mixed_verdict(git_repo)
+    slot = verdict.reviewers["A"]
+    mismatched = replace(slot.receipt, **{field: value})
+    verdict = replace(
+        verdict,
+        reviewers={**verdict.reviewers, "A": replace(slot, receipt=mismatched)},
+    )
+    with pytest.raises(SchemaError, match="^VERDICT_INVALID$"):
+        verdict.to_json()
+
+
+def test_schema_one_terminal_verdict_remains_readable_without_rewrite(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    finalize_round(
+        git_repo, reviewer_paths=report_paths(git_repo, pending.snapshot), now=NOW
+    )
+    path = git_repo / ".review/verdict.json"
+    before = path.read_bytes()
+    parsed = read_verdict(git_repo)
+    assert parsed.schema == 1
+    assert parsed.gate.status.value == "pass"
+    assert path.read_bytes() == before
+
+
+def test_schema_one_pending_is_readable_but_new_submit_requires_migration(git_repo):
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert read_verdict(git_repo).schema == 1
+    with pytest.raises(SchemaError, match="^LEGACY_ADOPTION_REQUIRED$"):
+        require_v2_in_progress(read_verdict(git_repo))
 
 
 @pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
