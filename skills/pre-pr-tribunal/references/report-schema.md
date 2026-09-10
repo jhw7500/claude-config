@@ -60,7 +60,7 @@ The installed CLI and its installed contract binding are the source of truth. Do
 }
 ```
 
-The exact controller command shapes are below. `submit-report` reads exact report bytes on stdin; it does not normalize or repair them, and canonical accepted report files remain runtime-managed. `record-failure` has a strict operational-reason whitelist and returns only `state`, cumulative `attempt_count`, and `last_error`. Pathless `finalize` authenticates all three sealed receipts. `validate-report --source stored` is read-only and must be run for A/B/C immediately before finalization.
+The exact controller command shapes are below. `submit-report` reads exact report bytes on stdin; it does not normalize or repair them, and canonical accepted report files remain runtime-managed. After an interrupted publication it may seal the existing canonical orphan instead of the new stdin bytes. REQUIRED receipt acceptance check, including pending recovery: `receipt.raw_sha256 == SHA256(exact_private_terminal_response_bytes)`, before accepting success or proceeding to stored validation. A mismatch is a controller `REPORT_BYTES_MISMATCH` integrity stop: preserve the new private response, old canonical report, and returned receipt without retry, replacement, or finalization. Stored-validation agreement with the receipt alone cannot establish this input binding. `record-failure` has a strict operational-reason whitelist and returns only `state`, cumulative `attempt_count`, and `last_error`. Pathless `finalize` authenticates all three sealed receipts. `validate-report --source stored` is read-only and must be run for A/B/C immediately before finalization.
 
 <!-- controller-command-examples -->
 | Purpose | Exact CLI arguments |

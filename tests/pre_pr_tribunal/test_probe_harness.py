@@ -743,6 +743,58 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
     assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "pass"
 
 
+def test_installed_probe_stops_when_orphan_receipt_discards_new_blocker(tmp_path):
+    """Removing the input/receipt digest check must not silently lose a new HIGH."""
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    begun = module._tribunal_cli(
+        cli, repo, home, "begin", "--base", "master", "--runtime", "codex",
+        "--round", "1",
+    )
+    old = module._synthetic_report_bytes("A", 1, begun["snapshot"])
+    canonical = repo / ".review/inbox/round-1/A.json"
+    # Crash boundary: publication succeeded, but the slot is still pending.
+    canonical.write_bytes(old)
+    canonical.chmod(0o600)
+    fresh = json.loads(old)
+    fresh["findings"] = [{
+        "id": "A-R1-001", "reviewer": "A", "severity": "HIGH",
+        "title": "New blocker after interrupted publication",
+        "rationale": "The new terminal response must not be silently discarded.",
+        "path": "tracked.txt", "line": 1, "execution_ids": [],
+        "acceptance_condition": "Preserve both reports and stop before finalization.",
+    }]
+    private = tmp_path / "terminal-A.json"
+    new = (json.dumps(fresh, separators=(",", ":")) + "\n").encode()
+    private.write_bytes(new)
+    private.chmod(0o600)
+    dispatched = []
+
+    def terminal_response(reviewer, attempt, snapshot):
+        dispatched.append(reviewer)
+        return private.read_bytes() if reviewer == "A" else module._synthetic_report_bytes(
+            reviewer, attempt, snapshot,
+        )
+
+    with pytest.raises(module.ProbeFailure, match="^REPORT_BYTES_MISMATCH$"):
+        module._create_pass_verdict(
+            cli, repo, home, "codex", report_factory=terminal_response,
+        )
+
+    status = module._tribunal_cli(cli, repo, home, "status")
+    assert dispatched == ["A"]  # No retry or peer dispatch after the integrity stop.
+    assert status["gate_status"] == "in_progress"
+    assert status["reviewers"]["A"]["state"] == "sealed"
+    assert status["reviewers"]["A"]["raw_sha256"] == hashlib.sha256(old).hexdigest()
+    assert status["reviewers"]["B"]["state"] == "pending"
+    assert status["reviewers"]["C"]["state"] == "pending"
+    for path, expected in ((canonical, old), (private, new)):
+        assert path.read_bytes() == expected
+        metadata = path.lstat()
+        assert stat.S_ISREG(metadata.st_mode)
+        assert metadata.st_uid == os.geteuid()
+        assert stat.S_IMODE(metadata.st_mode) == 0o600
+
+
 @pytest.mark.parametrize("inconsistency", ("digest", "attempt", "boolean_attempt"))
 def test_installed_probe_rejects_submit_receipt_status_inconsistency(
     tmp_path, monkeypatch, inconsistency,
