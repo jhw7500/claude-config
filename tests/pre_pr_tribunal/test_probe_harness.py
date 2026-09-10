@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -12,6 +13,7 @@ from pathlib import Path
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import textwrap
@@ -678,6 +680,364 @@ def _load_probe_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _installed_lifecycle(tmp_path):
+    module = _load_probe_module()
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    repo = tmp_path / "repo"
+    module._create_probe_repo(repo, home)
+    cli = module._install(REPO, home, repo)
+    return module, home, repo, cli
+
+
+@pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
+def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path, monkeypatch, mask):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    run = subprocess.run
+    captured = {}
+    validations = []
+    finalizations = []
+
+    def observe(argv, **kwargs):
+        if len(argv) > 2 and argv[1] == str(cli):
+            if argv[2] == "submit-report":
+                captured[argv[4]] = kwargs["input"]
+            elif argv[2] == "validate-report":
+                validations.append(argv[4])
+            elif argv[2] == "finalize":
+                # Every separate pre-final stored validation must have completed.
+                assert validations == list("ABC")
+                for reviewer in "ABC":
+                    target = repo / f".review/inbox/round-1/{reviewer}.json"
+                    metadata = target.lstat()
+                    assert stat.S_ISREG(metadata.st_mode)
+                    assert metadata.st_uid == os.geteuid()
+                    assert stat.S_IMODE(metadata.st_mode) == 0o600
+                    assert target.read_bytes() == captured[reviewer]
+                finalizations.append(True)
+        result = run(argv, **kwargs)
+        if len(argv) > 2 and argv[1] == str(cli) and argv[2] in {"submit-report", "validate-report"}:
+            assert json.loads(result.stdout)["raw_sha256"] == hashlib.sha256(captured[argv[4]]).hexdigest()
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", observe)
+    previous = os.umask(mask)
+    try:
+        result = module._create_pass_verdict(cli, repo, home, "codex")
+    finally:
+        os.umask(previous)
+    assert len(finalizations) == 1
+    assert result["status"]["gate_status"] == "pass"
+    assert result["status"]["verdict_schema"] == 2
+    summary = result["telemetry_summary"]
+    assert summary["binding"]["diff_sha256"] == result["begin"]["snapshot"]["diff_sha256"]
+    assert summary["stages"]["report_store"]["count"] == 3
+    assert summary["stages"]["report_validation"]["count"] == 3
+    assert summary["stages"]["finalize"]["count"] == 1
+    assert summary["outcomes"]["failure"] == 0
+    ledger = json.loads((repo / ".review/telemetry.json").read_bytes())
+    assert all(span["status"] != "running" for span in ledger["runs"][0]["spans"])
+    assert ledger["runs"][0]["status"] == "success"
+    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "pass"
+
+
+def test_installed_probe_stops_when_orphan_receipt_discards_new_blocker(tmp_path):
+    """Removing the input/receipt digest check must not silently lose a new HIGH."""
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    begun = module._tribunal_cli(
+        cli, repo, home, "begin", "--base", "master", "--runtime", "codex",
+        "--round", "1",
+    )
+    old = module._synthetic_report_bytes("A", 1, begun["snapshot"])
+    canonical = repo / ".review/inbox/round-1/A.json"
+    # Crash boundary: publication succeeded, but the slot is still pending.
+    canonical.write_bytes(old)
+    canonical.chmod(0o600)
+    fresh = json.loads(old)
+    fresh["findings"] = [{
+        "id": "A-R1-001", "reviewer": "A", "severity": "HIGH",
+        "title": "New blocker after interrupted publication",
+        "rationale": "The new terminal response must not be silently discarded.",
+        "path": "tracked.txt", "line": 1, "execution_ids": [],
+        "acceptance_condition": "Preserve both reports and stop before finalization.",
+    }]
+    private = tmp_path / "terminal-A.json"
+    new = (json.dumps(fresh, separators=(",", ":")) + "\n").encode()
+    private.write_bytes(new)
+    private.chmod(0o600)
+    dispatched = []
+
+    def terminal_response(reviewer, attempt, snapshot):
+        dispatched.append(reviewer)
+        return private.read_bytes() if reviewer == "A" else module._synthetic_report_bytes(
+            reviewer, attempt, snapshot,
+        )
+
+    with pytest.raises(module.ProbeFailure, match="^REPORT_BYTES_MISMATCH$"):
+        module._create_pass_verdict(
+            cli, repo, home, "codex", report_factory=terminal_response,
+        )
+
+    status = module._tribunal_cli(cli, repo, home, "status")
+    assert dispatched == ["A"]  # No retry or peer dispatch after the integrity stop.
+    assert status["gate_status"] == "in_progress"
+    assert status["reviewers"]["A"]["state"] == "sealed"
+    assert status["reviewers"]["A"]["raw_sha256"] == hashlib.sha256(old).hexdigest()
+    assert status["reviewers"]["B"]["state"] == "pending"
+    assert status["reviewers"]["C"]["state"] == "pending"
+    for path, expected in ((canonical, old), (private, new)):
+        assert path.read_bytes() == expected
+        metadata = path.lstat()
+        assert stat.S_ISREG(metadata.st_mode)
+        assert metadata.st_uid == os.geteuid()
+        assert stat.S_IMODE(metadata.st_mode) == 0o600
+
+
+@pytest.mark.parametrize("inconsistency", ("digest", "attempt", "boolean_attempt"))
+def test_installed_probe_rejects_submit_receipt_status_inconsistency(
+    tmp_path, monkeypatch, inconsistency,
+):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    run = subprocess.run
+
+    def inconsistent_submit(argv, **kwargs):
+        if (
+            len(argv) > 4
+            and argv[1] == str(cli)
+            and argv[2:5] == ["submit-report", "--reviewer", "A"]
+        ):
+            original = kwargs["input"]
+            if inconsistency == "digest":
+                kwargs = {**kwargs, "input": original + b" "}
+            result = run(argv, **kwargs)
+            payload = json.loads(result.stdout)
+            if inconsistency == "digest":
+                payload["raw_sha256"] = hashlib.sha256(original).hexdigest()
+            elif inconsistency == "attempt":
+                payload["attempt"] += 1
+            else:
+                payload["attempt"] = True
+            return subprocess.CompletedProcess(
+                result.args,
+                result.returncode,
+                (json.dumps(payload, separators=(",", ":")) + "\n").encode(),
+                result.stderr,
+            )
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", inconsistent_submit)
+
+    with pytest.raises(module.ProbeFailure, match="^REPORT_RECEIPT_MISMATCH$"):
+        module._create_pass_verdict(cli, repo, home, "codex")
+    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "in_progress"
+
+
+@pytest.mark.parametrize(("field", "values"), (
+    (None, None), ("findings", [{}]), ("findings", [{}] * 129),
+    ("executions", [{}] * 129), ("claims", [{}] * 129),
+))
+def test_installed_probe_preserves_valid_peers_when_c_retries(tmp_path, field, values):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    attempts = {"A": 0, "B": 0, "C": 0}
+
+    def report_factory(reviewer, attempt, snapshot):
+        attempts[reviewer] += 1
+        if reviewer == "C" and attempt == 1:
+            if field is None:
+                return b'{"schema":1'
+            invalid = json.loads(module._synthetic_report_bytes(reviewer, attempt, snapshot))
+            invalid[field] = values
+            return json.dumps(invalid).encode()
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=report_factory,
+    )
+
+    assert attempts == {"A": 1, "B": 1, "C": 2}
+    assert result["status"]["gate_status"] == "pass"
+    assert result["status"]["reviewers"]["A"]["attempt_count"] == 1
+    assert result["status"]["reviewers"]["C"]["attempt_count"] == 2
+
+
+def test_installed_probe_resumes_only_pending_c_and_reuses_native_sealed_peers(tmp_path):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    exhausted = []
+
+    def exhaust_c(reviewer, attempt, snapshot):
+        if reviewer == "C":
+            exhausted.append(attempt)
+            return b'{"schema":1'
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    with pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
+        module._create_pass_verdict(
+            cli, repo, home, "codex", report_factory=exhaust_c,
+        )
+    assert exhausted == [1, 2, 3]
+    before = {
+        reviewer: (repo / f".review/inbox/round-1/{reviewer}.json").read_bytes()
+        for reviewer in "AB"
+    }
+    called = []
+
+    def c_only(reviewer, attempt, snapshot):
+        called.append((reviewer, attempt))
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=c_only,
+    )
+
+    assert called == [("C", 4)]
+    assert {
+        reviewer: (repo / f".review/inbox/round-1/{reviewer}.json").read_bytes()
+        for reviewer in "AB"
+    } == before
+    assert result["status"]["gate_status"] == "pass"
+
+
+def test_installed_probe_migrates_unproven_legacy_reports_and_runs_all_slots(tmp_path):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    begun = module._tribunal_cli(
+        cli, repo, home, "begin", "--base", "master", "--runtime", "codex",
+        "--round", "1",
+    )
+    verdict_path = repo / ".review/verdict.json"
+    verdict = json.loads(verdict_path.read_bytes())
+    verdict["schema"] = 1
+    verdict.pop("contract")
+    verdict["reviewers"] = {reviewer: {"status": "pending"} for reviewer in "ABC"}
+    verdict_path.write_bytes(json.dumps(verdict, separators=(",", ":")).encode())
+    verdict_path.chmod(0o600)
+    legacy = {}
+    for reviewer in "AB":
+        raw = module._synthetic_report_bytes(reviewer, 1, begun["snapshot"])
+        legacy[reviewer] = raw
+        module._tribunal_cli(
+            cli, repo, home, "store-report", "--reviewer", reviewer, raw=raw,
+        )
+    called = []
+
+    def regenerated(reviewer, attempt, snapshot):
+        called.append((reviewer, attempt))
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=regenerated,
+    )
+
+    assert called == [("A", 2), ("B", 2), ("C", 1)]
+    for reviewer in "AB":
+        assert (
+            repo / f".review/attempts/round-1/{reviewer}/attempt-1.raw"
+        ).read_bytes() == legacy[reviewer]
+    assert result["status"]["gate_status"] == "pass"
+
+
+def test_installed_probe_seals_blocker_and_finalizes_fail(tmp_path):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+
+    def blocker(reviewer, attempt, snapshot):
+        report = json.loads(module._synthetic_report_bytes(reviewer, attempt, snapshot))
+        if reviewer == "A":
+            report["findings"] = [{
+                "id": "A-R1-001", "reviewer": "A", "severity": "HIGH",
+                "title": "Blocking canary finding",
+                "rationale": "The installed finalizer must preserve blockers.",
+                "path": "tracked.txt", "line": 1, "execution_ids": [],
+                "acceptance_condition": "The gate remains failed.",
+            }]
+        return (json.dumps(report, separators=(",", ":")) + "\n").encode()
+
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=blocker,
+    )
+
+    assert result["status"]["gate_status"] == "fail"
+    assert result["status"]["blocking_count"] == 1
+    assert result["status"]["reviewers"]["A"]["state"] == "sealed"
+
+
+@pytest.mark.parametrize("tamper", ("digest", "mode", "symlink"))
+def test_installed_probe_rechecks_each_report_immediately_before_finalize(tmp_path, monkeypatch, tamper):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    run = subprocess.run
+    validations = 0
+    finalizations = []
+
+    def change_after_validation(argv, **kwargs):
+        nonlocal validations
+        result = run(argv, **kwargs)
+        if len(argv) > 2 and argv[1] == str(cli):
+            if argv[2] == "finalize":
+                finalizations.append(True)
+            if argv[2] == "validate-report":
+                validations += 1
+                if validations == 3:
+                    target = repo / ".review/inbox/round-1/A.json"
+                    if tamper == "digest":
+                        target.write_bytes(target.read_bytes() + b" ")
+                    elif tamper == "mode":
+                        target.chmod(0o644)
+                    else:
+                        original = target.with_suffix(".original")
+                        target.rename(original)
+                        target.symlink_to(original.name)
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", change_after_validation)
+    expected = "REPORT_BYTES_MISMATCH" if tamper == "digest" else "FILE_UNSAFE"
+    with pytest.raises(module.ProbeFailure, match=f"^{expected}$"):
+        module._create_pass_verdict(cli, repo, home, "codex")
+    assert finalizations == [True]
+    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "in_progress"
+
+
+def test_installed_probe_telemetry_failure_does_not_block_valid_reports(tmp_path, monkeypatch):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    run = subprocess.run
+
+    def corrupt_telemetry(argv, **kwargs):
+        result = run(argv, **kwargs)
+        if len(argv) > 2 and argv[1] == str(cli) and argv[2] == "begin":
+            (repo / ".review/telemetry.json").write_bytes(b"{broken")
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", corrupt_telemetry)
+    result = module._create_pass_verdict(cli, repo, home, "codex")
+    assert result["telemetry_summary"] == {}
+    assert set(result["telemetry_gaps"]) == {"TELEMETRY_INVALID"}
+    assert (repo / ".review/telemetry.json").read_bytes() == b"{broken"
+    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "pass"
+
+
+def test_installed_probe_returns_contract_drift_for_wrong_installed_contract(tmp_path, monkeypatch):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    run = subprocess.run
+
+    def drift_after_begin(argv, **kwargs):
+        result = run(argv, **kwargs)
+        if len(argv) > 2 and argv[1] == str(cli) and argv[2] == "begin":
+            context = cli.with_name("review_context.py")
+            source = context.read_text(encoding="utf-8")
+            context.write_text(
+                source.replace(
+                    "report_text=REPORT_TEXT_CONTRACT_VERSION,",
+                    "report_text=REPORT_TEXT_CONTRACT_VERSION + 1,",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            context.chmod(0o600)
+        return result
+
+    monkeypatch.setattr(module.subprocess, "run", drift_after_begin)
+
+    with pytest.raises(module.ProbeFailure, match="^CONTRACT_DRIFT$"):
+        module._create_pass_verdict(cli, repo, home, "codex")
 
 
 def test_runtime_prompt_requires_literal_unwrapped_canary_command(tmp_path):

@@ -12,8 +12,8 @@ import pytest
 
 from pre_pr_tribunal import gate, hook_common
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
-from pre_pr_tribunal.model import SchemaError
-from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict
+from pre_pr_tribunal.model import Reviewer, SchemaError
+from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict, submit_reviewer_report
 
 
 PACKAGE = Path(__file__).resolve().parents[2] / "hooks" / "pre_pr_tribunal"
@@ -109,9 +109,8 @@ def _reports(
                 else []
             ),
         }
-        result[reviewer] = _write_json(
-            repo / f".review/inbox/round-{round_number}/{reviewer}.json", value
-        )
+        submit_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=json.dumps(value).encode())
+        result[reviewer] = repo / f".review/inbox/round-{round_number}/{reviewer}.json"
     return result
 
 
@@ -139,6 +138,44 @@ def _finish_round(
 
 def _passing_verdict(repo: Path):
     return _finish_round(repo)
+
+
+@pytest.mark.parametrize("version", (1, 2))
+def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo, version):
+    _passing_verdict(git_repo)
+    path = git_repo / ".review/verdict.json"
+    value = json.loads(path.read_bytes())
+    assert value["schema"] == 2
+    if version == 1:
+        value["schema"] = 1
+        del value["contract"]
+        value["reviewers"] = {key: slot["report"]
+                              for key, slot in value["reviewers"].items()}
+        _write_json(path, value)
+    assert evaluate_gate(git_repo, BOUND_COMMAND).code is GateCode.PASS
+    if version == 2:
+        value["contract"]["diff_recipe"] = 99
+        _write_json(path, value)
+        assert evaluate_gate(git_repo, BOUND_COMMAND).code is GateCode.VERDICT_STALE
+
+
+@pytest.mark.parametrize("name", ("codex_hook.py", "claude_hook.py"))
+@pytest.mark.parametrize("state", ("pass", "fail", "contract_drift"))
+def test_hook_adapter_consumes_native_v2_terminal_contract(installed_package, git_repo, name, state):
+    terminal = _finish_round(git_repo, finding_id="A-R1-001" if state == "fail" else None)
+    assert terminal.schema == 2
+    if state == "contract_drift":
+        value = terminal.to_json()
+        value["contract"]["diff_recipe"] = 99
+        _write_json(git_repo / ".review/verdict.json", value)
+    result = run_adapter(installed_package, name, payload(git_repo, BOUND_COMMAND), git_repo)
+    assert result.returncode == 0 and result.stderr == ""
+    if state == "pass":
+        assert result.stdout == ""
+    else:
+        specific = json.loads(result.stdout)["hookSpecificOutput"]
+        assert specific["permissionDecision"] == "deny"
+        assert ("BLOCKERS_OPEN" if state == "fail" else "VERDICT_STALE") in specific["permissionDecisionReason"]
 
 
 def _decision(round_number: int, finding_id: str) -> dict[str, object]:

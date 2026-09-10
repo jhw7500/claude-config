@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import json
 import re
 from typing import Mapping, Sequence
@@ -12,6 +13,10 @@ from urllib.parse import urlsplit
 
 
 SCHEMA_VERSION = 1
+VERDICT_SCHEMA_VERSION = 2
+SUPPORTED_VERDICT_SCHEMAS = frozenset((SCHEMA_VERSION, VERDICT_SCHEMA_VERSION))
+RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
+REPORT_TEXT_CONTRACT_VERSION = 2
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -37,6 +42,7 @@ _SECRET = re.compile(
 _HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>]+")
 _HTTP_URL_START = re.compile(r"https?://", re.IGNORECASE)
 _SHELL_CONTROL = frozenset(";|&()<>`")
+_EXCERPT_CONTROLS = frozenset(("\n", "\t"))
 _MAX_SHELL_NESTING = 64
 
 
@@ -237,16 +243,106 @@ class Decision:
 
 
 @dataclass(frozen=True)
+class ContractBinding:
+    report_text: int
+    diff_recipe: int
+    verdict_schema: int
+
+    def to_json(self) -> dict[str, int]:
+        return {
+            "report_text": self.report_text,
+            "diff_recipe": self.diff_recipe,
+            "verdict_schema": self.verdict_schema,
+        }
+
+
+@dataclass(frozen=True)
+class ReportReceipt:
+    reviewer: Reviewer
+    round: int
+    path: str
+    raw_sha256: str
+    context_sha256: str | None = None
+    report_contract_version: int | None = None
+    attempt: int | None = None
+    provenance: str | None = None
+
+
+@dataclass(frozen=True)
 class ReviewerSlot:
+    # The v2 wire format calls this field "state". Keep the Python name for
+    # compatibility with the v1 lifecycle and callers.
     status: str
     report: ReviewerReport | None = None
+    receipt: ReportReceipt | None = None
+    attempt_count: int = 0
+    last_error: str | None = None
 
-    def to_json(self) -> dict[str, object]:
-        if self.status == "pending":
-            return {"status": "pending"}
-        if self.report is None:
+    def to_json(self, verdict_schema: int = SCHEMA_VERSION) -> dict[str, object]:
+        if verdict_schema == SCHEMA_VERSION:
+            if self.status == "pending":
+                return {"status": "pending"}
+            if self.status != "complete" or self.report is None:
+                raise SchemaError("VERDICT_INVALID")
+            return self.report.to_json()
+        if verdict_schema != VERDICT_SCHEMA_VERSION:
             raise SchemaError("VERDICT_INVALID")
-        return self.report.to_json()
+        if (
+            not isinstance(self.attempt_count, int)
+            or isinstance(self.attempt_count, bool)
+            or self.attempt_count < 0
+            or (
+                self.last_error is not None
+                and (not isinstance(self.last_error, str) or not self.last_error)
+            )
+        ):
+            raise SchemaError("VERDICT_INVALID")
+        base: dict[str, object] = {
+            "state": self.status,
+            "attempt_count": self.attempt_count,
+            "last_error": self.last_error,
+        }
+        if self.status == "pending":
+            if self.report is not None or self.receipt is not None:
+                raise SchemaError("VERDICT_INVALID")
+            return base
+        receipt = self.receipt
+        if (
+            self.status != "sealed"
+            or self.report is None
+            or receipt is None
+            or receipt.context_sha256 is None
+            or receipt.report_contract_version is None
+            or receipt.attempt is None
+            or receipt.provenance is None
+            or not isinstance(receipt.raw_sha256, str)
+            or _SHA256.fullmatch(receipt.raw_sha256) is None
+            or not isinstance(receipt.context_sha256, str)
+            or _SHA256.fullmatch(receipt.context_sha256) is None
+            or not isinstance(receipt.report_contract_version, int)
+            or isinstance(receipt.report_contract_version, bool)
+            or receipt.report_contract_version < 1
+            or not isinstance(receipt.attempt, int)
+            or isinstance(receipt.attempt, bool)
+            or receipt.attempt < 1
+            or receipt.attempt != self.attempt_count
+            or receipt.provenance not in RECEIPT_PROVENANCE
+            or self.last_error is not None
+        ):
+            raise SchemaError("VERDICT_INVALID")
+        return {
+            "state": "sealed",
+            "report": self.report.to_json(),
+            "receipt": {
+                "raw_sha256": receipt.raw_sha256,
+                "context_sha256": receipt.context_sha256,
+                "report_contract_version": receipt.report_contract_version,
+                "attempt": receipt.attempt,
+                "provenance": receipt.provenance,
+            },
+            "attempt_count": self.attempt_count,
+            "last_error": self.last_error,
+        }
 
 
 @dataclass(frozen=True)
@@ -294,11 +390,12 @@ class Verdict:
     history: Sequence[RoundSummary]
     gate: GateSummary
     created_at: str
+    contract: ContractBinding | None = None
 
     @property
     def snapshot(self) -> Snapshot:
         return Snapshot(
-            self.schema,
+            SCHEMA_VERSION,
             self.repository,
             self.base_ref,
             self.base_sha,
@@ -312,7 +409,24 @@ class Verdict:
         )
 
     def to_json(self) -> dict[str, object]:
-        return {
+        if set(self.reviewers) != {"A", "B", "C"}:
+            raise SchemaError("VERDICT_INVALID")
+        if self.schema == VERDICT_SCHEMA_VERSION:
+            if self.contract is None:
+                raise SchemaError("VERDICT_INVALID")
+            for key in "ABC":
+                receipt = self.reviewers[key].receipt
+                if receipt is not None and (
+                    receipt.reviewer is not Reviewer(key)
+                    or not isinstance(receipt.round, int)
+                    or isinstance(receipt.round, bool)
+                    or receipt.round != self.round
+                    or receipt.path
+                    != f".review/inbox/round-{self.round}/{key}.json"
+                    or receipt.report_contract_version != self.contract.report_text
+                ):
+                    raise SchemaError("VERDICT_INVALID")
+        value: dict[str, object] = {
             "schema": self.schema,
             "repository": self.repository,
             "base": {"ref": self.base_ref, "sha": self.base_sha},
@@ -323,12 +437,17 @@ class Verdict:
             "initial_paths": list(self.initial_paths),
             "round": self.round,
             "producer_runtime": self.producer_runtime,
-            "reviewers": {key: self.reviewers[key].to_json() for key in "ABC"},
+            "reviewers": {
+                key: self.reviewers[key].to_json(self.schema) for key in "ABC"
+            },
             "decisions": [item.to_json() for item in self.decisions],
             "history": [item.to_json() for item in self.history],
             "gate": self.gate.to_json(),
             "created_at": self.created_at,
         }
+        if self.schema == VERDICT_SCHEMA_VERSION:
+            value["contract"] = self.contract.to_json()
+        return value
 
 
 def _unique_object(pairs: Sequence[tuple[str, object]]) -> dict[str, object]:
@@ -602,11 +721,24 @@ def _contains_home_path(text: str) -> bool:
     return False
 
 
-def _evidence(value: object) -> str:
-    text = _text(value, MAX_EVIDENCE_TEXT_BYTES, allow_empty=True)
-    if _SECRET.search(text) or _contains_home_path(text):
+def _execution_excerpt(value: object) -> str:
+    if not isinstance(value, str):
+        raise SchemaError("TEXT_INVALID")
+    try:
+        size = len(value.encode("utf-8", "strict"))
+    except UnicodeEncodeError:
+        raise SchemaError("TEXT_INVALID") from None
+    if size > MAX_EVIDENCE_TEXT_BYTES:
+        raise SchemaError("TEXT_TOO_LARGE")
+    if unicodedata.normalize("NFC", value) != value or any(
+        unicodedata.category(character) in {"Cc", "Cs"}
+        and character not in _EXCERPT_CONTROLS
+        for character in value
+    ):
+        raise SchemaError("TEXT_INVALID")
+    if _SECRET.search(value) or _contains_home_path(value):
         raise SchemaError("EVIDENCE_SECRET_DETECTED")
-    return text
+    return value
 
 
 def _command(value: object) -> str:
@@ -684,8 +816,8 @@ def _parse_execution(
     exit_code = _integer(
         obj["exit_code"], "EXECUTION_SCHEMA_INVALID", minimum=-255, maximum=255
     )
-    stdout = _evidence(obj["stdout_excerpt"])
-    stderr = _evidence(obj["stderr_excerpt"])
+    stdout = _execution_excerpt(obj["stdout_excerpt"])
+    stderr = _execution_excerpt(obj["stderr_excerpt"])
     capture = obj["capture_sha256"]
     if not isinstance(capture, str) or _SHA256.fullmatch(capture) is None:
         raise SchemaError("EXECUTION_SCHEMA_INVALID")
@@ -918,6 +1050,23 @@ def parse_reviewer_report(
         claims,
         responses,
     )
+
+
+def validate_report_bytes(
+    raw: bytes,
+    *,
+    expected_reviewer: Reviewer,
+    expected_round: int,
+    snapshot: Snapshot,
+) -> tuple[ReviewerReport, str]:
+    """Validate one exact reviewer response and return its raw-byte digest."""
+    report = parse_reviewer_report(
+        raw,
+        expected_reviewer=expected_reviewer,
+        expected_round=expected_round,
+        snapshot=snapshot,
+    )
+    return report, hashlib.sha256(raw).hexdigest()
 
 
 def _blocker_identity(value: object) -> tuple[str, int, Reviewer]:

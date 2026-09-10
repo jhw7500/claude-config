@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -19,6 +20,7 @@ CODEX_COMMAND = (
 )
 PACKAGE_NAMES = (
     "__init__.py",
+    "attempt_store.py",
     "claude_hook.py",
     "cli.py",
     "codex_hook.py",
@@ -26,7 +28,10 @@ PACKAGE_NAMES = (
     "git_state.py",
     "hook_common.py",
     "model.py",
+    "review_context.py",
+    "review_store.py",
     "shell_scan.py",
+    "telemetry.py",
     "verdict_store.py",
 )
 SKILL_SOURCE = REPO / "skills/pre-pr-tribunal"
@@ -138,6 +143,12 @@ def test_build_plan_installs_one_shared_package_two_hooks_and_two_skill_links(in
         home / ".codex/skills/pre-pr-tribunal",
     }
     assert all(by_path[package / name].mode == 0o600 for name in PACKAGE_NAMES)
+    assert {"attempt_store.py", "review_context.py"}.issubset(PACKAGE_NAMES)
+    for name in PACKAGE_NAMES:
+        source = REPO / "hooks/pre_pr_tribunal" / name
+        assert hashlib.sha256(by_path[package / name].data).digest() == hashlib.sha256(
+            source.read_bytes()
+        ).digest()
     claude = json.loads(by_path[home / ".claude/settings.json"].data)
     codex = json.loads(by_path[home / ".codex/hooks.json"].data)
     assert _managed(claude["hooks"]["PreToolUse"], CLAUDE_COMMAND) == [

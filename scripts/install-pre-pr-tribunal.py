@@ -45,6 +45,7 @@ _EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85
 
 PACKAGE_NAMES = (
     "__init__.py",
+    "attempt_store.py",
     "claude_hook.py",
     "cli.py",
     "codex_hook.py",
@@ -52,7 +53,10 @@ PACKAGE_NAMES = (
     "git_state.py",
     "hook_common.py",
     "model.py",
+    "review_context.py",
+    "review_store.py",
     "shell_scan.py",
+    "telemetry.py",
     "verdict_store.py",
 )
 CLAUDE_MATCHER = "Bash"

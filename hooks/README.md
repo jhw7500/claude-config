@@ -127,12 +127,117 @@ deny reason code와 기본 복구는 다음과 같다.
 | `REPOSITORY_UNSUPPORTED` | exact repository root, GitHub origin 또는 supported Git 상태가 아니다. root와 remote를 확인한다. |
 | `VERDICT_UNSAFE`, `VERDICT_INVALID` | `.review` 권한·파일 형식·schema/state invariant가 안전하지 않다. 우회하지 말고 원인을 고친 뒤 Skill로 재생성한다. |
 
-`finalize`가 reviewer report의 `TEXT_INVALID` 같은 schema 오류로 멈췄지만 verdict가 여전히
-`in_progress`라면, 기존 verdict를 reset하거나 `.review`를 지우지 않는다. 같은 bound snapshot과
-clean 상태를 확인한 뒤 fresh detached view에서 A/B/C 전원을 다시 실행한다. 기존 C가 valid였더라도
-재사용하지 않고, 세 reviewer의 exact 새 terminal JSON으로 inbox 세 파일을 교체한 다음 같은 round를
-`finalize`한다. JSON-decoded string은 NFC여야 하고 Unicode `Cc`/`Cs`를 포함할 수 없으므로 LF/TAB은
-escape로 표현해도 invalid다. Snapshot이 달라졌으면 이 pending 복구를 중단하고 사용자 판단을 받는다.
+`status`가 `in_progress`를 반환하면 `verdict_schema`를 먼저 확인한다. Native v2에서는
+`reviewers.A|B|C.state`의 `pending` role만 복구하고 `sealed` role은 다시 실행하거나 교체하지 않는다.
+v1이면 reviewer subset 없이 `migrate-legacy-pending`을 한 번 실행한 뒤 `status`를 다시 읽는다. Legacy
+raw/context digest로 native receipt provenance를 증명할 수 없으면 migration은 기존 raw evidence를 안전하게
+보존하면서 `LEGACY_PROVENANCE_UNAVAILABLE` 같은 이유로 모든 해당 slot을 pending으로 둔다. v1 A/B를
+fictional sealed receipt로 채택하면 안 된다. 어느 경로에서도 기존 verdict를 reset하거나 `.review`를
+지우거나 pending round에 `begin`을 실행하지 않는다. Bound snapshot 또는 installed contract binding이
+달라졌으면 복구를 중단하고 사용자 판단을 받는다.
+
+### Reviewer report handoff and validation
+
+The installed CLI and installed contract binding are authoritative; do not self-install candidate source for a live
+tribunal. The controller handles each terminal response privately and never sends one reviewer's output, slot state,
+or validation status to another reviewer. Preserve the full original response bytes in a controller-private file,
+explicitly enforce and verify current-user ownership, regular non-symlink type, and exact mode `0600` independently
+of ambient `umask`, then pipe those same bytes directly to `submit-report --reviewer A|B|C`. Do not trim,
+parse-and-re-emit, reserialize, repair, or silently truncate them. The CLI's bounded read of maximum report size plus
+one byte is not the full oversized response evidence; preserve that complete rejected evidence privately.
+
+A valid submit returns a sealed receipt with `raw_sha256`, `context_sha256`, `report_contract_version`, `attempt`,
+and `provenance`. Validate it immediately with `validate-report --reviewer A|B|C --source stored`. A valid HIGH or
+CRITICAL report stays sealed and contributes to final blocker aggregation. For a format rejection such as
+`JSON_INVALID`, `REPORT_TOO_LARGE`, `TEXT_INVALID`, `FINDING_SCHEMA_INVALID`, or bounded
+`FINDING_LIMIT_EXCEEDED`/`EXECUTION_LIMIT_EXCEEDED`/`CLAIM_LIMIT_EXCEEDED`, keep the verified detached view and send a complete format-only
+retry to the same handle. Fresh reports must also satisfy reviewer-local decision closure before sealing;
+`PRIOR_DECISION_RESPONSE_MISSING`/`PRIOR_DECISION_RESPONSE_INVALID` and
+`REPLACEMENT_FINDING_REQUIRED`/`REPLACEMENT_FINDING_INVALID` follow that same bounded content path.
+Finalization rechecks all-slot closure. Existing canonical-orphan failures remain integrity stops, outside
+fresh-input retry handling. For a supported terminal dispatch/process/timeout failure, use only
+`record-failure --reviewer X --reason DISPATCH_FAILED|REVIEWER_FAILED|REVIEWER_TIMEOUT`, then dispatch a fresh
+same-role replacement. A wait API expiring while its handle remains running is not a reviewer timeout: continue that
+handle without recording failure, duplicating the reviewer, or cleaning its view.
+
+Automatic dispatch is limited to three requests per role per controller invocation, not by the persisted cumulative
+`attempt_count`. Exhaustion returns `REVIEWER_UNAVAILABLE`, keeps every sealed peer, and leaves only pending roles for
+explicit resume. Each sealed or truly terminal role gets one bounded non-force cleanup attempt of its exact
+controller-created view. A verified terminal exact-view cleanup refusal and telemetry failure are observational
+warnings, not verdict gates; uncertain liveness, view identity, ownership, bytes, digest, snapshot, or contract are
+integrity stops. Never use force cleanup or delete a non-empty view root.
+
+Before pathless `finalize`, require `status` to show all A/B/C slots sealed. Re-run three separate stored validations,
+compare every digest to its receipt, and immediately recheck all report paths for current-user ownership, regular
+non-symlink type, exact `0600`, and unchanged bytes/contract. Any failure stops before `finalize`; two sealed slots can
+never pass. `store-report` and `--replace-pending-recovery` are v1-only and forbidden for native v2.
+
+### Telemetry is observational
+
+`begin` returns the telemetry run ID and records `snapshot_preflight`. Primary storage and telemetry independently
+require the whole `.review/` namespace to be ignored and untracked, including raw attempts and private staging
+artifacts. Individual file ignore rules are not sufficient: primary operations return `VERDICT_NOT_IGNORED`
+before publishing evidence, even when telemetry is unavailable. Telemetry-only failures remain advisory and
+cannot replace the primary result. The controller starts `reviewer_dispatch_wait`
+before dispatch, finishes it at runtime acceptance, and starts `reviewer_total` at acceptance through the terminal
+response. If acceptance is unavailable, both spans start before dispatch and finish at the terminal response;
+dispatch is `incomplete` with `RUNTIME_SIGNAL_UNAVAILABLE`, and total retains the actual dispatch-to-terminal duration.
+Do not invent a 0ms acceptance interval. Other spans surround their operations: `view_create`, `report_store`,
+`report_validation`, `view_cleanup`, `recovery_retry`, and pre-final checks through `finalize`.
+
+<!-- telemetry-command-examples -->
+```bash
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-start --run-id "$RUN_ID" --stage reviewer_total --reviewer A --attempt 1
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome success
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome failure --reason-code REPORT_SCHEMA_INVALID
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome timeout --reason-code REVIEWER_TIMEOUT
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome incomplete --reason-code CONTROLLER_INTERRUPTED
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome clock_anomaly --reason-code TELEMETRY_CLOCK_ANOMALY
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-recover --run-id "$RUN_ID"
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-close --run-id "$RUN_ID" --outcome incomplete --reason-code CONTROLLER_INTERRUPTED
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" telemetry-summary --run-id "$RUN_ID"
+```
+<!-- telemetry-command-examples-end -->
+
+`telemetry-start` requires the run ID, stage, and positive attempt. `snapshot_preflight` and `finalize` require no
+reviewer; every other stage except `recovery_retry` requires one A/B/C reviewer, and `recovery_retry` may omit it.
+`telemetry-finish` requires the run ID, span ID, outcome, and a stable `--reason-code` for `failure`, `timeout`,
+`incomplete`, or `clock_anomaly`; `success` omits the reason code. `telemetry-close` has the same outcome/reason
+rule without a span ID. `telemetry-recover` and `telemetry-summary` require only the run ID.
+
+`telemetry-start` returns `{run_id, span_id, stage, reviewer, status:"running"}`. `telemetry-finish` returns
+`{run_id, span_id, status, duration_ms}`; `telemetry-recover` returns `{run_id, recovered_count}`; and
+`telemetry-close` returns `{run_id, status}`. `telemetry-summary` returns bounded
+`{schema, binding, reviewers, stages, outcomes, telemetry_incomplete, anomaly_reason_codes, early_detection}`.
+If `begin` cannot create an observation, it returns `{status:"unavailable", reason_code}`; an external telemetry
+command returns its bounded telemetry error. In both cases, retain the primary tribunal result and record the missing
+observation rather than inventing a run or changing a gate result.
+
+Attempts start at 1 per run/stage/reviewer and increase for repeated operations. Before every terminal success or
+failure exit, finish observed spans, recover any remaining running spans with `telemetry-recover`, and call
+`telemetry-close` with the primary outcome after the required peer wait and non-force cleanup. Close each round
+before beginning another. On resumed interruption, recover the known running run before a new `recovery_retry`
+attempt. A previously closed or unavailable run remains an observation gap during pending report recovery;
+never reopen it or call `begin` solely for telemetry. The canonical Skill's telemetry lifecycle tables define the
+executable event/command order for both runtimes.
+
+Telemetry failure is an observation gap only. Telemetry is never a gate input and does not change report validity,
+gate status, or the finalize decision.
+
+### Snapshot diff contract and stable CLI codes
+
+The bound diff is SHA-256 over `/usr/bin/git diff --binary --no-ext-diff --no-textconv --full-index
+<merge-base>..<head-sha>`. The command clears inherited `GIT_` variables and fixes `LC_ALL=C`, `LANG=C`,
+`GIT_PAGER=cat`, `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
+`GIT_ATTR_NOSYSTEM=1`, and disables `core.fsmonitor` through the documented command-local config vector.
+
+CLI failures use bounded stable codes, including `USAGE`, `ROUND_NOT_IN_PROGRESS`, `SNAPSHOT_CHANGED`,
+`REPORT_FILE_EXISTS`, `REVIEWER_REPORT_MISSING`, `TEXT_INVALID`, `FILE_UNSAFE`, and telemetry's
+`TELEMETRY_INVALID`, `TELEMETRY_FILE_UNSAFE`, `TELEMETRY_TOO_LARGE`, or `TELEMETRY_CLOCK_ANOMALY`.
+Selective recovery additionally exposes `REVIEWER_SLOT_SEALED`, `ROUND_NOT_READY`,
+`REPORT_BYTES_MISMATCH`, `REPORT_RECEIPT_MISMATCH`, `LEGACY_COMMAND_NOT_ALLOWED`, and
+`LEGACY_MIGRATION_NOT_ALLOWED`. These are integrity/state results, not authorization to replace a sealed slot.
+Do not treat any telemetry code as report or gate evidence.
 
 `head_ref`가 도입되기 전에 생성된 terminal FAIL verdict는 다음 round `begin`에서만 현재 named
 branch를 새 snapshot에 기록하며 자동 전환된다. 그런 legacy verdict 자체는 PR을 허용하지 않는다.
