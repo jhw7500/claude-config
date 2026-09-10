@@ -113,10 +113,272 @@ def report_paths(repo, snapshot, *, round_number=1, overrides=None):
     for reviewer in "ABC":
         value = report(snapshot, reviewer, round_number=round_number)
         value.update(overrides.get(reviewer, {}))
-        result[reviewer] = write_json(
-            repo / f".review/inbox/round-{round_number}/{reviewer}.json", value
-        )
+        path = repo / f".review/inbox/round-{round_number}/{reviewer}.json"
+        if read_verdict(repo).schema == 1:
+            store_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=json.dumps(value).encode())
+        else:
+            submit_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=json.dumps(value).encode(), now=NOW)
+        result[reviewer] = path
     return result
+
+
+def legacy_pending(repo):
+    pending = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    legacy = replace(pending, schema=1, contract=None,
+                     reviewers={key: ReviewerSlot("pending") for key in "ABC"})
+    write_json(repo / ".review/verdict.json", legacy.to_json())
+    return legacy
+
+
+def begin_legacy_round(repo, **kwargs):
+    pending = begin_round(repo, **kwargs)
+    legacy = replace(pending, schema=1, contract=None,
+                     reviewers={key: ReviewerSlot("pending") for key in "ABC"})
+    write_json(repo / ".review/verdict.json", legacy.to_json())
+    return legacy
+
+
+@pytest.mark.parametrize("reviewer", "ABC")
+@pytest.mark.parametrize("tamper", ("bytes", "mode", "symlink", "owner", "context", "parsed", "contract"))
+def test_finalize_authenticates_every_sealed_receipt(git_repo, tamper, reviewer, monkeypatch):
+    pending = write_v2_pending(git_repo)
+    for key in "ABC":
+        submit_reviewer_report(git_repo, reviewer=Reviewer(key),
+                               raw=json.dumps(report(pending.snapshot, key)).encode(), now=NOW)
+    target = git_repo / f".review/inbox/round-1/{reviewer}.json"
+    expected = "FILE_UNSAFE"
+    if tamper == "bytes":
+        target.write_bytes(target.read_bytes() + b" ")
+        expected = "REPORT_BYTES_MISMATCH"
+    elif tamper == "mode":
+        target.chmod(0o644)
+    elif tamper == "symlink":
+        target.rename(target.with_suffix(".original"))
+        target.symlink_to(f"{reviewer}.original")
+    elif tamper == "owner":
+        original = os.fstat
+        inode = target.stat().st_ino
+        def wrong_owner(fd):
+            info = original(fd)
+            if info.st_ino == inode:
+                fields = list(info)
+                fields[4] = info.st_uid + 1
+                return os.stat_result(fields)
+            return info
+        monkeypatch.setattr(os, "fstat", wrong_owner)
+    else:
+        payload = read_verdict(git_repo).to_json()
+        if tamper == "context":
+            payload["reviewers"][reviewer]["receipt"]["context_sha256"] = "0" * 64
+            expected = "CONTEXT_DRIFT"
+        elif tamper == "parsed":
+            payload["reviewers"][reviewer]["report"]["executions"] = [execution(f"{reviewer}-R1-E001")]
+            expected = "REPORT_RECEIPT_MISMATCH"
+        else:
+            payload["contract"]["diff_recipe"] = 99
+            expected = "CONTRACT_DRIFT"
+        write_json(git_repo / ".review/verdict.json", payload)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with pytest.raises(SchemaError, match=f"^{expected}$"):
+        finalize_round(git_repo, now=NOW)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("sealed", (0, 2, 3))
+def test_v2_round_not_ready_and_successful_terminal_roundtrip(git_repo, sealed):
+    pending = write_v2_pending(git_repo)
+    for key in "ABC"[:sealed]:
+        submit_reviewer_report(git_repo, reviewer=Reviewer(key),
+                               raw=json.dumps(report(pending.snapshot, key)).encode(), now=NOW)
+    loaded = read_verdict(git_repo)
+    assert sum(slot.status == "sealed" for slot in loaded.reviewers.values()) == sealed
+    if sealed < 3:
+        with pytest.raises(SchemaError, match="^ROUND_NOT_READY$"):
+            finalize_round(git_repo, now=NOW)
+    else:
+        final = finalize_round(git_repo, now=NOW)
+        assert final.schema == 2 and final.gate.status.value == "pass"
+        assert read_verdict(git_repo) == final
+
+
+@pytest.mark.parametrize(("severity", "status", "count"), (
+    ("CRITICAL", "fail", 1), ("HIGH", "fail", 1), ("LOW", "pass", 0),
+))
+def test_v2_terminal_aggregates_every_sealed_report(git_repo, severity, status, count):
+    pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    report_paths(git_repo, pending.snapshot,
+                 overrides={"C": {"findings": [finding("C-R1-001", reviewer="C", severity=severity)]}})
+    sealed = read_verdict(git_repo)
+    final = finalize_round(git_repo, now=NOW)
+    assert final.gate.status.value == status
+    assert final.gate.blocking_count == count
+    assert final.reviewers == sealed.reviewers
+    assert read_verdict(git_repo) == final
+
+
+@pytest.mark.parametrize("version", (1, 2))
+def test_begin_refuses_pending_reset_without_losing_reports(git_repo, version):
+    pending = legacy_pending(git_repo) if version == 1 else write_v2_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A", findings=[finding()])).encode()
+    if version == 1:
+        store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+    else:
+        submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with pytest.raises(SchemaError, match="^ROUND_NOT_IN_PROGRESS$|^ROUND_TRANSITION_INVALID$"):
+        begin_legacy_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert (git_repo / ".review/inbox/round-1/A.json").read_bytes() == raw
+
+
+def test_new_round_writer_uses_v2(git_repo):
+    assert begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW).schema == 2
+
+
+@pytest.mark.parametrize("replacement", (False, True))
+@pytest.mark.parametrize("orphan", (False, True))
+def test_legacy_store_never_mutates_v2_canonical_or_orphan(git_repo, replacement, orphan):
+    pending = write_v2_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A", findings=[finding()])).encode()
+    path = git_repo / ".review/inbox/round-1/A.json"
+    if orphan:
+        path.write_bytes(raw)
+        path.chmod(0o600)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with pytest.raises(SchemaError, match="^LEGACY_COMMAND_NOT_ALLOWED$"):
+        store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=b"replacement",
+                              replace_pending_recovery=replacement)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert path.read_bytes() == raw if orphan else not path.exists()
+
+
+def test_legacy_migration_retains_all_bytes_without_inventing_provenance(git_repo):
+    from pre_pr_tribunal import verdict_store
+    pending = legacy_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A", findings=[finding()])).encode()
+    for key, value in (("A", raw), ("B", b'{"schema":1')):
+        store_reviewer_report(git_repo, reviewer=Reviewer(key), raw=value)
+    result = verdict_store.migrate_legacy_pending_round(git_repo)
+    assert result.reviewers == {"A": "pending:LEGACY_PROVENANCE_UNAVAILABLE",
+                                "B": "pending:JSON_INVALID", "C": "pending:REVIEWER_REPORT_MISSING"}
+    loaded = read_verdict(git_repo)
+    assert loaded.schema == 2
+    assert all(slot.status == "pending" for slot in loaded.reviewers.values())
+    assert (git_repo / ".review/attempts/round-1/A/attempt-1.raw").read_bytes() == raw
+    assert (git_repo / ".review/attempts/round-1/B/attempt-1.raw").read_bytes() == b'{"schema":1'
+    assert not (git_repo / ".review/inbox/round-1/A.json").exists()
+    assert loaded.reviewers["A"].attempt_count == 1
+    assert loaded.reviewers["C"].attempt_count == 0
+
+
+@pytest.mark.parametrize("unsafe", ("symlink", "fifo", "mode"))
+def test_legacy_migration_prescans_all_slots_before_mutation(git_repo, unsafe):
+    from pre_pr_tribunal import verdict_store
+    pending = legacy_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A")).encode()
+    store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+    target = git_repo / ".review/inbox/round-1/C.json"
+    if unsafe == "symlink":
+        target.symlink_to("A.json")
+    elif unsafe == "fifo":
+        os.mkfifo(target)
+    else:
+        target.write_bytes(raw)
+        target.chmod(0o644)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with pytest.raises(SchemaError, match="^FILE_UNSAFE$"):
+        verdict_store.migrate_legacy_pending_round(git_repo)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert (git_repo / ".review/inbox/round-1/A.json").read_bytes() == raw
+    assert not (git_repo / ".review/attempts").exists()
+
+
+@pytest.mark.parametrize("failure", ("verdict", "second_unlink"))
+def test_legacy_migration_retry_recovers_preserved_pending_evidence(git_repo, monkeypatch, failure):
+    from pre_pr_tribunal import verdict_store
+    pending = legacy_pending(git_repo)
+    raws = {key: json.dumps(report(pending.snapshot, key)).encode() for key in "ABC"}
+    for key, raw in raws.items():
+        store_reviewer_report(git_repo, reviewer=Reviewer(key), raw=raw)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with monkeypatch.context() as patch:
+        if failure == "verdict":
+            def fail(*args):
+                raise SchemaError("VERDICT_WRITE_FAILED")
+            patch.setattr(verdict_store, "_atomic_write", fail)
+        else:
+            original = os.unlink
+            def fail(path, *args, **kwargs):
+                if path == "B.json":
+                    raise OSError("injected removal failure")
+                return original(path, *args, **kwargs)
+            patch.setattr(os, "unlink", fail)
+        with pytest.raises(SchemaError):
+            verdict_store.migrate_legacy_pending_round(git_repo)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    verdict_store.migrate_legacy_pending_round(git_repo)
+    restored = read_verdict(git_repo)
+    for key in "ABC":
+        assert restored.reviewers[key].status == "pending"
+        assert restored.reviewers[key].attempt_count == 1
+        assert restored.reviewers[key].last_error == "LEGACY_PROVENANCE_UNAVAILABLE"
+        assert (git_repo / f".review/attempts/round-1/{key}/attempt-1.raw").read_bytes() == raws[key]
+        assert not (git_repo / f".review/inbox/round-1/{key}.json").exists()
+    replacement = json.dumps(report(pending.snapshot, "A", findings=[finding()])).encode()
+    submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=replacement, now=NOW)
+    assert read_verdict(git_repo).reviewers["A"].report.findings[0].severity.value == "HIGH"
+
+
+def test_legacy_migration_rejects_evidence_reason_inconsistent_with_raw(git_repo, monkeypatch):
+    from pre_pr_tribunal import verdict_store
+    pending = legacy_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A")).encode()
+    store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+    with monkeypatch.context() as patch:
+        def fail(*args):
+            raise SchemaError("VERDICT_WRITE_FAILED")
+        patch.setattr(verdict_store, "_atomic_write", fail)
+        with pytest.raises(SchemaError, match="VERDICT_WRITE_FAILED"):
+            verdict_store.migrate_legacy_pending_round(git_repo)
+    path = git_repo / ".review/attempts/round-1/A/attempt-1.meta.json"
+    value = json.loads(path.read_bytes())
+    value["reason_code"] = "JSON_INVALID"
+    write_json(path, value)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with pytest.raises(SchemaError, match="^ATTEMPT_EVIDENCE_UNSAFE$"):
+        verdict_store.migrate_legacy_pending_round(git_repo)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+
+
+def test_legacy_migration_refuses_subset_and_terminal_v1(git_repo):
+    from pre_pr_tribunal import verdict_store
+    pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    report_paths(git_repo, pending.snapshot)
+    native = finalize_round(git_repo, now=NOW)
+    terminal = replace(native, schema=1, contract=None,
+                       reviewers={key: ReviewerSlot("complete", slot.report)
+                                  for key, slot in native.reviewers.items()})
+    write_json(git_repo / ".review/verdict.json", terminal.to_json())
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    with pytest.raises(TypeError):
+        verdict_store.migrate_legacy_pending_round(git_repo, reviewers=("A",))
+    with pytest.raises(SchemaError, match="^LEGACY_MIGRATION_NOT_ALLOWED$"):
+        verdict_store.migrate_legacy_pending_round(git_repo)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+
+
+def test_legacy_migration_snapshot_drift_preserves_canonical_and_verdict(git_repo):
+    from pre_pr_tribunal.verdict_store import migrate_legacy_pending_round
+    pending = legacy_pending(git_repo)
+    raw = json.dumps(report(pending.snapshot, "A")).encode()
+    store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    commit_fix(git_repo)
+    with pytest.raises(SchemaError, match="^SNAPSHOT_CHANGED$"):
+        migrate_legacy_pending_round(git_repo)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert (git_repo / ".review/inbox/round-1/A.json").read_bytes() == raw
+    assert not (git_repo / ".review/attempts").exists()
 
 
 def write_v2_pending(git_repo):
@@ -1321,6 +1583,11 @@ def test_schema_one_terminal_verdict_remains_readable_without_rewrite(git_repo):
         git_repo, reviewer_paths=report_paths(git_repo, pending.snapshot), now=NOW
     )
     path = git_repo / ".review/verdict.json"
+    native = read_verdict(git_repo)
+    legacy = replace(native, schema=1, contract=None,
+                     reviewers={key: ReviewerSlot("complete", slot.report)
+                                for key, slot in native.reviewers.items()})
+    write_json(path, legacy.to_json())
     before = path.read_bytes()
     parsed = read_verdict(git_repo)
     assert parsed.schema == 1
@@ -1329,7 +1596,7 @@ def test_schema_one_terminal_verdict_remains_readable_without_rewrite(git_repo):
 
 
 def test_schema_one_pending_is_readable_but_new_submit_requires_migration(git_repo):
-    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    legacy_pending(git_repo)
     assert read_verdict(git_repo).schema == 1
     with pytest.raises(SchemaError, match="^LEGACY_ADOPTION_REQUIRED$"):
         require_v2_in_progress(read_verdict(git_repo))
@@ -1337,7 +1604,7 @@ def test_schema_one_pending_is_readable_but_new_submit_requires_migration(git_re
 
 @pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
 def test_store_reviewer_report_preserves_bytes_and_forces_mode(git_repo, mask):
-    pending = begin_round(
+    pending = begin_legacy_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\n"
@@ -1361,7 +1628,7 @@ def test_store_reviewer_report_preserves_bytes_and_forces_mode(git_repo, mask):
 def test_store_reviewer_report_rejects_nonexact_existing_report_directory(
     git_repo, relative, mode
 ):
-    pending = begin_round(
+    pending = begin_legacy_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     verdict_path = git_repo / ".review/verdict.json"
@@ -1382,7 +1649,7 @@ def test_store_reviewer_report_rejects_nonexact_existing_report_directory(
 
 
 def test_store_reviewer_report_preserves_invalid_bytes_and_never_overwrites(git_repo):
-    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    begin_legacy_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
     verdict_path = git_repo / ".review/verdict.json"
     verdict_before = verdict_path.read_bytes()
     raw = b'{"schema":1'
@@ -1399,7 +1666,7 @@ def test_store_reviewer_report_preserves_invalid_bytes_and_never_overwrites(git_
 
 @pytest.mark.parametrize("kind", ("symlink", "fifo", "readonly"))
 def test_store_reviewer_report_rejects_unsafe_existing_target(git_repo, kind):
-    pending = begin_round(
+    pending = begin_legacy_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     target = git_repo / ".review/inbox/round-1/A.json"
@@ -1423,7 +1690,7 @@ def test_store_reviewer_report_rejects_unsafe_existing_target(git_repo, kind):
 def test_explicit_full_panel_recovery_replace_preserves_each_new_response_exactly(
     git_repo,
 ):
-    pending = begin_round(
+    pending = begin_legacy_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     stale = {
@@ -1457,7 +1724,7 @@ def test_explicit_full_panel_recovery_replace_preserves_each_new_response_exactl
 def test_validate_stored_reviewer_report_is_snapshot_bound_and_does_not_mutate(
     git_repo,
 ):
-    pending = begin_round(
+    pending = begin_legacy_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
@@ -1473,55 +1740,49 @@ def test_validate_stored_reviewer_report_is_snapshot_bound_and_does_not_mutate(
 
 
 @pytest.mark.parametrize("control", ("\n", "\t"), ids=("lf", "tab"))
-def test_pending_round_recovers_from_invalid_text_with_a_fresh_complete_panel(
+def test_pending_slot_recovers_from_invalid_text_preserving_sealed_blockers(
     git_repo, control
 ):
     pending = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     verdict_path = git_repo / ".review/verdict.json"
-    pending_bytes = verdict_path.read_bytes()
     invalid = finding()
     invalid["rationale"] = f"first line{control}second line"
     stale_blocker_b = finding(identifier="B-R1-001", reviewer="B")
     stale_execution_b = execution("B-R1-E001")
     stale_blocker_b["execution_ids"] = [stale_execution_b["id"]]
     stale_blocker_c = finding(identifier="C-R1-001", reviewer="C")
-    malformed_paths = report_paths(
-        git_repo,
-        pending.snapshot,
-        overrides={
-            "A": {"findings": [invalid]},
-            "B": {
-                "findings": [stale_blocker_b],
-                "executions": [stale_execution_b],
-            },
-            "C": {"findings": [stale_blocker_c]},
-        },
-    )
-
     with pytest.raises(SchemaError, match="TEXT_INVALID"):
-        finalize_round(git_repo, reviewer_paths=malformed_paths, now=NOW)
+        submit_reviewer_report(git_repo, reviewer=Reviewer.A,
+                               raw=json.dumps(report(pending.snapshot, "A", findings=[invalid])).encode(), now=NOW)
+    for key, value in (("B", report(pending.snapshot, "B", findings=[stale_blocker_b], executions=[stale_execution_b])),
+                       ("C", report(pending.snapshot, "C", findings=[stale_blocker_c]))):
+        submit_reviewer_report(git_repo, reviewer=Reviewer(key), raw=json.dumps(value).encode(), now=NOW)
 
     still_pending = read_verdict(git_repo)
     assert still_pending.gate.status.value == "in_progress"
     assert still_pending.snapshot == pending.snapshot
-    assert verdict_path.read_bytes() == pending_bytes
-
-    fresh_paths = report_paths(git_repo, pending.snapshot)
-    recovered = finalize_round(git_repo, reviewer_paths=fresh_paths, now=NOW)
-    assert recovered.gate.status.value == "pass"
+    assert still_pending.reviewers["A"].last_error == "TEXT_INVALID"
+    submit_reviewer_report(git_repo, reviewer=Reviewer.A,
+                           raw=json.dumps(report(pending.snapshot, "A")).encode(), now=NOW)
+    recovered = finalize_round(git_repo, now=NOW)
+    assert recovered.gate.status.value == "fail"
+    assert recovered.gate.blocking_count == 2
     assert recovered.snapshot == pending.snapshot
-    assert all(slot.status == "complete" for slot in recovered.reviewers.values())
+    assert all(slot.status == "sealed" for slot in recovered.reviewers.values())
 
 
 def test_empty_reports_pass_and_round_one_restart_resets_pending(git_repo):
     pending = begin_round(
         git_repo, base="master", runtime="claude", round_number=1, now=NOW
     )
+    paths = report_paths(git_repo, pending.snapshot)
+    # Compare the immediate predecessor: each submit also atomically replaces
+    # verdict.json, and a previously freed inode may be reused by the filesystem.
     pending_inode = (git_repo / ".review/verdict.json").stat().st_ino
     final = finalize_round(
-        git_repo, reviewer_paths=report_paths(git_repo, pending.snapshot), now=NOW
+        git_repo, reviewer_paths=paths, now=NOW
     )
     assert final.gate.status.value == "pass"
     assert (git_repo / ".review/verdict.json").stat().st_ino != pending_inode
@@ -1537,7 +1798,9 @@ def test_empty_reports_pass_and_round_one_restart_resets_pending(git_repo):
 
 def test_round_one_replaces_owner_private_readonly_verdict(git_repo):
     """Checking a prior verdict's exact mode would reject safe owner-only state."""
-    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    report_paths(git_repo, pending.snapshot)
+    finalize_round(git_repo, now=NOW)
     verdict_path = git_repo / ".review/verdict.json"
     verdict_path.chmod(0o400)
 
@@ -1551,7 +1814,9 @@ def test_round_one_replaces_owner_private_readonly_verdict(git_repo):
 
 def test_verdict_persistence_failure_keeps_write_failure_code(git_repo, monkeypatch):
     """Mapping failed replacement persistence to file-unsafe breaks stable callers."""
-    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    report_paths(git_repo, pending.snapshot)
+    finalize_round(git_repo, now=NOW)
     verdict_path = git_repo / ".review/verdict.json"
     before = verdict_path.read_bytes()
 
@@ -1586,7 +1851,7 @@ def test_round_restart_invalidates_stale_reports_before_fresh_reports_pass(git_r
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     assert not stale_decisions.exists()
-    with pytest.raises(SchemaError, match="REVIEWER_REPORT_MISSING"):
+    with pytest.raises(SchemaError, match="ROUND_NOT_READY"):
         finalize_round(git_repo, reviewer_paths=stale_paths, now=NOW)
     fresh_paths = report_paths(git_repo, restarted.snapshot)
     assert (
@@ -1666,6 +1931,9 @@ def test_failed_legacy_verdict_without_head_ref_migrates_on_next_round(git_repo)
     )
     verdict_path = git_repo / ".review/verdict.json"
     legacy = json.loads(verdict_path.read_text(encoding="utf-8"))
+    legacy["schema"] = 1
+    del legacy["contract"]
+    legacy["reviewers"] = {key: slot["report"] for key, slot in legacy["reviewers"].items()}
     del legacy["head_ref"]
     write_json(verdict_path, legacy)
     commit_fix(git_repo)
@@ -1735,7 +2003,7 @@ def test_restart_rejects_existing_verdict_symlink_and_malformed_timestamp(git_re
 
 def test_persisted_complete_round_requires_originating_acceptance(git_repo):
     verdict_path, payload = finalized_round_two_pass(git_repo)
-    payload["reviewers"]["A"]["prior_decisions"] = []
+    payload["reviewers"]["A"]["report"]["prior_decisions"] = []
     write_json(verdict_path, payload)
     with pytest.raises(SchemaError, match="PRIOR_DECISION_RESPONSE_MISSING"):
         read_verdict(git_repo)
@@ -2010,13 +2278,13 @@ def test_only_originating_reviewer_can_close_decision(git_repo, owner_payload, c
         decisions_path=dpath,
         now=NOW,
     )
-    paths = report_paths(
-        git_repo,
-        second.snapshot,
-        round_number=2,
-        overrides={"A": {"prior_decisions": owner_payload}},
-    )
     with pytest.raises(SchemaError, match=code):
+        paths = report_paths(
+            git_repo,
+            second.snapshot,
+            round_number=2,
+            overrides={"A": {"prior_decisions": owner_payload}},
+        )
         finalize_round(git_repo, reviewer_paths=paths, now=NOW)
 
 
@@ -2292,7 +2560,7 @@ def test_cli_json_only_success_and_bounded_domain_error(git_repo):
     )
     assert failed.returncode == 1 and failed.stdout == ""
     assert (
-        failed.stderr == "PRE_PR_TRIBUNAL:REVIEWER_REPORT_MISSING\n"
+        failed.stderr == "PRE_PR_TRIBUNAL:ROUND_NOT_READY\n"
         and len(failed.stderr) < 128
     )
 
@@ -2394,7 +2662,7 @@ def run_cli_bytes(git_repo, *arguments, input=b""):
 
 
 def test_cli_stores_and_validates_exact_report_without_mutating_verdict(git_repo):
-    pending = begin_round(
+    pending = begin_legacy_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\n"
@@ -2470,7 +2738,7 @@ def test_cli_validates_stdin_bytes_and_rejects_invalid_without_mutation(git_repo
 
 
 def test_cli_stored_validation_completes_without_reading_open_stdin(git_repo):
-    pending = begin_round(
+    pending = begin_legacy_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
@@ -2531,7 +2799,7 @@ def test_cli_report_usage_is_bounded_exit_two(git_repo, arguments):
 
 
 def test_cli_stored_validation_rejects_unsafe_mode_symlink_and_swapped_content(git_repo):
-    pending = begin_round(
+    pending = begin_legacy_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode()
@@ -2565,7 +2833,7 @@ def test_cli_stored_validation_rejects_unsafe_mode_symlink_and_swapped_content(g
 
 
 def test_cli_report_stdin_reader_surfaces_oversize_without_truncation(git_repo):
-    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    begin_legacy_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
     oversize = b"{" + b" " * MAX_REPORT_BYTES + b"}"
     result = run_cli_bytes(git_repo, "store-report", "--reviewer", "A", input=oversize)
     assert result.returncode == 1
@@ -2575,7 +2843,7 @@ def test_cli_report_stdin_reader_surfaces_oversize_without_truncation(git_repo):
 
 
 def test_cli_recovery_flag_replaces_only_explicit_fresh_panel_and_normal_refuses(git_repo):
-    pending = begin_round(
+    pending = begin_legacy_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     stale = {}
@@ -2618,7 +2886,7 @@ def test_cli_recovery_flag_replaces_only_explicit_fresh_panel_and_normal_refuses
     ("committed", "SNAPSHOT_CHANGED"),
 ))
 def test_cli_recovery_rejects_snapshot_drift_before_replacing_any_evidence(git_repo, drift, code):
-    pending = begin_round(
+    pending = begin_legacy_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     paths = report_paths(git_repo, pending.snapshot)

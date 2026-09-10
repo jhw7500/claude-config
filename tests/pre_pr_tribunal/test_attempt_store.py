@@ -81,6 +81,45 @@ def test_sequence_reuse_preserves_existing_pair(git_repo):
     assert (git_repo / evidence.metadata_path).read_bytes() == before
 
 
+def test_legacy_attempt_preservation_is_idempotent_and_recovers_missing_canonical(git_repo):
+    from pre_pr_tribunal.attempt_store import preserve_legacy_report
+    with locked_review(git_repo, create=True) as review_fd:
+        args = dict(round_number=1, reviewer=Reviewer.A, raw=b"{", reason_code="JSON_INVALID")
+        assert preserve_legacy_report(review_fd, **args) == (b"{", "JSON_INVALID")
+        path = git_repo / ".review/attempts/round-1/A/attempt-1.raw"
+        before = path.stat()
+        assert preserve_legacy_report(review_fd, **args) == (b"{", "JSON_INVALID")
+        assert path.stat().st_ino == before.st_ino
+        assert preserve_legacy_report(review_fd, round_number=1, reviewer=Reviewer.A,
+                                       raw=None, reason_code=None) == (b"{", "JSON_INVALID")
+
+
+@pytest.mark.parametrize("damage", ("different_bytes", "different_reason", "partial", "mode", "digest", "symlink"))
+def test_legacy_attempt_recovery_refuses_unproven_or_different_evidence(git_repo, damage):
+    from pre_pr_tribunal.attempt_store import preserve_legacy_report
+    with locked_review(git_repo, create=True) as review_fd:
+        args = dict(round_number=1, reviewer=Reviewer.A, raw=b"{", reason_code="JSON_INVALID")
+        preserve_legacy_report(review_fd, **args)
+        raw_path = git_repo / ".review/attempts/round-1/A/attempt-1.raw"
+        meta_path = raw_path.with_name("attempt-1.meta.json")
+        if damage == "different_bytes":
+            args["raw"] = b"other"
+        elif damage == "different_reason":
+            args["reason_code"] = "REPORT_SCHEMA_INVALID"
+        elif damage == "partial":
+            meta_path.unlink()
+        elif damage == "mode":
+            raw_path.chmod(0o644)
+        elif damage == "digest":
+            raw_path.write_bytes(b"other")
+        else:
+            raw_path.unlink()
+            raw_path.symlink_to(git_repo / "tracked.txt")
+        with pytest.raises(SchemaError, match="^ATTEMPT_EVIDENCE_UNSAFE$"):
+            preserve_legacy_report(review_fd, **args)
+        assert raw_path.is_symlink() if damage == "symlink" else raw_path.exists()
+
+
 @pytest.mark.parametrize("kind", ("symlink", "fifo", "mode", "owner", "metadata", "digest"))
 @pytest.mark.parametrize("suffix", ("raw", "meta.json"))
 def test_rotation_rejects_unproven_pair_without_unlinking(git_repo, monkeypatch, kind, suffix):

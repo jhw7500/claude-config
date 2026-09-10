@@ -20,10 +20,54 @@ from pre_pr_tribunal.telemetry import (
     summarize_run,
 )
 from pre_pr_tribunal import telemetry as telemetry_module
+from pre_pr_tribunal.verdict_store import submit_reviewer_report
 
 
 def NOW():
     return "2026-09-09T00:00:00Z"
+
+
+@pytest.mark.parametrize("telemetry_state", ("successful", "substituted", "missing", "corrupt"))
+def test_legacy_telemetry_cannot_authorize_current_report_bytes(git_repo, telemetry_state):
+    from pre_pr_tribunal.verdict_store import (
+        begin_round, migrate_legacy_pending_round, read_verdict, store_reviewer_report,
+    )
+    pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    legacy = pending.to_json()
+    legacy["schema"] = 1
+    del legacy["contract"]
+    legacy["reviewers"] = {key: {"status": "pending"} for key in "ABC"}
+    (git_repo / ".review/verdict.json").write_text(json.dumps(legacy))
+    value = {"schema": 1, "reviewer": "A", "round": 1,
+             "snapshot": {"head_sha": pending.head_sha, "diff_sha256": pending.diff_sha256},
+             "status": "complete", "findings": [], "executions": [], "claims": [], "prior_decisions": []}
+    raw = json.dumps(value).encode()
+    store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+    if telemetry_state in {"successful", "substituted"}:
+        run = create_run(git_repo, base_ref="master", runtime="codex", round_number=1,
+                         started_at=NOW(), started_monotonic_ns=0)
+        bind_run(git_repo, run_id=run.run_id, snapshot=pending.snapshot)
+        for stage in (TelemetryStage.REPORT_STORE, TelemetryStage.REPORT_VALIDATION):
+            span = start_span(git_repo, run_id=run.run_id, stage=stage, reviewer=Reviewer.A,
+                              attempt=1, started_at=NOW(), started_monotonic_ns=0)
+            finish_span(git_repo, run_id=run.run_id, span_id=span.span_id,
+                        outcome=TelemetryOutcome.SUCCESS, reason_code=None, ended_at=NOW(), ended_monotonic_ns=1)
+        if telemetry_state == "substituted":
+            value["findings"] = [{"id": "A-R1-001", "reviewer": "A", "severity": "HIGH",
+                                  "title": "New blocker", "rationale": "Introduces invalid state.",
+                                  "path": "tracked.txt", "line": 1, "execution_ids": [],
+                                  "acceptance_condition": "Reject invalid state."}]
+            raw = json.dumps(value).encode() + b"\r\n"
+            store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, replace_pending_recovery=True)
+    elif telemetry_state == "corrupt":
+        path = git_repo / ".review/telemetry.json"
+        path.write_bytes(b"{")
+        path.chmod(0o600)
+    result = migrate_legacy_pending_round(git_repo)
+    assert result.reviewers["A"] == "pending:LEGACY_PROVENANCE_UNAVAILABLE"
+    assert all(slot.status == "pending" for slot in read_verdict(git_repo).reviewers.values())
+    assert (git_repo / ".review/attempts/round-1/A/attempt-1.raw").read_bytes() == raw
+    assert not (git_repo / ".review/inbox/round-1/A.json").exists()
 
 
 def run_cli(git_repo, *arguments, input=None):
@@ -251,11 +295,15 @@ def test_telemetry_cannot_alter_tribunal_result(git_repo, tmp_path, monkeypatch,
                 "status": "complete", "findings": [], "executions": [], "claims": [], "prior_decisions": []})
             if invalid_report and reviewer == "A":
                 raw = "{"
-            stored = run_cli(repo, "store-report", "--reviewer", reviewer, input=raw)
-            assert stored.returncode == 0
-            validation_results.append(command(repo, ("validate-report", "--reviewer", reviewer, "--source", "stored")))
-            assert (repo / ".review/verdict.json").read_bytes() == pending_bytes
-            report_bytes[reviewer] = (repo / f".review/inbox/round-1/{reviewer}.json").read_bytes()
+            try:
+                receipt = submit_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=raw.encode(), now=NOW)
+            except SchemaError as error:
+                validation_results.append((1, "", error.code))
+                path = repo / f".review/attempts/round-1/{reviewer}/attempt-1.raw"
+            else:
+                validation_results.append((0, receipt.raw_sha256, ""))
+                path = repo / f".review/inbox/round-1/{reviewer}.json"
+            report_bytes[reviewer] = path.read_bytes()
         finalized = command(repo, ("finalize", "--reviewer-a", ".review/inbox/round-1/A.json",
             "--reviewer-b", ".review/inbox/round-1/B.json", "--reviewer-c", ".review/inbox/round-1/C.json"))
         gates = []

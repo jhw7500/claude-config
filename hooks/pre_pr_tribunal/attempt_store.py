@@ -30,6 +30,8 @@ REPORT_RETRYABLE_CODES = frozenset((
     "REPORT_ROUND_MISMATCH", "REPORT_SCHEMA_INVALID", "REPORT_SNAPSHOT_MISMATCH",
     "REPORT_TOO_LARGE", "TEXT_INVALID", "TEXT_TOO_LARGE",
 ))
+LEGACY_FAILURE_CODES = frozenset(("LEGACY_PROVENANCE_UNAVAILABLE",))
+_RAW_EVIDENCE_CODES = REPORT_RETRYABLE_CODES | LEGACY_FAILURE_CODES
 _UNSAFE = "ATTEMPT_EVIDENCE_UNSAFE"
 _NAME = re.compile(r"attempt-([1-9][0-9]*)\.(raw|meta\.json)\Z")
 _META_LIMIT = 4096
@@ -104,7 +106,7 @@ def _verified_attempt(parent_fd: int, sequence: int, reviewer: Reviewer,
         if metadata["reason_code"] not in OPERATIONAL_FAILURE_CODES:
             raise SchemaError(_UNSAFE)
     else:
-        if metadata["reason_code"] not in REPORT_RETRYABLE_CODES:
+        if metadata["reason_code"] not in _RAW_EVIDENCE_CODES:
             raise SchemaError(_UNSAFE)
         raw_name = f"attempt-{sequence}.raw"
         raw_fd, raw = _read_pinned(parent_fd, raw_name, MAX_ATTEMPT_RAW_BYTES, stack)
@@ -164,7 +166,7 @@ def append_attempt_evidence(
         or type(sequence) is not int or sequence < 1
         or not isinstance(reason_code, str)
         or (raw is not None and not isinstance(raw, bytes))
-        or reason_code not in (OPERATIONAL_FAILURE_CODES if raw is None else REPORT_RETRYABLE_CODES)
+        or reason_code not in (OPERATIONAL_FAILURE_CODES if raw is None else _RAW_EVIDENCE_CODES)
     ):
         raise SchemaError(_UNSAFE)
     if raw is not None and len(raw) > MAX_ATTEMPT_RAW_BYTES:
@@ -198,3 +200,38 @@ def append_attempt_evidence(
     return AttemptEvidence(reviewer, round_number, sequence, reason_code, digest,
                            f"{relative}/{raw_name}" if raw is not None else None,
                            f"{relative}/{meta_name}")
+
+
+def preserve_legacy_report(
+    review_fd: int, *, round_number: int, reviewer: Reviewer,
+    raw: bytes | None, reason_code: str | None,
+) -> tuple[bytes, str] | None:
+    """Preserve attempt one, or authenticate its complete evidence on migration retry.
+
+    This proves only the pending attempt's bytes, never authority to seal a report.
+    A partial record or a different canonical response requires explicit recovery.
+    """
+    try:
+        with ExitStack() as stack:
+            attempts_fd = _private_directory(review_fd, "attempts", stack)
+            round_fd = _private_directory(attempts_fd, f"round-{round_number}", stack)
+            slot_fd = _private_directory(round_fd, reviewer.value, stack)
+            previous = _existing_attempts(slot_fd, reviewer, round_number)
+            if previous:
+                if previous != [1]:
+                    raise SchemaError(_UNSAFE)
+                _verified_attempt(slot_fd, 1, reviewer, round_number, stack)
+                _, metadata_raw = _read_pinned(slot_fd, "attempt-1.meta.json", _META_LIMIT, stack)
+                metadata = m._load_json(metadata_raw, limit=_META_LIMIT, too_large=_UNSAFE)
+                _, preserved = _read_pinned(slot_fd, "attempt-1.raw", MAX_ATTEMPT_RAW_BYTES, stack)
+                reason = metadata["reason_code"]
+                if raw is not None and (preserved != raw or reason != reason_code):
+                    raise SchemaError(_UNSAFE)
+                return preserved, reason
+        if raw is None:
+            return None
+        append_attempt_evidence(review_fd, round_number=round_number, reviewer=reviewer,
+                                sequence=1, raw=raw, reason_code=reason_code)
+        return raw, reason_code
+    except (OSError, ValueError, SchemaError):
+        raise SchemaError(_UNSAFE) from None

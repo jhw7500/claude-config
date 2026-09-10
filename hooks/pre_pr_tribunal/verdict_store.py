@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -24,6 +25,7 @@ from .attempt_store import (
     OPERATIONAL_FAILURE_CODES,
     REPORT_RETRYABLE_CODES,
     append_attempt_evidence,
+    preserve_legacy_report,
 )
 from .model import (
     ContractBinding,
@@ -922,6 +924,8 @@ def store_reviewer_report(
     check_ignored(root)
     with locked_review(root, create=False) as review_fd:
         pending = _read_verdict_locked(review_fd)
+        if pending.schema != 1:
+            raise SchemaError("LEGACY_COMMAND_NOT_ALLOWED")
         _require_all_pending(pending)
         if replace_pending_recovery:
             snapshot = capture_snapshot(root, pending.base_ref)
@@ -1091,6 +1095,8 @@ def begin_round(
     check_ignored(root)
     with locked_review(root, create=True) as review_fd:
         stored = _read_optional_verdict_locked(review_fd)
+        if stored is not None and stored.gate.status is GateStatus.IN_PROGRESS:
+            raise SchemaError("ROUND_TRANSITION_INVALID")
         previous: Verdict | None = None
         if round_number == 1:
             if decisions_path is not None:
@@ -1153,23 +1159,10 @@ def begin_round(
             initial_paths = tuple(previous.initial_paths)
             history = tuple((*previous.history, _summary(previous))[-2:])
         _invalidate_round_inputs(review_fd, round_number)
-        pending = Verdict(
-            1,
-            snapshot.repository,
-            snapshot.base_ref,
-            snapshot.base_sha,
-            snapshot.head_ref,
-            snapshot.head_sha,
-            snapshot.merge_base_sha,
-            snapshot.diff_sha256,
-            initial_paths,
-            round_number,
-            runtime,
-            {key: ReviewerSlot("pending") for key in "ABC"},
-            decisions,
-            history,
-            GateSummary(GateStatus.IN_PROGRESS, 0),
-            snapshot.created_at,
+        pending = _new_v2_pending(
+            snapshot, runtime=runtime, initial_paths=initial_paths,
+            round_number=round_number, decisions=decisions, history=history,
+            contract=current_contract_binding(),
         )
         _atomic_write(review_fd, pending)
         return pending
@@ -1212,43 +1205,63 @@ def _validate_closure(verdict: Verdict, reports: Mapping[str, ReviewerReport]) -
         raise SchemaError("PRIOR_DECISION_RESPONSE_INVALID")
 
 
+def _read_sealed_report(
+    review_fd: int, verdict: Verdict, reviewer: Reviewer
+) -> ReviewerReport:
+    slot = verdict.reviewers[reviewer.value]
+    if slot.status != "sealed" or slot.report is None or slot.receipt is None:
+        raise SchemaError("ROUND_NOT_READY")
+    round_fd = _round_fd(
+        review_fd, verdict.round, create=False, exact_report_directories=True
+    )
+    try:
+        raw = read_named_file(
+            round_fd, f"{reviewer.value}.json", maximum=m.MAX_REPORT_BYTES,
+            missing="REVIEWER_REPORT_MISSING", unsafe="FILE_UNSAFE", exact_mode=0o600,
+        )
+    finally:
+        os.close(round_fd)
+    if hashlib.sha256(raw).hexdigest() != slot.receipt.raw_sha256:
+        raise SchemaError("REPORT_BYTES_MISMATCH")
+    parsed, digest = m.validate_report_bytes(
+        raw, expected_reviewer=reviewer,
+        expected_round=verdict.round, snapshot=verdict.snapshot,
+    )
+    if digest != slot.receipt.raw_sha256 or parsed != slot.report:
+        raise SchemaError("REPORT_RECEIPT_MISMATCH")
+    if slot.receipt.context_sha256 != context_sha256(verdict, reviewer):
+        raise SchemaError("CONTEXT_DRIFT")
+    return parsed
+
+
 def finalize_round(
-    cwd: Path, *, reviewer_paths: Mapping[str, Path], now: Callable[[], str] = utc_now
+    cwd: Path, *, reviewer_paths: Mapping[str, Path] | None = None,
+    now: Callable[[], str] = utc_now,
 ) -> Verdict:
-    if not isinstance(reviewer_paths, Mapping) or set(reviewer_paths) != {
-        "A",
-        "B",
-        "C",
-    }:
+    if reviewer_paths is not None and (
+        not isinstance(reviewer_paths, Mapping) or set(reviewer_paths) != set("ABC")
+    ):
         raise SchemaError("REVIEWER_REPORT_MISSING")
     root = repository_root(cwd)
     preflight_review_directory(root)
     check_ignored(root)
     with locked_review(root, create=False) as review_fd:
         pending = _read_verdict_locked(review_fd)
-        _require_all_pending(pending)
+        require_v2_in_progress(pending)
+        if pending.contract != current_contract_binding():
+            raise SchemaError("CONTRACT_DRIFT")
+        if reviewer_paths is not None:
+            for key in "ABC":
+                _expected_input(
+                    root, reviewer_paths[key],
+                    f".review/inbox/round-{pending.round}/{key}.json", "REPORT_PATH_INVALID",
+                )
         snapshot = capture_snapshot(root, pending.base_ref, now=now)
         if not _snapshot_equal(pending, snapshot):
             raise SchemaError("SNAPSHOT_CHANGED")
         reports: dict[str, ReviewerReport] = {}
         for key in "ABC":
-            raw = _read_input(
-                root,
-                review_fd,
-                reviewer_paths[key],
-                round_number=pending.round,
-                basename=f"{key}.json",
-                maximum=m.MAX_REPORT_BYTES,
-                missing="REVIEWER_REPORT_MISSING",
-                path_code="REPORT_PATH_INVALID",
-                exact_mode=0o600,
-            )
-            reports[key], _raw_sha256 = m.validate_report_bytes(
-                raw,
-                expected_reviewer=Reviewer(key),
-                expected_round=pending.round,
-                snapshot=snapshot,
-            )
+            reports[key] = _read_sealed_report(review_fd, pending, Reviewer(key))
         _validate_closure(pending, reports)
         blockers = tuple(
             finding
@@ -1257,23 +1270,8 @@ def finalize_round(
             if finding.severity in {Severity.CRITICAL, Severity.HIGH}
         )
         status = GateStatus.FAIL if blockers else GateStatus.PASS
-        final = Verdict(
-            pending.schema,
-            pending.repository,
-            pending.base_ref,
-            pending.base_sha,
-            pending.head_ref,
-            pending.head_sha,
-            pending.merge_base_sha,
-            pending.diff_sha256,
-            pending.initial_paths,
-            pending.round,
-            pending.producer_runtime,
-            {key: ReviewerSlot("complete", reports[key]) for key in "ABC"},
-            pending.decisions,
-            pending.history,
-            GateSummary(status, len(blockers)),
-            snapshot.created_at,
+        final = replace(
+            pending, gate=GateSummary(status, len(blockers)), created_at=snapshot.created_at
         )
         _atomic_write(review_fd, final)
         return final
@@ -1285,3 +1283,110 @@ def read_verdict(cwd: Path) -> Verdict:
     check_ignored(root)
     with locked_review(root, create=False) as review_fd:
         return _read_verdict_locked(review_fd)
+
+
+@dataclass(frozen=True)
+class LegacyMigrationResult:
+    round: int
+    reviewers: Mapping[str, str]
+
+
+def migrate_legacy_pending_round(cwd: Path) -> LegacyMigrationResult:
+    """Preserve all legacy bytes and atomically migrate A/B/C to pending v2 slots.
+
+    Historical telemetry has no byte/context hashes. Its successful spans cannot
+    authenticate current canonical bytes, including replacements after validation.
+    """
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd, ExitStack() as stack:
+        legacy = _read_verdict_locked(review_fd)
+        if legacy.schema != 1 or legacy.gate.status is not GateStatus.IN_PROGRESS:
+            raise SchemaError("LEGACY_MIGRATION_NOT_ALLOWED")
+        _require_all_pending(legacy)
+        snapshot = capture_snapshot(root, legacy.base_ref)
+        if not _snapshot_equal(legacy, snapshot):
+            raise SchemaError("SNAPSHOT_CHANGED")
+        pending = _new_v2_pending(
+            legacy.snapshot, runtime=legacy.producer_runtime,
+            initial_paths=legacy.initial_paths, round_number=legacy.round,
+            decisions=legacy.decisions, history=legacy.history,
+            contract=current_contract_binding(),
+        )
+        round_fd = _round_fd(
+            review_fd, legacy.round, create=False, exact_report_directories=True
+        )
+        stack.callback(os.close, round_fd)
+        scanned: dict[str, tuple[bytes | None, str, int | None]] = {}
+        try:
+            # Pre-scan every fixed path before touching evidence or canonical files.
+            for key in "ABC":
+                name = f"{key}.json"
+                try:
+                    fd = os.open(
+                        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=round_fd
+                    )
+                except FileNotFoundError:
+                    scanned[key] = None, "REVIEWER_REPORT_MISSING", None
+                    continue
+                stack.callback(os.close, fd)
+                safe_file(fd, "FILE_UNSAFE", exact_mode=0o600)
+                raw = read_named_file(
+                    round_fd, name, maximum=MAX_ATTEMPT_RAW_BYTES,
+                    missing="REVIEWER_REPORT_MISSING", unsafe="FILE_UNSAFE", exact_mode=0o600,
+                )
+                _verify_legacy_name(round_fd, name, fd)
+                reason = _legacy_report_reason(raw, legacy, Reviewer(key))
+                scanned[key] = raw, reason, fd
+            slots = {}
+            for key, (raw, reason, _) in scanned.items():
+                evidence = preserve_legacy_report(
+                    review_fd, round_number=legacy.round, reviewer=Reviewer(key), raw=raw,
+                    reason_code=reason if raw is not None else None,
+                )
+                if evidence and (
+                    _legacy_report_reason(evidence[0], legacy, Reviewer(key)) != evidence[1]
+                ):
+                    raise SchemaError("ATTEMPT_EVIDENCE_UNSAFE")
+                slots[key] = ReviewerSlot(
+                    "pending", attempt_count=1 if evidence else 0,
+                    last_error=evidence[1] if evidence else reason,
+                )
+            # All exact evidence is durable before the first canonical removal.
+            # On failure, authenticated attempt-one records allow a bounded retry.
+            for key, (_, _, fd) in scanned.items():
+                if fd is not None:
+                    _verify_legacy_name(round_fd, f"{key}.json", fd)
+                    os.unlink(f"{key}.json", dir_fd=round_fd)
+            os.fsync(round_fd)
+        except OSError:
+            raise SchemaError("FILE_UNSAFE") from None
+        _atomic_write(review_fd, replace(pending, reviewers=slots))
+        return LegacyMigrationResult(
+            legacy.round, {key: f"pending:{slot.last_error}" for key, slot in slots.items()}
+        )
+
+
+def _legacy_report_reason(raw: bytes, verdict: Verdict, reviewer: Reviewer) -> str:
+    try:
+        m.validate_report_bytes(
+            raw, expected_reviewer=reviewer,
+            expected_round=verdict.round, snapshot=verdict.snapshot,
+        )
+    except SchemaError as error:
+        if error.code not in REPORT_RETRYABLE_CODES:
+            raise
+        return error.code
+    return "LEGACY_PROVENANCE_UNAVAILABLE"
+
+
+def _verify_legacy_name(round_fd: int, name: str, fd: int) -> None:
+    opened = safe_file(fd, "FILE_UNSAFE", exact_mode=0o600)
+    named = os.stat(name, dir_fd=round_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(named.st_mode) or named.st_uid != os.geteuid()
+        or stat.S_IMODE(named.st_mode) != 0o600
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+    ):
+        raise SchemaError("FILE_UNSAFE")
