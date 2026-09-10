@@ -93,7 +93,8 @@ def test_skill_encodes_the_exact_ordered_ten_step_state_machine():
     assert "peer" in steps[5]
     assert "all three" in steps[6] and "terminal" in steps[6]
     assert "malformed" in steps[6] and "non-pass" in steps[6]
-    assert "finalize --reviewer-a" in steps[7]
+    assert 'cli.py" finalize' in steps[7]
+    assert "finalize --reviewer-a" not in steps[7]
     assert CLI in steps[7]
     assert "no decisions" in steps[7]
     assert "never execute" in steps[8] and "verbatim" in steps[8]
@@ -291,13 +292,14 @@ def test_each_reviewer_prompt_is_read_only_self_contained_and_exactly_bounded():
         assert all(mandate in body for mandate in mandates)
 
 
-def test_skill_stores_and_validates_each_terminal_report_before_finalize():
+def test_skill_submits_and_seals_each_terminal_report_before_finalize():
     steps = numbered_steps(text("SKILL.md"))
     for token in (
-        "store-report --reviewer",
+        "submit-report --reviewer X",
         "validate-report --reviewer",
         "--source stored",
         "exact bytes",
+        "sealed receipt",
         "0600",
         "current-user-owned",
         "regular",
@@ -305,7 +307,9 @@ def test_skill_stores_and_validates_each_terminal_report_before_finalize():
         "raw_sha256",
     ):
         assert token in steps[6] or token in steps[7]
-    assert steps[7].index("validate-report") < steps[7].index("finalize --reviewer-a")
+    assert steps[6].index("exact bytes") < steps[6].index("submit-report --reviewer X")
+    assert steps[6].index("submit-report --reviewer X") < steps[6].index("sealed receipt")
+    assert steps[7].index("validate-report") < steps[7].index('cli.py" finalize')
     assert "do not call `finalize`" in steps[7]
 
 
@@ -331,9 +335,11 @@ def test_skill_failure_order_preserves_peer_privacy_and_cleanup():
     failure = steps[6]
     assert "peer output/status" in failure
     assert "already-started peer" in failure
+    assert "do not cancel or disturb an already-started peer" in failure
     assert "do not call `finalize`" in failure
     assert "non-force cleanup" in failure
-    assert failure.index("already-started peer") < failure.index("non-force cleanup")
+    assert "known terminal" in failure and "exact view identity" in failure
+    assert failure.index("known terminal") < failure.index("cleanup refusal")
 
 
 def test_every_report_contract_matches_the_decoded_text_parser_boundary():
@@ -368,7 +374,7 @@ def test_approved_design_and_plan_use_the_same_decoded_text_contract():
             assert token in body, f"{document.name} omits decoded-text rule: {token}"
 
 
-def test_pending_recovery_contract_preserves_state_and_reruns_the_complete_panel():
+def pending_recovery_contract() -> str:
     skill = text("SKILL.md")
     recovery = re.search(
         r"<!-- pending-recovery-contract -->(.*?)"
@@ -377,48 +383,148 @@ def test_pending_recovery_contract_preserves_state_and_reruns_the_complete_panel
         re.DOTALL,
     )
     assert recovery is not None
-    body = recovery.group(1)
-    normalized = body.lower()
+    return recovery.group(1)
+
+
+def test_pending_recovery_dispatches_only_pending_slots_and_never_replaces_sealed():
+    body = pending_recovery_contract()
     for token in (
         "explicit user intervention",
+        "status",
+        "verdict_schema",
+        "migrate-legacy-pending",
         "in_progress",
         "same bound snapshot",
         "do not run `begin`",
         "do not reset",
         "do not delete `.review`",
-        "fresh detached reviewer views",
-        "A, B, and C",
-        "Do not reuse",
-        "exact new terminal outputs",
+        "dispatch only reviewers whose slot is `pending`",
+        "never rerun or replace a `sealed` slot",
+        "submit-report --reviewer X",
         "snapshot changed",
     ):
-        assert token.lower() in normalized
+        assert token.lower() in body.lower()
+    assert re.search(r"fresh rerun.{0,120}A, B, and C", body, re.DOTALL) is None
+    assert "store-report --reviewer" not in body
 
 
-def test_pending_recovery_replaces_the_complete_fresh_panel_before_validation():
+def test_pending_recovery_uses_status_driven_command_sequence():
+    body = pending_recovery_contract()
+    status = "status"
+    migration = "migrate-legacy-pending"
+    context = "context --reviewer X"
+    dispatch = "dispatch only reviewers whose slot is `pending`"
+    submit = "submit-report --reviewer X"
+    validation = "validate-report --reviewer X --source stored"
+    finalize = "finalize"
+    assert body.index(status) < body.index(migration)
+    assert body.index(migration) < body.index(context)
+    assert body.index(context) < body.index(dispatch)
+    assert body.index(dispatch) < body.index(submit)
+    assert body.index(submit) < body.index(validation)
+    assert body.index(validation) < body.rindex(finalize)
+    assert "verdict_schema == 1" in body
+    assert "verdict_schema == 2" in body
+    assert "reviewer/subset" in body
+
+
+def test_operational_failure_policy_does_not_weaken_the_gate():
     skill = text("SKILL.md")
-    recovery = re.search(
-        r"<!-- pending-recovery-contract -->(.*?)"
-        r"<!-- pending-recovery-contract-end -->",
-        skill,
+    for token in (
+        "format-only retry",
+        "same reviewer handle",
+        "same-role fresh replacement",
+        "ATTEMPTS_THIS_INVOCATION[X]",
+        "maximum 3 attempts",
+        "REVIEWER_UNAVAILABLE",
+        "never pass with only two sealed slots",
+        "DISPATCH_FAILED",
+        "REVIEWER_FAILED",
+        "REVIEWER_TIMEOUT",
+    ):
+        assert token in skill
+    assert "CRITICAL" in skill and "HIGH" in skill
+    assert "persisted attempt_count is cumulative" in skill
+    assert "wait-interface timeout" in skill
+    assert "still-running handle" in skill
+    assert "do not call `record-failure`" in skill
+
+
+def test_observation_and_terminal_cleanup_failures_are_warnings_only():
+    skill = text("SKILL.md")
+    for token in (
+        "telemetry failure is an observation warning",
+        "terminal cleanup refusal does not change the verdict",
+        "uncertain reviewer process",
+        "uncertain worktree identity",
+        "uncertain ownership",
+        "changed bytes",
+        "changed contract",
+    ):
+        assert token in skill
+
+
+def test_report_reference_documents_v2_shapes_and_real_controller_commands():
+    schema = text("references/report-schema.md")
+    status = json_example(schema, "v2-status")
+    assert set(status) == {
+        "round", "gate_status", "blocking_count", "verdict_path",
+        "verdict_schema", "reviewers",
+    }
+    assert status["verdict_schema"] == 2
+    assert status["reviewers"]["A"]["state"] == "sealed"
+    assert set(status["reviewers"]["A"]) == {
+        "state", "attempt_count", "last_error", "raw_sha256",
+        "context_sha256", "report_contract_version", "provenance",
+    }
+    assert set(status["reviewers"]["B"]) == {
+        "state", "attempt_count", "last_error",
+    }
+
+    receipt = json_example(schema, "v2-submit-receipt")
+    assert set(receipt) == {
+        "reviewer", "round", "state", "raw_sha256", "context_sha256",
+        "report_contract_version", "attempt", "provenance",
+    }
+    assert receipt["state"] == "sealed"
+
+    match = re.search(
+        r"<!-- controller-command-examples -->(.*?)"
+        r"<!-- controller-command-examples-end -->",
+        schema,
         re.DOTALL,
     )
-    assert recovery is not None
-    body = recovery.group(1)
-    replacement = "store-report --reviewer X --replace-pending-recovery"
-    validation = "validate-report --reviewer X --source stored"
-    assert body.index("all three fresh reruns are terminal") < body.index(replacement)
-    assert body.index(replacement) < body.index(validation)
-    assert body.index(validation) < body.index("cleanup succeeds")
-    assert "all three replacement/validation" in body
-    assert "never reuse an earlier peer" in body
+    assert match is not None
+    commands = [
+        shlex.split(command)
+        for command in re.findall(r"`((?:status|context|submit-report|record-failure|"
+                                   r"migrate-legacy-pending|validate-report|finalize)[^`]*)`",
+                                   match.group(1))
+    ]
+    parsed = [cli._parser().parse_args(command) for command in commands]
+    by_command = {arguments.command for arguments in parsed}
+    assert by_command == {
+        "status", "context", "submit-report", "record-failure",
+        "migrate-legacy-pending", "validate-report", "finalize",
+    }
+    reasons = {
+        arguments.reason for arguments in parsed
+        if arguments.command == "record-failure"
+    }
+    assert reasons == {"DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"}
 
-    normal = numbered_steps(skill)[6]
-    assert "store-report --reviewer X" in normal
-    assert "--replace-pending-recovery" not in normal
-    assert normal.index("store-report --reviewer X") < normal.index(
-        "validate-report --reviewer X --source stored"
-    )
+
+def test_docs_separate_retryable_formats_operations_integrity_and_warnings():
+    for body in (text("SKILL.md"), text("references/report-schema.md")):
+        format_start = body.index("Format failures")
+        operation_start = body.index("Operational failures")
+        warning_start = body.index("Observation warnings")
+        integrity_start = body.index("Integrity stops")
+        assert format_start < operation_start < warning_start < integrity_start
+        for code in ("JSON_INVALID", "REPORT_TOO_LARGE", "TEXT_INVALID"):
+            assert code in body[format_start:operation_start]
+        for code in ("DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"):
+            assert code in body[operation_start:warning_start]
 
 
 def test_operator_telemetry_command_examples_parse_through_the_cli_contract():
