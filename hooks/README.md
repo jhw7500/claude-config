@@ -174,9 +174,11 @@ never pass. `store-report` and `--replace-pending-recovery` are v1-only and forb
 
 ### Telemetry is observational
 
-`begin` returns the telemetry run ID and records `snapshot_preflight`. Telemetry requires the whole `.review/`
-namespace to be ignored and untracked, including possible private staging artifacts; individual file ignore rules
-make telemetry unavailable without changing the primary `begin` result. The controller starts `reviewer_dispatch_wait`
+`begin` returns the telemetry run ID and records `snapshot_preflight`. Primary storage and telemetry independently
+require the whole `.review/` namespace to be ignored and untracked, including raw attempts and private staging
+artifacts. Individual file ignore rules are not sufficient: primary operations return `VERDICT_NOT_IGNORED`
+before publishing evidence, even when telemetry is unavailable. Telemetry-only failures remain advisory and
+cannot replace the primary result. The controller starts `reviewer_dispatch_wait`
 before dispatch, finishes it at runtime acceptance, and starts `reviewer_total` at acceptance through the terminal
 response. If acceptance is unavailable, both spans start before dispatch and finish at the terminal response;
 dispatch is `incomplete` with `RUNTIME_SIGNAL_UNAVAILABLE`, and total retains the actual dispatch-to-terminal duration.

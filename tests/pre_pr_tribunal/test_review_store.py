@@ -2,6 +2,7 @@ import errno
 import os
 from pathlib import Path
 import stat
+import subprocess
 
 import pytest
 
@@ -17,6 +18,48 @@ from pre_pr_tribunal.review_store import (
 
 def _temporary_artifacts(directory: Path) -> tuple[Path, ...]:
     return tuple(directory.glob(".tmp.*"))
+
+
+@pytest.mark.parametrize("rules", (
+    "/.review/verdict.json\n/.review/lock\n/.review/inbox/\n",
+    ".review/*\n!.review/attempts/\n",
+    ".review/**\n!.review/attempts/round-1/A/attempt-1.raw\n",
+))
+def test_ignore_guard_rejects_partial_namespace_exclusion(git_repo, rules):
+    """Checking only verdict.json would permit Git-visible raw attempts."""
+    (git_repo / ".gitignore").write_text(rules, encoding="utf-8")
+    with pytest.raises(SchemaError, match="^VERDICT_NOT_IGNORED$"):
+        review_store.check_ignored(git_repo)
+    assert not (git_repo / ".review").exists()
+
+
+@pytest.mark.parametrize("pattern", (".review/", "/.review/", ".review", "/.review"))
+@pytest.mark.parametrize("review_exists", (False, True))
+def test_ignore_guard_accepts_whole_parent_despite_child_negations(
+    git_repo, pattern, review_exists,
+):
+    """A safe parent exclusion must not be rejected because children are negated."""
+    (git_repo / ".gitignore").write_text(
+        f"{pattern}\n!.review/attempts/\n!.review/inbox/\n", encoding="utf-8",
+    )
+    if review_exists:
+        (git_repo / ".review").mkdir(mode=0o700)
+    review_store.check_ignored(git_repo)
+
+
+def test_ignore_guard_rejects_tracked_descendant_under_excluded_parent(git_repo):
+    """An ignored verdict does not prove that other private artifacts are untracked."""
+    review = git_repo / ".review"
+    review.mkdir(mode=0o700)
+    tracked = review / "already-tracked.txt"
+    tracked.write_text("synthetic fixture", encoding="utf-8")
+    subprocess.run(
+        ["/usr/bin/git", "-C", str(git_repo), "add", "-f", "--",
+         ".review/already-tracked.txt"], check=True,
+    )
+    with pytest.raises(SchemaError, match="^VERDICT_NOT_IGNORED$"):
+        review_store.check_ignored(git_repo)
+    assert tracked.read_text(encoding="utf-8") == "synthetic fixture"
 
 
 def test_atomic_create_publishes_complete_exact_private_file(git_repo):

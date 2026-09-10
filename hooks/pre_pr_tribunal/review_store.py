@@ -13,6 +13,7 @@ import stat
 import subprocess
 from typing import Iterator
 
+from .git_state import GitStateError, check_review_ignored
 from .model import SchemaError
 
 
@@ -43,27 +44,11 @@ def repository_root(cwd: Path) -> Path:
 
 
 def check_ignored(root: Path) -> None:
+    """Guard the complete private namespace, not only the verdict pathname."""
     try:
-        result = subprocess.run(
-            [
-                "/usr/bin/git",
-                "-C",
-                str(root),
-                "check-ignore",
-                "-q",
-                "--",
-                ".review/verdict.json",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        check_review_ignored(root)
+    except GitStateError:
         raise SchemaError("VERDICT_NOT_IGNORED") from None
-    if result.returncode != 0:
-        raise SchemaError("VERDICT_NOT_IGNORED")
 
 
 def preflight_review_directory(root: Path) -> None:

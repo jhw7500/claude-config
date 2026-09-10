@@ -2,6 +2,64 @@
 
 Date: 2026-09-10
 
+## Local follow-up: A-R1-001 private artifact exclusion
+
+The pre-PR panel at `1f278ce46b65fa7392d266cae5877ae1edc99086` was incomplete: A returned one HIGH finding,
+B dispatch hit the native agent thread limit, and C did not start. The user explicitly approved abandoning that
+local round with evidence preserved before fixing A-R1-001. The original verdict and report were moved unchanged
+to a private archive; their hashes and current-user ownership/type/modes matched before and after the move.
+The archived verdict remains literally `in_progress`; this archival disposition is not a fabricated terminal verdict.
+Issue #126 tracks the distinct native-capacity/partial-dispatch problem and remains unresolved by this code fix.
+
+Independent reproduction used four isolated Git fixtures. Whole-directory exclusions kept rejected malformed and
+synthetic secret-marker reports ignored and allowed the next valid submission. Individual verdict/lock/inbox
+exclusions exposed the exact raw attempt and metadata to Git and blocked the next submission with `WORKTREE_DIRTY`.
+The safety assertions therefore produced two expected failures and two passing controls. No real credentials were used.
+
+The local fix shares the existing whole-parent exclusion and untracked-namespace proof between two independent
+callers: primary storage returns `VERDICT_NOT_IGNORED`, while telemetry retains its advisory
+`TELEMETRY_FILE_UNSAFE` result. Begin, report submission, operational failure recording, and legacy migration
+now reject insufficient exclusions before publishing primary evidence. Safe parent exclusions still work even
+with ineffective child negations. No output schema, gate verdict rule, report bytes, or retry disposition was relaxed.
+
+This follow-up was validated as a **worktree change** based on `1f278ce46b65fa7392d266cae5877ae1edc99086`,
+not the previously reviewed implementation below. Its implementation/test diff SHA-256 is
+`e5142ba552e89cb1fe75392e22d99a7bc9ac02bcec1853e14f68f71407dd2738`, calculated using
+`git diff --binary --full-index --no-ext-diff --no-textconv HEAD --` and these five paths:
+
+- `hooks/pre_pr_tribunal/git_state.py`
+- `hooks/pre_pr_tribunal/review_store.py`
+- `tests/pre_pr_tribunal/test_model_store.py`
+- `tests/pre_pr_tribunal/test_review_store.py`
+- `tests/pre_pr_tribunal/test_telemetry.py`
+
+| Verification | Result |
+| --- | --- |
+| New primary-storage regression selection, before the fix | 10 failed, 8 passed, 398 deselected in 1.26s; missing guard or wrong error boundary |
+| Same selection after the fix | 18 passed, 398 deselected in 0.78s |
+| Entire `tests/pre_pr_tribunal` | 1467 passed, 11 failed in 235.69s; failure disposition below |
+| Repository remainder, `--ignore=tests/pre_pr_tribunal` | 2081 passed, 2 failed in 113.68s; both fixture AF_UNIX paths exceeded the platform length limit |
+| Final complete model-store, review-store, and telemetry suites | 576 passed in 71.46s; JUnit errors/failures/skips all zero |
+| Exact two AF_UNIX failures with a short fixture base, plus exact failed SIGINT probe | 3 passed in 0.92s; JUnit errors/failures/skips all zero |
+| Compile all five changed Python files; `git diff --check` | Exit 0 for both |
+
+The eleven tribunal failures were eight obsolete expectations that unsafe individual/negated/tracked exclusions
+could still start a primary review, two overly broad file-write fault injectors that also intercepted the new Git
+stdin proof, and one timing-sensitive SIGINT probe that observed its fixture PID file before both lines appeared.
+The first ten were corrected in tests without another product-code change: unsafe primary storage now rejects
+without artifacts, telemetry-only errors retain their independent behavior, and write faults target regular-file
+descriptors while allowing Git pipe writes. The final 576-case run covers those changes and all new regressions.
+The unchanged SIGINT probe passed its focused rerun; this does not claim that its timing sensitivity was repaired.
+
+These are partitioned suite results plus focused corrections/rechecks, **not one zero-failure full-suite run**.
+No unrelated runtime or socket implementation was changed. The initial tribunal run used system pytest 9.0.3;
+the repository remainder and final rechecks used an isolated Python 3.10 environment populated offline from the
+existing hash-locked `requirements-test.lock` (pytest 9.1.1). No system package or real installed runtime was modified.
+JUnit artifacts are preserved with the private archive `claude-config-124-20260910.UxoAFuHg`.
+At validation time, no commit, new reviewer allocation, fresh tribunal, installation, push, PR creation,
+merge, Claim release, or takeover had been performed for this follow-up. A fresh installed-workflow review
+of the changed snapshot remains required; committing this evidence does not constitute that review.
+
 ## Revisions and safety boundary
 
 - Original master base: `df1285dbb7655717af3d60c7fc098715a29203dd`

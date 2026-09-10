@@ -403,6 +403,59 @@ def record_reviewer_failure(*args, **kwargs):
     return record(*args, **kwargs)
 
 
+def test_begin_rejects_individual_ignores_before_creating_review_state(git_repo):
+    """Primary begin must reject unsafe storage independently of advisory telemetry."""
+    (git_repo / ".gitignore").write_text(
+        "/.review/verdict.json\n/.review/lock\n/.review/inbox/\n", encoding="utf-8",
+    )
+    subprocess.run(
+        ["/usr/bin/git", "-C", str(git_repo), "commit", "-qam", "partial exclusion"],
+        check=True,
+    )
+    with pytest.raises(SchemaError, match="^VERDICT_NOT_IGNORED$"):
+        begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert not (git_repo / ".review").exists()
+
+
+@pytest.mark.parametrize("operation", ("malformed", "secret-marker", "valid", "failure", "legacy"))
+def test_storage_rechecks_exclusion_before_report_or_attempt_publication(git_repo, operation):
+    """Dropping the storage guard leaks raw evidence or advances a slot after ignore drift."""
+    (git_repo / ".gitignore").write_text("", encoding="utf-8")
+    subprocess.run(
+        ["/usr/bin/git", "-C", str(git_repo), "commit", "-qam", "use local exclusion"],
+        check=True,
+    )
+    exclude = git_repo / ".git/info/exclude"
+    exclude.write_text(".review/\n", encoding="utf-8")
+    pending = legacy_pending(git_repo) if operation == "legacy" else write_v2_pending(git_repo)
+    value = report(pending.snapshot, "A")
+    if operation == "secret-marker":
+        value["executions"] = [{**execution(), "stdout_excerpt": "ghp_nonfunctional_fixture_marker"}]
+    raw = b"not-json" if operation == "malformed" else json.dumps(value).encode()
+    if operation == "legacy":
+        store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
+    before = (git_repo / ".review/verdict.json").read_bytes()
+    # A local exclusion change leaves HEAD and the committed diff unchanged.
+    exclude.write_text(
+        "/.review/verdict.json\n/.review/lock\n/.review/inbox/\n", encoding="utf-8",
+    )
+    with pytest.raises(SchemaError, match="^VERDICT_NOT_IGNORED$"):
+        if operation == "failure":
+            record_reviewer_failure(git_repo, reviewer=Reviewer.A, reason_code="DISPATCH_FAILED")
+        elif operation == "legacy":
+            from pre_pr_tribunal.verdict_store import migrate_legacy_pending_round
+            migrate_legacy_pending_round(git_repo)
+        else:
+            submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
+    assert not (git_repo / ".review/attempts").exists()
+    canonical = git_repo / ".review/inbox/round-1/A.json"
+    if operation == "legacy":
+        assert canonical.read_bytes() == raw
+    else:
+        assert not canonical.exists()
+
+
 @pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
 def test_submit_valid_report_seals_only_its_slot(git_repo, mask):
     pending = write_v2_pending(git_repo)
@@ -697,8 +750,12 @@ def test_submit_report_write_failure_is_not_a_retryable_attempt(git_repo, monkey
     before = (git_repo / ".review/verdict.json").read_bytes()
     raw = json.dumps(report(pending.snapshot, "A")).encode()
 
-    def fail_write(*args, **kwargs):
-        raise OSError("injected report write failure")
+    real_write = os.write
+
+    def fail_write(fd, data):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("injected report write failure")
+        return real_write(fd, data)
 
     monkeypatch.setattr(os, "write", fail_write)
     with pytest.raises(SchemaError, match="^REPORT_WRITE_FAILED$"):
@@ -712,8 +769,12 @@ def test_submit_evidence_write_failure_preserves_all_slots(git_repo, monkeypatch
     write_v2_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
 
-    def fail_write(*args, **kwargs):
-        raise OSError("injected evidence write failure")
+    real_write = os.write
+
+    def fail_write(fd, data):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("injected evidence write failure")
+        return real_write(fd, data)
 
     monkeypatch.setattr(os, "write", fail_write)
     with pytest.raises(SchemaError, match="^ATTEMPT_EVIDENCE_UNSAFE$"):

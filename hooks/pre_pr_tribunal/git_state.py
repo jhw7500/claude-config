@@ -85,7 +85,17 @@ def capture_telemetry_candidate(cwd: Path) -> TelemetryCandidate:
     return TelemetryCandidate(repository, head_ref, head_sha)
 
 
+def check_review_ignored(cwd: Path) -> None:
+    """Prove private primary artifacts cannot become Git-visible."""
+    _check_review_ignored(cwd, failure="VERDICT_NOT_IGNORED")
+
+
 def check_telemetry_ignored(cwd: Path) -> None:
+    """Keep the same namespace proof advisory for telemetry callers."""
+    _check_review_ignored(cwd, failure="TELEMETRY_FILE_UNSAFE")
+
+
+def _check_review_ignored(cwd: Path, *, failure: str) -> None:
     """Require the entire artifact namespace to be ignored and untracked."""
     root = _physical_root(_validated_cwd(cwd))
     # A trailing slash also matches .review/*, whose children can be negated.
@@ -97,7 +107,7 @@ def check_telemetry_ignored(cwd: Path) -> None:
             _git_environment(), input_bytes=b".review/\x00",
         )
     except GitStateError:
-        raise GitStateError("TELEMETRY_FILE_UNSAFE") from None
+        raise GitStateError(failure) from None
     fields = proof.stdout.split(b"\x00")
     if (
         proof.returncode != 0
@@ -108,17 +118,17 @@ def check_telemetry_ignored(cwd: Path) -> None:
         or fields[2] not in {b".review/", b"/.review/", b".review", b"/.review"}
         or fields[3:] != [b".review/", b""]
     ):
-        raise GitStateError("TELEMETRY_FILE_UNSAFE")
+        raise GitStateError(failure)
     for path in (".review/telemetry.json", ".review/lock"):
         _command_output(
             root, ("check-ignore", "-q", "--", path),
-            failure="TELEMETRY_FILE_UNSAFE",
+            failure=failure,
         )
     if _command_output(
         root, ("ls-files", "-z", "--", ".review"),
-        failure="TELEMETRY_FILE_UNSAFE",
+        failure=failure,
     ):
-        raise GitStateError("TELEMETRY_FILE_UNSAFE")
+        raise GitStateError(failure)
 
 
 def _git_environment() -> dict[str, str]:
