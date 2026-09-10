@@ -862,6 +862,34 @@ def test_installed_probe_preserves_valid_peers_when_c_retries(tmp_path, field, v
     assert result["status"]["reviewers"]["C"]["attempt_count"] == 2
 
 
+@pytest.mark.parametrize("runtime", ("claude", "codex"))
+def test_installed_probe_keeps_submit_failure_detection_after_successful_retry(tmp_path, runtime):
+    """A successful retry/finalize must not hide the original rejected submission."""
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+
+    def reject_b_once(reviewer, attempt, snapshot):
+        if reviewer == "B" and attempt == 1:
+            return b'{"schema":1'
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, runtime, report_factory=reject_b_once,
+    )
+    assert result["status"]["gate_status"] == "pass"
+    assert {role: slot["attempt_count"] for role, slot in result["status"]["reviewers"].items()} == {
+        "A": 1, "B": 2, "C": 1,
+    }
+    summary = result["telemetry_summary"]
+    detected = summary["early_detection"]
+    assert detected is not None
+    assert (detected["reviewer"], detected["reason_code"]) == ("B", "JSON_INVALID")
+    assert 0 <= detected["detected_elapsed_ms"] <= detected["all_reviewers_terminal_elapsed_ms"]
+    assert detected["wait_all_delay_ms"] >= 0
+    assert summary["binding"]["diff_sha256"] == result["begin"]["snapshot"]["diff_sha256"]
+    assert (repo / ".review/attempts/round-1/B/attempt-1.raw").read_bytes() == b'{"schema":1'
+
+
+
 def test_installed_probe_resumes_only_pending_c_and_reuses_native_sealed_peers(tmp_path):
     module, home, repo, cli = _installed_lifecycle(tmp_path)
     exhausted = []
