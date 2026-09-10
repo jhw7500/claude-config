@@ -458,16 +458,97 @@ def _start_probe(
 
 
 def _wait_for(
-    path: Path, process: subprocess.Popen[str], *, timeout: float = 15.0
+    path: Path,
+    process: subprocess.Popen[str],
+    *,
+    timeout: float = 15.0,
+    expected_lines: int | None = None,
 ) -> None:
+    def ready() -> bool:
+        if expected_lines is None:
+            return path.exists()
+        try:
+            content = path.read_text(encoding="ascii")
+        except FileNotFoundError:
+            return False
+        return content.endswith("\n") and len(content.splitlines()) == expected_lines
+
     deadline = time.monotonic() + timeout
-    while not path.exists() and process.poll() is None:
+    while not ready() and process.poll() is None:
         if time.monotonic() >= deadline:
             process.kill()
             process.communicate(timeout=5)
-            pytest.fail(f"probe did not create {path.name}")
+            pytest.fail(f"probe did not prepare {path.name}")
         time.sleep(0.02)
-    assert path.exists()
+    assert ready(), f"probe exited before {path.name} was ready"
+
+
+@pytest.fixture
+def waiting_process():
+    process = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("initial", [None, "", "123\n", "123\n4", "123\n456\n"])
+def test_wait_for_pid_file_waits_for_complete_lines(
+    tmp_path, monkeypatch, waiting_process, initial
+):
+    pid_file = tmp_path / "runtime-pids"
+    if initial is not None:
+        pid_file.write_text(initial, encoding="ascii")
+
+    def finish_write(_interval):
+        pid_file.write_text("123\n456\n", encoding="ascii")
+
+    monkeypatch.setattr(time, "sleep", finish_write)
+
+    _wait_for(pid_file, waiting_process, expected_lines=2)
+
+    assert pid_file.read_text(encoding="ascii") == "123\n456\n"
+
+
+@pytest.mark.parametrize("initial", ["", "123\n4"])
+def test_wait_for_pid_file_times_out_on_incomplete_lines(
+    tmp_path, waiting_process, initial
+):
+    pid_file = tmp_path / "runtime-pids"
+    pid_file.write_text(initial, encoding="ascii")
+
+    with pytest.raises(pytest.fail.Exception):
+        _wait_for(pid_file, waiting_process, expected_lines=2, timeout=0)
+
+    assert waiting_process.poll() is not None
+
+
+def test_wait_for_pid_file_rejects_incomplete_lines_after_process_exit(
+    tmp_path, waiting_process
+):
+    pid_file = tmp_path / "runtime-pids"
+    pid_file.write_text("123\n4", encoding="ascii")
+    waiting_process.communicate(timeout=5)
+
+    with pytest.raises(AssertionError):
+        _wait_for(pid_file, waiting_process, expected_lines=2)
+
+
+def test_wait_for_default_still_accepts_empty_marker(tmp_path, waiting_process):
+    marker = tmp_path / "ready"
+    marker.touch()
+
+    _wait_for(marker, waiting_process, timeout=0)
+
+    assert marker.stat().st_size == 0
 
 
 def _pidfd_ready(handle: ProcessHandle, timeout: float) -> bool:
@@ -2262,7 +2343,7 @@ def test_default_signal_semantics_leave_no_runtime_or_credential_copy(
     pid_file = work_dir / "tmp/runtime-pids"
     handles: list[ProcessHandle] = []
     try:
-        _wait_for(pid_file, process)
+        _wait_for(pid_file, process, expected_lines=2)
         assert len(pid_file.read_text().splitlines()) == 2
         handles = _open_descendant_pidfds(process.pid)
         assert len(handles) >= 2
@@ -2311,7 +2392,7 @@ def test_timeout_leaves_no_runtime_or_credential_copy(
     pid_file = work_dir / "tmp/runtime-pids"
     handles: list[ProcessHandle] = []
     try:
-        _wait_for(pid_file, process)
+        _wait_for(pid_file, process, expected_lines=2)
         assert len(pid_file.read_text().splitlines()) == 2
         handles = _open_descendant_pidfds(process.pid)
         assert len(handles) >= 2
