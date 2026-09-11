@@ -504,6 +504,8 @@ def _prior_request_history(
     complete = True
     requested: set[Reviewer] = set()
     for run in matching:
+        if run.invocation is not None:
+            requested.update(run.invocation.previously_attempted)
         if (
             run.started_late
             or run.telemetry_incomplete

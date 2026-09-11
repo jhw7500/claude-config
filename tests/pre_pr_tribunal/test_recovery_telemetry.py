@@ -117,6 +117,47 @@ def test_resume_counts_prior_observed_request_without_verdict_attempt(git_repo):
     assert recovery["rerun_slot_count"] == 1
 
 
+def test_resume_carries_prior_request_across_ledger_eviction(git_repo):
+    """Evicting the dispatch run must not turn a later request into a first attempt."""
+    begun = payload(
+        git_repo, "begin", "--base", "master", "--runtime", "codex", "--round", "1",
+    )
+    for role in "AC":
+        payload(git_repo, "submit-report", "--reviewer", role, raw=report(begun, role))
+    original_run_id = begun["telemetry"]["run_id"]
+    opened = payload(
+        git_repo, "telemetry-start", "--run-id", original_run_id,
+        "--stage", "reviewer_dispatch_wait", "--reviewer", "B", "--attempt", "1",
+    )
+    payload(
+        git_repo, "telemetry-finish", "--run-id", original_run_id,
+        "--span-id", opened["span_id"], "--outcome", "failure",
+        "--reason-code", "CAPACITY_REJECTED",
+    )
+    payload(
+        git_repo, "telemetry-close", "--run-id", original_run_id,
+        "--outcome", "failure", "--reason-code", "REVIEWER_UNAVAILABLE",
+    )
+
+    for _ in range(telemetry.MAX_TELEMETRY_RUNS):
+        resumed = payload(git_repo, "telemetry-resume", "--runtime", "codex")
+        payload(
+            git_repo, "telemetry-close", "--run-id", resumed["run_id"],
+            "--outcome", "success",
+        )
+    assert all(
+        run.run_id != original_run_id for run in telemetry.read_ledger(git_repo).runs
+    )
+
+    resumed = payload(git_repo, "telemetry-resume", "--runtime", "codex")
+    dispatch(git_repo, resumed["run_id"], "B", 1)
+    recovery = payload(
+        git_repo, "telemetry-summary", "--run-id", resumed["run_id"],
+    )["recovery"]
+    assert recovery["accounting_complete"] is True
+    assert recovery["rerun_slot_count"] == 1
+
+
 def test_resume_marks_interrupted_prior_request_history_unknown(git_repo):
     """An interrupted prior request cannot become a certain zero-rerun observation."""
     begun = payload(
