@@ -1008,6 +1008,96 @@ def test_installed_probe_resumes_only_pending_c_and_reuses_native_sealed_peers(t
     assert result["status"]["gate_status"] == "pass"
 
 
+@pytest.mark.parametrize(("started", "pending_attempts"), (
+    (0, [("A", 2), ("B", 1), ("C", 1)]),
+    (1, [("B", 2), ("C", 1)]),
+    (2, [("C", 2)]),
+))
+@pytest.mark.parametrize("severity", (None, "HIGH", "CRITICAL"))
+def test_installed_capacity_recovery_preserves_receipts_and_runs_only_pending(
+    tmp_path, started, pending_attempts, severity,
+):
+    """Exercise real CLI state after a rejected dispatch, not native scheduling.
+
+    Breaks caught: counting never-requested peers as failed, losing sealed exact
+    evidence/context, rerunning a sealed blocker, or passing an incomplete round.
+    The JSON controller scenarios are manual agent-replay inputs, not automated
+    assertions about native lifecycle decisions.
+    """
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    begun = module._tribunal_cli(
+        cli, repo, home, "begin", "--base", "master", "--runtime", "codex",
+        "--round", "1",
+    )
+    pending = "ABC"[started:]
+    contexts = {
+        role: module._tribunal_cli(cli, repo, home, "context", "--reviewer", role)
+        for role in pending
+    }
+    # A capacity rejection accepted no handle; only this requested role failed.
+    module._tribunal_cli(
+        cli, repo, home, "record-failure", "--reviewer", pending[0],
+        "--reason", "DISPATCH_FAILED",
+    )
+    sealed = {}
+    for role in "ABC"[:started]:
+        report = json.loads(module._synthetic_report_bytes(role, 1, begun["snapshot"]))
+        if role == "A" and severity is not None:
+            report["findings"] = [{
+                "id": "A-R1-001", "reviewer": "A", "severity": severity,
+                "title": "Preserved capacity-recovery blocker",
+                "rationale": "Dispatch capacity does not invalidate a completed review.",
+                "path": "tracked.txt", "line": 1, "execution_ids": [],
+                "acceptance_condition": "Keep this blocker through pending-only recovery.",
+            }]
+        # Non-canonical whitespace catches accidental parse/re-emit on reuse.
+        raw = (json.dumps(report, indent=2) + "\n \n").encode()
+        receipt = module._tribunal_cli(
+            cli, repo, home, "submit-report", "--reviewer", role, raw=raw,
+        )
+        assert receipt["raw_sha256"] == hashlib.sha256(raw).hexdigest()
+        sealed[role] = (raw, receipt)
+
+    before = module._tribunal_cli(cli, repo, home, "status")
+    assert before["gate_status"] == "in_progress"
+    for role in pending:
+        assert before["reviewers"][role]["state"] == "pending"
+        assert before["reviewers"][role]["attempt_count"] == (1 if role == pending[0] else 0)
+        assert module._tribunal_cli(
+            cli, repo, home, "context", "--reviewer", role,
+        ) == contexts[role]
+    with pytest.raises(module.ProbeFailure, match="^ROUND_NOT_READY$"):
+        module._tribunal_cli(cli, repo, home, "finalize")
+    assert module._tribunal_cli(cli, repo, home, "status") == before
+
+    requested = []
+
+    def resumed_response(role, attempt, snapshot):
+        requested.append((role, attempt))
+        return module._synthetic_report_bytes(role, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=resumed_response,
+    )
+    assert requested == pending_attempts
+    assert result["begin"] == {}  # Resume never resets the existing round.
+    assert result["status"]["gate_status"] == (
+        "fail" if started and severity is not None else "pass"
+    )
+    for role, (raw, receipt) in sealed.items():
+        path = repo / f".review/inbox/round-1/{role}.json"
+        assert path.read_bytes() == raw
+        metadata = path.lstat()
+        assert stat.S_ISREG(metadata.st_mode)
+        assert metadata.st_uid == os.geteuid()
+        assert stat.S_IMODE(metadata.st_mode) == 0o600
+        assert result["status"]["reviewers"][role] == before["reviewers"][role]
+        valid = module._tribunal_cli(
+            cli, repo, home, "validate-report", "--reviewer", role, "--source", "stored",
+        )
+        assert valid["raw_sha256"] == receipt["raw_sha256"]
+
+
 def test_installed_probe_migrates_unproven_legacy_reports_and_runs_all_slots(tmp_path):
     module, home, repo, cli = _installed_lifecycle(tmp_path)
     begun = module._tribunal_cli(

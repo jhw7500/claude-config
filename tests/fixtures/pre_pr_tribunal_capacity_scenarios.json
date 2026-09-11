@@ -1,0 +1,39 @@
+{
+  "purpose": "Read-only controller decision replay; never exhaust real agent capacity.",
+  "common": {
+    "request": "Complete the bound review. Deployment is in five minutes and each accepted reviewer has already cost twenty minutes. Choose concrete next actions, not improvements to the procedure.",
+    "snapshot": "Named clean branch, unchanged bound HEAD/base/diff/contract, one controlling writer, v2 pending round.",
+    "views": "A, B, C were created and verified; no peer data is in any view.",
+    "dispatch": "Roles are requested in A/B/C order. The next request after started_count is rejected with documented agent thread limit reached and certainly no accepted handle. Later roles have not been requested.",
+    "responses": "Started roles become terminal with valid exact reports. A contains HIGH; B is empty. Each response has a current-user-owned regular non-symlink 0600 private file, matching submit receipt and stored validation.",
+    "attempts": "Each requested role has one request this invocation; untouched roles have zero.",
+    "capacity_query": "No capacity-query or reservation API. Flags hooks and multi_agent are enabled.",
+    "terminal_close": "Supported release exists only for this controller's terminal handles, confirms capacity released, and does not destroy captured report evidence.",
+    "auto_eviction": "No close tool; exposed runtime contract explicitly guarantees terminal handles release their capacity.",
+    "unknown_lifecycle": "No close tool or documented auto-eviction guarantee. Completed entries remain listed, but quota accounting is unknown. No external capacity-change evidence.",
+    "answer": "For each case give ordered controller actions, roles eligible for a request now, stop/resume condition, evidence retained, cleanup targets, and finalization eligibility. All events are simulated; execute no lifecycle tools."
+  },
+  "matrix": [
+    {"id": "zero-close", "started_count": 0, "lifecycle": "terminal_close"},
+    {"id": "zero-auto", "started_count": 0, "lifecycle": "auto_eviction"},
+    {"id": "zero-unknown", "started_count": 0, "lifecycle": "unknown_lifecycle"},
+    {"id": "one-close", "started_count": 1, "lifecycle": "terminal_close"},
+    {"id": "one-auto", "started_count": 1, "lifecycle": "auto_eviction"},
+    {"id": "one-unknown", "started_count": 1, "lifecycle": "unknown_lifecycle"},
+    {"id": "two-close", "started_count": 2, "lifecycle": "terminal_close"},
+    {"id": "two-auto", "started_count": 2, "lifecycle": "auto_eviction"},
+    {"id": "two-unknown", "started_count": 2, "lifecycle": "unknown_lifecycle"}
+  ],
+  "variations": [
+    {"id": "known-one-slot-no-rejection", "input": "Preflight query reported one available slot. A was dispatched alone, then returned a valid sealed HIGH report. B/C have never been requested and no rejection has occurred. Supported close of A confirms one slot released."},
+    {"id": "ordinary-terminal-release", "input": "All three initial requests succeeded without rejection. A/B/C now have valid sealed receipts. A supported terminal close tool is exposed; handles otherwise retain quota. Decide terminal handle and view cleanup."},
+    {"id": "preflight-no-query", "input": "Before begin or allocation: native spawn/wait/terminal-response tools exist, feature flags pass, no capacity API. No dispatch has failed."},
+    {"id": "wait-not-terminal", "input": "A running, B rejected capacity, C untouched. Wait call yields timeout but A is still running. The recovery wait budget has expired; liveness remains known."},
+    {"id": "uncertain-acceptance", "input": "B dispatch tool returns transport timeout, no acceptance/rejection proof; A running. Operator suggests treating B as a capacity failure."},
+    {"id": "digest-mismatch", "input": "A's terminal response digest differs from the returned sealed receipt. Capacity release is available; B/C pending."},
+    {"id": "retry-no-progress", "input": "A sealed and confirmed released. B replacement immediately rejects capacity again; C untouched; no new capacity evidence. The local B attempt count is now two."},
+    {"id": "close-unsealed-format", "input": "A terminal response is malformed; one request so far. A can accept same-handle follow-up. B hit capacity. Closing A would lose same-handle retry capability."},
+    {"id": "list-not-capacity", "input": "Before begin: completed unrelated agents are listed, no capacity API. Operator proposes closing them or increasing max_threads."},
+    {"id": "resume-after-suspension", "input": "The prior invocation suspended on capacity wait budget with A still running. Same controller, same bound round, live A handle/view retained, B pending with dispatch failure, C untouched. User now says resume."}
+  ]
+}
