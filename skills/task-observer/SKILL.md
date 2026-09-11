@@ -71,8 +71,9 @@ above).
 
 ## Session Start Protocol
 
-1. If `skill-observations/log.md` or `cross-cutting-principles.md` don't
-   exist, create them (templates below / in the principles section of
+1. If `skill-observations/log.md` or
+   `skill-observations/cross-cutting-principles.md` don't exist, create them
+   at those exact workspace-relative paths (templates below / in the principles section of
    `references/skill-authoring.md`). Also create
    `skill-observations/last-review-date.txt` containing the literal value
    `never` if it doesn't exist — never write a date into it at setup; a
