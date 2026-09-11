@@ -171,6 +171,7 @@ def test_build_plan_installs_one_shared_package_two_hooks_and_two_skill_links(in
         Path("references/reviewer-b.md"),
         Path("references/reviewer-c.md"),
         Path("references/report-schema.md"),
+        Path("references/native-capacity.md"),
     ],
 )
 @pytest.mark.parametrize("kind", ["missing", "empty", "symlink", "directory", "fifo"])
