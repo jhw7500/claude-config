@@ -506,6 +506,9 @@ def _prior_request_history(
     for run in matching:
         if run.invocation is not None:
             requested.update(run.invocation.previously_attempted)
+        recovery = _recovery(run)
+        if recovery is None or recovery["accounting_complete"] is not True:
+            complete = False
         if (
             run.started_late
             or run.telemetry_incomplete

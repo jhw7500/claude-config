@@ -186,6 +186,58 @@ def test_resume_marks_interrupted_prior_request_history_unknown(git_repo):
     assert recovery["rerun_slot_count"] is None
 
 
+@pytest.mark.parametrize("stage", ("reviewer_total", "report_store"))
+def test_resume_marks_unmatched_prior_request_evidence_unknown(git_repo, stage):
+    """Auxiliary request evidence without a dispatch cannot become certain history."""
+    begun = payload(
+        git_repo, "begin", "--base", "master", "--runtime", "codex", "--round", "1",
+    )
+    for role in "AC":
+        payload(git_repo, "submit-report", "--reviewer", role, raw=report(begun, role))
+    prior_run_id = begun["telemetry"]["run_id"]
+    opened = payload(
+        git_repo, "telemetry-start", "--run-id", prior_run_id,
+        "--stage", stage, "--reviewer", "B", "--attempt", "1",
+    )
+    payload(
+        git_repo, "telemetry-finish", "--run-id", prior_run_id,
+        "--span-id", opened["span_id"], "--outcome", "success",
+    )
+    payload(git_repo, "telemetry-close", "--run-id", prior_run_id, "--outcome", "success")
+
+    resumed = payload(git_repo, "telemetry-resume", "--runtime", "codex")
+    dispatch(git_repo, resumed["run_id"], "B", 1)
+
+    recovery = payload(
+        git_repo, "telemetry-summary", "--run-id", resumed["run_id"],
+    )["recovery"]
+    assert recovery["accounting_complete"] is False
+    assert recovery["rerun_slot_count"] is None
+
+
+@pytest.mark.parametrize("attempts", ((1, 1), (2,), (1, 3)))
+def test_resume_marks_invalid_prior_dispatch_ordinals_unknown(git_repo, attempts):
+    """Invalid dispatch ordinals in an earlier run remain unknown after resume."""
+    begun = payload(
+        git_repo, "begin", "--base", "master", "--runtime", "codex", "--round", "1",
+    )
+    for role in "AC":
+        payload(git_repo, "submit-report", "--reviewer", role, raw=report(begun, role))
+    prior_run_id = begun["telemetry"]["run_id"]
+    for attempt in attempts:
+        dispatch(git_repo, prior_run_id, "B", attempt)
+    payload(git_repo, "telemetry-close", "--run-id", prior_run_id, "--outcome", "success")
+
+    resumed = payload(git_repo, "telemetry-resume", "--runtime", "codex")
+    dispatch(git_repo, resumed["run_id"], "B", 1)
+
+    recovery = payload(
+        git_repo, "telemetry-summary", "--run-id", resumed["run_id"],
+    )["recovery"]
+    assert recovery["accounting_complete"] is False
+    assert recovery["rerun_slot_count"] is None
+
+
 @pytest.mark.parametrize("change", ("dirty", "tampered_receipt", "active_observation", "terminal_verdict"))
 def test_resume_refuses_unverifiable_or_ambiguous_observation_without_writes(git_repo, change):
     begun = pending_b(git_repo, close=change != "active_observation")
