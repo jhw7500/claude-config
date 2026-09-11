@@ -238,6 +238,48 @@ def test_resume_marks_invalid_prior_dispatch_ordinals_unknown(git_repo, attempts
     assert recovery["rerun_slot_count"] is None
 
 
+@pytest.mark.parametrize("old_history", ("request", "incomplete"))
+def test_resume_scopes_prior_requests_to_current_lifecycle(git_repo, old_history):
+    """A completed tribunal at the same snapshot is not resume history."""
+    old = payload(
+        git_repo, "begin", "--base", "master", "--runtime", "codex", "--round", "1",
+    )
+    old_run_id = old["telemetry"]["run_id"]
+    if old_history == "request":
+        dispatch(git_repo, old_run_id, "B", 1)
+    else:
+        opened = payload(
+            git_repo, "telemetry-start", "--run-id", old_run_id,
+            "--stage", "report_store", "--reviewer", "B", "--attempt", "1",
+        )
+        payload(
+            git_repo, "telemetry-finish", "--run-id", old_run_id,
+            "--span-id", opened["span_id"], "--outcome", "success",
+        )
+    for role in "ABC":
+        payload(git_repo, "submit-report", "--reviewer", role, raw=report(old, role))
+    payload(git_repo, "finalize")
+    payload(git_repo, "telemetry-close", "--run-id", old_run_id, "--outcome", "success")
+
+    current = payload(
+        git_repo, "begin", "--base", "master", "--runtime", "codex", "--round", "1",
+    )
+    for role in "AC":
+        payload(git_repo, "submit-report", "--reviewer", role, raw=report(current, role))
+    payload(
+        git_repo, "telemetry-close", "--run-id", current["telemetry"]["run_id"],
+        "--outcome", "success",
+    )
+
+    resumed = payload(git_repo, "telemetry-resume", "--runtime", "codex")
+    dispatch(git_repo, resumed["run_id"], "B", 1)
+    recovery = payload(
+        git_repo, "telemetry-summary", "--run-id", resumed["run_id"],
+    )["recovery"]
+    assert recovery["accounting_complete"] is True
+    assert recovery["rerun_slot_count"] == 0
+
+
 @pytest.mark.parametrize("change", ("dirty", "tampered_receipt", "active_observation", "terminal_verdict"))
 def test_resume_refuses_unverifiable_or_ambiguous_observation_without_writes(git_repo, change):
     begun = pending_b(git_repo, close=change != "active_observation")

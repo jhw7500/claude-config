@@ -499,6 +499,11 @@ def _prior_request_history(
             for name in ("report_text", "diff_recipe")
         )
     ]
+    lifecycle_start = max((
+        index for index, run in enumerate(matching)
+        if run.invocation is not None and run.invocation.kind == "new_round"
+    ), default=0)
+    matching = matching[lifecycle_start:]
     if not matching:
         return set(), False
     complete = True
