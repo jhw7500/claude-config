@@ -88,13 +88,13 @@ For explicit pending resume, reconcile retained handles and verify the pending-r
 | `recovery.kind` | `new_round` or explicit pending `resume`; retries stay in that invocation |
 | `recovery.reused_slot_count` | Verified sealed roles present at invocation entry |
 | `recovery.requested_slot_count` | Distinct roles with dispatch/follow-up requests in this invocation |
-| `recovery.rerun_slot_count` | Requested roles previously attempted while pending, or requested more than once now |
+| `recovery.rerun_slot_count` | Requested roles previously attempted while pending, including complete prior bound dispatch observations, or requested more than once now |
 | `recovery.dispatch_request_count` | Observed requests, including capacity-rejected requests |
 | `recovery.retry_request_count` | Requests beyond the first per requested role, only within this invocation |
-| `recovery.accounting_complete` | False for missing/interrupted request observations, ordinal gaps/duplicates, or a request for a reused role; request-derived counts are then `null` |
+| `recovery.accounting_complete` | False for incomplete prior matching history, missing/interrupted request observations, ordinal gaps/duplicates, or a request for a reused role; request-derived counts are then `null` |
 | `invocation_elapsed_ms` | Entry-to-close monotonic elapsed time, not the sum of overlapping reviewer spans; `null` while running, interrupted, late-started, clock-anomalous, or missing end timing |
 
-Legacy schema-1 ledger runs remain readable and return `recovery: null` and `invocation_elapsed_ms: null`; no metrics are inferred from receipts. Example: A/C sealed, B pending with cumulative `attempt_count=3`, prior observation closed. After `telemetry-resume`, two B requests are ordinals 1 and 2: reused=2, requested=1, rerun=1, requests=2, retries=1. A subsequent complete new round starts reuse and request counts at zero. Missing durations are unknown, never 0ms. Counts alone cannot establish saved native seconds: compare full-panel and selective recovery only with matching snapshot, report contract, runtime/model, reviewer input and scheduling conditions; identify fixture/synthetic measurements separately from actual native runs.
+Legacy schema-1 ledger runs remain readable and return `recovery: null` and `invocation_elapsed_ms: null`; no metrics are inferred from receipts. Example: A/C sealed, B pending with cumulative `attempt_count=3`, prior observation closed. After `telemetry-resume`, two B requests are ordinals 1 and 2: reused=2, requested=1, rerun=1, requests=2, retries=1. A prior matching capacity-rejected dispatch also makes the next B request a rerun even when the verdict attempt count stayed zero; incomplete prior history makes request-derived counts unknown. A subsequent complete new round starts reuse and request counts at zero. Missing durations are unknown, never 0ms. Counts alone cannot establish saved native seconds: compare full-panel and selective recovery only with matching snapshot, report contract, runtime/model, reviewer input and scheduling conditions; identify fixture/synthetic measurements separately from actual native runs.
 
 ## Pending-round report recovery
 

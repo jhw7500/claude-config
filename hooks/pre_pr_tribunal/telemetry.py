@@ -478,6 +478,50 @@ def _bound_snapshot(snapshot: Snapshot) -> TelemetryBinding:
     ).to_json())
 
 
+def _prior_request_history(
+    ledger: TelemetryLedger, snapshot: Snapshot, round_number: int,
+) -> tuple[set[Reviewer], bool]:
+    expected = _bound_snapshot(snapshot)
+    fields = (
+        "repository", "base_ref", "base_sha", "head_ref", "head_sha",
+        "merge_base_sha", "diff_sha256",
+    )
+    matching = [
+        run for run in ledger.runs
+        if run.round == round_number
+        and run.binding.status == "bound"
+        and all(
+            getattr(run.binding, name) == getattr(expected, name)
+            for name in fields
+        )
+        and all(
+            run.binding.contract[name] == expected.contract[name]
+            for name in ("report_text", "diff_recipe")
+        )
+    ]
+    if not matching:
+        return set(), False
+    complete = True
+    requested: set[Reviewer] = set()
+    for run in matching:
+        if (
+            run.started_late
+            or run.telemetry_incomplete
+            or run.outcome in (
+                None, TelemetryOutcome.INCOMPLETE, TelemetryOutcome.CLOCK_ANOMALY,
+            )
+        ):
+            complete = False
+        for span in run.spans:
+            if span.stage is not TelemetryStage.REVIEWER_DISPATCH_WAIT:
+                continue
+            if span.reason_code == "CONTROLLER_INTERRUPTED":
+                complete = False
+            elif span.reviewer is not None:
+                requested.add(span.reviewer)
+    return requested, complete
+
+
 def resume_run(cwd: Path, *, runtime: str, started_at: str, started_monotonic_ns: int) -> TelemetryRun:
     """Observe a verified pending round under its lock; never mutate primary evidence."""
     from .git_state import capture_snapshot
@@ -492,22 +536,27 @@ def resume_run(cwd: Path, *, runtime: str, started_at: str, started_monotonic_ns
             _require(verdict.contract == current_contract_binding())
             snapshot = capture_snapshot(cwd, verdict.base_ref)
             _require(_snapshot_equal(verdict, snapshot))
+            ledger = _read(directory)
+            observed, history_complete = _prior_request_history(
+                ledger, snapshot, verdict.round,
+            )
             reused, attempted = [], []
             for reviewer in Reviewer:
                 slot = verdict.reviewers[reviewer.value]
                 if slot.status == "sealed":
                     _read_sealed_report(directory, verdict, reviewer)
                     reused.append(reviewer)
-                elif slot.attempt_count:
+                elif slot.attempt_count or reviewer in observed:
                     attempted.append(reviewer)
         except TribunalError:
             raise SchemaError(_INVALID) from None
-        ledger = _read(directory)
         # A live controller must explicitly terminalize its own observation first.
         _require(not any(item.outcome is None for item in ledger.runs))
         run = TelemetryRun(
             _token(secrets.token_hex), runtime, verdict.round, _bound_snapshot(snapshot),
-            started_at, None, started_monotonic_ns, None, None, False, False, None, (),
+            started_at, None, started_monotonic_ns, None, None, False,
+            not history_complete,
+            None if history_complete else "PRIOR_REQUEST_HISTORY_INCOMPLETE", (),
             Invocation("resume", tuple(reused), tuple(attempted)),
         )
         run = _parse_run(run.to_json())
