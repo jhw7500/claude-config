@@ -52,9 +52,11 @@ of a handle is insufficient. Other setup failures retain the skill's stop path.
    Never record failure for an unrequested peer.
 2. Drain started reviewers independently, accepting exact valid responses through
    the skill's private-file, submit-receipt digest, and stored-validation checks.
-   Valid HIGH/CRITICAL reports seal and remain reusable. A format error retains
-   its handle/view for bounded same-handle format retry; do not close that handle
-   to free capacity. Never repurpose a reviewer handle for another role.
+   Valid HIGH/CRITICAL reports seal and remain reusable. While automatic attempts
+   remain, a format error retains its handle/view for bounded same-handle format
+   retry; do not close that handle to free capacity during this retry path.
+   At format-retry exhaustion, a known-terminal handle follows step 4 instead.
+   Never repurpose a reviewer handle for another role.
 3. Wait in calls of at most 60 seconds with progress updates, using a cumulative
    capacity-recovery wait budget of 600 seconds per invocation. A wait-interface
    timeout does not establish terminal failure. At budget exhaustion, suspend
@@ -63,14 +65,21 @@ of a handle is insufficient. Other setup failures retain the skill's stop path.
    Unknown liveness remains an integrity stop.
 4. For a sealed role, preserve the complete private response and authenticated
    receipt before supported release of its terminal handle. Also release owned
-   terminal operationally failed handles when supported, retaining their failure
-   evidence. Release is one bounded attempt per eligible handle; failure or an
+   terminal operationally failed handles and terminal handles whose format-only
+   retry budget is exhausted, when supported. Preserve their exact private
+   responses and failure evidence outside the view before release or cleanup.
+   Release is one bounded attempt per eligible handle; failure or an
    unavailable release tool is a capacity observation, not a new verdict gate.
    It supplies no release evidence; do not retry close indefinitely. Cleanup each
-   verified view whose role sealed or operationally failed, and unused views, at
-   most once, non-force. Keep a terminal/unsealed format-retry view intact.
+   verified view whose role sealed, operationally failed, or exhausted format
+   retries while terminal, and unused views, at most once, non-force. Keep a
+   terminal/unsealed format-retry view intact while a same-handle retry remains.
    Refusal preserves a view as a warning. Terminal close is separate from view
    cleanup. Neither step authorizes discarding report evidence.
+   An exhausted format role stays pending with its existing format error and
+   cumulative attempt history; do not add `record-failure` for exhaustion.
+   Release grants no fourth request: drain started peers, then return
+   `REVIEWER_UNAVAILABLE` for explicit pending-only resume without finalizing.
 5. After draining the current wave, continue only when the lifecycle table gives
    new capacity evidence. If a supported query exists, it may be checked once
    after that drain. Each release/terminal-capacity event is consumed once to
