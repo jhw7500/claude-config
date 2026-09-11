@@ -650,7 +650,7 @@ def test_skill_interrupted_lifecycle_recovers_then_closes_without_changing_gate(
 ):
     commands = telemetry_lifecycle_commands()
     monkeypatch.chdir(git_repo)
-    variables = {"$REVIEWER": "A", "$ATTEMPT": "1", "$PRIMARY_CODE": reason}
+    variables = {"$REVIEWER": "A", "$ATTEMPT": "1", "$RETRY_ATTEMPT": "1", "$PRIMARY_CODE": reason}
     run = lambda rows, second: run_lifecycle_commands(monkeypatch, capsys, variables, rows, second)
     run([["begin", "--base", "master", "--runtime", "codex", "--round", "1"]], 0)
     before = (git_repo / ".review/verdict.json").read_bytes()
@@ -658,7 +658,7 @@ def test_skill_interrupted_lifecycle_recovers_then_closes_without_changing_gate(
     run(commands["unavailable", "dispatch_request"], 1)
     recovered = run(commands["recovery", "interrupted"], 4)
     assert recovered == [{"run_id": variables["$RUN_ID"], "recovered_count": 3}]
-    variables["$ATTEMPT"] = "2"
+    variables["$RETRY_ATTEMPT"] = "2"
     run(commands["recovery", "retry_start"], 5)
     run(commands["recovery", "retry_terminal"], 6)
     run(commands["exit", outcome], 7)

@@ -115,6 +115,8 @@ def _parser() -> argparse.ArgumentParser:
         terminal.add_argument("--reason-code")
     recover = commands.add_parser("telemetry-recover", add_help=False)
     recover.add_argument("--run-id", required=True)
+    resume = commands.add_parser("telemetry-resume", add_help=False)
+    resume.add_argument("--runtime", required=True, choices=("claude", "codex"))
     summary = commands.add_parser("telemetry-summary", add_help=False)
     summary.add_argument("--run-id")
     return parser
@@ -171,13 +173,14 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
                     )
                 telemetry.close_run(cwd, run_id=run.run_id,
                     outcome=telemetry.TelemetryOutcome.FAILURE, reason_code=primary_error.code,
-                    ended_at=ended_at)
+                    ended_at=ended_at, ended_monotonic_ns=ended_ns)
         except Exception:
             pass
         raise
     try:
         if run is not None:
-            telemetry.bind_run(cwd, run_id=run.run_id, snapshot=verdict.snapshot)
+            telemetry.bind_run(cwd, run_id=run.run_id, snapshot=verdict.snapshot,
+                               invocation=telemetry.Invocation("new_round", (), ()))
             if span is not None:
                 telemetry.finish_span(
                     cwd, run_id=run.run_id, span_id=span.span_id,
@@ -191,8 +194,12 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
 
 def _telemetry_command(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns):
     try:
-        run_id = arguments.run_id
         check_telemetry_ignored(cwd)
+        if arguments.command == "telemetry-resume":
+            run = telemetry.resume_run(cwd, runtime=arguments.runtime,
+                                       started_at=wall_clock(), started_monotonic_ns=monotonic_ns())
+            return {"status": "active", "run_id": run.run_id}
+        run_id = arguments.run_id
         if arguments.command == "telemetry-summary":
             return telemetry.summarize_run(cwd, run_id=run_id)
         if arguments.command == "telemetry-start":
@@ -217,7 +224,7 @@ def _telemetry_command(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=time.
             return {"run_id": run_id, "recovered_count": recovered}
         run = telemetry.close_run(cwd, run_id=run_id,
             outcome=telemetry.TelemetryOutcome(arguments.outcome), reason_code=arguments.reason_code,
-            ended_at=wall_clock())
+            ended_at=wall_clock(), ended_monotonic_ns=monotonic_ns())
         return {"run_id": run_id, "status": run.outcome.value}
     except Exception as error:
         raise TribunalError(_telemetry_unavailable(error)["reason_code"]) from None

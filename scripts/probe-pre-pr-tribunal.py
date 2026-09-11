@@ -1442,8 +1442,15 @@ def _create_pass_verdict(
     observation = payload.get("telemetry", {})
     if not isinstance(observation, dict):
         raise ProbeFailure("SETUP_FAILED")
-    run_id = observation.get("run_id")
     gaps = []
+    if not payload:
+        try:
+            observation = _tribunal_cli(cli, repo, home, "telemetry-resume", "--runtime", runtime)
+        except ProbeFailure as error:
+            gaps.append(error.code)
+    elif observation.get("status") == "unavailable":
+        gaps.append(observation.get("reason_code", "TELEMETRY_INVALID"))
+    run_id = observation.get("run_id")
 
     def telemetry(command, *arguments):
         if run_id is None:
@@ -1496,12 +1503,16 @@ def _create_pass_verdict(
             snapshot = context.get("snapshot")
             if not isinstance(snapshot, dict):
                 raise ProbeFailure("SETUP_FAILED")
-            total = start("reviewer_total", reviewer, attempt)
+            local_attempt = local_attempts + 1
+            dispatch = start("reviewer_dispatch_wait", reviewer, local_attempt)
+            # This factory is synchronous synthetic work, not a native scheduler.
+            finish(dispatch)
+            total = start("reviewer_total", reviewer, local_attempt)
             try:
                 raw = report_factory(reviewer, attempt, snapshot)
                 if not isinstance(raw, bytes):
                     raise ProbeFailure("SETUP_FAILED")
-                receipt = measured("report_store", reviewer, attempt, lambda: _tribunal_cli(
+                receipt = measured("report_store", reviewer, local_attempt, lambda: _tribunal_cli(
                     cli, repo, home, "submit-report", "--reviewer", reviewer, raw=raw,
                 ))
                 if receipt.get("raw_sha256") != hashlib.sha256(raw).hexdigest():

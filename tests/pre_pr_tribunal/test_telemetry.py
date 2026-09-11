@@ -619,13 +619,14 @@ def test_bound_run_records_terminal_span_and_sanitized_summary(git_repo):
     assert summary["reviewers"]["B"]["total_ms"] == 4000
     assert summary["outcomes"]["success"] == 1
     assert summary["binding"]["contract"] == {
-        "report_text": 2, "diff_recipe": 1, "telemetry_schema": 1,
+        "report_text": 2, "diff_recipe": 1, "telemetry_schema": 2,
     }
     assert summary["stages"]["reviewer_total"] == {"count": 1, "total_ms": 4000}
     assert summary["early_detection"] is None
     assert set(summary) == {
         "schema", "binding", "reviewers", "stages", "outcomes",
         "telemetry_incomplete", "anomaly_reason_codes", "early_detection",
+        "recovery", "invocation_elapsed_ms",
     }
     assert set(summary["binding"]) == {"contract", "diff_sha256"}
     for forbidden in ("command", "/home/", "monotonic", "started_at", span.span_id):
@@ -828,7 +829,7 @@ def test_span_limit_sets_reserved_incomplete_marker(git_repo):
 
 @pytest.mark.parametrize(("where", "key", "value"), (
     ("ledger", "schema", True), ("ledger", "schema", 1.0),
-    ("ledger", "schema", 2), ("ledger", "unknown", 1),
+    ("ledger", "schema", 3), ("ledger", "unknown", 1),
     ("run", "runtime", "unknown"), ("run", "round", True),
     ("run", "round", 4), ("run", "run_id", "a" * 31),
     ("run", "started_late", 1), ("run", "telemetry_incomplete", "true"),
@@ -879,7 +880,7 @@ def test_parser_rejects_duplicates_and_resource_overflow(git_repo, kind):
         raw["runs"][0]["spans"] *= 129 if kind == "spans" else 2
     payload = json.dumps(raw).encode()
     if kind == "duplicate_key":
-        payload = payload.replace(b'"schema": 1', b'"schema": 1, "schema": 1')
+        payload = b'{"schema":2,' + payload[1:]
     elif kind == "bytes":
         payload = b" " * (2 * 1024 * 1024 + 1)
     elif kind == "nan":
@@ -1082,7 +1083,7 @@ def test_early_detection_requires_all_three_usable_terminal_milestones(git_repo,
 
 
 def test_missing_ledger_is_empty_and_unknown_run_is_bounded(git_repo):
-    assert read_ledger(git_repo).to_json() == {"schema": 1, "runs": []}
+    assert read_ledger(git_repo).to_json() == {"schema": 2, "runs": []}
     with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
         summarize_run(git_repo)
 
