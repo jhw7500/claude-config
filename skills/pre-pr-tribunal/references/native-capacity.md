@@ -14,9 +14,11 @@ If a supported bounded capacity query exists, call it once. A documented bounded
 reservation may be used only with known release semantics; retain its exact
 owned token and release unused reservations on every exit. A reservation backing
 a live reviewer is not unused. Positive capacity permits that many concurrent
-requests, not necessarily three. A confirmed zero means stop before allocation
-and explain how supported capacity release followed by explicit resume can help.
-An unavailable/inconclusive optional query means capacity is unknown: report that
+new-handle requests, not necessarily three. A confirmed zero means stop before
+fresh-view allocation or fresh dispatch. An explicit same-handle resume follows
+the retained-format-handle checks below instead; zero fresh capacity alone does
+not reject a supported same-handle continuation. An unavailable/inconclusive
+optional query means capacity is unknown: report that
 limitation and attempt native dispatch; it is not a permanent preflight blocker.
 
 Record the applicable lifecycle evidence, not a quota inferred from agent lists:
@@ -70,12 +72,21 @@ of a handle is insufficient. Other setup failures retain the skill's stop path.
    responses and failure evidence outside the view before release or cleanup.
    Release is one bounded attempt per eligible handle; failure or an
    unavailable release tool is a capacity observation, not a new verdict gate.
-   It supplies no release evidence; do not retry close indefinitely. Cleanup each
-   verified view whose role sealed, operationally failed, or exhausted format
-   retries while terminal, and unused views, at most once, non-force. Keep a
-   terminal/unsealed format-retry view intact while a same-handle retry remains.
-   Refusal preserves a view as a warning. Terminal close is separate from view
-   cleanup. Neither step authorizes discarding report evidence.
+   It supplies no release evidence; do not retry close indefinitely.
+   For an exhausted pending format role, select view disposition by the observed
+   handle state:
+
+   | Handle state | View disposition |
+   | --- | --- |
+   | Confirmed released, or known terminal and no longer callable | One bounded non-force cleanup; later fresh pending-only recovery requires capacity |
+   | Owned terminal handle remains retry-capable; release unavailable or unsuccessful | Retain the exact registered handle/view and tracking for explicit same-handle resume below |
+   | Release result or follow-up capability unresolved | Preserve handle/view tracking and evidence for reconciliation; assume neither release nor callability |
+
+   Clean verified views of sealed or terminal operationally failed roles and
+   unused views at most once, non-force. Keep a terminal/unsealed format-retry
+   view intact while an automatic retry remains or the table retains it for
+   explicit resume. Refusal preserves a view as a warning. Terminal close is
+   separate from view cleanup. Neither step authorizes discarding report evidence.
    An exhausted format role stays pending with its existing format error and
    cumulative attempt history; do not add `record-failure` for exhaustion.
    Release grants no fourth request: drain started peers, then return
@@ -102,19 +113,50 @@ When all three roles are sealed, perform every immediate pre-final check and
 pathless `finalize`. Preserved blockers still yield a non-pass verdict; there is
 no two-of-three pass. Capacity recovery does not downgrade an integrity stop.
 
+## Explicit resume of a retained format-retry handle
+
+Apply the skill's pending-round status, snapshot/contract, ownership, and context
+checks first. Retained tracking includes the role, exact handle and registered
+view, bound snapshot, failure evidence, and prior release/cleanup attempts.
+Preserve these mappings across invocations; do not reset them during setup.
+
+- For a still-running handle, use the existing wait/suspension path, not a new
+  request. Unknown liveness or identity remains an integrity stop.
+- For a retained terminal format-retry handle, reverify the same controlling
+  ownership and role, and require supported evidence that the exact handle can
+  accept follow-up in its existing cwd without a fresh dispatch. Independently
+  verify that exact registered detached view still has the bound HEAD, empty
+  `git status --porcelain -uall`, and no `.review`. If the view is dirty, missing,
+  or unverifiable, preserve remaining evidence and stop; do not repair or
+  recreate its cwd to make reuse possible. Unresolved follow-up capability also
+  stops this recovery without assuming release or recording a process failure.
+- When those checks pass, send a complete format-only request to that same
+  handle, with only its own role prompt, shared snapshot, installed report
+  schema, and projected context. No new view, spawn, or fresh-slot query is
+  required for this supported continuation. Explicit resume starts a new
+  per-invocation budget: this follow-up is request 1 of at most 3; persisted
+  attempt history remains cumulative. This is not an automatic fourth request
+  in the exhausted invocation. Apply every step 6 exact-byte acceptance check.
+- A confirmed released or no-longer-callable terminal handle instead takes the
+  ordinary fresh pending-only recovery path, subject to fresh capacity. Preserve
+  evidence and prior cleanup/release-attempt tracking; do not repeat those
+  operations or convert missing capabilities into an operational failure.
+
 ## If continuation is unavailable
 
 Return `REVIEWER_UNAVAILABLE` for an unresolved capacity stop. If a request was
 actually rejected, retain `DISPATCH_FAILED` on that pending slot; a planned wave
 with no rejected request records no dispatch failure. Report together:
 
-- Exact sealed/pending roles and any retained live handle/view coordinates.
+- Exact sealed/pending roles and any retained live or terminal format-retry
+  handle/view coordinates, with the reason for preservation.
 - The observed capacity rejection, missing capability or exhausted budget, and
   whether release is supported, explicitly automatic, or unknown.
-- The supported operator path: release capacity through the runtime's supported
-  controls (by its owner for unrelated work), then explicitly resume this same
-  bound pending round. If those controls are not exposed, say so; do not invent
-  an executable close command or promise that waiting will free capacity.
+- The supported operator path: explicitly resume a retained format-retry handle
+  through the checks above, or release capacity through the runtime's supported
+  controls (by its owner for unrelated work) and explicitly resume pending roles
+  with fresh reviewers. If neither path is available, say so; do not invent an
+  executable close command or promise that waiting will free capacity.
 
 On explicit resume, re-inspect capabilities and reconcile retained handles before
 fresh dispatch; absence of a capacity-query API alone still does not block an
