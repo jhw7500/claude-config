@@ -189,18 +189,19 @@ engine에서도 상한으로 검증한다. Nonzero exit, timeout, invalid JSON, 
 ### 6.3 포트폴리오 판정
 
 Engine은 projected `repositories[].slug`, `truncated`, `total_items`와 optional
-pagination indicator를 schema 검증한다. 결과는 다음 표로만 결정한다.
+pagination indicator를 schema 검증한다. `repositories`는 매 페이지의 전체 Registry
+요약이며 `truncated`와 pagination은 Project items에만 적용된다. 결과는 다음 표로만 결정한다.
 
 | 증거 | 결과 |
 | --- | --- |
 | 정확히 정규화된 slug가 결과에 존재 | `registered` |
-| slug가 없고 결과가 완전함 | `unregistered` |
-| slug가 없고 `truncated` 또는 pagination 잔여가 있음 | `unknown` |
+| 전체 `repositories`에 slug가 없음 (Project pagination 여부 무관) | `unregistered` |
 | launcher/schema/slug 검증 실패 | `unknown` |
 
-잘린 결과에서 slug가 발견되면 존재 증거는 완전하므로 `registered`다. 부재는
-완전한 결과에서만 증명한다. Engine은 다음 page ID를 사용해 직접 pagination하지
-않으며 누락된 Project/Repository ID를 조립하지 않는다.
+Project items가 잘려도 repository 요약은 완전하므로 존재와 부재를 모두 판정할 수 있다.
+2026-09-12에 실제 14/19 Project page에서 repository 부재를 `unknown`으로 오판한
+사례를 수정했다. Launcher/schema 검증 실패는 계속 `unknown`이다. Engine은 다음
+page ID를 사용해 직접 pagination하지 않으며 누락된 Project/Repository ID를 조립하지 않는다.
 
 ### 6.4 세션당 한 번 상태
 

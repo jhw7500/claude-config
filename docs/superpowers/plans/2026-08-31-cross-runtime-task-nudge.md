@@ -16,7 +16,7 @@
 - Project Control 자동 호출은 정확히 `$HOME/.local/bin/jhw-control-host portfolio status` 하나이며 shell을 통하지 않는다.
 - Launcher stdin은 비우고 timeout은 15초, stdout/stderr capture 상한은 각각 12 KiB다.
 - Runtime hook stdin은 최대 1 MiB이며 초과·invalid JSON은 `HOOK_INPUT_INVALID`로 fail closed한다.
-- 완전한 portfolio 결과에서 slug가 없을 때만 `unregistered`; truncated, malformed, timeout, nonzero exit는 `unknown`이다.
+- schema 검증을 통과한 전체 `repositories`에 slug가 없으면 `unregistered`; Project items의 truncated 여부는 이 판정을 바꾸지 않는다. malformed, timeout, nonzero exit는 `unknown`이다.
 - `unknown`과 deterministic skip은 완료 marker를 만들지 않는다. 정상 결과만 runtime/session당 최대 한 번 출력한다.
 - Codex native matcher는 `apply_patch|Edit|Write`, Claude matcher는 `Edit|Write|NotebookEdit`다. Bash mutation parser는 만들지 않는다.
 - Hook은 permission denial을 반환하지 않지만 `unknown`은 guidance에서 후속 실질 변경을 중단시키는 fail-closed 상태다.
@@ -246,15 +246,14 @@ def test_portfolio_complete_miss_is_unregistered(core):
     assert result.status is core.RegistrationStatus.UNREGISTERED
 
 
-def test_portfolio_truncated_miss_is_unknown(core):
+def test_portfolio_project_pagination_does_not_hide_registry_miss(core):
     result = core.parse_portfolio_output(
         portfolio_bytes(slugs=("jhw7500/other",), truncated=True),
         "jhw7500/claude-config",
     )
     assert result == core.RegistrationResult(
-        core.RegistrationStatus.UNKNOWN,
+        core.RegistrationStatus.UNREGISTERED,
         "jhw7500/claude-config",
-        "PORTFOLIO_RESULT_INCOMPLETE",
     )
 
 
@@ -330,8 +329,7 @@ def parse_portfolio_output(raw: bytes, slug: str) -> RegistrationResult:
             normalized.append(parsed)
         if slug.lower() in normalized:
             return RegistrationResult(RegistrationStatus.REGISTERED, slug.lower())
-        if truncated:
-            return _unknown(slug.lower(), "PORTFOLIO_RESULT_INCOMPLETE")
+        # Every project page includes the complete repository summary.
         return RegistrationResult(RegistrationStatus.UNREGISTERED, slug.lower())
     except (UnicodeDecodeError, ValueError, TypeError):
         return _unknown(slug, "PORTFOLIO_UNAVAILABLE")

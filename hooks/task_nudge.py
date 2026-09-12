@@ -470,8 +470,9 @@ def parse_portfolio_output(raw: bytes, slug: str) -> RegistrationResult:
                     raise ValueError("item repository reference is invalid")
         if normalized_slug in normalized_repositories:
             return RegistrationResult(RegistrationStatus.REGISTERED, normalized_slug)
-        if truncated:
-            return _unknown(normalized_slug, "PORTFOLIO_RESULT_INCOMPLETE")
+        # Portfolio pagination applies to project items. The host returns the
+        # complete Registry repository summary on every page, so a validated
+        # registry miss is authoritative even when more project items remain.
         return RegistrationResult(RegistrationStatus.UNREGISTERED, normalized_slug)
     except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
         return _unknown(slug if isinstance(slug, str) else None, "PORTFOLIO_UNAVAILABLE")
