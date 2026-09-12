@@ -14,6 +14,7 @@ from pre_pr_tribunal.model import Reviewer
 
 CLI = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
 NOW = "2026-09-11T00:00:00Z"
+LIFECYCLE = "1" * 32
 
 
 def invoke(repo, *args, raw=None):
@@ -307,6 +308,7 @@ def test_new_round_starts_with_zero_reuse_and_does_not_inherit_old_attempts(git_
     run = telemetry.create_run(git_repo, base_ref="master", runtime="codex", round_number=2,
                                started_at=NOW, started_monotonic_ns=0)
     telemetry.bind_run(git_repo, run_id=run.run_id, snapshot=snapshot,
+                       lifecycle_id=LIFECYCLE,
                        invocation=telemetry.Invocation("new_round", (), ()))
     summary = telemetry.summarize_run(git_repo, run_id=run.run_id)
     assert summary["recovery"] == {
@@ -322,6 +324,7 @@ def test_elapsed_is_measured_once_not_sum_of_overlapping_reviewer_spans(git_repo
                                started_at=NOW, started_monotonic_ns=0)
     run_id = run.run_id
     telemetry.bind_run(git_repo, run_id=run_id, snapshot=capture_snapshot(git_repo, "master"),
+                       lifecycle_id=LIFECYCLE,
                        invocation=telemetry.Invocation("new_round", (), ()))
     for role in (Reviewer.A, Reviewer.C):
         span = telemetry.start_span(git_repo, run_id=run_id, stage=telemetry.TelemetryStage.REVIEWER_TOTAL,
@@ -350,6 +353,7 @@ def test_legacy_ledger_is_read_without_fabricating_reuse_or_elapsed(git_repo):
         run["binding"]["contract"]["telemetry_schema"] = 1
         run.pop("invocation", None)
         run.pop("ended_monotonic_ns", None)
+        run.pop("lifecycle_id", None)
     path.write_text(json.dumps(ledger))
     before = path.read_bytes()
     summary = payload(git_repo, "telemetry-summary", "--run-id", begun["telemetry"]["run_id"])
@@ -422,6 +426,7 @@ def test_resume_appends_to_legacy_ledger_without_inventing_prior_measurements(gi
     old = ledger["runs"][0]
     old["binding"]["contract"]["telemetry_schema"] = 1
     del old["invocation"], old["ended_monotonic_ns"]
+    del old["lifecycle_id"]
     path.write_text(json.dumps(ledger))
     resumed = payload(git_repo, "telemetry-resume", "--runtime", "codex")
     persisted = json.loads(path.read_bytes())

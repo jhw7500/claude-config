@@ -21,7 +21,8 @@ from .review_store import (
 )
 
 
-TELEMETRY_SCHEMA_VERSION = 2
+TELEMETRY_SCHEMA_VERSION = 3
+SUPPORTED_TELEMETRY_SCHEMAS = frozenset((1, 2, 3))
 MAX_TELEMETRY_BYTES = 2 * 1024 * 1024
 MAX_TELEMETRY_RUNS = 16
 MAX_TELEMETRY_SPANS_PER_RUN = 128
@@ -29,6 +30,7 @@ MAX_REASON_CODE_BYTES = 64
 
 _REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _ID = re.compile(r"[0-9a-f]{32}\Z")
+_LIFECYCLE_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIFF = re.compile(r"[0-9a-f]{64}\Z")
 _TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
@@ -141,6 +143,7 @@ class TelemetryRun:
     spans: tuple[TelemetrySpan, ...]
     invocation: Invocation | None = None
     ended_monotonic_ns: int | None = None
+    lifecycle_id: str | None = None
 
     def to_json(self) -> dict[str, object]:
         result = {
@@ -157,6 +160,8 @@ class TelemetryRun:
         if self.binding.contract["telemetry_schema"] >= 2:
             result.update(invocation=self.invocation.to_json() if self.invocation else None,
                           ended_monotonic_ns=self.ended_monotonic_ns)
+        if self.binding.contract["telemetry_schema"] >= 3:
+            result["lifecycle_id"] = self.lifecycle_id
         return result
 
 
@@ -261,7 +266,7 @@ def _parse_binding(value: object) -> TelemetryBinding:
     _ref(obj["base_ref"], base=True)
     contract = _object(obj["contract"], "report_text diff_recipe telemetry_schema")
     for name, expected in _contract().items():
-        supported = (1, expected) if name == "telemetry_schema" else (expected,)
+        supported = SUPPORTED_TELEMETRY_SCHEMAS if name == "telemetry_schema" else (expected,)
         _require(type(contract[name]) is int and contract[name] in supported)
     for name in ("repository", "base_sha", "head_ref", "head_sha", "merge_base_sha", "diff_sha256"):
         value = obj[name]
@@ -331,6 +336,8 @@ def _parse_run(value: object) -> TelemetryRun:
     keys = "run_id runtime round binding started_at ended_at started_monotonic_ns status reason_code started_late telemetry_incomplete telemetry_incomplete_reason spans"
     if binding.contract["telemetry_schema"] >= 2:
         keys += " invocation ended_monotonic_ns"
+    if binding.contract["telemetry_schema"] >= 3:
+        keys += " lifecycle_id"
     obj = _object(value, keys)
     _pattern(obj["run_id"], _ID)
     _require(obj["runtime"] in ("claude", "codex"))
@@ -348,6 +355,15 @@ def _parse_run(value: object) -> TelemetryRun:
         _require(outcome is not None)
         if end_ns < obj["started_monotonic_ns"]:
             _require(outcome is TelemetryOutcome.CLOCK_ANOMALY and obj["reason_code"] == _ANOMALY)
+    if binding.contract["telemetry_schema"] >= 3:
+        _require((outcome is None) == (end_ns is None))
+    lifecycle_id = obj.get("lifecycle_id")
+    if binding.contract["telemetry_schema"] >= 3:
+        _require(
+            lifecycle_id is None
+            if binding.status == "pending"
+            else isinstance(lifecycle_id, str) and _LIFECYCLE_ID.fullmatch(lifecycle_id)
+        )
     invocation = _parse_invocation(obj.get("invocation"))
     _require(invocation is None or binding.status == "bound")
     for name in ("started_late", "telemetry_incomplete"):
@@ -363,14 +379,15 @@ def _parse_run(value: object) -> TelemetryRun:
     fields = dict(obj)
     del fields["status"]
     fields.update(binding=binding, spans=spans, outcome=outcome,
-                  invocation=invocation, ended_monotonic_ns=end_ns)
+                  invocation=invocation, ended_monotonic_ns=end_ns,
+                  lifecycle_id=lifecycle_id)
     return TelemetryRun(**fields)
 
 
 def _parse_ledger(raw: bytes) -> TelemetryLedger:
     try:
         obj = _object(_load_json(raw, limit=MAX_TELEMETRY_BYTES, too_large=_TOO_LARGE), "schema runs")
-        _require(type(obj["schema"]) is int and obj["schema"] in (1, TELEMETRY_SCHEMA_VERSION))
+        _require(type(obj["schema"]) is int and obj["schema"] in SUPPORTED_TELEMETRY_SCHEMAS)
         runs = tuple(_parse_run(item) for item in _array(obj["runs"], MAX_TELEMETRY_RUNS))
         _require(all(item.binding.contract["telemetry_schema"] <= obj["schema"] for item in runs))
         _require(len({item.run_id for item in runs}) == len(runs))
@@ -568,6 +585,7 @@ def resume_run(cwd: Path, *, runtime: str, started_at: str, started_monotonic_ns
             not history_complete,
             None if history_complete else "PRIOR_REQUEST_HISTORY_INCOMPLETE", (),
             Invocation("resume", tuple(reused), tuple(attempted)),
+            lifecycle_id=verdict.lifecycle_id,
         )
         run = _parse_run(run.to_json())
         _append_run(directory, ledger, run)
@@ -589,15 +607,19 @@ def record_candidate(cwd: Path, *, run_id: str, repository: str,
         return updated
 
 
-def bind_run(cwd: Path, *, run_id: str, snapshot: Snapshot,
+def bind_run(cwd: Path, *, run_id: str, snapshot: Snapshot, lifecycle_id: str,
              invocation: Invocation | None = None) -> TelemetryRun:
     _require(isinstance(snapshot, Snapshot) and type(snapshot.schema) is int and snapshot.schema == 1)
+    _pattern(lifecycle_id, _LIFECYCLE_ID)
     with _store(cwd) as directory:
         ledger = _read(directory)
         run = _find_run(ledger, run_id, active=True)
         _require(run.binding.status == "pending" and run.binding.base_ref == snapshot.base_ref)
         # Candidate identity is provisional; capture_snapshot is authoritative.
-        updated = replace(run, binding=_bound_snapshot(snapshot), invocation=invocation)
+        updated = replace(
+            run, binding=_bound_snapshot(snapshot), lifecycle_id=lifecycle_id,
+            invocation=invocation,
+        )
         _save_run(directory, replace(ledger, schema=TELEMETRY_SCHEMA_VERSION), updated)
         return updated
 
@@ -682,6 +704,8 @@ def close_run(cwd: Path, *, run_id: str, outcome: TelemetryOutcome,
         ledger = _read(directory)
         run = _find_run(ledger, run_id, active=True)
         _require(all(item.outcome is not None for item in run.spans))
+        if run.binding.contract["telemetry_schema"] >= 3:
+            _require(ended_monotonic_ns is not None)
         if ended_at < run.started_at or (
                 ended_monotonic_ns is not None and ended_monotonic_ns < run.started_monotonic_ns):
             outcome, reason_code = TelemetryOutcome.CLOCK_ANOMALY, _ANOMALY

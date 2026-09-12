@@ -185,6 +185,7 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
     try:
         if run is not None:
             telemetry.bind_run(cwd, run_id=run.run_id, snapshot=verdict.snapshot,
+                               lifecycle_id=verdict.lifecycle_id,
                                invocation=telemetry.Invocation("new_round", (), ()))
             if span is not None:
                 telemetry.finish_span(

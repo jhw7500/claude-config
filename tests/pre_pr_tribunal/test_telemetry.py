@@ -27,6 +27,9 @@ def NOW():
     return "2026-09-09T00:00:00Z"
 
 
+LIFECYCLE = "1" * 32
+
+
 @pytest.mark.parametrize("telemetry_state", ("successful", "substituted", "missing", "corrupt"))
 def test_legacy_telemetry_cannot_authorize_current_report_bytes(git_repo, telemetry_state):
     from pre_pr_tribunal.verdict_store import (
@@ -36,6 +39,7 @@ def test_legacy_telemetry_cannot_authorize_current_report_bytes(git_repo, teleme
     legacy = pending.to_json()
     legacy["schema"] = 1
     del legacy["contract"]
+    del legacy["lifecycle_id"]
     legacy["reviewers"] = {key: {"status": "pending"} for key in "ABC"}
     (git_repo / ".review/verdict.json").write_text(json.dumps(legacy))
     value = {"schema": 1, "reviewer": "A", "round": 1,
@@ -46,7 +50,8 @@ def test_legacy_telemetry_cannot_authorize_current_report_bytes(git_repo, teleme
     if telemetry_state in {"successful", "substituted"}:
         run = create_run(git_repo, base_ref="master", runtime="codex", round_number=1,
                          started_at=NOW(), started_monotonic_ns=0)
-        bind_run(git_repo, run_id=run.run_id, snapshot=pending.snapshot)
+        bind_run(git_repo, run_id=run.run_id, snapshot=pending.snapshot,
+                 lifecycle_id=LIFECYCLE)
         for stage in (TelemetryStage.REPORT_STORE, TelemetryStage.REPORT_VALIDATION):
             span = start_span(git_repo, run_id=run.run_id, stage=stage, reviewer=Reviewer.A,
                               attempt=1, started_at=NOW(), started_monotonic_ns=0)
@@ -333,9 +338,12 @@ def corrupt_telemetry(repo, kind):
 ))
 @pytest.mark.parametrize("invalid_report", (False, True))
 def test_telemetry_cannot_alter_tribunal_result(git_repo, tmp_path, monkeypatch, capsys, kind, reason, invalid_report):
-    # Fixed primary clocks make complete verdict bytes comparable across identical Git copies.
+    # Fixed primary clocks and lifecycle IDs make verdict bytes comparable across identical Git copies.
     original_begin, original_finalize = cli.begin_round, cli.finalize_round
-    monkeypatch.setattr(cli, "begin_round", lambda *a, **kw: original_begin(*a, **kw, now=NOW))
+    monkeypatch.setattr(
+        cli, "begin_round",
+        lambda *a, **kw: original_begin(*a, **kw, now=NOW, token_hex=lambda _size: LIFECYCLE),
+    )
     monkeypatch.setattr(cli, "finalize_round", lambda *a, **kw: original_finalize(*a, **kw, now=NOW))
     damaged = tmp_path / "damaged"
     shutil.copytree(git_repo, damaged)
@@ -589,7 +597,8 @@ def running_span(git_repo, *, started_at="2026-09-09T00:00:10Z",
                  started_monotonic_ns=10_000):
     snapshot = capture_snapshot(git_repo, "master", now=NOW)
     run = new_run(git_repo)
-    bind_run(git_repo, run_id=run.run_id, snapshot=snapshot)
+    bind_run(git_repo, run_id=run.run_id, snapshot=snapshot,
+             lifecycle_id=LIFECYCLE)
     span = start_span(
         git_repo, run_id=run.run_id, stage=TelemetryStage.REVIEWER_TOTAL,
         reviewer=Reviewer.B, attempt=1, started_at=started_at,
@@ -619,7 +628,7 @@ def test_bound_run_records_terminal_span_and_sanitized_summary(git_repo):
     assert summary["reviewers"]["B"]["total_ms"] == 4000
     assert summary["outcomes"]["success"] == 1
     assert summary["binding"]["contract"] == {
-        "report_text": 2, "diff_recipe": 1, "telemetry_schema": 2,
+        "report_text": 2, "diff_recipe": 1, "telemetry_schema": 3,
     }
     assert summary["stages"]["reviewer_total"] == {"count": 1, "total_ms": 4000}
     assert summary["early_detection"] is None
@@ -637,6 +646,72 @@ def test_bound_run_records_terminal_span_and_sanitized_summary(git_repo):
     with pytest.raises(TypeError):
         bound.binding.contract["report_text"] = 1
     assert span.outcome is None
+
+
+def test_schema_three_bound_run_records_lifecycle_id(git_repo):
+    snapshot = capture_snapshot(git_repo, "master", now=NOW)
+    run = new_run(git_repo)
+    bound = bind_run(
+        git_repo, run_id=run.run_id, snapshot=snapshot,
+        lifecycle_id=LIFECYCLE,
+        invocation=telemetry_module.Invocation("new_round", (), ()),
+    )
+    raw = json.loads(ledger_path(git_repo).read_bytes())["runs"][0]
+    assert raw["lifecycle_id"] == LIFECYCLE
+    assert raw["invocation"] == {
+        "kind": "new_round", "reused": [], "previously_attempted": [],
+    }
+    assert summarize_run(git_repo, run_id=bound.run_id)["recovery"]["kind"] == "new_round"
+
+
+@pytest.mark.parametrize(
+    ("status", "ended_at", "ended_monotonic_ns"),
+    (("success", NOW(), None), ("running", None, 5)),
+)
+def test_schema_three_rejects_run_end_state_mismatch(
+    git_repo, status, ended_at, ended_monotonic_ns,
+):
+    snapshot = capture_snapshot(git_repo, "master", now=NOW)
+    run = new_run(git_repo)
+    bind_run(
+        git_repo, run_id=run.run_id, snapshot=snapshot,
+        lifecycle_id=LIFECYCLE,
+    )
+    close_run(
+        git_repo, run_id=run.run_id, outcome=TelemetryOutcome.SUCCESS,
+        reason_code=None, ended_at=NOW(), ended_monotonic_ns=2,
+    )
+    path = ledger_path(git_repo)
+    value = json.loads(path.read_bytes())
+    stored = value["runs"][0]
+    stored["status"] = status
+    stored["ended_at"] = ended_at
+    stored["reason_code"] = None
+    stored["ended_monotonic_ns"] = ended_monotonic_ns
+    corrupted = json.dumps(value).encode()
+    path.write_bytes(corrupted)
+    with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
+        read_ledger(git_repo)
+    assert path.read_bytes() == corrupted
+
+
+def test_schema_two_terminal_null_monotonic_end_remains_readable(git_repo):
+    run = new_run(git_repo)
+    path = ledger_path(git_repo)
+    value = json.loads(path.read_bytes())
+    value["schema"] = 2
+    stored = value["runs"][0]
+    stored["binding"]["contract"]["telemetry_schema"] = 2
+    del stored["lifecycle_id"]
+    stored["invocation"] = None
+    stored["ended_monotonic_ns"] = None
+    stored["status"] = "success"
+    stored["ended_at"] = NOW()
+    stored["reason_code"] = None
+    raw = json.dumps(value).encode()
+    path.write_bytes(raw)
+    assert read_ledger(git_repo).runs[0].ended_monotonic_ns is None
+    assert path.read_bytes() == raw
 
 
 @pytest.mark.parametrize(("outcome", "reason"), (
@@ -782,7 +857,8 @@ def test_seventeenth_run_prunes_only_oldest_closed_run(git_repo):
         run = new_run(git_repo, number)
         if number in (2, 3):
             close_run(git_repo, run_id=run.run_id, outcome=TelemetryOutcome.SUCCESS,
-                      reason_code=None, ended_at="2026-09-09T00:00:01Z")
+                      reason_code=None, ended_at="2026-09-09T00:00:01Z",
+                      ended_monotonic_ns=1)
     before = json.loads(ledger_path(git_repo).read_bytes())
     new_run(git_repo, 17)
     after = json.loads(ledger_path(git_repo).read_bytes())
@@ -798,7 +874,8 @@ def test_running_and_incomplete_runs_are_never_pruned(git_repo):
         run = new_run(git_repo, number)
         if number % 2 == 0:
             close_run(git_repo, run_id=run.run_id, outcome=TelemetryOutcome.INCOMPLETE,
-                      reason_code="CONTROLLER_INTERRUPTED", ended_at=NOW())
+                      reason_code="CONTROLLER_INTERRUPTED", ended_at=NOW(),
+                      ended_monotonic_ns=1)
     previous = ledger_path(git_repo).read_bytes()
     with pytest.raises(SchemaError, match="^TELEMETRY_TOO_LARGE$"):
         new_run(git_repo, 17)
@@ -829,9 +906,10 @@ def test_span_limit_sets_reserved_incomplete_marker(git_repo):
 
 @pytest.mark.parametrize(("where", "key", "value"), (
     ("ledger", "schema", True), ("ledger", "schema", 1.0),
-    ("ledger", "schema", 3), ("ledger", "unknown", 1),
+    ("ledger", "schema", 4), ("ledger", "unknown", 1),
     ("run", "runtime", "unknown"), ("run", "round", True),
     ("run", "round", 4), ("run", "run_id", "a" * 31),
+    ("run", "lifecycle_id", None), ("run", "lifecycle_id", "A" * 32),
     ("run", "started_late", 1), ("run", "telemetry_incomplete", "true"),
     ("run", "telemetry_incomplete_reason", "UNEXPECTED"),
     ("binding", "status", "other"), ("binding", "repository", "/home/private"),
@@ -900,11 +978,13 @@ def test_pending_candidate_and_binding_are_one_way(git_repo):
     candidate = record_candidate(git_repo, run_id=run.run_id, repository=snapshot.repository,
                                  head_ref=snapshot.head_ref, head_sha=snapshot.head_sha)
     assert candidate.binding.head_sha == snapshot.head_sha
-    bound = bind_run(git_repo, run_id=run.run_id, snapshot=snapshot)
+    bound = bind_run(git_repo, run_id=run.run_id, snapshot=snapshot,
+                     lifecycle_id=LIFECYCLE)
     assert bound.binding.status == "bound"
     before = ledger_path(git_repo).read_bytes()
     for action in (
-        lambda: bind_run(git_repo, run_id=run.run_id, snapshot=snapshot),
+        lambda: bind_run(git_repo, run_id=run.run_id, snapshot=snapshot,
+                         lifecycle_id=LIFECYCLE),
         lambda: record_candidate(git_repo, run_id=run.run_id, repository=snapshot.repository,
                                  head_ref=snapshot.head_ref, head_sha=snapshot.head_sha),
         lambda: new_run(git_repo),
@@ -919,28 +999,30 @@ def test_stale_pending_candidate_is_replaced_once_by_authoritative_snapshot(git_
     run = new_run(git_repo)
     record_candidate(git_repo, run_id=run.run_id, repository="old/repository",
                      head_ref="refs/heads/old", head_sha="f" * 40)
-    bound = bind_run(git_repo, run_id=run.run_id, snapshot=snapshot)
+    bound = bind_run(git_repo, run_id=run.run_id, snapshot=snapshot,
+                     lifecycle_id=LIFECYCLE)
     assert bound.binding.repository == snapshot.repository
     assert bound.binding.head_ref == snapshot.head_ref
     assert bound.binding.head_sha == snapshot.head_sha
     assert bound.binding.diff_sha256 == snapshot.diff_sha256
     before = ledger_path(git_repo).read_bytes()
     with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
-        bind_run(git_repo, run_id=run.run_id, snapshot=snapshot)
+        bind_run(git_repo, run_id=run.run_id, snapshot=snapshot,
+                 lifecycle_id=LIFECYCLE)
     assert ledger_path(git_repo).read_bytes() == before
 
 
 def test_closed_run_mutations_are_rejected(git_repo):
     run = new_run(git_repo)
     close_run(git_repo, run_id=run.run_id, outcome=TelemetryOutcome.FAILURE,
-              reason_code="SNAPSHOT_CHANGED", ended_at=NOW())
+              reason_code="SNAPSHOT_CHANGED", ended_at=NOW(), ended_monotonic_ns=1)
     before = ledger_path(git_repo).read_bytes()
     with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
         start_span(git_repo, run_id=run.run_id, stage=TelemetryStage.SNAPSHOT_PREFLIGHT,
                    reviewer=None, attempt=1, started_at=NOW(), started_monotonic_ns=1)
     with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
         close_run(git_repo, run_id=run.run_id, outcome=TelemetryOutcome.SUCCESS,
-                  reason_code=None, ended_at=NOW())
+                  reason_code=None, ended_at=NOW(), ended_monotonic_ns=1)
     assert ledger_path(git_repo).read_bytes() == before
 
 
@@ -950,7 +1032,8 @@ def test_binding_preserves_requested_base(git_repo):
                      started_at=NOW(), started_monotonic_ns=1)
     before = ledger_path(git_repo).read_bytes()
     with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
-        bind_run(git_repo, run_id=run.run_id, snapshot=snapshot)
+        bind_run(git_repo, run_id=run.run_id, snapshot=snapshot,
+                 lifecycle_id=LIFECYCLE)
     assert ledger_path(git_repo).read_bytes() == before
 
 
@@ -993,11 +1076,13 @@ def test_close_rejects_running_spans_and_preserves_terminal_data(git_repo):
     before = ledger_path(git_repo).read_bytes()
     with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
         close_run(git_repo, run_id=run.run_id, outcome=TelemetryOutcome.SUCCESS,
-                  reason_code=None, ended_at="2026-09-09T00:00:12Z")
+                  reason_code=None, ended_at="2026-09-09T00:00:12Z",
+                  ended_monotonic_ns=1_000_010_001)
     assert ledger_path(git_repo).read_bytes() == before
     terminal = finish(git_repo, run, span)
     closed = close_run(git_repo, run_id=run.run_id, outcome=TelemetryOutcome.SUCCESS,
-                       reason_code=None, ended_at="2026-09-09T00:00:12Z")
+                       reason_code=None, ended_at="2026-09-09T00:00:12Z",
+                       ended_monotonic_ns=1_000_010_001)
     assert closed.spans == (terminal,)
     assert closed.outcome is TelemetryOutcome.SUCCESS
 
@@ -1083,7 +1168,7 @@ def test_early_detection_requires_all_three_usable_terminal_milestones(git_repo,
 
 
 def test_missing_ledger_is_empty_and_unknown_run_is_bounded(git_repo):
-    assert read_ledger(git_repo).to_json() == {"schema": 2, "runs": []}
+    assert read_ledger(git_repo).to_json() == {"schema": 3, "runs": []}
     with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
         summarize_run(git_repo)
 
