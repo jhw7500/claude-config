@@ -16,6 +16,21 @@ REPO_DIR="$(cd -- "$SCRIPT_DIR" && pwd -P)"
 # shellcheck source=scripts/lib/private-file.sh
 . "$REPO_DIR/scripts/lib/private-file.sh"
 
+case "${1-}" in
+  "") INSTALL_MODE=full ;;
+  --launcher-only)
+    [ "$#" -eq 1 ] || {
+      echo "Usage: $0 [--launcher-only]" >&2
+      exit 2
+    }
+    INSTALL_MODE=launcher-only
+    ;;
+  *)
+    echo "Usage: $0 [--launcher-only]" >&2
+    exit 2
+    ;;
+esac
+
 if ! assert_trusted_command_path "$PATH"; then
   echo "[install] 오류: installer command path가 안전하지 않다" >&2
   exit 1
@@ -23,19 +38,59 @@ fi
 
 # launcher가 credential을 읽기 전 다른 local principal이 entrypoint/target을
 # 치환할 수 없도록, 설치 작업에 앞서 기존 전체 경로 체인을 fail-closed 검사한다.
-for LAUNCHER_PATH in \
-  "$HOME" \
-  "$HOME/.local" \
-  "$HOME/.local/bin" \
-  "$HOME/.local/lib" \
-  "$HOME/.local/lib/jhw-control-host"
-do
-  if { [ -e "$LAUNCHER_PATH" ] || [ -L "$LAUNCHER_PATH" ]; } && \
-     ! assert_private_path_chain "$LAUNCHER_PATH"; then
+preflight_host_launcher_path() {
+  local launcher_path
+  for launcher_path in \
+    "$HOME" \
+    "$HOME/.local" \
+    "$HOME/.local/bin" \
+    "$HOME/.local/lib" \
+    "$HOME/.local/lib/jhw-control-host"
+  do
+    if { [ -e "$launcher_path" ] || [ -L "$launcher_path" ]; } && \
+       ! assert_private_path_chain "$launcher_path"; then
+      echo "[install] 오류: launcher 설치 경로가 안전하지 않다" >&2
+      return 1
+    fi
+  done
+}
+
+install_host_launcher() {
+  local host_launcher_dir host_launcher host_launcher_tmp
+  private_dir "$HOME/.local"
+  private_dir "$HOME/.local/bin"
+  private_dir "$HOME/.local/lib"
+  host_launcher_dir="$HOME/.local/lib/jhw-control-host"
+  host_launcher="$host_launcher_dir/jhw-control-host.py"
+  private_dir "$host_launcher_dir"
+  if ! assert_private_path_chain \
+    "$HOME" "$HOME/.local" "$HOME/.local/bin" "$HOME/.local/lib" "$host_launcher_dir"; then
     echo "[install] 오류: launcher 설치 경로가 안전하지 않다" >&2
-    exit 1
+    return 1
   fi
-done
+  if [ -d "$host_launcher" ]; then
+    echo "[install] 오류: launcher 설치 대상이 디렉터리다" >&2
+    return 1
+  fi
+  host_launcher_tmp="$(mktemp "$host_launcher_dir/.jhw-control-host.XXXXXX")"
+  if ! install -m 0500 "$REPO_DIR/scripts/jhw-control-host.py" "$host_launcher_tmp"; then
+    rm -f -- "$host_launcher_tmp"
+    return 1
+  fi
+  if ! mv -fT -- "$host_launcher_tmp" "$host_launcher"; then
+    rm -f -- "$host_launcher_tmp"
+    return 1
+  fi
+  link_safely "$host_launcher" "$HOME/.local/bin/jhw-control-host"
+  echo "[install] host-control launcher 설치: ~/.local/bin/jhw-control-host"
+}
+
+preflight_host_launcher_path
+if [ "$INSTALL_MODE" = launcher-only ]; then
+  install_host_launcher
+  exit 0
+fi
+
 private_dir "$HOME/.claude"
 
 # 1) 스킬 심볼릭 링크 (skills/ 아래 모든 스킬 자동 링크, repo pull 시 자동 갱신)
@@ -71,32 +126,7 @@ done
 echo "[install] 스크립트 링크: ~/.claude/scripts/ (${SCRIPT_LINKS}개)"
 
 # 3.25) Project Control host launcher — 설치 시 credential 조회/실행은 하지 않는다.
-private_dir "$HOME/.local"
-private_dir "$HOME/.local/bin"
-private_dir "$HOME/.local/lib"
-HOST_LAUNCHER_DIR="$HOME/.local/lib/jhw-control-host"
-HOST_LAUNCHER="$HOST_LAUNCHER_DIR/jhw-control-host.py"
-private_dir "$HOST_LAUNCHER_DIR"
-if ! assert_private_path_chain \
-  "$HOME" "$HOME/.local" "$HOME/.local/bin" "$HOME/.local/lib" "$HOST_LAUNCHER_DIR"; then
-  echo "[install] 오류: launcher 설치 경로가 안전하지 않다" >&2
-  exit 1
-fi
-if [ -d "$HOST_LAUNCHER" ]; then
-  echo "[install] 오류: launcher 설치 대상이 디렉터리다" >&2
-  exit 1
-fi
-HOST_LAUNCHER_TMP="$(mktemp "$HOST_LAUNCHER_DIR/.jhw-control-host.XXXXXX")"
-if ! install -m 0500 "$REPO_DIR/scripts/jhw-control-host.py" "$HOST_LAUNCHER_TMP"; then
-  rm -f -- "$HOST_LAUNCHER_TMP"
-  exit 1
-fi
-if ! mv -fT -- "$HOST_LAUNCHER_TMP" "$HOST_LAUNCHER"; then
-  rm -f -- "$HOST_LAUNCHER_TMP"
-  exit 1
-fi
-link_safely "$HOST_LAUNCHER" "$HOME/.local/bin/jhw-control-host"
-echo "[install] host-control launcher 설치: ~/.local/bin/jhw-control-host"
+install_host_launcher
 
 # 3.5) 커스텀 훅 심볼릭 링크 (hooks/ 전체 — repo pull 시 자동 갱신)
 private_dir ~/.claude/hooks

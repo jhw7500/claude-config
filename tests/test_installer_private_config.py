@@ -17,6 +17,7 @@ def run_install(
     home: Path,
     umask: str = "022",
     *,
+    args: tuple[str, ...] = (),
     path: str | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -27,7 +28,8 @@ def run_install(
         env.update(extra_env)
     # permissive umask 에서도 결과 mode 가 결정적이어야 한다
     return subprocess.run(
-        ["/bin/bash", "-c", f'umask {umask}; exec /bin/bash "{INSTALL}"'],
+        ["/bin/bash", "-c", f'umask {umask}; exec /bin/bash "$1" "${{@:2}}"',
+         "install-test", str(INSTALL), *args],
         env=env, text=True, capture_output=True, check=False,
     )
 
@@ -182,6 +184,49 @@ def test_links_are_still_created_except_task_nudge_shim(home: Path) -> None:
     assert mode_of(home / ".local" / "bin") == 0o700
     assert mode_of(home / ".local" / "lib") == 0o700
     assert os.access(launcher, os.X_OK)
+
+
+def test_launcher_only_preserves_pinned_tribunal_and_runtime_configs(
+    home: Path, tmp_path: Path,
+) -> None:
+    pinned_skill = tmp_path / "pinned-runtime" / "skills" / "pre-pr-tribunal"
+    pinned_skill.mkdir(parents=True)
+    claude = home / ".claude"
+    codex = home / ".codex"
+    (claude / "skills").mkdir(parents=True)
+    (codex / "skills").mkdir(parents=True)
+    claude_settings = claude / "settings.json"
+    codex_hooks = codex / "hooks.json"
+    claude_settings.write_bytes(b'{"keep":"claude"}\n')
+    codex_hooks.write_bytes(b'{"keep":"codex"}\n')
+    tribunal_links = (
+        claude / "skills" / "pre-pr-tribunal",
+        codex / "skills" / "pre-pr-tribunal",
+    )
+    for link in tribunal_links:
+        link.symlink_to(pinned_skill, target_is_directory=True)
+
+    result = run_install(home, args=("--launcher-only",))
+
+    assert result.returncode == 0, result.stderr
+    installed = home / ".local" / "lib" / "jhw-control-host" / "jhw-control-host.py"
+    assert installed.read_bytes() == (REPO / "scripts" / "jhw-control-host.py").read_bytes()
+    assert mode_of(installed) == 0o500
+    assert claude_settings.read_bytes() == b'{"keep":"claude"}\n'
+    assert codex_hooks.read_bytes() == b'{"keep":"codex"}\n'
+    assert all(link.is_symlink() and link.readlink() == pinned_skill for link in tribunal_links)
+    assert not (home / ".local" / "share" / "claude-config").exists()
+
+
+@pytest.mark.parametrize("args", [("--unknown",), ("--launcher-only", "extra")])
+def test_install_rejects_invalid_arguments_before_mutation(
+    home: Path, args: tuple[str, ...],
+) -> None:
+    result = run_install(home, args=args)
+
+    assert result.returncode == 2
+    assert "Usage:" in result.stderr
+    assert list(home.iterdir()) == []
 
 
 def test_session_handoff_commands_are_linked_without_touching_unrelated_commands(
@@ -358,7 +403,10 @@ def test_trusted_command_path_rejects_another_principals_writable_directory(tmp_
 
 
 @pytest.mark.parametrize("unsafe", ["writable-local", "unsafe-symlink-target"])
-def test_launcher_install_rejects_unsafe_path_ancestors(home: Path, unsafe: str) -> None:
+@pytest.mark.parametrize("args", [(), ("--launcher-only",)])
+def test_launcher_install_rejects_unsafe_path_ancestors(
+    home: Path, unsafe: str, args: tuple[str, ...],
+) -> None:
     local = home / ".local"
     if unsafe == "writable-local":
         local.mkdir(mode=0o777)
@@ -369,14 +417,17 @@ def test_launcher_install_rejects_unsafe_path_ancestors(home: Path, unsafe: str)
         target.chmod(0o777)
         local.symlink_to(target, target_is_directory=True)
 
-    result = run_install(home)
+    result = run_install(home, args=args)
 
     assert result.returncode != 0
     assert "launcher 설치 경로가 안전하지 않다" in result.stderr
     assert not (home / ".local" / "lib" / "jhw-control-host" / "jhw-control-host.py").exists()
 
 
-def test_launcher_install_rejects_symlink_to_directory_target(home: Path) -> None:
+@pytest.mark.parametrize("args", [(), ("--launcher-only",)])
+def test_launcher_install_rejects_symlink_to_directory_target(
+    home: Path, args: tuple[str, ...],
+) -> None:
     launcher_dir = home / ".local" / "lib" / "jhw-control-host"
     launcher_dir.mkdir(parents=True)
     directory_target = launcher_dir / "unexpected-directory"
@@ -384,18 +435,12 @@ def test_launcher_install_rejects_symlink_to_directory_target(home: Path) -> Non
     launcher = launcher_dir / "jhw-control-host.py"
     launcher.symlink_to(directory_target, target_is_directory=True)
 
-    result = run_install(home)
+    result = run_install(home, args=args)
 
     assert result.returncode != 0
     assert "launcher 설치 대상이 디렉터리다" in result.stderr
     assert launcher.is_symlink()
     assert list(directory_target.iterdir()) == []
-
-
-def test_readme_requires_reinstall_to_update_launcher_copy() -> None:
-    readme = (REPO / "README.md").read_text(encoding="utf-8")
-
-    assert "launcher 갱신에는 `./install.sh` 재실행" in readme
 
 
 def test_launcher_install_backs_up_existing_file_once_and_is_idempotent(home: Path) -> None:

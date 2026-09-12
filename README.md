@@ -25,7 +25,9 @@ source ~/.bashrc
 ```
 
 - `skills/`·`hooks/`·`commands/`·일반 `scripts/`는 **심볼릭 링크**라 `git pull`로 갱신됩니다. `commands/`는 `handoff.md`·`resume.md`만 배포하며 기존 동명 파일은 교체 전에 백업합니다. host-control
-  launcher는 mode `0500` 보안 사본이므로 launcher 갱신에는 `./install.sh` 재실행이 필요합니다.
+  launcher는 mode `0500` 보안 사본이므로 launcher만 갱신할 때는 `./install.sh --launcher-only`를
+  사용합니다. 이 경로는 launcher의 보안 경로 검사와 atomic 설치만 수행하며 스킬·훅·설정·Task
+  nudge·pre-PR tribunal 배포는 변경하지 않습니다.
 - **CLAUDE.md 전역지침 (env-aware)**: `~/.claude/CLAUDE.md`의 `claude-config:START/END` 블록만 관리 — 항상 `@global-guidance.md`, **notion MCP 있으면** `@CLAUDE-notion.md`, **`rtk` 있으면** `@RTK.md`를 자동 추가. **OMC 블록은 미변경**(inline/file-split 무관), 실행 전 `.bak` 백업
 - **훅 자동 배선**: `settings.json`에 멱등 추가 — `.bak` 백업, `statusLine`·기존 훅 보존
   - **항상**: `timestamp`(프롬프트/완료) · `stop-text-required`(조기종료 방지) · `general-continuation` · `bg-task-progress`(Pre/Post/SubagentStop, `Agent|Bash`) · `post-info-tool-continuation`
