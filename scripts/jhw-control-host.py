@@ -1757,8 +1757,9 @@ def _validate_board_detail_holder(value: object) -> dict[str, object]:
         value,
         {
             "holder_id", "session", "mode", "purpose", "acquired_at", "granted_until",
-            "liveness", "expired", "overstay", "extended_after_expiry",
+            "liveness", "expired", "extended_after_expiry",
         },
+        {"overstay"},
     )
     mode = holder["mode"]
     liveness = holder["liveness"]

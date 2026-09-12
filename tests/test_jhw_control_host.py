@@ -2786,6 +2786,50 @@ def test_board_json_commands_use_config_only_environment_without_credentials(
     assert child_environment["JHW_CONTROL_STATE_DIR"] == CONFIG_VALUES["JHW_CONTROL_STATE_DIR"]
 
 
+def test_board_status_accepts_holder_without_optional_overstay(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("board", "status", "board-alpha")
+    payload = {
+        "command": "board status",
+        "result": {
+            "boards": [
+                {
+                    "board_id": "board-alpha",
+                    "interfaces": [{"type": "serial", "address": "/dev/ttyUSB0"}],
+                    "holders": [
+                        {
+                            "holder_id": "hld-01a0930d-4df3-7035-88ca-6fd3095a50ae",
+                            "session": "session-a",
+                            "mode": "exclusive",
+                            "purpose": "deploy",
+                            "acquired_at": "2026-09-12T02:00:00.000Z",
+                            "granted_until": "2026-09-12T02:30:00.000Z",
+                            "liveness": "alive",
+                            "expired": False,
+                            "extended_after_expiry": 0,
+                        }
+                    ],
+                    "reservations": [],
+                    "truncated": False,
+                }
+            ]
+        },
+    }
+    runner.control_results[command] = launcher.CommandResult(
+        0,
+        json.dumps(payload, separators=(",", ":")).encode() + b"\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == payload
+
+
 def test_board_conflict_coordinates_survive_secure_projection(
     launcher: ModuleType,
     tmp_path: Path,
