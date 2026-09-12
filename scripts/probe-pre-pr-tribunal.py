@@ -1434,10 +1434,18 @@ def _create_pass_verdict(
         payload = _tribunal_cli(cli, repo, home, "begin", "--base", "master",
                                 "--runtime", runtime, "--round", "1")
         status = _tribunal_cli(cli, repo, home, "status")
-    if status.get("verdict_schema") == 1:
-        _tribunal_cli(cli, repo, home, "migrate-legacy-pending")
+    verdict_schema = status.get("verdict_schema")
+    migration_command = {
+        1: "migrate-legacy-pending",
+        2: "migrate-v2-pending",
+        3: None,
+    }.get(verdict_schema)
+    if verdict_schema not in {1, 2, 3}:
+        raise ProbeFailure("SETUP_FAILED")
+    if migration_command is not None:
+        _tribunal_cli(cli, repo, home, migration_command)
         status = _tribunal_cli(cli, repo, home, "status")
-    if status.get("verdict_schema") != 2:
+    if status.get("verdict_schema") != 3:
         raise ProbeFailure("SETUP_FAILED")
     observation = payload.get("telemetry", {})
     if not isinstance(observation, dict):

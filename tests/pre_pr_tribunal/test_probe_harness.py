@@ -811,7 +811,7 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
         os.umask(previous)
     assert len(finalizations) == 1
     assert result["status"]["gate_status"] == "pass"
-    assert result["status"]["verdict_schema"] == 2
+    assert result["status"]["verdict_schema"] == 3
     summary = result["telemetry_summary"]
     assert summary["binding"]["diff_sha256"] == result["begin"]["snapshot"]["diff_sha256"]
     assert summary["stages"]["report_store"]["count"] == 3
@@ -819,9 +819,63 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
     assert summary["stages"]["finalize"]["count"] == 1
     assert summary["outcomes"]["failure"] == 0
     ledger = json.loads((repo / ".review/telemetry.json").read_bytes())
+    verdict = json.loads((repo / ".review/verdict.json").read_bytes())
+    assert verdict["lifecycle_id"] == ledger["runs"][0]["lifecycle_id"]
+    assert ledger["runs"][0]["invocation"] is None
     assert all(span["status"] != "running" for span in ledger["runs"][0]["spans"])
     assert ledger["runs"][0]["status"] == "success"
-    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "pass"
+    assert verdict["gate"]["status"] == "pass"
+
+
+def test_installed_probe_migrates_v2_pending_before_selective_resume(tmp_path, monkeypatch):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    begun = module._tribunal_cli(
+        cli, repo, home, "begin", "--base", "master", "--runtime", "codex",
+        "--round", "1",
+    )
+    sealed_a = module._synthetic_report_bytes("A", 1, begun["snapshot"])
+    module._tribunal_cli(
+        cli, repo, home, "submit-report", "--reviewer", "A", raw=sealed_a,
+    )
+    module._tribunal_cli(
+        cli, repo, home, "telemetry-close", "--run-id", begun["telemetry"]["run_id"],
+        "--outcome", "failure", "--reason-code", "CONTROLLER_INTERRUPTED",
+    )
+
+    verdict_path = repo / ".review/verdict.json"
+    legacy = json.loads(verdict_path.read_bytes())
+    legacy["schema"] = 2
+    legacy["contract"]["verdict_schema"] = 2
+    del legacy["lifecycle_id"]
+    verdict_path.write_text(json.dumps(legacy))
+    verdict_path.chmod(0o600)
+
+    commands = []
+    real_cli = module._tribunal_cli
+
+    def observe(cli_path, repository, caller_home, command, *arguments, **kwargs):
+        commands.append(command)
+        return real_cli(
+            cli_path, repository, caller_home, command, *arguments, **kwargs,
+        )
+
+    monkeypatch.setattr(module, "_tribunal_cli", observe)
+    requested = []
+
+    def pending_only(reviewer, attempt, snapshot):
+        requested.append(reviewer)
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=pending_only,
+    )
+
+    assert commands.index("migrate-v2-pending") < commands.index("telemetry-resume")
+    assert requested == ["B", "C"]
+    assert (repo / ".review/inbox/round-1/A.json").read_bytes() == sealed_a
+    assert result["status"]["verdict_schema"] == 3
+    assert result["telemetry_summary"]["recovery"]["accounting_complete"] is False
+    assert result["telemetry_summary"]["recovery"]["requested_slot_count"] is None
 
 
 def test_installed_probe_stops_when_orphan_receipt_discards_new_blocker(tmp_path):
@@ -1197,6 +1251,7 @@ def test_installed_probe_migrates_unproven_legacy_reports_and_runs_all_slots(tmp
     verdict = json.loads(verdict_path.read_bytes())
     verdict["schema"] = 1
     verdict.pop("contract")
+    verdict.pop("lifecycle_id")
     verdict["reviewers"] = {reviewer: {"status": "pending"} for reviewer in "ABC"}
     verdict_path.write_bytes(json.dumps(verdict, separators=(",", ":")).encode())
     verdict_path.chmod(0o600)
