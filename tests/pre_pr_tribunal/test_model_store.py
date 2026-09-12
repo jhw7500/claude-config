@@ -13,6 +13,7 @@ import pytest
 from pre_pr_tribunal.git_state import DIFF_RECIPE_VERSION, capture_snapshot
 from pre_pr_tribunal.model import (
     SCHEMA_VERSION,
+    SLOT_VERDICT_SCHEMA_VERSION,
     VERDICT_SCHEMA_VERSION,
     ContractBinding,
     MAX_EVIDENCE_TEXT_BYTES,
@@ -27,11 +28,10 @@ from pre_pr_tribunal.model import (
     validate_report_bytes,
 )
 from pre_pr_tribunal.verdict_store import (
-    _new_v2_pending,
     begin_round,
     finalize_round,
     read_verdict,
-    require_v2_in_progress,
+    require_current_in_progress,
     store_reviewer_report,
     validate_stored_reviewer_report,
 )
@@ -124,7 +124,7 @@ def report_paths(repo, snapshot, *, round_number=1, overrides=None):
 
 def legacy_pending(repo):
     pending = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
-    legacy = replace(pending, schema=1, contract=None,
+    legacy = replace(pending, schema=1, contract=None, lifecycle_id=None,
                      reviewers={key: ReviewerSlot("pending") for key in "ABC"})
     write_json(repo / ".review/verdict.json", legacy.to_json())
     return legacy
@@ -132,7 +132,7 @@ def legacy_pending(repo):
 
 def begin_legacy_round(repo, **kwargs):
     pending = begin_round(repo, **kwargs)
-    legacy = replace(pending, schema=1, contract=None,
+    legacy = replace(pending, schema=1, contract=None, lifecycle_id=None,
                      reviewers={key: ReviewerSlot("pending") for key in "ABC"})
     write_json(repo / ".review/verdict.json", legacy.to_json())
     return legacy
@@ -141,7 +141,7 @@ def begin_legacy_round(repo, **kwargs):
 @pytest.mark.parametrize("reviewer", "ABC")
 @pytest.mark.parametrize("tamper", ("bytes", "mode", "symlink", "owner", "context", "parsed", "contract"))
 def test_finalize_authenticates_every_sealed_receipt(git_repo, tamper, reviewer, monkeypatch):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     for key in "ABC":
         submit_reviewer_report(git_repo, reviewer=Reviewer(key),
                                raw=json.dumps(report(pending.snapshot, key)).encode(), now=NOW)
@@ -186,7 +186,7 @@ def test_finalize_authenticates_every_sealed_receipt(git_repo, tamper, reviewer,
 
 @pytest.mark.parametrize("sealed", (0, 2, 3))
 def test_v2_round_not_ready_and_successful_terminal_roundtrip(git_repo, sealed):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     for key in "ABC"[:sealed]:
         submit_reviewer_report(git_repo, reviewer=Reviewer(key),
                                raw=json.dumps(report(pending.snapshot, key)).encode(), now=NOW)
@@ -197,7 +197,7 @@ def test_v2_round_not_ready_and_successful_terminal_roundtrip(git_repo, sealed):
             finalize_round(git_repo, now=NOW)
     else:
         final = finalize_round(git_repo, now=NOW)
-        assert final.schema == 2 and final.gate.status.value == "pass"
+        assert final.schema == 3 and final.gate.status.value == "pass"
         assert read_verdict(git_repo) == final
 
 
@@ -218,7 +218,7 @@ def test_v2_terminal_aggregates_every_sealed_report(git_repo, severity, status, 
 
 @pytest.mark.parametrize("version", (1, 2))
 def test_begin_refuses_pending_reset_without_losing_reports(git_repo, version):
-    pending = legacy_pending(git_repo) if version == 1 else write_v2_pending(git_repo)
+    pending = legacy_pending(git_repo) if version == 1 else write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=[finding()])).encode()
     if version == 1:
         store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
@@ -231,14 +231,14 @@ def test_begin_refuses_pending_reset_without_losing_reports(git_repo, version):
     assert (git_repo / ".review/inbox/round-1/A.json").read_bytes() == raw
 
 
-def test_new_round_writer_uses_v2(git_repo):
-    assert begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW).schema == 2
+def test_new_round_writer_uses_schema_three(git_repo):
+    assert begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW).schema == 3
 
 
 @pytest.mark.parametrize("replacement", (False, True))
 @pytest.mark.parametrize("orphan", (False, True))
 def test_legacy_store_never_mutates_v2_canonical_or_orphan(git_repo, replacement, orphan):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=[finding()])).encode()
     path = git_repo / ".review/inbox/round-1/A.json"
     if orphan:
@@ -258,11 +258,14 @@ def test_legacy_migration_retains_all_bytes_without_inventing_provenance(git_rep
     raw = json.dumps(report(pending.snapshot, "A", findings=[finding()])).encode()
     for key, value in (("A", raw), ("B", b'{"schema":1')):
         store_reviewer_report(git_repo, reviewer=Reviewer(key), raw=value)
-    result = verdict_store.migrate_legacy_pending_round(git_repo)
+    result = verdict_store.migrate_legacy_pending_round(
+        git_repo, token_hex=lambda _size: "d" * 32,
+    )
     assert result.reviewers == {"A": "pending:LEGACY_PROVENANCE_UNAVAILABLE",
                                 "B": "pending:JSON_INVALID", "C": "pending:REVIEWER_REPORT_MISSING"}
     loaded = read_verdict(git_repo)
-    assert loaded.schema == 2
+    assert loaded.schema == 3
+    assert loaded.lifecycle_id == "d" * 32
     assert all(slot.status == "pending" for slot in loaded.reviewers.values())
     assert (git_repo / ".review/attempts/round-1/A/attempt-1.raw").read_bytes() == raw
     assert (git_repo / ".review/attempts/round-1/B/attempt-1.raw").read_bytes() == b'{"schema":1'
@@ -355,7 +358,7 @@ def test_legacy_migration_refuses_subset_and_terminal_v1(git_repo):
     pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
     report_paths(git_repo, pending.snapshot)
     native = finalize_round(git_repo, now=NOW)
-    terminal = replace(native, schema=1, contract=None,
+    terminal = replace(native, schema=1, contract=None, lifecycle_id=None,
                        reviewers={key: ReviewerSlot("complete", slot.report)
                                   for key, slot in native.reviewers.items()})
     write_json(git_repo / ".review/verdict.json", terminal.to_json())
@@ -381,16 +384,10 @@ def test_legacy_migration_snapshot_drift_preserves_canonical_and_verdict(git_rep
     assert not (git_repo / ".review/attempts").exists()
 
 
-def write_v2_pending(git_repo):
-    legacy = begin_round(
+def write_current_pending(git_repo):
+    return begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
-    pending = _new_v2_pending(
-        legacy.snapshot, runtime="codex", initial_paths=legacy.initial_paths,
-        round_number=1, decisions=(), history=(), contract=current_contract_binding(),
-    )
-    write_json(git_repo / ".review/verdict.json", pending.to_json())
-    return read_verdict(git_repo)
 
 
 def submit_reviewer_report(*args, **kwargs):
@@ -427,7 +424,7 @@ def test_storage_rechecks_exclusion_before_report_or_attempt_publication(git_rep
     )
     exclude = git_repo / ".git/info/exclude"
     exclude.write_text(".review/\n", encoding="utf-8")
-    pending = legacy_pending(git_repo) if operation == "legacy" else write_v2_pending(git_repo)
+    pending = legacy_pending(git_repo) if operation == "legacy" else write_current_pending(git_repo)
     value = report(pending.snapshot, "A")
     if operation == "secret-marker":
         value["executions"] = [{**execution(), "stdout_excerpt": "ghp_nonfunctional_fixture_marker"}]
@@ -458,7 +455,7 @@ def test_storage_rechecks_exclusion_before_report_or_attempt_publication(git_rep
 
 @pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
 def test_submit_valid_report_seals_only_its_slot(git_repo, mask):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\r\n"
     previous = os.umask(mask)
     try:
@@ -487,7 +484,7 @@ def test_submit_valid_report_seals_only_its_slot(git_repo, mask):
     (b"x" * (MAX_REPORT_BYTES + 1), "REPORT_TOO_LARGE"),
 ), ids=("malformed", "duplicate", "oversize"))
 def test_submit_malformed_report_records_attempt_without_touching_peers(git_repo, raw, code):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     with pytest.raises(SchemaError, match=f"^{code}$"):
         submit_reviewer_report(git_repo, reviewer=Reviewer.C, raw=raw, now=NOW)
     stored = read_verdict(git_repo)
@@ -501,7 +498,7 @@ def test_submit_malformed_report_records_attempt_without_touching_peers(git_repo
 
 
 def test_record_timeout_changes_only_pending_slot(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     slot = record_reviewer_failure(git_repo, reviewer=Reviewer.B, reason_code="REVIEWER_TIMEOUT")
     assert slot.attempt_count == 1 and slot.last_error == "REVIEWER_TIMEOUT"
     stored = read_verdict(git_repo)
@@ -511,7 +508,7 @@ def test_record_timeout_changes_only_pending_slot(git_repo):
 
 
 def test_submit_after_failure_clears_error_and_preserves_peer_context(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     digest = context_sha256(pending, Reviewer.C)
     record_reviewer_failure(git_repo, reviewer=Reviewer.C, reason_code="REVIEWER_FAILED")
     submit_reviewer_report(git_repo, reviewer=Reviewer.A,
@@ -525,7 +522,7 @@ def test_submit_after_failure_clears_error_and_preserves_peer_context(git_repo):
 
 
 def test_submit_blocker_containing_report_seals(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=(finding(),))).encode()
     submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
     stored = read_verdict(git_repo)
@@ -536,7 +533,7 @@ def test_submit_blocker_containing_report_seals(git_repo):
 
 @pytest.mark.parametrize("operation", ("submit", "failure"))
 def test_sealed_slot_rejects_report_or_reviewer_failure_without_mutation(git_repo, operation):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A")).encode()
     submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
     verdict_path = git_repo / ".review/verdict.json"
@@ -553,7 +550,7 @@ def test_sealed_slot_rejects_report_or_reviewer_failure_without_mutation(git_rep
 @pytest.mark.parametrize("operation", ("submit", "failure"))
 @pytest.mark.parametrize("drift", ("contract", "snapshot"))
 def test_submit_and_reviewer_failure_drift_preserve_all_bytes(git_repo, operation, drift):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     if drift == "contract":
         pending = replace(pending, contract=replace(pending.contract, report_text=99))
         write_json(git_repo / ".review/verdict.json", pending.to_json())
@@ -579,7 +576,7 @@ def test_submit_report_published_before_verdict_failure_is_sealed_without_replac
 ):
     from pre_pr_tribunal import verdict_store
 
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=(finding(),))).encode() + b"\n"
     if replacement is None:
         replacement = json.dumps(report(pending.snapshot, "A")).encode()
@@ -602,7 +599,7 @@ def test_submit_report_published_before_verdict_failure_is_sealed_without_replac
 
 @pytest.mark.parametrize("kind", ("invalid", "symlink", "fifo", "mode", "owner"))
 def test_submit_never_overwrites_invalid_or_unsafe_canonical(git_repo, monkeypatch, kind):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     target = git_repo / ".review/inbox/round-1/A.json"
     raw = json.dumps(report(pending.snapshot, "A")).encode()
     if kind == "symlink":
@@ -635,7 +632,7 @@ def test_submit_never_overwrites_invalid_or_unsafe_canonical(git_repo, monkeypat
 
 @pytest.mark.parametrize("code", ("JSON_INVALID", "FILE_UNSAFE", "REPORT_WRITE_FAILED", "unknown"))
 def test_reviewer_failure_rejects_non_operational_reasons(git_repo, code):
-    write_v2_pending(git_repo)
+    write_current_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
     with pytest.raises(SchemaError, match="^REVIEWER_FAILURE_INVALID$"):
         record_reviewer_failure(git_repo, reviewer=Reviewer.A, reason_code=code)
@@ -655,7 +652,7 @@ def test_reviewer_failure_rejects_non_operational_reasons(git_repo, code):
 def test_bounded_content_errors_preserve_exact_evidence_and_pending_slot(git_repo, fields, code, legacy):
     from pre_pr_tribunal import verdict_store
 
-    pending = legacy_pending(git_repo) if legacy else write_v2_pending(git_repo)
+    pending = legacy_pending(git_repo) if legacy else write_current_pending(git_repo)
     peer_raw = json.dumps(report(pending.snapshot, "B", findings=[
         finding("B-R1-001", reviewer="B", execution_ids=["B-R1-E001"])],
         executions=[execution("B-R1-E001")])).encode()
@@ -695,7 +692,7 @@ def test_bounded_content_errors_preserve_exact_evidence_and_pending_slot(git_rep
 
 
 def test_submit_orphan_content_error_is_integrity_stop_without_failure_evidence(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=[finding()] * 129)).encode()
     target = git_repo / ".review/inbox/round-1/A.json"
     target.write_bytes(raw)
@@ -710,7 +707,7 @@ def test_submit_orphan_content_error_is_integrity_stop_without_failure_evidence(
 
 
 def test_submit_accepts_cumulative_attempts_after_three_failures(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     for _ in range(5):
         record_reviewer_failure(git_repo, reviewer=Reviewer.C, reason_code="REVIEWER_TIMEOUT")
     assert read_verdict(git_repo).reviewers["C"].attempt_count == 5
@@ -727,7 +724,7 @@ def test_submit_accepts_cumulative_attempts_after_three_failures(git_repo):
 
 
 def test_v2_pending_cumulative_attempt_count_roundtrips_above_three(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     pending = replace(pending, reviewers={**pending.reviewers,
         "C": ReviewerSlot("pending", attempt_count=5, last_error="REVIEWER_TIMEOUT")})
     write_json(git_repo / ".review/verdict.json", pending.to_json())
@@ -735,7 +732,7 @@ def test_v2_pending_cumulative_attempt_count_roundtrips_above_three(git_repo):
 
 
 def test_submit_unbounded_raw_input_preserves_verdict_without_evidence(git_repo):
-    write_v2_pending(git_repo)
+    write_current_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
     with pytest.raises(SchemaError, match="^REPORT_TOO_LARGE$"):
         submit_reviewer_report(git_repo, reviewer=Reviewer.C,
@@ -746,7 +743,7 @@ def test_submit_unbounded_raw_input_preserves_verdict_without_evidence(git_repo)
 
 
 def test_submit_report_write_failure_is_not_a_retryable_attempt(git_repo, monkeypatch):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
     raw = json.dumps(report(pending.snapshot, "A")).encode()
 
@@ -766,7 +763,7 @@ def test_submit_report_write_failure_is_not_a_retryable_attempt(git_repo, monkey
 
 
 def test_submit_evidence_write_failure_preserves_all_slots(git_repo, monkeypatch):
-    write_v2_pending(git_repo)
+    write_current_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
 
     real_write = os.write
@@ -786,7 +783,7 @@ def test_submit_evidence_write_failure_preserves_all_slots(git_repo, monkeypatch
 def test_reviewer_failure_verdict_publication_failure_preserves_prior_verdict_and_evidence(
     git_repo, monkeypatch
 ):
-    write_v2_pending(git_repo)
+    write_current_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
 
     def fail_replace(*args, **kwargs):
@@ -1543,28 +1540,69 @@ def test_begin_writes_in_progress_and_finalize_requires_all_reviewers(git_repo):
         )
 
 
+def test_new_verdict_owns_lifecycle_id_and_preserves_it_through_finalize(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW,
+        token_hex=lambda size: "a" * (size * 2),
+    )
+    assert pending.schema == VERDICT_SCHEMA_VERSION == 3
+    assert pending.lifecycle_id == "a" * 32
+    assert pending.to_json()["lifecycle_id"] == "a" * 32
+    paths = report_paths(git_repo, pending.snapshot)
+    final = finalize_round(git_repo, reviewer_paths=paths, now=NOW)
+    assert final.lifecycle_id == "a" * 32
+    assert read_verdict(git_repo).lifecycle_id == "a" * 32
+
+
+@pytest.mark.parametrize("value", (None, "A" * 32, "a" * 31, "g" * 32, 7))
+def test_schema_three_rejects_invalid_lifecycle_id(git_repo, value):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW,
+        token_hex=lambda _size: "b" * 32,
+    )
+    raw = pending.to_json()
+    raw["lifecycle_id"] = value
+    write_json(git_repo / ".review/verdict.json", raw)
+    with pytest.raises(SchemaError, match="^VERDICT_INVALID$"):
+        read_verdict(git_repo)
+
+
+def test_schema_three_lifecycle_id_survives_failure_submit_and_finalize(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW,
+        token_hex=lambda _size: "c" * 32,
+    )
+    record_reviewer_failure(
+        git_repo, reviewer=Reviewer.A, reason_code="REVIEWER_TIMEOUT"
+    )
+    assert read_verdict(git_repo).lifecycle_id == "c" * 32
+    paths = report_paths(git_repo, pending.snapshot)
+    assert read_verdict(git_repo).lifecycle_id == "c" * 32
+    final = finalize_round(git_repo, reviewer_paths=paths, now=NOW)
+    assert final.lifecycle_id == "c" * 32
+
+
 def test_verdict_schema_two_does_not_change_report_or_snapshot_schema(git_repo):
     legacy = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
-    pending = _new_v2_pending(
-        legacy.snapshot,
-        runtime="codex",
-        initial_paths=legacy.initial_paths,
-        round_number=1,
-        decisions=(),
-        history=(),
+    pending = replace(
+        legacy,
+        schema=SLOT_VERDICT_SCHEMA_VERSION,
         contract=ContractBinding(
-            REPORT_TEXT_CONTRACT_VERSION, DIFF_RECIPE_VERSION, 2
+            REPORT_TEXT_CONTRACT_VERSION,
+            DIFF_RECIPE_VERSION,
+            SLOT_VERDICT_SCHEMA_VERSION,
         ),
+        lifecycle_id=None,
     )
-    assert pending.schema == VERDICT_SCHEMA_VERSION == 2
+    assert pending.schema == SLOT_VERDICT_SCHEMA_VERSION == 2
     assert pending.snapshot.schema == SCHEMA_VERSION == 1
     assert all(slot.status == "pending" for slot in pending.reviewers.values())
     assert pending.contract.to_json() == {
         "report_text": REPORT_TEXT_CONTRACT_VERSION,
         "diff_recipe": DIFF_RECIPE_VERSION,
-        "verdict_schema": 2,
+        "verdict_schema": SLOT_VERDICT_SCHEMA_VERSION,
     }
     assert pending.to_json()["reviewers"]["A"] == {
         "state": "pending",
@@ -1586,10 +1624,13 @@ def _schema_two_mixed_verdict(git_repo):
     )
     sealed = replace(
         pending,
-        schema=VERDICT_SCHEMA_VERSION,
+        schema=SLOT_VERDICT_SCHEMA_VERSION,
         contract=ContractBinding(
-            REPORT_TEXT_CONTRACT_VERSION, DIFF_RECIPE_VERSION, 2
+            REPORT_TEXT_CONTRACT_VERSION,
+            DIFF_RECIPE_VERSION,
+            SLOT_VERDICT_SCHEMA_VERSION,
         ),
+        lifecycle_id=None,
         reviewers={
             "A": ReviewerSlot(
                 "sealed",
@@ -1613,11 +1654,127 @@ def _schema_two_mixed_verdict(git_repo):
     return sealed
 
 
+def _v2_mixed_pending(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW,
+        token_hex=lambda _size: "a" * 32,
+    )
+    raw = json.dumps(report(pending.snapshot, "A")).encode()
+    submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    with pytest.raises(SchemaError, match="^JSON_INVALID$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=b"{", now=NOW)
+    native = read_verdict(git_repo)
+    legacy = replace(
+        native,
+        schema=SLOT_VERDICT_SCHEMA_VERSION,
+        contract=replace(native.contract, verdict_schema=SLOT_VERDICT_SCHEMA_VERSION),
+        lifecycle_id=None,
+    )
+    write_json(git_repo / ".review/verdict.json", legacy.to_json())
+    return legacy, raw
+
+
+def test_migrate_v2_pending_preserves_authenticated_slots_and_attempts(git_repo):
+    from pre_pr_tribunal import verdict_store
+
+    legacy, raw = _v2_mixed_pending(git_repo)
+    canonical = git_repo / ".review/inbox/round-1/A.json"
+
+    result = verdict_store.migrate_v2_pending_round(
+        git_repo, token_hex=lambda _size: "c" * 32,
+    )
+
+    migrated = read_verdict(git_repo)
+    assert result.telemetry_history == "unknown"
+    assert migrated.schema == 3
+    assert migrated.lifecycle_id == "c" * 32
+    assert migrated.reviewers["A"] == legacy.reviewers["A"]
+    assert migrated.reviewers["B"].attempt_count == 1
+    assert migrated.reviewers["B"].last_error == "JSON_INVALID"
+    assert canonical.read_bytes() == raw
+    assert stat.S_IMODE(canonical.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("tamper", "expected"),
+    (
+        ("snapshot", "SNAPSHOT_CHANGED"),
+        ("report_bytes", "REPORT_BYTES_MISMATCH"),
+        ("report_mode", "FILE_UNSAFE"),
+        ("receipt_digest", "REPORT_BYTES_MISMATCH"),
+        ("report_text_contract", "CONTRACT_DRIFT"),
+        ("diff_recipe_contract", "CONTRACT_DRIFT"),
+    ),
+)
+def test_migrate_v2_pending_refuses_without_mutating_verdict_or_report(
+    git_repo, tamper, expected,
+):
+    from pre_pr_tribunal import verdict_store
+
+    legacy, raw = _v2_mixed_pending(git_repo)
+    canonical = git_repo / ".review/inbox/round-1/A.json"
+    if tamper == "snapshot":
+        commit_fix(git_repo)
+    elif tamper == "report_bytes":
+        canonical.write_bytes(raw + b"\n")
+        canonical.chmod(0o600)
+    elif tamper == "report_mode":
+        canonical.chmod(0o644)
+    elif tamper == "receipt_digest":
+        slot = legacy.reviewers["A"]
+        legacy = replace(
+            legacy,
+            reviewers={
+                **legacy.reviewers,
+                "A": replace(slot, receipt=replace(slot.receipt, raw_sha256="0" * 64)),
+            },
+        )
+        write_json(git_repo / ".review/verdict.json", legacy.to_json())
+    elif tamper == "report_text_contract":
+        slot = legacy.reviewers["A"]
+        legacy = replace(
+            legacy,
+            contract=replace(legacy.contract, report_text=99),
+            reviewers={
+                **legacy.reviewers,
+                "A": replace(slot, receipt=replace(slot.receipt, report_contract_version=99)),
+            },
+        )
+        write_json(git_repo / ".review/verdict.json", legacy.to_json())
+    else:
+        legacy = replace(legacy, contract=replace(legacy.contract, diff_recipe=99))
+        write_json(git_repo / ".review/verdict.json", legacy.to_json())
+    verdict_before = (git_repo / ".review/verdict.json").read_bytes()
+    report_before = canonical.read_bytes()
+
+    with pytest.raises(SchemaError, match=f"^{expected}$"):
+        verdict_store.migrate_v2_pending_round(git_repo)
+
+    assert (git_repo / ".review/verdict.json").read_bytes() == verdict_before
+    assert canonical.read_bytes() == report_before
+
+
+def test_cli_migrate_v2_pending_returns_stable_migration_projection(git_repo):
+    _v2_mixed_pending(git_repo)
+
+    result = run_cli_bytes(git_repo, "migrate-v2-pending")
+
+    assert result.returncode == 0 and result.stderr == b""
+    assert json.loads(result.stdout) == {
+        "round": 1,
+        "reviewers": {"A": "sealed", "B": "pending", "C": "pending"},
+        "telemetry_history": "unknown",
+    }
+
+
 def test_schema_two_parser_accepts_mixed_pending_and_sealed_slots(git_repo):
     sealed = _schema_two_mixed_verdict(git_repo)
     verdict_path = write_json(git_repo / ".review/verdict.json", sealed.to_json())
     verdict_path.chmod(0o600)
+    before = verdict_path.read_bytes()
     parsed = read_verdict(git_repo)
+    assert parsed.lifecycle_id is None
+    assert verdict_path.read_bytes() == before
     assert parsed.reviewers["A"].status == "sealed"
     assert parsed.reviewers["B"].last_error == "JSON_INVALID"
     assert parsed.reviewers["A"].receipt == sealed.reviewers["A"].receipt
@@ -1701,7 +1858,7 @@ def test_schema_one_terminal_verdict_remains_readable_without_rewrite(git_repo):
     )
     path = git_repo / ".review/verdict.json"
     native = read_verdict(git_repo)
-    legacy = replace(native, schema=1, contract=None,
+    legacy = replace(native, schema=1, contract=None, lifecycle_id=None,
                      reviewers={key: ReviewerSlot("complete", slot.report)
                                 for key, slot in native.reviewers.items()})
     write_json(path, legacy.to_json())
@@ -1716,7 +1873,7 @@ def test_schema_one_pending_is_readable_but_new_submit_requires_migration(git_re
     legacy_pending(git_repo)
     assert read_verdict(git_repo).schema == 1
     with pytest.raises(SchemaError, match="^LEGACY_ADOPTION_REQUIRED$"):
-        require_v2_in_progress(read_verdict(git_repo))
+        require_current_in_progress(read_verdict(git_repo))
 
 
 @pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
@@ -2132,6 +2289,7 @@ def test_failed_legacy_verdict_without_head_ref_migrates_on_next_round(git_repo)
     legacy = json.loads(verdict_path.read_text(encoding="utf-8"))
     legacy["schema"] = 1
     del legacy["contract"]
+    del legacy["lifecycle_id"]
     legacy["reviewers"] = {key: slot["report"] for key, slot in legacy["reviewers"].items()}
     del legacy["head_ref"]
     write_json(verdict_path, legacy)
@@ -2840,7 +2998,7 @@ def test_cli_finalize_and_status_emit_only_bounded_projections(git_repo):
         "gate_status": "pass",
         "blocking_count": 0,
         "verdict_path": ".review/verdict.json",
-        "verdict_schema": 2,
+        "verdict_schema": 3,
     }
     finalized_payload = json.loads(finalized.stdout)
     assert {key: finalized_payload[key] for key in expected} == expected
@@ -3191,7 +3349,7 @@ def test_cli_submit_seals_one_slot_and_status_exposes_no_report_body(git_repo):
     status_result = run_cli_bytes(git_repo, "status")
     status = json.loads(status_result.stdout)
     assert status_result.returncode == 0 and status_result.stderr == b""
-    assert status["verdict_schema"] == 2
+    assert status["verdict_schema"] == 3
     assert status["reviewers"] == {
         "A": {
             "state": "sealed",
@@ -3346,12 +3504,13 @@ def test_cli_status_discriminates_all_pending_v1_from_v2(git_repo):
         native,
         schema=1,
         contract=None,
+        lifecycle_id=None,
         reviewers={key: ReviewerSlot("pending") for key in "ABC"},
     )
     write_json(git_repo / ".review/verdict.json", legacy.to_json())
     legacy_status = json.loads(run_cli_bytes(git_repo, "status").stdout)
 
-    assert native_status["verdict_schema"] == 2
+    assert native_status["verdict_schema"] == 3
     assert native_status["reviewers"] == {
         key: {"state": "pending", "attempt_count": 0, "last_error": None}
         for key in "ABC"
@@ -3382,7 +3541,7 @@ def test_cli_finalize_without_paths_authenticates_all_sealed_reports(git_repo):
     assert finalized.returncode == 0 and finalized.stderr == b""
     payload = json.loads(finalized.stdout)
     assert payload["gate_status"] == "pass"
-    assert payload["verdict_schema"] == 2
+    assert payload["verdict_schema"] == 3
     assert all(slot["state"] == "sealed" for slot in payload["reviewers"].values())
     assert finalized.stdout.count(b"\n") == 1
     assert len(finalized.stdout) < 4096

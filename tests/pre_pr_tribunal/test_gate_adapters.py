@@ -140,20 +140,27 @@ def _passing_verdict(repo: Path):
     return _finish_round(repo)
 
 
-@pytest.mark.parametrize("version", (1, 2))
+@pytest.mark.parametrize("version", (1, 2, 3))
 def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo, version):
     _passing_verdict(git_repo)
     path = git_repo / ".review/verdict.json"
     value = json.loads(path.read_bytes())
-    assert value["schema"] == 2
+    assert value["schema"] == 3
     if version == 1:
         value["schema"] = 1
         del value["contract"]
+        del value["lifecycle_id"]
         value["reviewers"] = {key: slot["report"]
                               for key, slot in value["reviewers"].items()}
         _write_json(path, value)
-    assert evaluate_gate(git_repo, BOUND_COMMAND).code is GateCode.PASS
-    if version == 2:
+    elif version == 2:
+        value["schema"] = 2
+        value["contract"]["verdict_schema"] = 2
+        del value["lifecycle_id"]
+        _write_json(path, value)
+    expected = GateCode.VERDICT_STALE if version == 2 else GateCode.PASS
+    assert evaluate_gate(git_repo, BOUND_COMMAND).code is expected
+    if version == 3:
         value["contract"]["diff_recipe"] = 99
         _write_json(path, value)
         assert evaluate_gate(git_repo, BOUND_COMMAND).code is GateCode.VERDICT_STALE
@@ -161,9 +168,9 @@ def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo,
 
 @pytest.mark.parametrize("name", ("codex_hook.py", "claude_hook.py"))
 @pytest.mark.parametrize("state", ("pass", "fail", "contract_drift"))
-def test_hook_adapter_consumes_native_v2_terminal_contract(installed_package, git_repo, name, state):
+def test_hook_adapter_consumes_native_current_terminal_contract(installed_package, git_repo, name, state):
     terminal = _finish_round(git_repo, finding_id="A-R1-001" if state == "fail" else None)
-    assert terminal.schema == 2
+    assert terminal.schema == 3
     if state == "contract_drift":
         value = terminal.to_json()
         value["contract"]["diff_recipe"] = 99

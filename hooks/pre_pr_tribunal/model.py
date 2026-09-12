@@ -13,8 +13,14 @@ from urllib.parse import urlsplit
 
 
 SCHEMA_VERSION = 1
-VERDICT_SCHEMA_VERSION = 2
-SUPPORTED_VERDICT_SCHEMAS = frozenset((SCHEMA_VERSION, VERDICT_SCHEMA_VERSION))
+SLOT_VERDICT_SCHEMA_VERSION = 2
+VERDICT_SCHEMA_VERSION = 3
+MIXED_SLOT_VERDICT_SCHEMAS = frozenset(
+    (SLOT_VERDICT_SCHEMA_VERSION, VERDICT_SCHEMA_VERSION)
+)
+SUPPORTED_VERDICT_SCHEMAS = frozenset(
+    (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
+)
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
 REPORT_TEXT_CONTRACT_VERSION = 2
 MAX_VERDICT_BYTES = 256 * 1024
@@ -27,6 +33,7 @@ MAX_EXECUTIONS_PER_REVIEWER = 128
 
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_LIFECYCLE_ID = re.compile(r"[0-9a-f]{32}\Z")
 _FINDING_ID = re.compile(r"([ABC])-R([1-3])-([0-9]{3})\Z")
 _EXECUTION_ID = re.compile(r"([ABC])-R([1-3])-E([0-9]{3})\Z")
 _DECISION_EXECUTION_ID = re.compile(r"D-R([1-3])-E([0-9]{3})\Z")
@@ -285,7 +292,7 @@ class ReviewerSlot:
             if self.status != "complete" or self.report is None:
                 raise SchemaError("VERDICT_INVALID")
             return self.report.to_json()
-        if verdict_schema != VERDICT_SCHEMA_VERSION:
+        if verdict_schema not in MIXED_SLOT_VERDICT_SCHEMAS:
             raise SchemaError("VERDICT_INVALID")
         if (
             not isinstance(self.attempt_count, int)
@@ -391,6 +398,7 @@ class Verdict:
     gate: GateSummary
     created_at: str
     contract: ContractBinding | None = None
+    lifecycle_id: str | None = None
 
     @property
     def snapshot(self) -> Snapshot:
@@ -411,8 +419,21 @@ class Verdict:
     def to_json(self) -> dict[str, object]:
         if set(self.reviewers) != {"A", "B", "C"}:
             raise SchemaError("VERDICT_INVALID")
-        if self.schema == VERDICT_SCHEMA_VERSION:
-            if self.contract is None:
+        if self.schema in MIXED_SLOT_VERDICT_SCHEMAS:
+            if (
+                self.contract is None
+                or (
+                    self.schema == VERDICT_SCHEMA_VERSION
+                    and (
+                        not isinstance(self.lifecycle_id, str)
+                        or _LIFECYCLE_ID.fullmatch(self.lifecycle_id) is None
+                    )
+                )
+                or (
+                    self.schema == SLOT_VERDICT_SCHEMA_VERSION
+                    and self.lifecycle_id is not None
+                )
+            ):
                 raise SchemaError("VERDICT_INVALID")
             for key in "ABC":
                 receipt = self.reviewers[key].receipt
@@ -426,6 +447,11 @@ class Verdict:
                     or receipt.report_contract_version != self.contract.report_text
                 ):
                     raise SchemaError("VERDICT_INVALID")
+        elif self.schema == SCHEMA_VERSION:
+            if self.contract is not None or self.lifecycle_id is not None:
+                raise SchemaError("VERDICT_INVALID")
+        else:
+            raise SchemaError("VERDICT_INVALID")
         value: dict[str, object] = {
             "schema": self.schema,
             "repository": self.repository,
@@ -445,8 +471,10 @@ class Verdict:
             "gate": self.gate.to_json(),
             "created_at": self.created_at,
         }
-        if self.schema == VERDICT_SCHEMA_VERSION:
+        if self.schema in MIXED_SLOT_VERDICT_SCHEMAS:
             value["contract"] = self.contract.to_json()
+        if self.schema == VERDICT_SCHEMA_VERSION:
+            value["lifecycle_id"] = self.lifecycle_id
         return value
 
 

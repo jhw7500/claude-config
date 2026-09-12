@@ -393,6 +393,7 @@ def test_pending_recovery_dispatches_only_pending_slots_and_never_replaces_seale
         "status",
         "verdict_schema",
         "migrate-legacy-pending",
+        "migrate-v2-pending",
         "in_progress",
         "same bound snapshot",
         "do not run `begin`",
@@ -411,21 +412,41 @@ def test_pending_recovery_dispatches_only_pending_slots_and_never_replaces_seale
 def test_pending_recovery_uses_status_driven_command_sequence():
     body = pending_recovery_contract()
     status = "status"
-    migration = "migrate-legacy-pending"
+    legacy_migration = "migrate-legacy-pending"
+    v2_migration = "migrate-v2-pending"
     context = "context --reviewer X"
     dispatch = "dispatch only reviewers whose slot is `pending`"
     submit = "submit-report --reviewer X"
     validation = "validate-report --reviewer X --source stored"
     finalize = "finalize"
-    assert body.index(status) < body.index(migration)
-    assert body.index(migration) < body.index(context)
+    assert body.index(status) < body.index(legacy_migration)
+    assert body.index(legacy_migration) < body.index(v2_migration)
+    assert body.index(v2_migration) < body.index(context)
     assert body.index(context) < body.index(dispatch)
     assert body.index(dispatch) < body.index(submit)
     assert body.index(submit) < body.index(validation)
     assert body.index(validation) < body.rindex(finalize)
     assert "verdict_schema == 1" in body
     assert "verdict_schema == 2" in body
+    assert "verdict_schema == 3" in body
     assert "reviewer/subset" in body
+
+
+def test_pending_recovery_documents_exact_migration_route_by_schema():
+    migration_command_by_schema = {}
+    for line in pending_recovery_contract().splitlines():
+        match = re.match(r"- If `verdict_schema == ([123])`, (.*)", line)
+        if match is None:
+            continue
+        command = re.search(r"run `([^`]+)`", match.group(2))
+        migration_command_by_schema[int(match.group(1))] = (
+            command.group(1) if command is not None else None
+        )
+    assert migration_command_by_schema == {
+        1: "migrate-legacy-pending",
+        2: "migrate-v2-pending",
+        3: None,
+    }
 
 
 def test_operational_failure_policy_does_not_weaken_the_gate():
@@ -464,14 +485,14 @@ def test_observation_and_terminal_cleanup_failures_are_warnings_only():
         assert token in skill
 
 
-def test_report_reference_documents_v2_shapes_and_real_controller_commands():
+def test_report_reference_documents_v3_shapes_and_real_controller_commands():
     schema = text("references/report-schema.md")
-    status = json_example(schema, "v2-status")
+    status = json_example(schema, "v3-status")
     assert set(status) == {
         "round", "gate_status", "blocking_count", "verdict_path",
         "verdict_schema", "reviewers",
     }
-    assert status["verdict_schema"] == 2
+    assert status["verdict_schema"] == 3
     assert status["reviewers"]["A"]["state"] == "sealed"
     assert set(status["reviewers"]["A"]) == {
         "state", "attempt_count", "last_error", "raw_sha256",
@@ -481,7 +502,7 @@ def test_report_reference_documents_v2_shapes_and_real_controller_commands():
         "state", "attempt_count", "last_error",
     }
 
-    receipt = json_example(schema, "v2-submit-receipt")
+    receipt = json_example(schema, "v3-submit-receipt")
     assert set(receipt) == {
         "reviewer", "round", "state", "raw_sha256", "context_sha256",
         "report_contract_version", "attempt", "provenance",
@@ -498,20 +519,29 @@ def test_report_reference_documents_v2_shapes_and_real_controller_commands():
     commands = [
         shlex.split(command)
         for command in re.findall(r"`((?:status|context|submit-report|record-failure|"
-                                   r"migrate-legacy-pending|validate-report|finalize)[^`]*)`",
+                                   r"migrate-legacy-pending|migrate-v2-pending|"
+                                   r"validate-report|finalize)[^`]*)`",
                                    match.group(1))
     ]
     parsed = [cli._parser().parse_args(command) for command in commands]
     by_command = {arguments.command for arguments in parsed}
     assert by_command == {
         "status", "context", "submit-report", "record-failure",
-        "migrate-legacy-pending", "validate-report", "finalize",
+        "migrate-legacy-pending", "migrate-v2-pending", "validate-report", "finalize",
     }
     reasons = {
         arguments.reason for arguments in parsed
         if arguments.command == "record-failure"
     }
     assert reasons == {"DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"}
+
+
+def test_report_reference_documents_internal_v3_lifecycle_identity():
+    stored_verdict = json_example(
+        text("references/report-schema.md"), "v3-stored-verdict",
+    )
+    assert stored_verdict["schema"] == 3
+    assert re.fullmatch(r"[0-9a-f]{32}", stored_verdict["lifecycle_id"])
 
 
 def test_docs_separate_retryable_formats_operations_integrity_and_warnings():
@@ -650,7 +680,7 @@ def test_skill_interrupted_lifecycle_recovers_then_closes_without_changing_gate(
 ):
     commands = telemetry_lifecycle_commands()
     monkeypatch.chdir(git_repo)
-    variables = {"$REVIEWER": "A", "$ATTEMPT": "1", "$PRIMARY_CODE": reason}
+    variables = {"$REVIEWER": "A", "$ATTEMPT": "1", "$RETRY_ATTEMPT": "1", "$PRIMARY_CODE": reason}
     run = lambda rows, second: run_lifecycle_commands(monkeypatch, capsys, variables, rows, second)
     run([["begin", "--base", "master", "--runtime", "codex", "--round", "1"]], 0)
     before = (git_repo / ".review/verdict.json").read_bytes()
@@ -658,7 +688,7 @@ def test_skill_interrupted_lifecycle_recovers_then_closes_without_changing_gate(
     run(commands["unavailable", "dispatch_request"], 1)
     recovered = run(commands["recovery", "interrupted"], 4)
     assert recovered == [{"run_id": variables["$RUN_ID"], "recovered_count": 3}]
-    variables["$ATTEMPT"] = "2"
+    variables["$RETRY_ATTEMPT"] = "2"
     run(commands["recovery", "retry_start"], 5)
     run(commands["recovery", "retry_terminal"], 6)
     run(commands["exit", outcome], 7)

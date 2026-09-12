@@ -10,18 +10,30 @@ A finding path may be any normalized repository-relative path, including outside
 
 ## Controller receipt and recovery contract
 
-The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. Native v2 slots are either `pending` or `sealed`; only `submit-report` can turn a pending native slot into a sealed slot. `store-report`, including its legacy replacement option, is v1-only.
+The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. Native schema-3 slots are either `pending` or `sealed`; only `submit-report` can turn a pending native slot into a sealed slot. `store-report`, including its legacy replacement option, is v1-only.
 
-`status.verdict_schema` selects the workflow: schema 2 exposes authoritative slot state and receipt fields; schema 1 must be passed once through all-slot `migrate-legacy-pending`, which accepts no reviewer subset. Legacy migration preserves available exact raw evidence but leaves slots pending when receipt provenance is unavailable; `LEGACY_PROVENANCE_UNAVAILABLE` never means a fictional native receipt was adopted.
+`status.verdict_schema` selects the workflow. Schema 1 requires an explicit all-slot `migrate-legacy-pending`; schema 2 requires an explicit `migrate-v2-pending`; schema 3 must not be migrated. Neither migration accepts a reviewer subset. Legacy schema-1 migration preserves available exact raw evidence but leaves slots pending when receipt provenance is unavailable; `LEGACY_PROVENANCE_UNAVAILABLE` never means a fictional native receipt was adopted. Schema-2 migration preserves sealed evidence only after exact receipt/file validation and assigns a new lifecycle identity, so its first telemetry resume reports prior request accounting unknown.
 
-<!-- v2-status -->
+The following stored-verdict excerpt records the schema-3 lifecycle identity for
+internal telemetry binding. It is not reviewer report content or review
+authority input.
+
+<!-- v3-stored-verdict -->
+```json
+{
+  "schema": 3,
+  "lifecycle_id": "0123456789abcdef0123456789abcdef"
+}
+```
+
+<!-- v3-status -->
 ```json
 {
   "round": 1,
   "gate_status": "in_progress",
   "blocking_count": 0,
   "verdict_path": ".review/verdict.json",
-  "verdict_schema": 2,
+  "verdict_schema": 3,
   "reviewers": {
     "A": {
       "state": "sealed",
@@ -46,7 +58,7 @@ The installed CLI and its installed contract binding are the source of truth. Do
 }
 ```
 
-<!-- v2-submit-receipt -->
+<!-- v3-submit-receipt -->
 ```json
 {
   "reviewer": "A",
@@ -72,9 +84,12 @@ The exact controller command shapes are below. `submit-report` reads exact repor
 | record process failure | `record-failure --reviewer A --reason REVIEWER_FAILED` |
 | record true terminal timeout | `record-failure --reviewer A --reason REVIEWER_TIMEOUT` |
 | migrate an authentic v1 all-pending round | `migrate-legacy-pending` |
+| migrate an authentic v2 pending round | `migrate-v2-pending` |
 | authenticate one stored receipt | `validate-report --reviewer A --source stored` |
 | authenticate all three and aggregate | `finalize` |
 <!-- controller-command-examples-end -->
+
+Schema-1 and schema-2 verdicts remain readable without rewrite; pending recovery requires explicit migration. New rounds and both migration commands write schema 3. A schema-2 migration validates every sealed report and receipt before one atomic verdict replacement; it never rewrites report bytes or infers pre-migration telemetry identity.
 
 ### Format failures
 

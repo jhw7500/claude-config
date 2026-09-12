@@ -811,7 +811,7 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
         os.umask(previous)
     assert len(finalizations) == 1
     assert result["status"]["gate_status"] == "pass"
-    assert result["status"]["verdict_schema"] == 2
+    assert result["status"]["verdict_schema"] == 3
     summary = result["telemetry_summary"]
     assert summary["binding"]["diff_sha256"] == result["begin"]["snapshot"]["diff_sha256"]
     assert summary["stages"]["report_store"]["count"] == 3
@@ -819,9 +819,63 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
     assert summary["stages"]["finalize"]["count"] == 1
     assert summary["outcomes"]["failure"] == 0
     ledger = json.loads((repo / ".review/telemetry.json").read_bytes())
+    verdict = json.loads((repo / ".review/verdict.json").read_bytes())
+    assert verdict["lifecycle_id"] == ledger["runs"][0]["lifecycle_id"]
+    assert ledger["runs"][0]["invocation"] is None
     assert all(span["status"] != "running" for span in ledger["runs"][0]["spans"])
     assert ledger["runs"][0]["status"] == "success"
-    assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "pass"
+    assert verdict["gate"]["status"] == "pass"
+
+
+def test_installed_probe_migrates_v2_pending_before_selective_resume(tmp_path, monkeypatch):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    begun = module._tribunal_cli(
+        cli, repo, home, "begin", "--base", "master", "--runtime", "codex",
+        "--round", "1",
+    )
+    sealed_a = module._synthetic_report_bytes("A", 1, begun["snapshot"])
+    module._tribunal_cli(
+        cli, repo, home, "submit-report", "--reviewer", "A", raw=sealed_a,
+    )
+    module._tribunal_cli(
+        cli, repo, home, "telemetry-close", "--run-id", begun["telemetry"]["run_id"],
+        "--outcome", "failure", "--reason-code", "CONTROLLER_INTERRUPTED",
+    )
+
+    verdict_path = repo / ".review/verdict.json"
+    legacy = json.loads(verdict_path.read_bytes())
+    legacy["schema"] = 2
+    legacy["contract"]["verdict_schema"] = 2
+    del legacy["lifecycle_id"]
+    verdict_path.write_text(json.dumps(legacy))
+    verdict_path.chmod(0o600)
+
+    commands = []
+    real_cli = module._tribunal_cli
+
+    def observe(cli_path, repository, caller_home, command, *arguments, **kwargs):
+        commands.append(command)
+        return real_cli(
+            cli_path, repository, caller_home, command, *arguments, **kwargs,
+        )
+
+    monkeypatch.setattr(module, "_tribunal_cli", observe)
+    requested = []
+
+    def pending_only(reviewer, attempt, snapshot):
+        requested.append(reviewer)
+        return module._synthetic_report_bytes(reviewer, attempt, snapshot)
+
+    result = module._create_pass_verdict(
+        cli, repo, home, "codex", report_factory=pending_only,
+    )
+
+    assert commands.index("migrate-v2-pending") < commands.index("telemetry-resume")
+    assert requested == ["B", "C"]
+    assert (repo / ".review/inbox/round-1/A.json").read_bytes() == sealed_a
+    assert result["status"]["verdict_schema"] == 3
+    assert result["telemetry_summary"]["recovery"]["accounting_complete"] is False
+    assert result["telemetry_summary"]["recovery"]["requested_slot_count"] is None
 
 
 def test_installed_probe_stops_when_orphan_receipt_discards_new_blocker(tmp_path):
@@ -961,6 +1015,12 @@ def test_installed_probe_keeps_submit_failure_detection_after_successful_retry(t
         "A": 1, "B": 2, "C": 1,
     }
     summary = result["telemetry_summary"]
+    assert summary["recovery"] == {
+        "kind": "new_round", "reused_slot_count": 0, "requested_slot_count": 3,
+        "rerun_slot_count": 1, "dispatch_request_count": 4, "retry_request_count": 1,
+        "accounting_complete": True,
+    }
+    assert summary["invocation_elapsed_ms"] >= 0
     detected = summary["early_detection"]
     assert detected is not None
     assert (detected["reviewer"], detected["reason_code"]) == ("B", "JSON_INVALID")
@@ -1006,6 +1066,89 @@ def test_installed_probe_resumes_only_pending_c_and_reuses_native_sealed_peers(t
         for reviewer in "AB"
     } == before
     assert result["status"]["gate_status"] == "pass"
+
+
+@pytest.mark.parametrize("runtime", ("claude", "codex"))
+def test_installed_resume_measures_b_only_after_a_and_c_seal(tmp_path, runtime):
+    """Losing resume telemetry or using cumulative attempts breaks local recovery counts."""
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    begun = module._tribunal_cli(cli, repo, home, "begin", "--base", "master",
+                                "--runtime", runtime, "--round", "1")
+    saved = {}
+    for role in "AC":
+        raw = module._synthetic_report_bytes(role, 1, begun["snapshot"])
+        module._tribunal_cli(cli, repo, home, "submit-report", "--reviewer", role, raw=raw)
+        saved[role] = raw
+    for _ in range(3):
+        with pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
+            module._tribunal_cli(cli, repo, home, "submit-report", "--reviewer", "B", raw=b"{")
+    module._tribunal_cli(cli, repo, home, "telemetry-close", "--run-id", begun["telemetry"]["run_id"],
+                        "--outcome", "failure", "--reason-code", "JSON_INVALID")
+    requested = []
+
+    def response(role, attempt, snapshot):
+        requested.append((role, attempt))
+        if attempt == 4:
+            return b"{"
+        return module._synthetic_report_bytes(role, attempt, snapshot)
+
+    result = module._create_pass_verdict(cli, repo, home, runtime, report_factory=response)
+    assert requested == [("B", 4), ("B", 5)]
+    assert result["status"]["gate_status"] == "pass"
+    assert result["begin"] == {}
+    assert result["telemetry_gaps"] == []
+    assert result["telemetry_summary"]["recovery"] == {
+        "kind": "resume", "reused_slot_count": 2, "requested_slot_count": 1,
+        "rerun_slot_count": 1, "dispatch_request_count": 2, "retry_request_count": 1,
+        "accounting_complete": True,
+    }
+    assert result["telemetry_summary"]["invocation_elapsed_ms"] >= 0
+    for role, raw in saved.items():
+        assert (repo / f".review/inbox/round-1/{role}.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("runtime", ("claude", "codex"))
+def test_installed_full_panel_and_selective_recovery_comparison(tmp_path, runtime):
+    """Same snapshot and synchronous fixture, not a native latency/speedup claim.
+
+    Full-panel control starts in an independent evidence-empty clone: it must
+    never reset the pending selective arm to obtain a baseline.
+    """
+    module, home, selective_repo, cli = _installed_lifecycle(tmp_path)
+    full_repo = tmp_path / "full-panel"
+    shutil.copytree(selective_repo, full_repo)
+    begun = module._tribunal_cli(cli, selective_repo, home, "begin", "--base", "master",
+                                "--runtime", runtime, "--round", "1")
+    for role in "AC":
+        raw = module._synthetic_report_bytes(role, 1, begun["snapshot"])
+        module._tribunal_cli(cli, selective_repo, home, "submit-report", "--reviewer", role, raw=raw)
+    with pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
+        module._tribunal_cli(cli, selective_repo, home, "submit-report", "--reviewer", "B", raw=b"{")
+    module._tribunal_cli(cli, selective_repo, home, "telemetry-close", "--run-id", begun["telemetry"]["run_id"],
+                        "--outcome", "failure", "--reason-code", "JSON_INVALID")
+    full = module._create_pass_verdict(cli, full_repo, home, runtime)
+    selective = module._create_pass_verdict(cli, selective_repo, home, runtime)
+    full_summary, selective_summary = full["telemetry_summary"], selective["telemetry_summary"]
+    assert full["begin"]["snapshot"] == begun["snapshot"]
+    assert full_summary["binding"] == selective_summary["binding"]
+    assert full_summary["recovery"]["dispatch_request_count"] == 3
+    assert selective_summary["recovery"]["dispatch_request_count"] == 1
+    assert full_summary["recovery"]["reused_slot_count"] == 0
+    assert selective_summary["recovery"]["reused_slot_count"] == 2
+    assert full["status"]["gate_status"] == selective["status"]["gate_status"] == "pass"
+    assert full["telemetry_gaps"] == selective["telemetry_gaps"] == []
+    for summary in (full_summary, selective_summary):
+        assert summary["recovery"]["accounting_complete"] is True
+        assert type(summary["invocation_elapsed_ms"]) is int
+        assert summary["invocation_elapsed_ms"] >= 0
+    print(json.dumps({
+        "measurement": "synthetic-sequential-installed-cli", "runtime_contract": runtime,
+        "same_snapshot": True, "same_report_contract": True,
+        "full_panel_elapsed_ms": full_summary["invocation_elapsed_ms"],
+        "selective_elapsed_ms": selective_summary["invocation_elapsed_ms"],
+        "full_panel_requests": 3, "selective_requests": 1,
+        "native_latency_measured": False,
+    }, sort_keys=True))
 
 
 @pytest.mark.parametrize(("started", "pending_attempts"), (
@@ -1108,6 +1251,7 @@ def test_installed_probe_migrates_unproven_legacy_reports_and_runs_all_slots(tmp
     verdict = json.loads(verdict_path.read_bytes())
     verdict["schema"] = 1
     verdict.pop("contract")
+    verdict.pop("lifecycle_id")
     verdict["reviewers"] = {reviewer: {"status": "pending"} for reviewer in "ABC"}
     verdict_path.write_bytes(json.dumps(verdict, separators=(",", ":")).encode())
     verdict_path.chmod(0o600)

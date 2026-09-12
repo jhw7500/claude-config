@@ -23,25 +23,16 @@ from pre_pr_tribunal.review_context import (
     reviewer_context_body,
     reviewer_context_envelope,
 )
-from pre_pr_tribunal.verdict_store import _new_v2_pending, begin_round, read_verdict
+from pre_pr_tribunal.verdict_store import begin_round, read_verdict
 
 
 def NOW():
     return "2026-09-01T00:00:00Z"
 
 
-def _v2_pending(git_repo):
-    legacy = begin_round(
+def _current_pending(git_repo):
+    return begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
-    )
-    return _new_v2_pending(
-        legacy.snapshot,
-        runtime="codex",
-        initial_paths=legacy.initial_paths,
-        round_number=1,
-        decisions=(),
-        history=(),
-        contract=current_contract_binding(),
     )
 
 
@@ -121,7 +112,7 @@ def _with_mixed_prior_reviewer_data(verdict):
 
 
 def test_context_digest_is_over_canonical_body_and_is_stable(git_repo):
-    pending_verdict = _v2_pending(git_repo)
+    pending_verdict = _current_pending(git_repo)
     body = reviewer_context_body(pending_verdict, Reviewer.A)
     canonical = json.dumps(
         body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
@@ -135,7 +126,7 @@ def test_context_digest_is_over_canonical_body_and_is_stable(git_repo):
 
 
 def test_sealing_peer_does_not_change_pending_reviewer_context(git_repo):
-    pending_verdict = _with_mixed_prior_reviewer_data(_v2_pending(git_repo))
+    pending_verdict = _with_mixed_prior_reviewer_data(_current_pending(git_repo))
     before = context_sha256(pending_verdict, Reviewer.C)
     changed = replace(
         pending_verdict,
@@ -161,7 +152,7 @@ def test_sealing_peer_does_not_change_pending_reviewer_context(git_repo):
 
 
 def test_context_rejects_sealed_reviewer_slot(git_repo):
-    pending_verdict = _v2_pending(git_repo)
+    pending_verdict = _current_pending(git_repo)
     sealed = replace(
         pending_verdict,
         reviewers={
@@ -175,7 +166,7 @@ def test_context_rejects_sealed_reviewer_slot(git_repo):
 
 
 def test_context_rejects_installed_contract_drift(git_repo):
-    pending_verdict = _v2_pending(git_repo)
+    pending_verdict = _current_pending(git_repo)
     drifted = replace(
         pending_verdict,
         contract=replace(pending_verdict.contract, report_text=999),
@@ -185,7 +176,7 @@ def test_context_rejects_installed_contract_drift(git_repo):
 
 
 def test_persisted_contract_drift_reaches_context_runtime_check(git_repo):
-    pending_verdict = _v2_pending(git_repo)
+    pending_verdict = _current_pending(git_repo)
     payload = pending_verdict.to_json()
     payload["contract"]["report_text"] = 999
     verdict_path = git_repo / ".review/verdict.json"

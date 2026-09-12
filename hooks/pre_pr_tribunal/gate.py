@@ -17,7 +17,7 @@ from .git_state import (
     _worktree_is_dirty,
     capture_snapshot,
 )
-from .model import GateStatus, SchemaError, TribunalError
+from .model import MIXED_SLOT_VERDICT_SCHEMAS, GateStatus, SchemaError, TribunalError
 from .review_context import current_contract_binding
 from .shell_scan import ScanKind, is_target_environment_name, scan_pr_create
 from .verdict_store import read_verdict
@@ -205,7 +205,10 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
         return _decision(True, snapshot_error or GateCode.VERDICT_INVALID)
     if not _snapshot_is_bound(verdict, snapshot):
         return _decision(True, GateCode.VERDICT_STALE)
-    if verdict.schema == 2 and verdict.contract != current_contract_binding():
+    if (
+        verdict.schema in MIXED_SLOT_VERDICT_SCHEMAS
+        and verdict.contract != current_contract_binding()
+    ):
         return _decision(True, GateCode.VERDICT_STALE)
 
     bound_scan = scan_pr_create(command, expected_base=verdict.base_ref)
@@ -215,7 +218,9 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
         )
 
     if set(verdict.reviewers) != set("ABC") or any(
-        slot.status != ("sealed" if verdict.schema == 2 else "complete") or slot.report is None
+        slot.status != (
+            "sealed" if verdict.schema in MIXED_SLOT_VERDICT_SCHEMAS else "complete"
+        ) or slot.report is None
         for slot in verdict.reviewers.values()
     ):
         return _decision(True, GateCode.REVIEW_INCOMPLETE)

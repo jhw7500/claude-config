@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 
 from .git_state import (
@@ -212,6 +213,7 @@ class _VerdictFields:
     history: tuple[RoundSummary, ...]
     gate: GateSummary
     created_at: str
+    lifecycle_id: str | None
     snapshot: Snapshot
 
 
@@ -233,8 +235,10 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         "gate",
         "created_at",
     }
-    if schema == m.VERDICT_SCHEMA_VERSION:
+    if schema in m.MIXED_SLOT_VERDICT_SCHEMAS:
         verdict_keys.add("contract")
+        if schema == m.VERDICT_SCHEMA_VERSION:
+            verdict_keys.add("lifecycle_id")
         valid_shapes = {frozenset(verdict_keys)}
     else:
         valid_shapes = {
@@ -289,6 +293,14 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
         raise SchemaError("VERDICT_INVALID") from None
+    lifecycle_id: str | None = None
+    if schema == m.VERDICT_SCHEMA_VERSION:
+        lifecycle_id = data["lifecycle_id"]
+        if (
+            not isinstance(lifecycle_id, str)
+            or m._LIFECYCLE_ID.fullmatch(lifecycle_id) is None
+        ):
+            raise SchemaError("VERDICT_INVALID")
 
     reviewers = m._object(data["reviewers"], {"A", "B", "C"}, "VERDICT_INVALID")
     history = _parse_history(data["history"])
@@ -349,6 +361,7 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         history,
         GateSummary(status, count),
         created_at,
+        lifecycle_id,
         snapshot,
     )
 
@@ -396,6 +409,7 @@ def _verdict_from_fields(
     reviewers: Mapping[str, ReviewerSlot],
     *,
     contract: ContractBinding | None = None,
+    lifecycle_id: str | None = None,
 ) -> Verdict:
     return Verdict(
         fields.schema,
@@ -415,6 +429,7 @@ def _verdict_from_fields(
         fields.gate,
         fields.created_at,
         contract,
+        lifecycle_id,
     )
 
 
@@ -525,8 +540,8 @@ def _parse_v2_receipt(
     )
 
 
-def _parse_verdict_v2(data: dict[str, object]) -> Verdict:
-    fields = _parse_verdict_fields(data, schema=m.VERDICT_SCHEMA_VERSION)
+def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
+    fields = _parse_verdict_fields(data, schema=schema)
     contract = _parse_contract(data["contract"])
     reviewers: dict[str, ReviewerSlot] = {}
     for key in "ABC":
@@ -577,7 +592,9 @@ def _parse_verdict_v2(data: dict[str, object]) -> Verdict:
             raise SchemaError("VERDICT_INVALID")
         if (status is GateStatus.PASS) != (count == 0):
             raise SchemaError("VERDICT_INVALID")
-    verdict = _verdict_from_fields(fields, reviewers, contract=contract)
+    verdict = _verdict_from_fields(
+        fields, reviewers, contract=contract, lifecycle_id=fields.lifecycle_id
+    )
     if status is not GateStatus.IN_PROGRESS:
         _validate_closure(
             verdict,
@@ -592,8 +609,8 @@ def _parse_verdict(raw: bytes) -> Verdict:
         raise SchemaError("VERDICT_INVALID")
     if data["schema"] == m.SCHEMA_VERSION:
         return _parse_verdict_v1(data)
-    if data["schema"] == m.VERDICT_SCHEMA_VERSION:
-        return _parse_verdict_v2(data)
+    if data["schema"] in m.MIXED_SLOT_VERDICT_SCHEMAS:
+        return _parse_mixed_verdict(data, schema=data["schema"])
     raise SchemaError("VERDICT_SCHEMA_UNSUPPORTED")
 
 
@@ -777,9 +794,11 @@ def _require_all_pending(verdict: Verdict) -> None:
         raise SchemaError("ROUND_NOT_IN_PROGRESS")
 
 
-def require_v2_in_progress(verdict: Verdict) -> Verdict:
+def require_current_in_progress(verdict: Verdict) -> Verdict:
     if verdict.schema == m.SCHEMA_VERSION:
         raise SchemaError("LEGACY_ADOPTION_REQUIRED")
+    if verdict.schema == m.SLOT_VERDICT_SCHEMA_VERSION:
+        raise SchemaError("V2_MIGRATION_REQUIRED")
     if (
         verdict.schema != m.VERDICT_SCHEMA_VERSION
         or verdict.gate.status is not GateStatus.IN_PROGRESS
@@ -798,7 +817,7 @@ def _validate_report_store_input(reviewer: Reviewer, raw: bytes) -> None:
 def _pending_slot_snapshot(
     root: Path, pending: Verdict, reviewer: Reviewer, *, now: Callable[[], str]
 ) -> Snapshot:
-    require_v2_in_progress(pending)
+    require_current_in_progress(pending)
     if pending.contract != current_contract_binding():
         raise SchemaError("CONTRACT_DRIFT")
     if pending.reviewers[reviewer.value].status != "pending":
@@ -830,7 +849,7 @@ def _record_failure_locked(
 def submit_reviewer_report(
     cwd: Path, *, reviewer: Reviewer, raw: bytes, now: Callable[[], str] = utc_now,
 ) -> ReportReceipt:
-    """Validate exact bytes, publish the canonical report, and seal one v2 slot."""
+    """Validate exact bytes, publish the canonical report, and seal one current schema-3 slot."""
     if not isinstance(reviewer, Reviewer) or not isinstance(raw, bytes):
         raise SchemaError("REPORT_SCHEMA_INVALID")
     root = repository_root(cwd)
@@ -897,7 +916,7 @@ def submit_reviewer_report(
 def record_reviewer_failure(
     cwd: Path, *, reviewer: Reviewer, reason_code: str,
 ) -> ReviewerSlot:
-    """Persist one bounded operational failure for a still-pending v2 slot."""
+    """Persist one bounded operational failure for a still-pending current schema-3 slot."""
     if (
         not isinstance(reviewer, Reviewer)
         or not isinstance(reason_code, str)
@@ -987,7 +1006,7 @@ def validate_stored_reviewer_report(
         verdict = _read_verdict_locked(review_fd)
         if verdict.schema == m.SCHEMA_VERSION:
             _require_all_pending(verdict)
-        elif verdict.schema == m.VERDICT_SCHEMA_VERSION:
+        elif verdict.schema in m.MIXED_SLOT_VERDICT_SCHEMAS:
             if verdict.contract != current_contract_binding():
                 raise SchemaError("CONTRACT_DRIFT")
             slot = verdict.reviewers[reviewer.value]
@@ -998,7 +1017,7 @@ def validate_stored_reviewer_report(
         snapshot = capture_snapshot(root, verdict.base_ref)
         if not _snapshot_equal(verdict, snapshot):
             raise SchemaError("SNAPSHOT_CHANGED")
-        if verdict.schema == m.VERDICT_SCHEMA_VERSION and slot.status == "sealed":
+        if verdict.schema in m.MIXED_SLOT_VERDICT_SCHEMAS and slot.status == "sealed":
             parsed = _read_sealed_report(review_fd, verdict, reviewer)
             if slot.receipt is None:
                 raise SchemaError("VERDICT_INVALID")
@@ -1056,7 +1075,7 @@ def _summary(verdict: Verdict) -> RoundSummary:
     )
 
 
-def _new_v2_pending(
+def _new_current_pending(
     snapshot: Snapshot,
     *,
     runtime: str,
@@ -1065,6 +1084,7 @@ def _new_v2_pending(
     decisions: Sequence[Decision],
     history: Sequence[RoundSummary],
     contract: ContractBinding,
+    lifecycle_id: str,
 ) -> Verdict:
     return Verdict(
         m.VERDICT_SCHEMA_VERSION,
@@ -1084,7 +1104,18 @@ def _new_v2_pending(
         GateSummary(GateStatus.IN_PROGRESS, 0),
         snapshot.created_at,
         contract,
+        lifecycle_id,
     )
+
+
+def _lifecycle_id(token_hex: Callable[[int], str]) -> str:
+    try:
+        value = token_hex(16)
+    except Exception:
+        raise SchemaError("VERDICT_INVALID") from None
+    if not isinstance(value, str) or m._LIFECYCLE_ID.fullmatch(value) is None:
+        raise SchemaError("VERDICT_INVALID")
+    return value
 
 
 def begin_round(
@@ -1095,6 +1126,7 @@ def begin_round(
     round_number: int,
     decisions_path: Path | None = None,
     now: Callable[[], str] = utc_now,
+    token_hex: Callable[[int], str] = secrets.token_hex,
 ) -> Verdict:
     if (
         not isinstance(round_number, int)
@@ -1182,10 +1214,10 @@ def begin_round(
                 review_fd, round_number=target_round, allow_reset=stored is not None,
             )
         _invalidate_round_inputs(review_fd, round_number)
-        pending = _new_v2_pending(
+        pending = _new_current_pending(
             snapshot, runtime=runtime, initial_paths=initial_paths,
             round_number=round_number, decisions=decisions, history=history,
-            contract=current_contract_binding(),
+            contract=current_contract_binding(), lifecycle_id=_lifecycle_id(token_hex),
         )
         _atomic_write(review_fd, pending)
         return pending
@@ -1278,7 +1310,7 @@ def finalize_round(
     check_ignored(root)
     with locked_review(root, create=False) as review_fd:
         pending = _read_verdict_locked(review_fd)
-        require_v2_in_progress(pending)
+        require_current_in_progress(pending)
         if pending.contract != current_contract_binding():
             raise SchemaError("CONTRACT_DRIFT")
         if reviewer_paths is not None:
@@ -1322,8 +1354,59 @@ class LegacyMigrationResult:
     reviewers: Mapping[str, str]
 
 
-def migrate_legacy_pending_round(cwd: Path) -> LegacyMigrationResult:
-    """Preserve all legacy bytes and atomically migrate A/B/C to pending v2 slots.
+@dataclass(frozen=True)
+class PendingMigrationResult:
+    round: int
+    reviewers: Mapping[str, str]
+    telemetry_history: str
+
+
+def migrate_v2_pending_round(
+    cwd: Path, *, token_hex: Callable[[int], str] = secrets.token_hex,
+) -> PendingMigrationResult:
+    """Atomically assign a lifecycle ID to a verified schema-2 pending verdict."""
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        legacy = _read_verdict_locked(review_fd)
+        if (
+            legacy.schema != m.SLOT_VERDICT_SCHEMA_VERSION
+            or legacy.gate.status is not GateStatus.IN_PROGRESS
+        ):
+            raise SchemaError("V2_MIGRATION_NOT_ALLOWED")
+        snapshot = capture_snapshot(root, legacy.base_ref)
+        if not _snapshot_equal(legacy, snapshot):
+            raise SchemaError("SNAPSHOT_CHANGED")
+        current = current_contract_binding()
+        if (
+            legacy.contract is None
+            or legacy.contract.report_text != current.report_text
+            or legacy.contract.diff_recipe != current.diff_recipe
+            or legacy.contract.verdict_schema != m.SLOT_VERDICT_SCHEMA_VERSION
+        ):
+            raise SchemaError("CONTRACT_DRIFT")
+        for key in "ABC":
+            if legacy.reviewers[key].status == "sealed":
+                _read_sealed_report(review_fd, legacy, Reviewer(key))
+        migrated = replace(
+            legacy,
+            schema=m.VERDICT_SCHEMA_VERSION,
+            contract=current,
+            lifecycle_id=_lifecycle_id(token_hex),
+        )
+        _atomic_write(review_fd, migrated)
+        return PendingMigrationResult(
+            migrated.round,
+            {key: migrated.reviewers[key].status for key in "ABC"},
+            "unknown",
+        )
+
+
+def migrate_legacy_pending_round(
+    cwd: Path, *, token_hex: Callable[[int], str] = secrets.token_hex,
+) -> LegacyMigrationResult:
+    """Preserve all legacy bytes and atomically migrate A/B/C to pending current slots.
 
     Historical telemetry has no byte/context hashes. Its successful spans cannot
     authenticate current canonical bytes, including replacements after validation.
@@ -1339,11 +1422,11 @@ def migrate_legacy_pending_round(cwd: Path) -> LegacyMigrationResult:
         snapshot = capture_snapshot(root, legacy.base_ref)
         if not _snapshot_equal(legacy, snapshot):
             raise SchemaError("SNAPSHOT_CHANGED")
-        pending = _new_v2_pending(
+        pending = _new_current_pending(
             legacy.snapshot, runtime=legacy.producer_runtime,
             initial_paths=legacy.initial_paths, round_number=legacy.round,
             decisions=legacy.decisions, history=legacy.history,
-            contract=current_contract_binding(),
+            contract=current_contract_binding(), lifecycle_id=_lifecycle_id(token_hex),
         )
         round_fd = _round_fd(
             review_fd, legacy.round, create=False, exact_report_directories=True

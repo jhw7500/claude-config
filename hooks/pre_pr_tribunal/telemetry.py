@@ -13,7 +13,7 @@ from types import MappingProxyType
 
 from .git_state import DIFF_RECIPE_VERSION
 from .model import (
-    REPORT_TEXT_CONTRACT_VERSION, Reviewer, SchemaError, Snapshot,
+    REPORT_TEXT_CONTRACT_VERSION, Reviewer, SchemaError, Snapshot, TribunalError,
     _contains_home_path, _head_ref, _load_json, _SECRET, _text,
 )
 from .review_store import (
@@ -21,7 +21,8 @@ from .review_store import (
 )
 
 
-TELEMETRY_SCHEMA_VERSION = 1
+TELEMETRY_SCHEMA_VERSION = 3
+SUPPORTED_TELEMETRY_SCHEMAS = frozenset((1, 2, 3))
 MAX_TELEMETRY_BYTES = 2 * 1024 * 1024
 MAX_TELEMETRY_RUNS = 16
 MAX_TELEMETRY_SPANS_PER_RUN = 128
@@ -29,6 +30,7 @@ MAX_REASON_CODE_BYTES = 64
 
 _REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 _ID = re.compile(r"[0-9a-f]{32}\Z")
+_LIFECYCLE_ID = re.compile(r"[0-9a-f]{32}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIFF = re.compile(r"[0-9a-f]{64}\Z")
 _TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
@@ -114,6 +116,17 @@ class TelemetrySpan:
 
 
 @dataclass(frozen=True)
+class Invocation:
+    kind: str
+    reused: tuple[Reviewer, ...]
+    previously_attempted: tuple[Reviewer, ...]
+
+    def to_json(self) -> dict[str, object]:
+        return {"kind": self.kind, "reused": [item.value for item in self.reused],
+                "previously_attempted": [item.value for item in self.previously_attempted]}
+
+
+@dataclass(frozen=True)
 class TelemetryRun:
     run_id: str
     runtime: str
@@ -128,9 +141,12 @@ class TelemetryRun:
     telemetry_incomplete: bool
     telemetry_incomplete_reason: str | None
     spans: tuple[TelemetrySpan, ...]
+    invocation: Invocation | None = None
+    ended_monotonic_ns: int | None = None
+    lifecycle_id: str | None = None
 
     def to_json(self) -> dict[str, object]:
-        return {
+        result = {
             "run_id": self.run_id, "runtime": self.runtime, "round": self.round,
             "binding": self.binding.to_json(), "started_at": self.started_at,
             "ended_at": self.ended_at,
@@ -141,6 +157,12 @@ class TelemetryRun:
             "telemetry_incomplete_reason": self.telemetry_incomplete_reason,
             "spans": [item.to_json() for item in self.spans],
         }
+        if self.binding.contract["telemetry_schema"] >= 2:
+            result.update(invocation=self.invocation.to_json() if self.invocation else None,
+                          ended_monotonic_ns=self.ended_monotonic_ns)
+        if self.binding.contract["telemetry_schema"] >= 3:
+            result["lifecycle_id"] = self.lifecycle_id
+        return result
 
 
 @dataclass(frozen=True)
@@ -244,7 +266,8 @@ def _parse_binding(value: object) -> TelemetryBinding:
     _ref(obj["base_ref"], base=True)
     contract = _object(obj["contract"], "report_text diff_recipe telemetry_schema")
     for name, expected in _contract().items():
-        _require(type(contract[name]) is int and contract[name] == expected)
+        supported = SUPPORTED_TELEMETRY_SCHEMAS if name == "telemetry_schema" else (expected,)
+        _require(type(contract[name]) is int and contract[name] in supported)
     for name in ("repository", "base_sha", "head_ref", "head_sha", "merge_base_sha", "diff_sha256"):
         value = obj[name]
         if value is None:
@@ -294,12 +317,32 @@ def _array(value: object, maximum: int) -> list:
     return value
 
 
+def _parse_invocation(value: object, *, telemetry_schema: int) -> Invocation | None:
+    if value is None:
+        return None
+    obj = _object(value, "kind reused previously_attempted")
+    _require(obj["kind"] in ("new_round", "resume"))
+    roles = [tuple(_enum(Reviewer, item) for item in _array(obj[name], 3))
+             for name in ("reused", "previously_attempted")]
+    _require(all(len(set(items)) == len(items) for items in roles))
+    _require(not set(roles[0]) & set(roles[1]))
+    _require(obj["kind"] != "new_round" or not any(roles))
+    _require(telemetry_schema < 3 or obj["kind"] == "resume")
+    return Invocation(obj["kind"], *roles)
+
+
 def _parse_run(value: object) -> TelemetryRun:
-    obj = _object(value, "run_id runtime round binding started_at ended_at started_monotonic_ns status reason_code started_late telemetry_incomplete telemetry_incomplete_reason spans")
+    _require(isinstance(value, dict) and "binding" in value)
+    binding = _parse_binding(value["binding"])
+    keys = "run_id runtime round binding started_at ended_at started_monotonic_ns status reason_code started_late telemetry_incomplete telemetry_incomplete_reason spans"
+    if binding.contract["telemetry_schema"] >= 2:
+        keys += " invocation ended_monotonic_ns"
+    if binding.contract["telemetry_schema"] >= 3:
+        keys += " lifecycle_id"
+    obj = _object(value, keys)
     _pattern(obj["run_id"], _ID)
     _require(obj["runtime"] in ("claude", "codex"))
     _integer(obj["round"], 1, 3)
-    binding = _parse_binding(obj["binding"])
     _timestamp(obj["started_at"])
     _integer(obj["started_monotonic_ns"])
     outcome = _status(obj["status"], obj["reason_code"])
@@ -307,6 +350,26 @@ def _parse_run(value: object) -> TelemetryRun:
         _require(obj["ended_at"] is None)
     elif _timestamp(obj["ended_at"]) < obj["started_at"]:
         _require(outcome is TelemetryOutcome.CLOCK_ANOMALY and obj["reason_code"] == _ANOMALY)
+    end_ns = obj.get("ended_monotonic_ns")
+    if end_ns is not None:
+        _integer(end_ns)
+        _require(outcome is not None)
+        if end_ns < obj["started_monotonic_ns"]:
+            _require(outcome is TelemetryOutcome.CLOCK_ANOMALY and obj["reason_code"] == _ANOMALY)
+    if binding.contract["telemetry_schema"] >= 3:
+        _require((outcome is None) == (end_ns is None))
+    lifecycle_id = obj.get("lifecycle_id")
+    if binding.contract["telemetry_schema"] >= 3:
+        _require(
+            lifecycle_id is None
+            if binding.status == "pending"
+            else isinstance(lifecycle_id, str) and _LIFECYCLE_ID.fullmatch(lifecycle_id)
+        )
+    invocation = _parse_invocation(
+        obj.get("invocation"),
+        telemetry_schema=binding.contract["telemetry_schema"],
+    )
+    _require(invocation is None or binding.status == "bound")
     for name in ("started_late", "telemetry_incomplete"):
         _require(type(obj[name]) is bool)
     if obj["telemetry_incomplete"]:
@@ -319,17 +382,20 @@ def _parse_run(value: object) -> TelemetryRun:
         _require(all(item.outcome is not None for item in spans))
     fields = dict(obj)
     del fields["status"]
-    fields.update(binding=binding, spans=spans, outcome=outcome)
+    fields.update(binding=binding, spans=spans, outcome=outcome,
+                  invocation=invocation, ended_monotonic_ns=end_ns,
+                  lifecycle_id=lifecycle_id)
     return TelemetryRun(**fields)
 
 
 def _parse_ledger(raw: bytes) -> TelemetryLedger:
     try:
         obj = _object(_load_json(raw, limit=MAX_TELEMETRY_BYTES, too_large=_TOO_LARGE), "schema runs")
-        _require(type(obj["schema"]) is int and obj["schema"] == TELEMETRY_SCHEMA_VERSION)
+        _require(type(obj["schema"]) is int and obj["schema"] in SUPPORTED_TELEMETRY_SCHEMAS)
         runs = tuple(_parse_run(item) for item in _array(obj["runs"], MAX_TELEMETRY_RUNS))
+        _require(all(item.binding.contract["telemetry_schema"] <= obj["schema"] for item in runs))
         _require(len({item.run_id for item in runs}) == len(runs))
-        return TelemetryLedger(TELEMETRY_SCHEMA_VERSION, runs)
+        return TelemetryLedger(obj["schema"], runs)
     except SchemaError as error:
         raise SchemaError(_TOO_LARGE if error.code == _TOO_LARGE else _INVALID) from None
 
@@ -406,21 +472,125 @@ def create_run(cwd: Path, *, base_ref: str, runtime: str, round_number: int,
     )
     run = _parse_run(run.to_json())
     with _store(cwd) as directory:
-        ledger = _read(directory)
-        _require(all(item.run_id != run.run_id for item in ledger.runs))
-        runs = ledger.runs
-        if len(runs) == MAX_TELEMETRY_RUNS:
-            candidates = [item for item in runs if (
-                item.outcome not in (None, TelemetryOutcome.INCOMPLETE)
-                and not item.telemetry_incomplete
-                and all(span.outcome is not TelemetryOutcome.INCOMPLETE for span in item.spans)
-            )]
-            if not candidates:
-                raise SchemaError(_TOO_LARGE)
-            oldest = min(candidates, key=lambda item: item.started_at)
-            runs = tuple(item for item in runs if item.run_id != oldest.run_id)
-        _write(directory, replace(ledger, runs=(*runs, run)))
+        _append_run(directory, _read(directory), run)
     return run
+
+
+def _append_run(directory: int, ledger: TelemetryLedger, run: TelemetryRun) -> None:
+    _require(all(item.run_id != run.run_id for item in ledger.runs))
+    runs = ledger.runs
+    if len(runs) == MAX_TELEMETRY_RUNS:
+        candidates = [item for item in runs if (
+            item.outcome not in (None, TelemetryOutcome.INCOMPLETE)
+            and not item.telemetry_incomplete
+            and all(span.outcome is not TelemetryOutcome.INCOMPLETE for span in item.spans)
+        )]
+        if not candidates:
+            raise SchemaError(_TOO_LARGE)
+        oldest = min(candidates, key=lambda item: item.started_at)
+        runs = tuple(item for item in runs if item.run_id != oldest.run_id)
+    _write(directory, TelemetryLedger(TELEMETRY_SCHEMA_VERSION, (*runs, run)))
+
+
+def _bound_snapshot(snapshot: Snapshot) -> TelemetryBinding:
+    fields = ("repository", "base_ref", "base_sha", "head_ref", "head_sha", "merge_base_sha", "diff_sha256")
+    return _parse_binding(TelemetryBinding(
+        status="bound", contract=_contract(), **{name: getattr(snapshot, name) for name in fields},
+    ).to_json())
+
+
+def _prior_request_history(
+    ledger: TelemetryLedger, snapshot: Snapshot, round_number: int,
+    lifecycle_id: str,
+) -> tuple[set[Reviewer], bool]:
+    expected = _bound_snapshot(snapshot)
+    fields = (
+        "repository", "base_ref", "base_sha", "head_ref", "head_sha",
+        "merge_base_sha", "diff_sha256",
+    )
+    matching = [
+        run for run in ledger.runs
+        if run.round == round_number
+        and run.lifecycle_id == lifecycle_id
+        and run.binding.status == "bound"
+        and all(
+            getattr(run.binding, name) == getattr(expected, name)
+            for name in fields
+        )
+        and all(
+            run.binding.contract[name] == expected.contract[name]
+            for name in ("report_text", "diff_recipe")
+        )
+    ]
+    if not matching:
+        return set(), False
+    complete = True
+    requested: set[Reviewer] = set()
+    for run in matching:
+        if run.invocation is not None:
+            requested.update(run.invocation.previously_attempted)
+        recovery = _recovery(run)
+        if recovery is None or recovery["accounting_complete"] is not True:
+            complete = False
+        if (
+            run.started_late
+            or run.telemetry_incomplete
+            or run.outcome in (
+                None, TelemetryOutcome.INCOMPLETE, TelemetryOutcome.CLOCK_ANOMALY,
+            )
+        ):
+            complete = False
+        for span in run.spans:
+            if span.stage is not TelemetryStage.REVIEWER_DISPATCH_WAIT:
+                continue
+            if span.reason_code == "CONTROLLER_INTERRUPTED":
+                complete = False
+            elif span.reviewer is not None:
+                requested.add(span.reviewer)
+    return requested, complete
+
+
+def resume_run(cwd: Path, *, runtime: str, started_at: str, started_monotonic_ns: int) -> TelemetryRun:
+    """Observe a verified pending round under its lock; never mutate primary evidence."""
+    from .git_state import capture_snapshot
+    from .review_context import current_contract_binding
+    from .verdict_store import (
+        _read_sealed_report, _read_verdict_locked, _snapshot_equal, require_current_in_progress,
+    )
+
+    with _store(cwd) as directory:
+        try:
+            verdict = require_current_in_progress(_read_verdict_locked(directory))
+            _require(verdict.contract == current_contract_binding())
+            snapshot = capture_snapshot(cwd, verdict.base_ref)
+            _require(_snapshot_equal(verdict, snapshot))
+            ledger = _read(directory)
+            observed, history_complete = _prior_request_history(
+                ledger, snapshot, verdict.round, verdict.lifecycle_id,
+            )
+            reused, attempted = [], []
+            for reviewer in Reviewer:
+                slot = verdict.reviewers[reviewer.value]
+                if slot.status == "sealed":
+                    _read_sealed_report(directory, verdict, reviewer)
+                    reused.append(reviewer)
+                elif slot.attempt_count or reviewer in observed:
+                    attempted.append(reviewer)
+        except TribunalError:
+            raise SchemaError(_INVALID) from None
+        # A live controller must explicitly terminalize its own observation first.
+        _require(not any(item.outcome is None for item in ledger.runs))
+        run = TelemetryRun(
+            _token(secrets.token_hex), runtime, verdict.round, _bound_snapshot(snapshot),
+            started_at, None, started_monotonic_ns, None, None, False,
+            not history_complete,
+            None if history_complete else "PRIOR_REQUEST_HISTORY_INCOMPLETE", (),
+            Invocation("resume", tuple(reused), tuple(attempted)),
+            lifecycle_id=verdict.lifecycle_id,
+        )
+        run = _parse_run(run.to_json())
+        _append_run(directory, ledger, run)
+        return run
 
 
 def record_candidate(cwd: Path, *, run_id: str, repository: str,
@@ -438,19 +608,20 @@ def record_candidate(cwd: Path, *, run_id: str, repository: str,
         return updated
 
 
-def bind_run(cwd: Path, *, run_id: str, snapshot: Snapshot) -> TelemetryRun:
+def bind_run(cwd: Path, *, run_id: str, snapshot: Snapshot, lifecycle_id: str,
+             invocation: Invocation | None = None) -> TelemetryRun:
     _require(isinstance(snapshot, Snapshot) and type(snapshot.schema) is int and snapshot.schema == 1)
+    _pattern(lifecycle_id, _LIFECYCLE_ID)
     with _store(cwd) as directory:
         ledger = _read(directory)
         run = _find_run(ledger, run_id, active=True)
         _require(run.binding.status == "pending" and run.binding.base_ref == snapshot.base_ref)
-        fields = ("repository", "base_ref", "base_sha", "head_ref", "head_sha", "merge_base_sha", "diff_sha256")
         # Candidate identity is provisional; capture_snapshot is authoritative.
-        binding = _parse_binding(TelemetryBinding(
-            status="bound", contract=_contract(), **{name: getattr(snapshot, name) for name in fields},
-        ).to_json())
-        updated = replace(run, binding=binding)
-        _save_run(directory, ledger, updated)
+        updated = replace(
+            run, binding=_bound_snapshot(snapshot), lifecycle_id=lifecycle_id,
+            invocation=invocation,
+        )
+        _save_run(directory, replace(ledger, schema=TELEMETRY_SCHEMA_VERSION), updated)
         return updated
 
 
@@ -523,17 +694,24 @@ def recover_run(cwd: Path, *, run_id: str, ended_at: str,
 
 
 def close_run(cwd: Path, *, run_id: str, outcome: TelemetryOutcome,
-              reason_code: str | None, ended_at: str) -> TelemetryRun:
+              reason_code: str | None, ended_at: str,
+              ended_monotonic_ns: int | None = None) -> TelemetryRun:
     _require(isinstance(outcome, TelemetryOutcome))
     _status(outcome.value, reason_code)
     _timestamp(ended_at)
+    if ended_monotonic_ns is not None:
+        _integer(ended_monotonic_ns)
     with _store(cwd) as directory:
         ledger = _read(directory)
         run = _find_run(ledger, run_id, active=True)
         _require(all(item.outcome is not None for item in run.spans))
-        if ended_at < run.started_at:
+        if run.binding.contract["telemetry_schema"] >= 3:
+            _require(ended_monotonic_ns is not None)
+        if ended_at < run.started_at or (
+                ended_monotonic_ns is not None and ended_monotonic_ns < run.started_monotonic_ns):
             outcome, reason_code = TelemetryOutcome.CLOCK_ANOMALY, _ANOMALY
-        updated = replace(run, outcome=outcome, reason_code=reason_code, ended_at=ended_at)
+        updated = replace(run, outcome=outcome, reason_code=reason_code, ended_at=ended_at,
+                          ended_monotonic_ns=ended_monotonic_ns)
         _save_run(directory, ledger, updated)
         return updated
 
@@ -598,6 +776,68 @@ def summarize_run(cwd: Path, *, run_id: str | None = None) -> dict[str, object]:
         "outcomes": {outcome.value: sum(item.outcome is outcome for item in run.spans) for outcome in TelemetryOutcome},
         "telemetry_incomplete": run.telemetry_incomplete,
         "anomaly_reason_codes": sorted({item.reason_code for item in run.spans if item.outcome is TelemetryOutcome.CLOCK_ANOMALY}
-                                       | ({run.reason_code} if run.outcome is TelemetryOutcome.CLOCK_ANOMALY else set())),
+                                       | ({run.reason_code} if run.outcome is TelemetryOutcome.CLOCK_ANOMALY else set())
+                                       | ({_ANOMALY} if _invocation_clock_anomaly(run) else set())),
         "early_detection": _early_detection(run),
+        "recovery": _recovery(run),
+        "invocation_elapsed_ms": _invocation_elapsed(run),
+    }
+
+
+def _invocation_clock_anomaly(run: TelemetryRun) -> bool:
+    if run.ended_monotonic_ns is None:
+        return False
+    return any(
+        item.outcome is TelemetryOutcome.CLOCK_ANOMALY
+        or item.started_monotonic_ns < run.started_monotonic_ns
+        or item.ended_monotonic_ns > run.ended_monotonic_ns
+        or item.started_at < run.started_at or item.ended_at > run.ended_at
+        for item in run.spans
+    )
+
+
+def _invocation_elapsed(run: TelemetryRun) -> int | None:
+    if (run.started_late or run.outcome in (None, TelemetryOutcome.INCOMPLETE, TelemetryOutcome.CLOCK_ANOMALY)
+            or run.ended_monotonic_ns is None
+            or _invocation_clock_anomaly(run)
+            or any(item.reason_code == "CONTROLLER_INTERRUPTED" for item in run.spans)):
+        return None
+    return (run.ended_monotonic_ns - run.started_monotonic_ns) // 1_000_000
+
+
+def _recovery(run: TelemetryRun) -> dict[str, object] | None:
+    invocation = run.invocation
+    if invocation is None:
+        if (
+            run.binding.contract["telemetry_schema"] < 3
+            or run.binding.status != "bound"
+        ):
+            return None
+        invocation = Invocation("new_round", (), ())
+    requests = [item for item in run.spans if item.stage is TelemetryStage.REVIEWER_DISPATCH_WAIT]
+    by_role = {role: [item.attempt for item in requests if item.reviewer is role] for role in Reviewer}
+    complete = not run.telemetry_incomplete and not any(
+        item.reason_code == "CONTROLLER_INTERRUPTED" for item in requests
+    ) and all(
+        attempts == list(range(1, len(attempts) + 1)) for attempts in by_role.values()
+    )
+    complete = complete and not any(by_role[role] for role in invocation.reused)
+    complete = complete and all(
+        item.attempt in by_role[item.reviewer] for item in run.spans
+        if item.stage in (TelemetryStage.REVIEWER_TOTAL, TelemetryStage.REPORT_STORE)
+    )
+    complete = complete and all(
+        bool(by_role[item.reviewer]) for item in run.spans
+        if item.stage is TelemetryStage.REPORT_VALIDATION and item.reviewer not in invocation.reused
+    )
+    requested = sum(bool(attempts) for attempts in by_role.values())
+    rerun = sum(bool(attempts) and (role in invocation.previously_attempted or len(attempts) > 1)
+                for role, attempts in by_role.items())
+    return {
+        "kind": invocation.kind, "reused_slot_count": len(invocation.reused),
+        "requested_slot_count": requested if complete else None,
+        "rerun_slot_count": rerun if complete else None,
+        "dispatch_request_count": len(requests) if complete else None,
+        "retry_request_count": len(requests) - requested if complete else None,
+        "accounting_complete": complete,
     }
