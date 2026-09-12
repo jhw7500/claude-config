@@ -16,20 +16,14 @@ REPO_DIR="$(cd -- "$SCRIPT_DIR" && pwd -P)"
 # shellcheck source=scripts/lib/private-file.sh
 . "$REPO_DIR/scripts/lib/private-file.sh"
 
-case "${1-}" in
-  "") INSTALL_MODE=full ;;
-  --launcher-only)
-    [ "$#" -eq 1 ] || {
-      echo "Usage: $0 [--launcher-only]" >&2
-      exit 2
-    }
-    INSTALL_MODE=launcher-only
-    ;;
-  *)
-    echo "Usage: $0 [--launcher-only]" >&2
-    exit 2
-    ;;
-esac
+if [ "$#" -eq 0 ]; then
+  INSTALL_MODE=full
+elif [ "$#" -eq 1 ] && [ "$1" = "--launcher-only" ]; then
+  INSTALL_MODE=launcher-only
+else
+  echo "Usage: $0 [--launcher-only]" >&2
+  exit 2
+fi
 
 if ! assert_trusted_command_path "$PATH"; then
   echo "[install] 오류: installer command path가 안전하지 않다" >&2

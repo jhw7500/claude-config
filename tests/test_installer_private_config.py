@@ -218,7 +218,15 @@ def test_launcher_only_preserves_pinned_tribunal_and_runtime_configs(
     assert not (home / ".local" / "share" / "claude-config").exists()
 
 
-@pytest.mark.parametrize("args", [("--unknown",), ("--launcher-only", "extra")])
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--unknown",),
+        ("--launcher-only", "extra"),
+        ("",),
+        ("", "--launcher-only"),
+    ],
+)
 def test_install_rejects_invalid_arguments_before_mutation(
     home: Path, args: tuple[str, ...],
 ) -> None:
