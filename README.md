@@ -99,24 +99,26 @@ plug off bkit                            # 플러그인 끄기 → 세션에서 
 
 ## Project Control Task launcher
 
-<!-- jhw-control-host-v4-operator-contract:start -->
+<!-- jhw-control-host-v5-operator-contract:start -->
 `jhw-control-host`는 clean shell에서 Project Control 호출에 필요한 non-secret 좌표와 세 credential을
 parent shell에 남기지 않고 child `jhw-control`에만 주입하는 **secure-store-only** launcher입니다.
-contract v4는 아래 13개 command family만 공개합니다. lifecycle mutation은 hidden preflight 뒤에만
-실행하고, 읽기 전용 진단은 preflight 장애 중에도 secure launcher 경계 안에서 실행합니다.
+contract v5는 아래 16개 command family만 공개합니다. lifecycle mutation은 hidden preflight 뒤에만
+실행하고, 읽기 전용 진단은 preflight 장애 중에도 secure launcher 경계 안에서 실행합니다. Board
+command는 credential provider와 hidden preflight를 거치지 않는 별도 config-only 경계를 사용합니다.
 
-### v4 contract inventory
+### v5 contract inventory
 
-<!-- jhw-control-host-v4-contract:start -->
-| Inventory | Exact v4 values |
+<!-- jhw-control-host-v5-contract:start -->
+| Inventory | Exact v5 values |
 | --- | --- |
-| launcher command families | `unlock`, `preflight`, `portfolio status`, `task start`, `task child-start`, `task contract`, `task completion-ready`, `task promote`, `task status`, `task handoff`, `task finish`, `task recover`, `task assert-owner` |
+| launcher command families | `unlock`, `preflight`, `portfolio status`, `task start`, `task child-start`, `task contract`, `task completion-ready`, `task promote`, `task status`, `task handoff`, `task finish`, `task recover`, `task assert-owner`, `board status`, `board acquire`, `board with` |
 | hidden preflight mutations | `task start`, `task child-start`, `task contract`, `task completion-ready`, `task promote`, `task finish`, `task recover --action force-end|takeover|cleanup` |
-| read-only without hidden preflight | `task status`, `task handoff`, `task assert-owner`, `task recover --action status` |
+| read-only without hidden preflight | `task status`, `task handoff`, `task assert-owner`, `task recover --action status`, `board status` |
+| credential-free board execution | `board status`, `board acquire`, `board with` |
 | compatibility projections | `task start`, `task finish`, `task child-start` |
 | generic Task results | canonical JSON object pass-through after common security validation |
 | downstream errors | code `[A-Z][A-Z0-9_]{1,63}`, optional reason `[a-z][a-z0-9_]{0,63}`, exit `1|2|4|75|78` |
-<!-- jhw-control-host-v4-contract:end -->
+<!-- jhw-control-host-v5-contract:end -->
 
 지원 범위는 Linux Secret Service(DBus session), `/usr/bin/python3`의 system `keyring`·`SecretStorage`,
 그리고 `auth status --show-token --json hosts`와 secure credential store를 지원하는 GitHub CLI입니다.
@@ -136,11 +138,17 @@ D-Bus에만 전달하고 argv·환경·파일·출력에는 넣지 않습니다.
 fail-closed합니다. 이미 풀렸으면 암호를 묻지 않습니다. 잠금 해제 후 backend를 고정해 다음 값을
 명시적으로 provision합니다.
 
-unlock 이외의 모든 command는 credential provider 실행 전후에 `NO_AUTO_START` probe를 수행합니다.
+Board command를 제외한 credential-dependent command는 provider 실행 전후에 `NO_AUTO_START` probe를 수행합니다.
 두 probe는 canonical user bus의 single Secret Service owner, GNOME private interface, login collection의
 unlocked 상태를 credential 없이 확인합니다. provider 구간에서 owner가 교체되면
 `OS_CREDENTIAL_STORE_CHANGED`로 실패하고 downstream control child를 실행하지 않습니다. process 수는
 authority가 아니며 launcher는 daemon을 start/restart/kill하지 않습니다.
+
+`board status`, `board acquire`, `board with`는 board registry와 host-local lock state에만 접근하므로
+Secret Service, GitHub CLI, Project token, Repository token, Notion credential을 조회하거나 child에
+전달하지 않습니다. `board status`와 `board acquire`는 bounded canonical JSON만 반환합니다. `board with`는
+lease를 잡은 뒤 실행하는 operator command의 stdio를 그대로 연결하고 종료 코드와 termination signal을
+보존합니다.
 
 ```bash
 /usr/bin/python3 -I -m keyring --keyring-backend keyring.backends.SecretService.Keyring set jhw-control GH_PROJECT_TOKEN
@@ -182,6 +190,9 @@ credential 조회 전에 같은 기준으로 검사하고, 검색 디렉터리 �
 "$HOME/.local/bin/jhw-control-host" task finish --task <tsk-id> --claim <clm-id> --status <completed|handoff|abandoned>
 "$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <clm-id> --action <status|force-end|takeover|cleanup>
 "$HOME/.local/bin/jhw-control-host" task assert-owner --task <tsk-id> --claim <clm-id>
+"$HOME/.local/bin/jhw-control-host" board status [<board-id>]
+"$HOME/.local/bin/jhw-control-host" board acquire <board-id> <acquire-args>
+"$HOME/.local/bin/jhw-control-host" board with <board-id> <lease-args> -- <command> [args...]
 ```
 
 재부팅 뒤에는 canonical owner가 준비된 후 interactive terminal에서 unlock을 한 번 허용합니다. 이어서
@@ -210,8 +221,10 @@ downstream error는 stable code, optional bounded reason, 원래 exit를 보존�
 code allowlist나 code-to-exit 표를 복제하지 않습니다. workflow 분기에 필요한 `conflicting_claim`은
 `task_id`, `claim_id`, `host`, `branch`, `worktree_ref`, `started_at` 여섯 coordinate만 남깁니다.
 `retained_claim`, `retained_task`도 각 canonical coordinate만 남기고 그 밖의 detail은 폐기합니다.
+`COMMAND_FAILED`의 bounded `command`, `exit_code`, optional `stderr_head`는 진단을 위해 보존하고,
+Board 충돌은 bounded `conflicting_board`의 `board_id`와 holder 또는 reservation coordinate만 남깁니다.
 
-모든 child output은 최대 12 KiB, duplicate-free 단일 JSON, success stdout/error stderr, success command
+`board with`의 streaming operator output을 제외한 모든 child output은 최대 12 KiB, duplicate-free 단일 JSON, success stdout/error stderr, success command
 binding을 만족해야 합니다. credential과 protected config/store/state/checkout path가 raw 또는 encoded
 형태로 섞이면 `SENSITIVE_OUTPUT_REJECTED`로 전체 출력을 폐기합니다. raw `jhw-control task`, ambient
 credential, 파일 credential fallback은 제공하지 않습니다.
@@ -221,7 +234,7 @@ producer rollout 순서는 `producer merge → install.sh 재실행 → clean-sh
 #68 stability gate는 `canonical owner 확인 → 필요 시 1회 interactive unlock → clean contract/preflight
 → tmux clean preflight → consumer 전환` 순서로 위 rollout 사이에 적용합니다. credential migration은
 없으며 rollback도 이전 검증 launcher의 atomic 재설치와 같은 unlock/preflight 검증만 수행합니다.
-<!-- jhw-control-host-v4-operator-contract:end -->
+<!-- jhw-control-host-v5-operator-contract:end -->
 
 ## MCP 등록 (opt-in)
 
