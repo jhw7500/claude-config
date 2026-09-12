@@ -141,7 +141,7 @@ def begin_legacy_round(repo, **kwargs):
 @pytest.mark.parametrize("reviewer", "ABC")
 @pytest.mark.parametrize("tamper", ("bytes", "mode", "symlink", "owner", "context", "parsed", "contract"))
 def test_finalize_authenticates_every_sealed_receipt(git_repo, tamper, reviewer, monkeypatch):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     for key in "ABC":
         submit_reviewer_report(git_repo, reviewer=Reviewer(key),
                                raw=json.dumps(report(pending.snapshot, key)).encode(), now=NOW)
@@ -186,7 +186,7 @@ def test_finalize_authenticates_every_sealed_receipt(git_repo, tamper, reviewer,
 
 @pytest.mark.parametrize("sealed", (0, 2, 3))
 def test_v2_round_not_ready_and_successful_terminal_roundtrip(git_repo, sealed):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     for key in "ABC"[:sealed]:
         submit_reviewer_report(git_repo, reviewer=Reviewer(key),
                                raw=json.dumps(report(pending.snapshot, key)).encode(), now=NOW)
@@ -218,7 +218,7 @@ def test_v2_terminal_aggregates_every_sealed_report(git_repo, severity, status, 
 
 @pytest.mark.parametrize("version", (1, 2))
 def test_begin_refuses_pending_reset_without_losing_reports(git_repo, version):
-    pending = legacy_pending(git_repo) if version == 1 else write_v2_pending(git_repo)
+    pending = legacy_pending(git_repo) if version == 1 else write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=[finding()])).encode()
     if version == 1:
         store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
@@ -238,7 +238,7 @@ def test_new_round_writer_uses_schema_three(git_repo):
 @pytest.mark.parametrize("replacement", (False, True))
 @pytest.mark.parametrize("orphan", (False, True))
 def test_legacy_store_never_mutates_v2_canonical_or_orphan(git_repo, replacement, orphan):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=[finding()])).encode()
     path = git_repo / ".review/inbox/round-1/A.json"
     if orphan:
@@ -384,7 +384,7 @@ def test_legacy_migration_snapshot_drift_preserves_canonical_and_verdict(git_rep
     assert not (git_repo / ".review/attempts").exists()
 
 
-def write_v2_pending(git_repo):
+def write_current_pending(git_repo):
     return begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
@@ -424,7 +424,7 @@ def test_storage_rechecks_exclusion_before_report_or_attempt_publication(git_rep
     )
     exclude = git_repo / ".git/info/exclude"
     exclude.write_text(".review/\n", encoding="utf-8")
-    pending = legacy_pending(git_repo) if operation == "legacy" else write_v2_pending(git_repo)
+    pending = legacy_pending(git_repo) if operation == "legacy" else write_current_pending(git_repo)
     value = report(pending.snapshot, "A")
     if operation == "secret-marker":
         value["executions"] = [{**execution(), "stdout_excerpt": "ghp_nonfunctional_fixture_marker"}]
@@ -455,7 +455,7 @@ def test_storage_rechecks_exclusion_before_report_or_attempt_publication(git_rep
 
 @pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
 def test_submit_valid_report_seals_only_its_slot(git_repo, mask):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A"), separators=(",", ":")).encode() + b"\r\n"
     previous = os.umask(mask)
     try:
@@ -484,7 +484,7 @@ def test_submit_valid_report_seals_only_its_slot(git_repo, mask):
     (b"x" * (MAX_REPORT_BYTES + 1), "REPORT_TOO_LARGE"),
 ), ids=("malformed", "duplicate", "oversize"))
 def test_submit_malformed_report_records_attempt_without_touching_peers(git_repo, raw, code):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     with pytest.raises(SchemaError, match=f"^{code}$"):
         submit_reviewer_report(git_repo, reviewer=Reviewer.C, raw=raw, now=NOW)
     stored = read_verdict(git_repo)
@@ -498,7 +498,7 @@ def test_submit_malformed_report_records_attempt_without_touching_peers(git_repo
 
 
 def test_record_timeout_changes_only_pending_slot(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     slot = record_reviewer_failure(git_repo, reviewer=Reviewer.B, reason_code="REVIEWER_TIMEOUT")
     assert slot.attempt_count == 1 and slot.last_error == "REVIEWER_TIMEOUT"
     stored = read_verdict(git_repo)
@@ -508,7 +508,7 @@ def test_record_timeout_changes_only_pending_slot(git_repo):
 
 
 def test_submit_after_failure_clears_error_and_preserves_peer_context(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     digest = context_sha256(pending, Reviewer.C)
     record_reviewer_failure(git_repo, reviewer=Reviewer.C, reason_code="REVIEWER_FAILED")
     submit_reviewer_report(git_repo, reviewer=Reviewer.A,
@@ -522,7 +522,7 @@ def test_submit_after_failure_clears_error_and_preserves_peer_context(git_repo):
 
 
 def test_submit_blocker_containing_report_seals(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=(finding(),))).encode()
     submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
     stored = read_verdict(git_repo)
@@ -533,7 +533,7 @@ def test_submit_blocker_containing_report_seals(git_repo):
 
 @pytest.mark.parametrize("operation", ("submit", "failure"))
 def test_sealed_slot_rejects_report_or_reviewer_failure_without_mutation(git_repo, operation):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A")).encode()
     submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
     verdict_path = git_repo / ".review/verdict.json"
@@ -550,7 +550,7 @@ def test_sealed_slot_rejects_report_or_reviewer_failure_without_mutation(git_rep
 @pytest.mark.parametrize("operation", ("submit", "failure"))
 @pytest.mark.parametrize("drift", ("contract", "snapshot"))
 def test_submit_and_reviewer_failure_drift_preserve_all_bytes(git_repo, operation, drift):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     if drift == "contract":
         pending = replace(pending, contract=replace(pending.contract, report_text=99))
         write_json(git_repo / ".review/verdict.json", pending.to_json())
@@ -576,7 +576,7 @@ def test_submit_report_published_before_verdict_failure_is_sealed_without_replac
 ):
     from pre_pr_tribunal import verdict_store
 
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=(finding(),))).encode() + b"\n"
     if replacement is None:
         replacement = json.dumps(report(pending.snapshot, "A")).encode()
@@ -599,7 +599,7 @@ def test_submit_report_published_before_verdict_failure_is_sealed_without_replac
 
 @pytest.mark.parametrize("kind", ("invalid", "symlink", "fifo", "mode", "owner"))
 def test_submit_never_overwrites_invalid_or_unsafe_canonical(git_repo, monkeypatch, kind):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     target = git_repo / ".review/inbox/round-1/A.json"
     raw = json.dumps(report(pending.snapshot, "A")).encode()
     if kind == "symlink":
@@ -632,7 +632,7 @@ def test_submit_never_overwrites_invalid_or_unsafe_canonical(git_repo, monkeypat
 
 @pytest.mark.parametrize("code", ("JSON_INVALID", "FILE_UNSAFE", "REPORT_WRITE_FAILED", "unknown"))
 def test_reviewer_failure_rejects_non_operational_reasons(git_repo, code):
-    write_v2_pending(git_repo)
+    write_current_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
     with pytest.raises(SchemaError, match="^REVIEWER_FAILURE_INVALID$"):
         record_reviewer_failure(git_repo, reviewer=Reviewer.A, reason_code=code)
@@ -652,7 +652,7 @@ def test_reviewer_failure_rejects_non_operational_reasons(git_repo, code):
 def test_bounded_content_errors_preserve_exact_evidence_and_pending_slot(git_repo, fields, code, legacy):
     from pre_pr_tribunal import verdict_store
 
-    pending = legacy_pending(git_repo) if legacy else write_v2_pending(git_repo)
+    pending = legacy_pending(git_repo) if legacy else write_current_pending(git_repo)
     peer_raw = json.dumps(report(pending.snapshot, "B", findings=[
         finding("B-R1-001", reviewer="B", execution_ids=["B-R1-E001"])],
         executions=[execution("B-R1-E001")])).encode()
@@ -692,7 +692,7 @@ def test_bounded_content_errors_preserve_exact_evidence_and_pending_slot(git_rep
 
 
 def test_submit_orphan_content_error_is_integrity_stop_without_failure_evidence(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     raw = json.dumps(report(pending.snapshot, "A", findings=[finding()] * 129)).encode()
     target = git_repo / ".review/inbox/round-1/A.json"
     target.write_bytes(raw)
@@ -707,7 +707,7 @@ def test_submit_orphan_content_error_is_integrity_stop_without_failure_evidence(
 
 
 def test_submit_accepts_cumulative_attempts_after_three_failures(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     for _ in range(5):
         record_reviewer_failure(git_repo, reviewer=Reviewer.C, reason_code="REVIEWER_TIMEOUT")
     assert read_verdict(git_repo).reviewers["C"].attempt_count == 5
@@ -724,7 +724,7 @@ def test_submit_accepts_cumulative_attempts_after_three_failures(git_repo):
 
 
 def test_v2_pending_cumulative_attempt_count_roundtrips_above_three(git_repo):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     pending = replace(pending, reviewers={**pending.reviewers,
         "C": ReviewerSlot("pending", attempt_count=5, last_error="REVIEWER_TIMEOUT")})
     write_json(git_repo / ".review/verdict.json", pending.to_json())
@@ -732,7 +732,7 @@ def test_v2_pending_cumulative_attempt_count_roundtrips_above_three(git_repo):
 
 
 def test_submit_unbounded_raw_input_preserves_verdict_without_evidence(git_repo):
-    write_v2_pending(git_repo)
+    write_current_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
     with pytest.raises(SchemaError, match="^REPORT_TOO_LARGE$"):
         submit_reviewer_report(git_repo, reviewer=Reviewer.C,
@@ -743,7 +743,7 @@ def test_submit_unbounded_raw_input_preserves_verdict_without_evidence(git_repo)
 
 
 def test_submit_report_write_failure_is_not_a_retryable_attempt(git_repo, monkeypatch):
-    pending = write_v2_pending(git_repo)
+    pending = write_current_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
     raw = json.dumps(report(pending.snapshot, "A")).encode()
 
@@ -763,7 +763,7 @@ def test_submit_report_write_failure_is_not_a_retryable_attempt(git_repo, monkey
 
 
 def test_submit_evidence_write_failure_preserves_all_slots(git_repo, monkeypatch):
-    write_v2_pending(git_repo)
+    write_current_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
 
     real_write = os.write
@@ -783,7 +783,7 @@ def test_submit_evidence_write_failure_preserves_all_slots(git_repo, monkeypatch
 def test_reviewer_failure_verdict_publication_failure_preserves_prior_verdict_and_evidence(
     git_repo, monkeypatch
 ):
-    write_v2_pending(git_repo)
+    write_current_pending(git_repo)
     before = (git_repo / ".review/verdict.json").read_bytes()
 
     def fail_replace(*args, **kwargs):

@@ -849,7 +849,7 @@ def _record_failure_locked(
 def submit_reviewer_report(
     cwd: Path, *, reviewer: Reviewer, raw: bytes, now: Callable[[], str] = utc_now,
 ) -> ReportReceipt:
-    """Validate exact bytes, publish the canonical report, and seal one v2 slot."""
+    """Validate exact bytes, publish the canonical report, and seal one current schema-3 slot."""
     if not isinstance(reviewer, Reviewer) or not isinstance(raw, bytes):
         raise SchemaError("REPORT_SCHEMA_INVALID")
     root = repository_root(cwd)
@@ -916,7 +916,7 @@ def submit_reviewer_report(
 def record_reviewer_failure(
     cwd: Path, *, reviewer: Reviewer, reason_code: str,
 ) -> ReviewerSlot:
-    """Persist one bounded operational failure for a still-pending v2 slot."""
+    """Persist one bounded operational failure for a still-pending current schema-3 slot."""
     if (
         not isinstance(reviewer, Reviewer)
         or not isinstance(reason_code, str)

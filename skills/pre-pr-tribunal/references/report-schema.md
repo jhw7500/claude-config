@@ -89,7 +89,7 @@ The exact controller command shapes are below. `submit-report` reads exact repor
 | authenticate all three and aggregate | `finalize` |
 <!-- controller-command-examples-end -->
 
-Schema-1 and schema-2 verdicts remain readable for explicit migration only. New rounds and both migration commands write schema 3. A schema-2 migration validates every sealed report and receipt before one atomic verdict replacement; it never rewrites report bytes or infers pre-migration telemetry identity.
+Schema-1 and schema-2 verdicts remain readable without rewrite; pending recovery requires explicit migration. New rounds and both migration commands write schema 3. A schema-2 migration validates every sealed report and receipt before one atomic verdict replacement; it never rewrites report bytes or infers pre-migration telemetry identity.
 
 ### Format failures
 
