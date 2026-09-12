@@ -4,12 +4,13 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
-from pre_pr_tribunal import telemetry
+from pre_pr_tribunal import cli, telemetry
 from pre_pr_tribunal.git_state import capture_snapshot
-from pre_pr_tribunal.model import Reviewer
+from pre_pr_tribunal.model import Reviewer, SchemaError
 
 
 CLI = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
@@ -281,6 +282,120 @@ def test_resume_scopes_prior_requests_to_current_lifecycle(git_repo, old_history
     assert recovery["rerun_slot_count"] == 0
 
 
+def test_resume_ignores_old_requests_after_current_marker_is_evicted(git_repo):
+    """Evicting the current marker must not expose an older lifecycle's requests."""
+    old = payload(
+        git_repo, "begin", "--base", "master", "--runtime", "codex", "--round", "1",
+    )
+    dispatch(git_repo, old["telemetry"]["run_id"], "B", 1)
+    for role in "ABC":
+        payload(git_repo, "submit-report", "--reviewer", role, raw=report(old, role))
+    payload(git_repo, "finalize")
+    payload(
+        git_repo, "telemetry-close", "--run-id", old["telemetry"]["run_id"],
+        "--outcome", "success",
+    )
+
+    current = payload(
+        git_repo, "begin", "--base", "master", "--runtime", "codex", "--round", "1",
+    )
+    for role in "AC":
+        payload(git_repo, "submit-report", "--reviewer", role, raw=report(current, role))
+    current_run_id = current["telemetry"]["run_id"]
+    payload(
+        git_repo, "telemetry-close", "--run-id", current_run_id,
+        "--outcome", "success",
+    )
+
+    snapshot = capture_snapshot(git_repo, "master")
+    for number in range(14):
+        filler = telemetry.create_run(
+            git_repo, base_ref="master", runtime="codex", round_number=2,
+            started_at="2026-09-13T00:00:00Z", started_monotonic_ns=1,
+            token_hex=lambda _size, value=number: f"{value + 1:032x}",
+        )
+        telemetry.bind_run(
+            git_repo, run_id=filler.run_id, snapshot=snapshot,
+            lifecycle_id=f"{number + 100:032x}",
+        )
+        outcome = (
+            telemetry.TelemetryOutcome.INCOMPLETE
+            if number == 0 else telemetry.TelemetryOutcome.SUCCESS
+        )
+        telemetry.close_run(
+            git_repo, run_id=filler.run_id, outcome=outcome,
+            reason_code="CONTROLLER_INTERRUPTED" if number == 0 else None,
+            ended_at="2026-09-13T00:00:01Z", ended_monotonic_ns=2,
+        )
+
+    path = git_repo / ".review/telemetry.json"
+    ledger = json.loads(path.read_bytes())
+    marker = next(item for item in ledger["runs"] if item["run_id"] == current_run_id)
+    marker["started_at"] = "2000-01-01T00:00:00Z"
+    path.write_text(json.dumps(ledger))
+    path.chmod(0o600)
+
+    first = payload(git_repo, "telemetry-resume", "--runtime", "codex")
+    assert all(
+        run.run_id != current_run_id for run in telemetry.read_ledger(git_repo).runs
+    )
+    payload(
+        git_repo, "telemetry-close", "--run-id", first["run_id"],
+        "--outcome", "success",
+    )
+    second = payload(git_repo, "telemetry-resume", "--runtime", "codex")
+    dispatch(git_repo, second["run_id"], "B", 1)
+    recovery = payload(
+        git_repo, "telemetry-summary", "--run-id", second["run_id"],
+    )["recovery"]
+    assert recovery["accounting_complete"] is True
+    assert recovery["rerun_slot_count"] == 0
+
+
+def test_resume_marks_history_unknown_when_current_begin_telemetry_is_missing(
+    git_repo, monkeypatch,
+):
+    """A missing current marker must not make older lifecycle history authoritative."""
+    old = payload(
+        git_repo, "begin", "--base", "master", "--runtime", "codex", "--round", "1",
+    )
+    dispatch(git_repo, old["telemetry"]["run_id"], "B", 1)
+    for role in "ABC":
+        payload(git_repo, "submit-report", "--reviewer", role, raw=report(old, role))
+    payload(git_repo, "finalize")
+    payload(
+        git_repo, "telemetry-close", "--run-id", old["telemetry"]["run_id"],
+        "--outcome", "success",
+    )
+
+    original_create_run = telemetry.create_run
+    monkeypatch.setattr(
+        telemetry, "create_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            SchemaError("TELEMETRY_TOO_LARGE")
+        ),
+    )
+    verdict, projection = cli._begin_with_telemetry(
+        git_repo,
+        SimpleNamespace(base="master", runtime="codex", round=1, decisions=None),
+    )
+    assert projection == {
+        "status": "unavailable", "reason_code": "TELEMETRY_TOO_LARGE",
+    }
+    monkeypatch.setattr(telemetry, "create_run", original_create_run)
+
+    current = {"snapshot": verdict.snapshot.to_json()}
+    for role in "AC":
+        payload(git_repo, "submit-report", "--reviewer", role, raw=report(current, role))
+    resumed = payload(git_repo, "telemetry-resume", "--runtime", "codex")
+    dispatch(git_repo, resumed["run_id"], "B", 1)
+    recovery = payload(
+        git_repo, "telemetry-summary", "--run-id", resumed["run_id"],
+    )["recovery"]
+    assert recovery["accounting_complete"] is False
+    assert recovery["rerun_slot_count"] is None
+
+
 @pytest.mark.parametrize("change", ("dirty", "tampered_receipt", "active_observation", "terminal_verdict"))
 def test_resume_refuses_unverifiable_or_ambiguous_observation_without_writes(git_repo, change):
     begun = pending_b(git_repo, close=change != "active_observation")
@@ -308,8 +423,7 @@ def test_new_round_starts_with_zero_reuse_and_does_not_inherit_old_attempts(git_
     run = telemetry.create_run(git_repo, base_ref="master", runtime="codex", round_number=2,
                                started_at=NOW, started_monotonic_ns=0)
     telemetry.bind_run(git_repo, run_id=run.run_id, snapshot=snapshot,
-                       lifecycle_id=LIFECYCLE,
-                       invocation=telemetry.Invocation("new_round", (), ()))
+                       lifecycle_id=LIFECYCLE)
     summary = telemetry.summarize_run(git_repo, run_id=run.run_id)
     assert summary["recovery"] == {
         "kind": "new_round", "reused_slot_count": 0, "requested_slot_count": 0,
@@ -324,8 +438,7 @@ def test_elapsed_is_measured_once_not_sum_of_overlapping_reviewer_spans(git_repo
                                started_at=NOW, started_monotonic_ns=0)
     run_id = run.run_id
     telemetry.bind_run(git_repo, run_id=run_id, snapshot=capture_snapshot(git_repo, "master"),
-                       lifecycle_id=LIFECYCLE,
-                       invocation=telemetry.Invocation("new_round", (), ()))
+                       lifecycle_id=LIFECYCLE)
     for role in (Reviewer.A, Reviewer.C):
         span = telemetry.start_span(git_repo, run_id=run_id, stage=telemetry.TelemetryStage.REVIEWER_TOTAL,
             reviewer=role, attempt=1, started_at=run.started_at,
@@ -401,6 +514,7 @@ def test_duplicate_or_gapped_dispatch_counts_are_unknown(git_repo, attempts):
 @pytest.mark.parametrize("invocation", (
     {"kind": "resume", "reused": ["A", "A"], "previously_attempted": []},
     {"kind": "resume", "reused": ["A"], "previously_attempted": ["A"]},
+    {"kind": "new_round", "reused": [], "previously_attempted": []},
     {"kind": "new_round", "reused": ["A"], "previously_attempted": []},
     {"kind": "resume", "reused": ["D"], "previously_attempted": []},
     {"kind": "resume", "reused": [], "previously_attempted": [], "command": "ignored?"},

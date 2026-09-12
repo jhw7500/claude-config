@@ -654,14 +654,53 @@ def test_schema_three_bound_run_records_lifecycle_id(git_repo):
     bound = bind_run(
         git_repo, run_id=run.run_id, snapshot=snapshot,
         lifecycle_id=LIFECYCLE,
-        invocation=telemetry_module.Invocation("new_round", (), ()),
     )
     raw = json.loads(ledger_path(git_repo).read_bytes())["runs"][0]
     assert raw["lifecycle_id"] == LIFECYCLE
-    assert raw["invocation"] == {
+    assert raw["invocation"] is None
+    assert summarize_run(git_repo, run_id=bound.run_id)["recovery"]["kind"] == "new_round"
+
+
+def test_schema_three_rejects_persisted_new_round_invocation_without_rewrite(git_repo):
+    snapshot = capture_snapshot(git_repo, "master", now=NOW)
+    run = new_run(git_repo)
+    bind_run(
+        git_repo, run_id=run.run_id, snapshot=snapshot,
+        lifecycle_id=LIFECYCLE,
+    )
+    path = ledger_path(git_repo)
+    value = json.loads(path.read_bytes())
+    value["runs"][0]["invocation"] = {
         "kind": "new_round", "reused": [], "previously_attempted": [],
     }
-    assert summarize_run(git_repo, run_id=bound.run_id)["recovery"]["kind"] == "new_round"
+    corrupted = json.dumps(value).encode()
+    path.write_bytes(corrupted)
+    with pytest.raises(SchemaError, match="^TELEMETRY_INVALID$"):
+        read_ledger(git_repo)
+    assert path.read_bytes() == corrupted
+
+
+def test_schema_two_new_round_invocation_remains_readable(git_repo):
+    snapshot = capture_snapshot(git_repo, "master", now=NOW)
+    run = new_run(git_repo)
+    bind_run(
+        git_repo, run_id=run.run_id, snapshot=snapshot,
+        lifecycle_id=LIFECYCLE,
+    )
+    path = ledger_path(git_repo)
+    value = json.loads(path.read_bytes())
+    value["schema"] = 2
+    stored = value["runs"][0]
+    stored["binding"]["contract"]["telemetry_schema"] = 2
+    del stored["lifecycle_id"]
+    stored["invocation"] = {
+        "kind": "new_round", "reused": [], "previously_attempted": [],
+    }
+    raw = json.dumps(value).encode()
+    path.write_bytes(raw)
+    parsed = read_ledger(git_repo).runs[0]
+    assert parsed.invocation == telemetry_module.Invocation("new_round", (), ())
+    assert path.read_bytes() == raw
 
 
 @pytest.mark.parametrize(

@@ -317,7 +317,7 @@ def _array(value: object, maximum: int) -> list:
     return value
 
 
-def _parse_invocation(value: object) -> Invocation | None:
+def _parse_invocation(value: object, *, telemetry_schema: int) -> Invocation | None:
     if value is None:
         return None
     obj = _object(value, "kind reused previously_attempted")
@@ -327,6 +327,7 @@ def _parse_invocation(value: object) -> Invocation | None:
     _require(all(len(set(items)) == len(items) for items in roles))
     _require(not set(roles[0]) & set(roles[1]))
     _require(obj["kind"] != "new_round" or not any(roles))
+    _require(telemetry_schema < 3 or obj["kind"] == "resume")
     return Invocation(obj["kind"], *roles)
 
 
@@ -364,7 +365,10 @@ def _parse_run(value: object) -> TelemetryRun:
             if binding.status == "pending"
             else isinstance(lifecycle_id, str) and _LIFECYCLE_ID.fullmatch(lifecycle_id)
         )
-    invocation = _parse_invocation(obj.get("invocation"))
+    invocation = _parse_invocation(
+        obj.get("invocation"),
+        telemetry_schema=binding.contract["telemetry_schema"],
+    )
     _require(invocation is None or binding.status == "bound")
     for name in ("started_late", "telemetry_incomplete"):
         _require(type(obj[name]) is bool)
@@ -497,6 +501,7 @@ def _bound_snapshot(snapshot: Snapshot) -> TelemetryBinding:
 
 def _prior_request_history(
     ledger: TelemetryLedger, snapshot: Snapshot, round_number: int,
+    lifecycle_id: str,
 ) -> tuple[set[Reviewer], bool]:
     expected = _bound_snapshot(snapshot)
     fields = (
@@ -506,6 +511,7 @@ def _prior_request_history(
     matching = [
         run for run in ledger.runs
         if run.round == round_number
+        and run.lifecycle_id == lifecycle_id
         and run.binding.status == "bound"
         and all(
             getattr(run.binding, name) == getattr(expected, name)
@@ -516,11 +522,6 @@ def _prior_request_history(
             for name in ("report_text", "diff_recipe")
         )
     ]
-    lifecycle_start = max((
-        index for index, run in enumerate(matching)
-        if run.invocation is not None and run.invocation.kind == "new_round"
-    ), default=0)
-    matching = matching[lifecycle_start:]
     if not matching:
         return set(), False
     complete = True
@@ -565,7 +566,7 @@ def resume_run(cwd: Path, *, runtime: str, started_at: str, started_monotonic_ns
             _require(_snapshot_equal(verdict, snapshot))
             ledger = _read(directory)
             observed, history_complete = _prior_request_history(
-                ledger, snapshot, verdict.round,
+                ledger, snapshot, verdict.round, verdict.lifecycle_id,
             )
             reused, attempted = [], []
             for reviewer in Reviewer:
@@ -805,8 +806,14 @@ def _invocation_elapsed(run: TelemetryRun) -> int | None:
 
 
 def _recovery(run: TelemetryRun) -> dict[str, object] | None:
-    if run.invocation is None:
-        return None
+    invocation = run.invocation
+    if invocation is None:
+        if (
+            run.binding.contract["telemetry_schema"] < 3
+            or run.binding.status != "bound"
+        ):
+            return None
+        invocation = Invocation("new_round", (), ())
     requests = [item for item in run.spans if item.stage is TelemetryStage.REVIEWER_DISPATCH_WAIT]
     by_role = {role: [item.attempt for item in requests if item.reviewer is role] for role in Reviewer}
     complete = not run.telemetry_incomplete and not any(
@@ -814,20 +821,20 @@ def _recovery(run: TelemetryRun) -> dict[str, object] | None:
     ) and all(
         attempts == list(range(1, len(attempts) + 1)) for attempts in by_role.values()
     )
-    complete = complete and not any(by_role[role] for role in run.invocation.reused)
+    complete = complete and not any(by_role[role] for role in invocation.reused)
     complete = complete and all(
         item.attempt in by_role[item.reviewer] for item in run.spans
         if item.stage in (TelemetryStage.REVIEWER_TOTAL, TelemetryStage.REPORT_STORE)
     )
     complete = complete and all(
         bool(by_role[item.reviewer]) for item in run.spans
-        if item.stage is TelemetryStage.REPORT_VALIDATION and item.reviewer not in run.invocation.reused
+        if item.stage is TelemetryStage.REPORT_VALIDATION and item.reviewer not in invocation.reused
     )
     requested = sum(bool(attempts) for attempts in by_role.values())
-    rerun = sum(bool(attempts) and (role in run.invocation.previously_attempted or len(attempts) > 1)
+    rerun = sum(bool(attempts) and (role in invocation.previously_attempted or len(attempts) > 1)
                 for role, attempts in by_role.items())
     return {
-        "kind": run.invocation.kind, "reused_slot_count": len(run.invocation.reused),
+        "kind": invocation.kind, "reused_slot_count": len(invocation.reused),
         "requested_slot_count": requested if complete else None,
         "rerun_slot_count": rerun if complete else None,
         "dispatch_request_count": len(requests) if complete else None,
