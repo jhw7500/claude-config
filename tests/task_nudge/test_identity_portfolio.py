@@ -144,16 +144,42 @@ def test_portfolio_complete_miss_is_unregistered(core):
     assert result.status is core.RegistrationStatus.UNREGISTERED
 
 
-def test_portfolio_truncated_miss_is_unknown(core):
+@pytest.mark.parametrize(("page_items", "total_items"), [(1, 2), (14, 19)])
+def test_portfolio_project_pagination_does_not_hide_registry_miss(core, page_items, total_items):
+    payload = portfolio_payload(slugs=("jhw7500/other",), truncated=True, total_items=total_items)
+    payload["result"]["items"] = [
+        {"project_id": f"project-{index}", "title": "Project", "repo_ids": ["repo-1"]}
+        for index in range(page_items)
+    ]
     result = core.parse_portfolio_output(
-        portfolio_bytes(slugs=("jhw7500/other",), truncated=True),
-        "jhw7500/claude-config",
+        json.dumps(payload).encode(),
+        "jhw7500/tossapp",
     )
     assert result == core.RegistrationResult(
-        core.RegistrationStatus.UNKNOWN,
-        "jhw7500/claude-config",
-        "PORTFOLIO_RESULT_INCOMPLETE",
+        core.RegistrationStatus.UNREGISTERED,
+        "jhw7500/tossapp",
     )
+
+
+def test_query_registration_uses_complete_registry_without_fetching_project_pages(core):
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=portfolio_bytes(slugs=("jhw7500/other",), truncated=True),
+            stderr=b"",
+        )
+
+    result = core.query_registration(
+        core.RepositoryIdentity(Path("/workspace/project"), "jhw7500/tossapp"),
+        Path("/safe/home"),
+        runner=runner,
+    )
+
+    assert result.status is core.RegistrationStatus.UNREGISTERED
+    assert calls == [["/safe/home/.local/bin/jhw-control-host", "portfolio", "status"]]
 
 
 def test_portfolio_rejects_duplicate_json_keys(core):
