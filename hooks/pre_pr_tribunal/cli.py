@@ -33,6 +33,7 @@ if __package__ in {None, ""}:
         begin_round,
         finalize_round,
         migrate_legacy_pending_round,
+        migrate_v2_pending_round,
         read_verdict,
         record_reviewer_failure,
         store_reviewer_report,
@@ -58,6 +59,7 @@ else:
         begin_round,
         finalize_round,
         migrate_legacy_pending_round,
+        migrate_v2_pending_round,
         read_verdict,
         record_reviewer_failure,
         store_reviewer_report,
@@ -92,6 +94,7 @@ def _parser() -> argparse.ArgumentParser:
         choices=("DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"),
     )
     commands.add_parser("migrate-legacy-pending", add_help=False)
+    commands.add_parser("migrate-v2-pending", add_help=False)
     store = commands.add_parser("store-report", add_help=False)
     store.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     store.add_argument("--replace-pending-recovery", action="store_true")
@@ -377,6 +380,13 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
             payload = {
                 "round": migrated.round,
                 "reviewers": dict(migrated.reviewers),
+            }
+        elif arguments.command == "migrate-v2-pending":
+            migrated = migrate_v2_pending_round(cwd)
+            payload = {
+                "round": migrated.round,
+                "reviewers": dict(migrated.reviewers),
+                "telemetry_history": migrated.telemetry_history,
             }
         elif arguments.command == "store-report":
             receipt = store_reviewer_report(

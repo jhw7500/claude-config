@@ -1354,7 +1354,58 @@ class LegacyMigrationResult:
     reviewers: Mapping[str, str]
 
 
-def migrate_legacy_pending_round(cwd: Path) -> LegacyMigrationResult:
+@dataclass(frozen=True)
+class PendingMigrationResult:
+    round: int
+    reviewers: Mapping[str, str]
+    telemetry_history: str
+
+
+def migrate_v2_pending_round(
+    cwd: Path, *, token_hex: Callable[[int], str] = secrets.token_hex,
+) -> PendingMigrationResult:
+    """Atomically assign a lifecycle ID to a verified schema-2 pending verdict."""
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        legacy = _read_verdict_locked(review_fd)
+        if (
+            legacy.schema != m.SLOT_VERDICT_SCHEMA_VERSION
+            or legacy.gate.status is not GateStatus.IN_PROGRESS
+        ):
+            raise SchemaError("V2_MIGRATION_NOT_ALLOWED")
+        snapshot = capture_snapshot(root, legacy.base_ref)
+        if not _snapshot_equal(legacy, snapshot):
+            raise SchemaError("SNAPSHOT_CHANGED")
+        current = current_contract_binding()
+        if (
+            legacy.contract is None
+            or legacy.contract.report_text != current.report_text
+            or legacy.contract.diff_recipe != current.diff_recipe
+            or legacy.contract.verdict_schema != m.SLOT_VERDICT_SCHEMA_VERSION
+        ):
+            raise SchemaError("CONTRACT_DRIFT")
+        for key in "ABC":
+            if legacy.reviewers[key].status == "sealed":
+                _read_sealed_report(review_fd, legacy, Reviewer(key))
+        migrated = replace(
+            legacy,
+            schema=m.VERDICT_SCHEMA_VERSION,
+            contract=current,
+            lifecycle_id=_lifecycle_id(token_hex),
+        )
+        _atomic_write(review_fd, migrated)
+        return PendingMigrationResult(
+            migrated.round,
+            {key: migrated.reviewers[key].status for key in "ABC"},
+            "unknown",
+        )
+
+
+def migrate_legacy_pending_round(
+    cwd: Path, *, token_hex: Callable[[int], str] = secrets.token_hex,
+) -> LegacyMigrationResult:
     """Preserve all legacy bytes and atomically migrate A/B/C to pending current slots.
 
     Historical telemetry has no byte/context hashes. Its successful spans cannot
@@ -1375,7 +1426,7 @@ def migrate_legacy_pending_round(cwd: Path) -> LegacyMigrationResult:
             legacy.snapshot, runtime=legacy.producer_runtime,
             initial_paths=legacy.initial_paths, round_number=legacy.round,
             decisions=legacy.decisions, history=legacy.history,
-            contract=current_contract_binding(), lifecycle_id=_lifecycle_id(secrets.token_hex),
+            contract=current_contract_binding(), lifecycle_id=_lifecycle_id(token_hex),
         )
         round_fd = _round_fd(
             review_fd, legacy.round, create=False, exact_report_directories=True

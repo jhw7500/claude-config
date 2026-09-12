@@ -258,11 +258,14 @@ def test_legacy_migration_retains_all_bytes_without_inventing_provenance(git_rep
     raw = json.dumps(report(pending.snapshot, "A", findings=[finding()])).encode()
     for key, value in (("A", raw), ("B", b'{"schema":1')):
         store_reviewer_report(git_repo, reviewer=Reviewer(key), raw=value)
-    result = verdict_store.migrate_legacy_pending_round(git_repo)
+    result = verdict_store.migrate_legacy_pending_round(
+        git_repo, token_hex=lambda _size: "d" * 32,
+    )
     assert result.reviewers == {"A": "pending:LEGACY_PROVENANCE_UNAVAILABLE",
                                 "B": "pending:JSON_INVALID", "C": "pending:REVIEWER_REPORT_MISSING"}
     loaded = read_verdict(git_repo)
     assert loaded.schema == 3
+    assert loaded.lifecycle_id == "d" * 32
     assert all(slot.status == "pending" for slot in loaded.reviewers.values())
     assert (git_repo / ".review/attempts/round-1/A/attempt-1.raw").read_bytes() == raw
     assert (git_repo / ".review/attempts/round-1/B/attempt-1.raw").read_bytes() == b'{"schema":1'
@@ -1649,6 +1652,119 @@ def _schema_two_mixed_verdict(git_repo):
         },
     )
     return sealed
+
+
+def _v2_mixed_pending(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW,
+        token_hex=lambda _size: "a" * 32,
+    )
+    raw = json.dumps(report(pending.snapshot, "A")).encode()
+    submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    with pytest.raises(SchemaError, match="^JSON_INVALID$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=b"{", now=NOW)
+    native = read_verdict(git_repo)
+    legacy = replace(
+        native,
+        schema=SLOT_VERDICT_SCHEMA_VERSION,
+        contract=replace(native.contract, verdict_schema=SLOT_VERDICT_SCHEMA_VERSION),
+        lifecycle_id=None,
+    )
+    write_json(git_repo / ".review/verdict.json", legacy.to_json())
+    return legacy, raw
+
+
+def test_migrate_v2_pending_preserves_authenticated_slots_and_attempts(git_repo):
+    from pre_pr_tribunal import verdict_store
+
+    legacy, raw = _v2_mixed_pending(git_repo)
+    canonical = git_repo / ".review/inbox/round-1/A.json"
+
+    result = verdict_store.migrate_v2_pending_round(
+        git_repo, token_hex=lambda _size: "c" * 32,
+    )
+
+    migrated = read_verdict(git_repo)
+    assert result.telemetry_history == "unknown"
+    assert migrated.schema == 3
+    assert migrated.lifecycle_id == "c" * 32
+    assert migrated.reviewers["A"] == legacy.reviewers["A"]
+    assert migrated.reviewers["B"].attempt_count == 1
+    assert migrated.reviewers["B"].last_error == "JSON_INVALID"
+    assert canonical.read_bytes() == raw
+    assert stat.S_IMODE(canonical.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("tamper", "expected"),
+    (
+        ("snapshot", "SNAPSHOT_CHANGED"),
+        ("report_bytes", "REPORT_BYTES_MISMATCH"),
+        ("report_mode", "FILE_UNSAFE"),
+        ("receipt_digest", "REPORT_BYTES_MISMATCH"),
+        ("report_text_contract", "CONTRACT_DRIFT"),
+        ("diff_recipe_contract", "CONTRACT_DRIFT"),
+    ),
+)
+def test_migrate_v2_pending_refuses_without_mutating_verdict_or_report(
+    git_repo, tamper, expected,
+):
+    from pre_pr_tribunal import verdict_store
+
+    legacy, raw = _v2_mixed_pending(git_repo)
+    canonical = git_repo / ".review/inbox/round-1/A.json"
+    if tamper == "snapshot":
+        commit_fix(git_repo)
+    elif tamper == "report_bytes":
+        canonical.write_bytes(raw + b"\n")
+        canonical.chmod(0o600)
+    elif tamper == "report_mode":
+        canonical.chmod(0o644)
+    elif tamper == "receipt_digest":
+        slot = legacy.reviewers["A"]
+        legacy = replace(
+            legacy,
+            reviewers={
+                **legacy.reviewers,
+                "A": replace(slot, receipt=replace(slot.receipt, raw_sha256="0" * 64)),
+            },
+        )
+        write_json(git_repo / ".review/verdict.json", legacy.to_json())
+    elif tamper == "report_text_contract":
+        slot = legacy.reviewers["A"]
+        legacy = replace(
+            legacy,
+            contract=replace(legacy.contract, report_text=99),
+            reviewers={
+                **legacy.reviewers,
+                "A": replace(slot, receipt=replace(slot.receipt, report_contract_version=99)),
+            },
+        )
+        write_json(git_repo / ".review/verdict.json", legacy.to_json())
+    else:
+        legacy = replace(legacy, contract=replace(legacy.contract, diff_recipe=99))
+        write_json(git_repo / ".review/verdict.json", legacy.to_json())
+    verdict_before = (git_repo / ".review/verdict.json").read_bytes()
+    report_before = canonical.read_bytes()
+
+    with pytest.raises(SchemaError, match=f"^{expected}$"):
+        verdict_store.migrate_v2_pending_round(git_repo)
+
+    assert (git_repo / ".review/verdict.json").read_bytes() == verdict_before
+    assert canonical.read_bytes() == report_before
+
+
+def test_cli_migrate_v2_pending_returns_stable_migration_projection(git_repo):
+    _v2_mixed_pending(git_repo)
+
+    result = run_cli_bytes(git_repo, "migrate-v2-pending")
+
+    assert result.returncode == 0 and result.stderr == b""
+    assert json.loads(result.stdout) == {
+        "round": 1,
+        "reviewers": {"A": "sealed", "B": "pending", "C": "pending"},
+        "telemetry_history": "unknown",
+    }
 
 
 def test_schema_two_parser_accepts_mixed_pending_and_sealed_slots(git_repo):
