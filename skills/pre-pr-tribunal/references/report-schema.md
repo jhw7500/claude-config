@@ -14,6 +14,18 @@ The installed CLI and its installed contract binding are the source of truth. Do
 
 `status.verdict_schema` selects the workflow. Schema 1 requires an explicit all-slot `migrate-legacy-pending`; schema 2 requires an explicit `migrate-v2-pending`; schema 3 must not be migrated. Neither migration accepts a reviewer subset. Legacy schema-1 migration preserves available exact raw evidence but leaves slots pending when receipt provenance is unavailable; `LEGACY_PROVENANCE_UNAVAILABLE` never means a fictional native receipt was adopted. Schema-2 migration preserves sealed evidence only after exact receipt/file validation and assigns a new lifecycle identity, so its first telemetry resume reports prior request accounting unknown.
 
+The following stored-verdict excerpt records the schema-3 lifecycle identity for
+internal telemetry binding. It is not reviewer report content or review
+authority input.
+
+<!-- v3-stored-verdict -->
+```json
+{
+  "schema": 3,
+  "lifecycle_id": "0123456789abcdef0123456789abcdef"
+}
+```
+
 <!-- v3-status -->
 ```json
 {

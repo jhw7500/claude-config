@@ -536,6 +536,14 @@ def test_report_reference_documents_v3_shapes_and_real_controller_commands():
     assert reasons == {"DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"}
 
 
+def test_report_reference_documents_internal_v3_lifecycle_identity():
+    stored_verdict = json_example(
+        text("references/report-schema.md"), "v3-stored-verdict",
+    )
+    assert stored_verdict["schema"] == 3
+    assert re.fullmatch(r"[0-9a-f]{32}", stored_verdict["lifecycle_id"])
+
+
 def test_docs_separate_retryable_formats_operations_integrity_and_warnings():
     for body in (text("SKILL.md"), text("references/report-schema.md")):
         format_start = body.index("Format failures")
