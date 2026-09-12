@@ -14,6 +14,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from pre_pr_tribunal.model import (  # type: ignore
         MAX_REPORT_BYTES,
+        MIXED_SLOT_VERDICT_SCHEMAS,
         Reviewer,
         TribunalError,
         validate_report_bytes,
@@ -42,6 +43,7 @@ if __package__ in {None, ""}:
 else:
     from .model import (
         MAX_REPORT_BYTES,
+        MIXED_SLOT_VERDICT_SCHEMAS,
         Reviewer,
         TribunalError,
         validate_report_bytes,
@@ -238,7 +240,7 @@ def _status(verdict) -> dict[str, object]:
         "verdict_path": ".review/verdict.json",
         "verdict_schema": verdict.schema,
     }
-    if verdict.schema == 2:
+    if verdict.schema in MIXED_SLOT_VERDICT_SCHEMAS:
         reviewers = {}
         for key in "ABC":
             slot = verdict.reviewers[key]

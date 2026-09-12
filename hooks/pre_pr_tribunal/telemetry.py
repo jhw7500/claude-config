@@ -537,12 +537,12 @@ def resume_run(cwd: Path, *, runtime: str, started_at: str, started_monotonic_ns
     from .git_state import capture_snapshot
     from .review_context import current_contract_binding
     from .verdict_store import (
-        _read_sealed_report, _read_verdict_locked, _snapshot_equal, require_v2_in_progress,
+        _read_sealed_report, _read_verdict_locked, _snapshot_equal, require_current_in_progress,
     )
 
     with _store(cwd) as directory:
         try:
-            verdict = require_v2_in_progress(_read_verdict_locked(directory))
+            verdict = require_current_in_progress(_read_verdict_locked(directory))
             _require(verdict.contract == current_contract_binding())
             snapshot = capture_snapshot(cwd, verdict.base_ref)
             _require(_snapshot_equal(verdict, snapshot))
