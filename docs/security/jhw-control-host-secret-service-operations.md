@@ -62,7 +62,9 @@ env -i HOME="$HOME" LANG=C.UTF-8 PATH=/usr/local/bin:/usr/bin:/bin \
   "$HOME/.local/bin/jhw-control-host" preflight
 ```
 
-contract version은 `4`, credential policy는 `secure-store-only`여야 한다. preflight가 성공하기 전에는
+contract version은 `5`, credential policy는 `secure-store-only`여야 한다. `board status`, `board acquire`,
+`board with`는 config-only 경계라 Secret Service를 조회하지 않는다. 그 밖의 credential-dependent
+command는 preflight가 성공하기 전에는
 Project Control mutation을 실행하지 않는다.
 
 ## tmux 검증

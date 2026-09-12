@@ -55,6 +55,12 @@ V4_COMMANDS = [
     "task recover",
     "task assert-owner",
 ]
+V5_COMMANDS = [
+    *V4_COMMANDS,
+    "board status",
+    "board acquire",
+    "board with",
+]
 V4_TASK_SUBCOMMANDS = [
     "start", "child-start", "contract", "completion-ready", "promote",
     "status", "handoff", "finish", "recover", "assert-owner",
@@ -70,6 +76,11 @@ V4_TASK_COMMAND_LINES = [
     '"$HOME/.local/bin/jhw-control-host" task finish --task <tsk-id> --claim <clm-id> --status <completed|handoff|abandoned>',
     '"$HOME/.local/bin/jhw-control-host" task recover --task <tsk-id> --expect <clm-id> --action <status|force-end|takeover|cleanup>',
     '"$HOME/.local/bin/jhw-control-host" task assert-owner --task <tsk-id> --claim <clm-id>',
+]
+V5_BOARD_COMMAND_LINES = [
+    '"$HOME/.local/bin/jhw-control-host" board status [<board-id>]',
+    '"$HOME/.local/bin/jhw-control-host" board acquire <board-id> <acquire-args>',
+    '"$HOME/.local/bin/jhw-control-host" board with <board-id> <lease-args> -- <command> [args...]',
 ]
 V4_PRODUCER_ROLLOUT = (
     "`producer merge → install.sh 재실행 → clean-shell --contract/preflight\n"
@@ -235,10 +246,10 @@ def test_executable_startup_ignores_path_and_python_poison(tmp_path: Path) -> No
 
     assert path_result.returncode == 0, path_result.stderr
     assert module_result.returncode == 0, module_result.stderr
-    assert json.loads(path_result.stdout)["version"] == 4
-    assert json.loads(module_result.stdout)["version"] == 4
-    assert json.loads(path_result.stdout)["commands"] == V4_COMMANDS
-    assert json.loads(module_result.stdout)["commands"] == V4_COMMANDS
+    assert json.loads(path_result.stdout)["version"] == 5
+    assert json.loads(module_result.stdout)["version"] == 5
+    assert json.loads(path_result.stdout)["commands"] == V5_COMMANDS
+    assert json.loads(module_result.stdout)["commands"] == V5_COMMANDS
     assert not path_marker.exists()
     assert not module_marker.exists()
 
@@ -262,10 +273,10 @@ def test_contract_needs_no_config_or_provider_and_is_path_free(
     assert result.stderr == b""
     payload = json.loads(result.stdout)
     assert payload == {
-        "commands": V4_COMMANDS,
+        "commands": V5_COMMANDS,
         "credential_policy": "secure-store-only",
         "name": "jhw-control-host",
-        "version": 4,
+        "version": 5,
     }
     assert str(tmp_path).encode() not in result.stdout
     assert b"ambient-must-not-appear" not in result.stdout
@@ -2643,6 +2654,253 @@ def test_safe_reason_survives_and_unrecognized_details_are_dropped(
     }
 
 
+def test_bounded_command_failure_detail_survives_secure_projection(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "status", "--task", TASK_ID)
+    detail = {
+        "command": "git",
+        "exit_code": 128,
+        "stderr_head": "fatal: cannot change directory\n",
+    }
+    runner.control_results[command] = launcher.CommandResult(
+        1,
+        b"",
+        json.dumps({"error": {"code": "COMMAND_FAILED", "detail": detail}}).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert json.loads(result.stderr) == {
+        "error": {"code": "COMMAND_FAILED", "detail": detail},
+    }
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        {"command": "", "exit_code": 128},
+        {"command": "git", "exit_code": True},
+        {"command": "git", "exit_code": -1},
+        {"command": "git", "exit_code": 128, "stderr_head": "x" * 513},
+    ],
+)
+def test_malformed_command_failure_detail_fails_closed(
+    launcher: ModuleType,
+    tmp_path: Path,
+    detail: dict[str, object],
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "status", "--task", TASK_ID)
+    runner.control_results[command] = launcher.CommandResult(
+        1,
+        b"",
+        json.dumps({"error": {"code": "COMMAND_FAILED", "detail": detail}}).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+
+
+@pytest.mark.parametrize(
+    ("command", "payload"),
+    [
+        (
+            ("board", "status"),
+            {
+                "command": "board status",
+                "result": {"boards": [], "total_boards": 0, "truncated": False},
+            },
+        ),
+        (
+            ("board", "status", "board-alpha"),
+            {
+                "command": "board status",
+                "result": {
+                    "boards": [
+                        {
+                            "board_id": "board-alpha",
+                            "description": "PIM target",
+                            "interfaces": [{"type": "serial", "address": "/dev/ttyUSB0"}],
+                            "holders": [],
+                            "reservations": [],
+                            "truncated": False,
+                        }
+                    ]
+                },
+            },
+        ),
+        (
+            (
+                "board", "acquire", "board-alpha", "--mode", "exclusive",
+                "--for", "30m", "--session", "session-a", "--purpose", "deploy",
+            ),
+            {
+                "command": "board acquire",
+                "result": {
+                    "holder": {
+                        "board_id": "board-alpha",
+                        "holder_id": "hld-01a0930d-4df3-7035-88ca-6fd3095a50ae",
+                        "session": "session-a",
+                        "mode": "exclusive",
+                        "purpose": "deploy",
+                        "acquired_at": "2026-09-12T02:00:00.000Z",
+                        "granted_until": "2026-09-12T02:30:00.000Z",
+                        "liveness_tracked": False,
+                    },
+                    "shortened": False,
+                    "evicted_expired": [],
+                    "cross_session": False,
+                },
+            },
+        ),
+    ],
+)
+def test_board_json_commands_use_config_only_environment_without_credentials(
+    launcher: ModuleType,
+    tmp_path: Path,
+    command: tuple[str, ...],
+    payload: dict[str, object],
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    runner.control_results[command] = launcher.CommandResult(
+        0,
+        json.dumps(payload, separators=(",", ":")).encode() + b"\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == payload
+    assert len(runner.calls) == 1
+    child_environment = runner.calls[0]["env"]
+    assert isinstance(child_environment, dict)
+    assert set(child_environment).isdisjoint(
+        {"GH_TOKEN", "GITHUB_TOKEN", "GH_PROJECT_TOKEN", "GH_REPO_TOKEN", "NOTION_API_KEY"}
+    )
+    assert child_environment["JHW_CONTROL_STATE_DIR"] == CONFIG_VALUES["JHW_CONTROL_STATE_DIR"]
+
+
+def test_board_status_accepts_holder_without_optional_overstay(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("board", "status", "board-alpha")
+    payload = {
+        "command": "board status",
+        "result": {
+            "boards": [
+                {
+                    "board_id": "board-alpha",
+                    "interfaces": [{"type": "serial", "address": "/dev/ttyUSB0"}],
+                    "holders": [
+                        {
+                            "holder_id": "hld-01a0930d-4df3-7035-88ca-6fd3095a50ae",
+                            "session": "session-a",
+                            "mode": "exclusive",
+                            "purpose": "deploy",
+                            "acquired_at": "2026-09-12T02:00:00.000Z",
+                            "granted_until": "2026-09-12T02:30:00.000Z",
+                            "liveness": "alive",
+                            "expired": False,
+                            "extended_after_expiry": 0,
+                        }
+                    ],
+                    "reservations": [],
+                    "truncated": False,
+                }
+            ]
+        },
+    }
+    runner.control_results[command] = launcher.CommandResult(
+        0,
+        json.dumps(payload, separators=(",", ":")).encode() + b"\n",
+        b"",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == payload
+
+
+def test_board_conflict_coordinates_survive_secure_projection(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = (
+        "board", "acquire", "board-alpha", "--mode", "exclusive",
+        "--for", "30m", "--session", "session-a", "--purpose", "deploy",
+    )
+    conflict = {
+        "board_id": "board-alpha",
+        "holder_id": "hld-01a0930d-4df3-7035-88ca-6fd3095a50ae",
+        "mode": "exclusive",
+        "purpose": "other-session",
+        "granted_until": "2026-09-12T02:30:00.000Z",
+    }
+    runner.control_results[command] = launcher.CommandResult(
+        4,
+        b"",
+        json.dumps({
+            "error": {
+                "code": "BOARD_BUSY",
+                "reason": "exclusive_holder",
+                "conflicting_board": conflict,
+            }
+        }).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 4
+    assert json.loads(result.stderr) == {
+        "error": {
+            "code": "BOARD_BUSY",
+            "reason": "exclusive_holder",
+            "conflicting_board": conflict,
+        }
+    }
+
+
+def test_board_with_uses_config_only_streaming_environment_and_preserves_exit(
+    launcher: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    calls: list[dict[str, object]] = []
+
+    def fake_streaming(argv, *, env):
+        calls.append({"argv": tuple(argv), "env": dict(env)})
+        return 23
+
+    monkeypatch.setattr(launcher, "run_streaming", fake_streaming, raising=False)
+    command = [
+        "board", "with", "board-alpha", "--mode", "exclusive", "--for", "30m",
+        "--session", "session-a", "--purpose", "deploy", "--", "/usr/bin/false",
+    ]
+
+    result = run_secure(launcher, tmp_path, command, runner)
+
+    assert result == launcher.ProgramResult(23)
+    assert len(calls) == 1
+    assert calls[0]["argv"] == (runner.tools.node, runner.tools.control, *command)
+    stream_environment = calls[0]["env"]
+    assert isinstance(stream_environment, dict)
+    assert set(stream_environment).isdisjoint(
+        {"GH_TOKEN", "GITHUB_TOKEN", "GH_PROJECT_TOKEN", "GH_REPO_TOKEN", "NOTION_API_KEY"}
+    )
+    assert runner.calls == []
+
+
 @pytest.mark.parametrize("returncode", [1, 2, 4, 75, 78])
 @pytest.mark.parametrize("argv", [
     ["preflight"],
@@ -2693,7 +2951,7 @@ def test_task_finish_error_preserves_outer_warnings(launcher: ModuleType, tmp_pa
     "argv",
     [
         [], ["--help"], ["task"], ["task", "cancel"], ["task", "switch"],
-        ["board", "status"], ["project", "register"],
+        ["board", "release"], ["project", "register"],
     ],
 )
 def test_non_allowlisted_command_stops_before_config_or_provider(
@@ -3878,11 +4136,11 @@ def _readme_inline_code_spans(markdown: str) -> list[str]:
     return spans
 
 
-def _assert_readme_v4_contract_boundaries(readme: str) -> None:
-    outer_start = "<!-- jhw-control-host-v4-operator-contract:start -->"
-    outer_end = "<!-- jhw-control-host-v4-operator-contract:end -->"
-    inventory_start = "<!-- jhw-control-host-v4-contract:start -->"
-    inventory_end = "<!-- jhw-control-host-v4-contract:end -->"
+def _assert_readme_v5_contract_boundaries(readme: str) -> None:
+    outer_start = "<!-- jhw-control-host-v5-operator-contract:start -->"
+    outer_end = "<!-- jhw-control-host-v5-operator-contract:end -->"
+    inventory_start = "<!-- jhw-control-host-v5-contract:start -->"
+    inventory_end = "<!-- jhw-control-host-v5-contract:end -->"
 
     assert readme.count(outer_start) == 1
     assert readme.count(outer_end) == 1
@@ -3895,14 +4153,16 @@ def _assert_readme_v4_contract_boundaries(readme: str) -> None:
     )[1].split("```", 1)[0]
     task_commands = [line.strip() for line in command_block.splitlines() if " task " in line]
     assert task_commands == V4_TASK_COMMAND_LINES
+    board_commands = [line.strip() for line in command_block.splitlines() if " board " in line]
+    assert board_commands == V5_BOARD_COMMAND_LINES
 
     assert operator_contract.count(inventory_start) == 1
     assert operator_contract.count(inventory_end) == 1
     inventory = operator_contract.split(inventory_start, 1)[1].split(inventory_end, 1)[0]
     lines = [line for line in inventory.splitlines() if line]
-    assert len(lines) == 8
+    assert len(lines) == 9
     assert lines[:2] == [
-        "| Inventory | Exact v4 values |",
+        "| Inventory | Exact v5 values |",
         "| --- | --- |",
     ]
     rows = {}
@@ -3914,18 +4174,22 @@ def _assert_readme_v4_contract_boundaries(readme: str) -> None:
         "launcher command families",
         "hidden preflight mutations",
         "read-only without hidden preflight",
+        "credential-free board execution",
         "compatibility projections",
         "generic Task results",
         "downstream errors",
     }
     command_families = re.findall(r"`([^`]+)`", rows["launcher command families"])
-    assert command_families == V4_COMMANDS
+    assert command_families == V5_COMMANDS
     assert re.findall(r"`([^`]+)`", rows["hidden preflight mutations"]) == [
         "task start", "task child-start", "task contract", "task completion-ready",
         "task promote", "task finish", "task recover --action force-end|takeover|cleanup",
     ]
     assert re.findall(r"`([^`]+)`", rows["read-only without hidden preflight"]) == [
-        "task status", "task handoff", "task assert-owner", "task recover --action status",
+        "task status", "task handoff", "task assert-owner", "task recover --action status", "board status",
+    ]
+    assert re.findall(r"`([^`]+)`", rows["credential-free board execution"]) == [
+        "board status", "board acquire", "board with",
     ]
     assert rows["compatibility projections"] == "`task start`, `task finish`, `task child-start`"
     assert rows["generic Task results"] == (
@@ -3946,16 +4210,20 @@ def _assert_readme_v4_contract_boundaries(readme: str) -> None:
     )
     documented_command_families = set(re.findall(
         r"(?<![A-Za-z0-9_-])(?:jhw-control-host[\"`]?\s+)?"
-        r"(unlock|preflight|portfolio\s+[a-z][a-z-]*|task\s+[a-z][a-z-]*)"
+        r"(unlock|preflight|portfolio\s+[a-z][a-z-]*|task\s+[a-z][a-z-]*|board\s+(?:status|acquire|with))"
         r"(?![A-Za-z0-9_-])",
         operator_prose,
     ))
-    assert documented_command_families == set(V4_COMMANDS)
+    assert documented_command_families == set(V5_COMMANDS)
 
     expected_identifier_tokens = {
         "branch",
+        "board_id",
         "claim_id",
+        "command",
+        "conflicting_board",
         "conflicting_claim",
+        "exit_code",
         "gh",
         "host",
         "keyring",
@@ -3963,6 +4231,7 @@ def _assert_readme_v4_contract_boundaries(readme: str) -> None:
         "retained_task",
         "task_id",
         "started_at",
+        "stderr_head",
         "worktree_ref",
     }
     documented_identifier_tokens = {
@@ -3989,14 +4258,14 @@ def _assert_readme_v4_contract_boundaries(readme: str) -> None:
         assert required in operator_contract
 
 
-def _add_to_v4_contract_section(readme: str, addition: str) -> str:
-    marker = "<!-- jhw-control-host-v4-contract:end -->"
+def _add_to_v5_contract_section(readme: str, addition: str) -> str:
+    marker = "<!-- jhw-control-host-v5-contract:end -->"
     assert readme.count(marker) == 1
     return readme.replace(marker, f"{addition}\n{marker}", 1)
 
 
-def _add_after_v4_contract_inventory(readme: str, addition: str) -> str:
-    marker = "<!-- jhw-control-host-v4-contract:end -->"
+def _add_after_v5_contract_inventory(readme: str, addition: str) -> str:
+    marker = "<!-- jhw-control-host-v5-contract:end -->"
     assert readme.count(marker) == 1
     return readme.replace(marker, f"{marker}\n{addition}", 1)
 
@@ -4019,7 +4288,7 @@ def test_readme_documents_secure_store_only_provision_and_no_migration() -> None
         "현재 UID",
         "0500",
         "--contract",
-        "contract v4",
+        "contract v5",
         "preflight",
         "portfolio status",
         "task start",
@@ -4036,6 +4305,8 @@ def test_readme_documents_secure_store_only_provision_and_no_migration() -> None
         assert f'"$HOME/.local/bin/jhw-control-host" task {task_subcommand}' in command_block
     task_commands = [line.strip() for line in command_block.splitlines() if " task " in line]
     assert task_commands == V4_TASK_COMMAND_LINES
+    board_commands = [line.strip() for line in command_block.splitlines() if " board " in line]
+    assert board_commands == V5_BOARD_COMMAND_LINES
     assert "jhw-control task" in readme
     assert "canonical JSON object pass-through after common security validation" in readme
     assert "code `[A-Z][A-Z0-9_]{1,63}`, optional reason `[a-z][a-z0-9_]{0,63}`, exit `1|2|4|75|78`" in readme
@@ -4044,42 +4315,42 @@ def test_readme_documents_secure_store_only_provision_and_no_migration() -> None
     assert "host는 command별\ncode allowlist나 code-to-exit 표를 복제하지 않습니다" in readme
     assert V4_PRODUCER_ROLLOUT in readme
     assert V4_COORDINATE_POLICY in readme
-    _assert_readme_v4_contract_boundaries(readme)
+    _assert_readme_v5_contract_boundaries(readme)
 
-    extra_command = _add_to_v4_contract_section(
+    extra_command = _add_to_v5_contract_section(
         readme,
         "`jhw-control-host task cancel --task <tsk-id>`",
     )
     with pytest.raises(AssertionError):
-        _assert_readme_v4_contract_boundaries(extra_command)
+        _assert_readme_v5_contract_boundaries(extra_command)
 
-    extra_conditional_field = _add_to_v4_contract_section(
+    extra_conditional_field = _add_to_v5_contract_section(
         readme,
         "abandoned 결과에는 `release_note`도 반환할 수 있다.",
     )
     with pytest.raises(AssertionError):
-        _assert_readme_v4_contract_boundaries(extra_conditional_field)
+        _assert_readme_v5_contract_boundaries(extra_conditional_field)
 
 
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda readme: _add_after_v4_contract_inventory(
+        lambda readme: _add_after_v5_contract_inventory(
             readme,
             "`jhw-control-host task cancel --task <tsk-id>`",
         ),
-        lambda readme: _add_after_v4_contract_inventory(
+        lambda readme: _add_after_v5_contract_inventory(
             readme,
             "abandoned 결과에는 `release_note`도 반환할 수 있다.",
         ),
-        lambda readme: _add_after_v4_contract_inventory(
+        lambda readme: _add_after_v5_contract_inventory(
             readme,
             "운영자 note `operator_note`도 required/base output이다.",
         ),
     ],
     ids=["extra-launcher-command", "extra-conditional-field", "extra-required-base-field"],
 )
-def test_readme_documents_v4_contract_boundaries_rejects_outside_inventory_bypasses(
+def test_readme_documents_v5_contract_boundaries_rejects_outside_inventory_bypasses(
     mutate,
 ) -> None:
     readme = (REPO / "README.md").read_text(encoding="utf-8")
@@ -4087,4 +4358,4 @@ def test_readme_documents_v4_contract_boundaries_rejects_outside_inventory_bypas
 
     assert mutated != readme
     with pytest.raises(AssertionError):
-        _assert_readme_v4_contract_boundaries(mutated)
+        _assert_readme_v5_contract_boundaries(mutated)

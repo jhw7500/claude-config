@@ -45,6 +45,10 @@ GITHUB_SLUG_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{
 OFFSET_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$")
 ERROR_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 ERROR_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+BOARD_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
+HOLDER_ID_RE = re.compile(r"^hld-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+RESERVATION_ID_RE = re.compile(r"^rsv-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+BOARD_SUBCOMMANDS = frozenset({"status", "acquire", "with"})
 HANDOFF_SECTION_NAMES = frozenset(
     {
         "Progress Since Last Checkpoint",
@@ -246,10 +250,13 @@ CONTRACT = {
         "preflight",
         "portfolio status",
         *(f"task {subcommand}" for subcommand in TASK_SUBCOMMANDS),
+        "board status",
+        "board acquire",
+        "board with",
     ],
     "credential_policy": "secure-store-only",
     "name": "jhw-control-host",
-    "version": 4,
+    "version": 5,
 }
 
 
@@ -664,6 +671,47 @@ def run_bounded(
             tty_stream.close()
 
 
+def run_streaming(argv: Sequence[str], *, env: Mapping[str, str]) -> int:
+    """Run `board with` with inherited stdio and forwarded termination signals."""
+
+    process: subprocess.Popen[bytes] | None = None
+    previous_signal_handlers: dict[int, object] = {}
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        if process is None:
+            return
+        try:
+            os.killpg(process.pid, signum)
+        except OSError:
+            pass
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_signal_handlers[signum] = signal.signal(signum, forward_signal)
+        try:
+            process = subprocess.Popen(
+                tuple(argv),
+                env=dict(env),
+                start_new_session=True,
+                close_fds=True,
+            )
+        except (OSError, ValueError):
+            raise CommandStartFailed from None
+        returncode = process.wait()
+        return returncode if returncode >= 0 else 128 + abs(returncode)
+    except BaseException:
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            process.wait()
+        raise
+    finally:
+        for signum, previous_handler in previous_signal_handlers.items():
+            signal.signal(signum, previous_handler)
+
+
 def _group_is_private_to_uid(gid: int, uid: int) -> bool:
     try:
         group = grp.getgrgid(gid)
@@ -867,6 +915,33 @@ def _child_environment(
             "NOTION_API_KEY": credentials.notion,
         }
     )
+    socket_path = source.get("SSH_AUTH_SOCK")
+    if socket_path:
+        try:
+            metadata = os.stat(socket_path, follow_symlinks=False)
+        except OSError:
+            metadata = None
+        if metadata is not None and stat.S_ISSOCK(metadata.st_mode) and metadata.st_uid == uid:
+            env["SSH_AUTH_SOCK"] = socket_path
+    return env
+
+
+def _board_environment(
+    home: Path,
+    source: Mapping[str, str],
+    config: Mapping[str, str],
+    *,
+    uid: int,
+) -> dict[str, str]:
+    """Build a config-only environment for local board operations.
+
+    `board with` deliberately runs an operator-selected child, so no Project,
+    Repository, or Notion credential may enter the control process that will
+    become that child's parent.
+    """
+
+    env = _base_identity_environment(home, source, uid=uid)
+    env.update({"GCM_INTERACTIVE": "Never", "GIT_TERMINAL_PROMPT": "0", **config})
     socket_path = source.get("SSH_AUTH_SOCK")
     if socket_path:
         try:
@@ -1163,12 +1238,18 @@ def _allowed_invocation(argv: Sequence[str]) -> bool:
         values == ("unlock",)
         or values == ("preflight",)
         or values[:2] == ("portfolio", "status")
+        or (len(values) >= 2 and values[0] == "board" and values[1] in BOARD_SUBCOMMANDS)
         or (
             len(values) >= 2
             and values[0] == "task"
             and values[1] in TASK_SUBCOMMAND_SET
         )
     )
+
+
+def _board_invocation(argv: Sequence[str]) -> bool:
+    values = tuple(argv)
+    return len(values) >= 2 and values[0] == "board" and values[1] in BOARD_SUBCOMMANDS
 
 
 def _task_requires_preflight(argv: Sequence[str]) -> bool:
@@ -1617,6 +1698,272 @@ def _validate_conflicting_claim(
     }
 
 
+def _board_id(value: object) -> str:
+    return _canonical_id(value, BOARD_ID_RE)
+
+
+def _holder_id(value: object) -> str:
+    return _canonical_id(value, HOLDER_ID_RE)
+
+
+def _reservation_id(value: object) -> str:
+    return _canonical_id(value, RESERVATION_ID_RE)
+
+
+def _nonnegative_integer(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    return value
+
+
+def _validate_board_interfaces(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list) or len(value) > 8:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    interfaces: list[dict[str, str]] = []
+    for raw in value:
+        interface = _exact_object(raw, {"type", "address"})
+        kind = interface["type"]
+        if kind not in {"ethernet", "wireless", "serial"}:
+            raise LauncherError("CONTROL_OUTPUT_INVALID")
+        interfaces.append({
+            "type": str(kind),
+            "address": _bounded_text(interface["address"], maximum=255),
+        })
+    return interfaces
+
+
+def _validate_board_summary(value: object) -> dict[str, object]:
+    summary = _exact_object(
+        value,
+        {"board_id", "interfaces", "holder_count", "reservation_count", "expired_holder_count"},
+        {"description"},
+    )
+    projected: dict[str, object] = {
+        "board_id": _board_id(summary["board_id"]),
+        "interfaces": _validate_board_interfaces(summary["interfaces"]),
+        "holder_count": _nonnegative_integer(summary["holder_count"]),
+        "reservation_count": _nonnegative_integer(summary["reservation_count"]),
+        "expired_holder_count": _nonnegative_integer(summary["expired_holder_count"]),
+    }
+    if projected["expired_holder_count"] > projected["holder_count"]:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    if "description" in summary:
+        projected["description"] = _bounded_text(summary["description"], maximum=255)
+    return projected
+
+
+def _validate_board_detail_holder(value: object) -> dict[str, object]:
+    holder = _exact_object(
+        value,
+        {
+            "holder_id", "session", "mode", "purpose", "acquired_at", "granted_until",
+            "liveness", "expired", "extended_after_expiry",
+        },
+        {"overstay"},
+    )
+    mode = holder["mode"]
+    liveness = holder["liveness"]
+    if mode not in {"exclusive", "shared"} or liveness not in {"alive", "dead", "untracked"}:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    expired = holder["expired"]
+    if not isinstance(expired, bool):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    projected = {
+        "holder_id": _holder_id(holder["holder_id"]),
+        "session": _bounded_text(holder["session"], maximum=255),
+        "mode": str(mode),
+        "purpose": _bounded_text(holder["purpose"], maximum=255),
+        "acquired_at": _timestamp(holder["acquired_at"]),
+        "granted_until": _timestamp(holder["granted_until"]),
+        "liveness": str(liveness),
+        "expired": expired,
+        "extended_after_expiry": _nonnegative_integer(holder["extended_after_expiry"]),
+    }
+    if "overstay" in holder:
+        overstay = holder["overstay"]
+        if not isinstance(overstay, bool) or overstay != (expired and liveness != "dead"):
+            raise LauncherError("CONTROL_OUTPUT_INVALID")
+        projected["overstay"] = overstay
+    return projected
+
+
+def _validate_board_reservation(value: object) -> dict[str, object]:
+    reservation = _exact_object(
+        value,
+        {"reservation_id", "session", "mode", "from", "to", "purpose", "consumed_by", "lapsed"},
+    )
+    mode = reservation["mode"]
+    consumed = reservation["consumed_by"]
+    if mode not in {"exclusive", "shared"} or (consumed is not None and not isinstance(consumed, str)):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    if not isinstance(reservation["lapsed"], bool):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    return {
+        "reservation_id": _reservation_id(reservation["reservation_id"]),
+        "session": _bounded_text(reservation["session"], maximum=255),
+        "mode": str(mode),
+        "from": _timestamp(reservation["from"]),
+        "to": _timestamp(reservation["to"]),
+        "purpose": _bounded_text(reservation["purpose"], maximum=255),
+        "consumed_by": None if consumed is None else _holder_id(consumed),
+        "lapsed": reservation["lapsed"],
+    }
+
+
+def _validate_board_detail(value: object, *, requested_board: str) -> dict[str, object]:
+    detail = _exact_object(
+        value,
+        {"board_id", "interfaces", "holders", "reservations", "truncated"},
+        {"description"},
+    )
+    if _board_id(detail["board_id"]) != requested_board:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    holders = detail["holders"]
+    reservations = detail["reservations"]
+    if not isinstance(holders, list) or len(holders) > 16:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    if not isinstance(reservations, list) or len(reservations) > 12:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    truncated = detail["truncated"]
+    if not isinstance(truncated, bool):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    projected: dict[str, object] = {
+        "board_id": requested_board,
+        "interfaces": _validate_board_interfaces(detail["interfaces"]),
+        "holders": [_validate_board_detail_holder(holder) for holder in holders],
+        "reservations": [_validate_board_reservation(entry) for entry in reservations],
+        "truncated": truncated,
+    }
+    if "description" in detail:
+        projected["description"] = _bounded_text(detail["description"], maximum=255)
+    return projected
+
+
+def _validate_board_status_result(value: object, *, request: Sequence[str]) -> dict[str, object]:
+    result = _required_object(value, {"boards"})
+    boards = result["boards"]
+    if not isinstance(boards, list):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    named = len(request) >= 3 and not request[2].startswith("--")
+    if named:
+        requested_board = _board_id(request[2])
+        if set(result) != {"boards"} or len(boards) != 1:
+            raise LauncherError("CONTROL_OUTPUT_INVALID")
+        return {"boards": [_validate_board_detail(boards[0], requested_board=requested_board)]}
+    collection = _exact_object(result, {"boards", "total_boards", "truncated"}, {"next_after"})
+    projected_boards = [_validate_board_summary(board) for board in boards]
+    identifiers = [str(board["board_id"]) for board in projected_boards]
+    if identifiers != sorted(set(identifiers)):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    total = _nonnegative_integer(collection["total_boards"])
+    truncated = collection["truncated"]
+    if not isinstance(truncated, bool) or total < len(projected_boards):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    next_after = collection.get("next_after")
+    if truncated != (next_after is not None):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    if next_after is not None:
+        if not projected_boards or _board_id(next_after) != projected_boards[-1]["board_id"]:
+            raise LauncherError("CONTROL_OUTPUT_INVALID")
+    return {
+        "boards": projected_boards,
+        "total_boards": total,
+        "truncated": truncated,
+        **({"next_after": next_after} if next_after is not None else {}),
+    }
+
+
+def _validate_board_holder_summary(value: object, *, requested_board: str) -> dict[str, object]:
+    holder = _exact_object(
+        value,
+        {
+            "board_id", "holder_id", "session", "mode", "purpose", "acquired_at",
+            "granted_until", "liveness_tracked",
+        },
+    )
+    mode = holder["mode"]
+    if _board_id(holder["board_id"]) != requested_board or mode not in {"exclusive", "shared"}:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    if not isinstance(holder["liveness_tracked"], bool):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    return {
+        "board_id": requested_board,
+        "holder_id": _holder_id(holder["holder_id"]),
+        "session": _bounded_text(holder["session"], maximum=255),
+        "mode": str(mode),
+        "purpose": _bounded_text(holder["purpose"], maximum=255),
+        "acquired_at": _timestamp(holder["acquired_at"]),
+        "granted_until": _timestamp(holder["granted_until"]),
+        "liveness_tracked": holder["liveness_tracked"],
+    }
+
+
+def _validate_board_acquire_result(value: object, *, request: Sequence[str]) -> dict[str, object]:
+    result = _exact_object(
+        value,
+        {"holder", "shortened", "evicted_expired", "cross_session"},
+        {"consumed_reservation"},
+    )
+    if len(request) < 3:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    requested_board = _board_id(request[2])
+    if not isinstance(result["shortened"], bool) or not isinstance(result["cross_session"], bool):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    evicted = result["evicted_expired"]
+    if not isinstance(evicted, list) or len(evicted) > 16:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    projected: dict[str, object] = {
+        "holder": _validate_board_holder_summary(result["holder"], requested_board=requested_board),
+        "shortened": result["shortened"],
+        "evicted_expired": [_holder_id(holder) for holder in evicted],
+        "cross_session": result["cross_session"],
+    }
+    if "consumed_reservation" in result:
+        projected["consumed_reservation"] = _reservation_id(result["consumed_reservation"])
+    return projected
+
+
+def _validate_command_failure_detail(value: object) -> dict[str, object]:
+    detail = _exact_object(value, {"command", "exit_code"}, {"stderr_head"})
+    command = _bounded_text(detail["command"], maximum=255)
+    exit_code = detail["exit_code"]
+    if exit_code is not None and (
+        not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code <= 0
+    ):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    projected: dict[str, object] = {"command": command, "exit_code": exit_code}
+    if "stderr_head" in detail:
+        projected["stderr_head"] = _bounded_zod_utf8_text(detail["stderr_head"], maximum=512)
+    return projected
+
+
+def _validate_conflicting_board(value: object) -> dict[str, object]:
+    conflict = _exact_object(
+        value,
+        {"board_id", "mode"},
+        {"holder_id", "reservation_id", "purpose", "granted_until", "from", "to"},
+    )
+    mode = conflict["mode"]
+    if mode not in {"exclusive", "shared"}:
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    projected: dict[str, object] = {
+        "board_id": _board_id(conflict["board_id"]),
+        "mode": str(mode),
+    }
+    if "holder_id" in conflict:
+        projected["holder_id"] = _holder_id(conflict["holder_id"])
+    if "reservation_id" in conflict:
+        projected["reservation_id"] = _reservation_id(conflict["reservation_id"])
+    if ("holder_id" in projected) == ("reservation_id" in projected):
+        raise LauncherError("CONTROL_OUTPUT_INVALID")
+    if "purpose" in conflict:
+        projected["purpose"] = _bounded_text(conflict["purpose"], maximum=255)
+    for field in ("granted_until", "from", "to"):
+        if field in conflict:
+            projected[field] = _timestamp(conflict[field])
+    return projected
+
+
 def _validate_error_result(
     value: object,
     *,
@@ -1632,6 +1979,10 @@ def _validate_error_result(
         if not isinstance(reason, str) or ERROR_REASON_RE.fullmatch(reason) is None:
             raise LauncherError("CONTROL_OUTPUT_INVALID")
         projected["reason"] = reason
+    if "detail" in error:
+        projected["detail"] = _validate_command_failure_detail(error["detail"])
+    if "conflicting_board" in error:
+        projected["conflicting_board"] = _validate_conflicting_board(error["conflicting_board"])
     if "conflicting_claim" in error:
         projected["conflicting_claim"] = _validate_conflicting_claim(
             error["conflicting_claim"], request=request,
@@ -1658,7 +2009,7 @@ def _validated_control_result(result: CommandResult, command: Sequence[str], *, 
             {"command", "result"},
             {"journal_warning", "registration_record_warning"},
         )
-        expected = " ".join(command[:2]) if command and command[0] in {"portfolio", "task"} else " ".join(command)
+        expected = " ".join(command[:2]) if command and command[0] in {"portfolio", "task", "board"} else " ".join(command)
         if payload.get("command") != expected:
             raise LauncherError("CONTROL_OUTPUT_INVALID")
         if expected == "preflight":
@@ -1677,6 +2028,10 @@ def _validated_control_result(result: CommandResult, command: Sequence[str], *, 
             projected_result = _validate_task_finish_result(payload.get("result"), request=command)
         elif expected.startswith("task ") and expected.split(" ", 1)[1] in TASK_SUBCOMMAND_SET:
             projected_result = _validate_generic_task_result(payload.get("result"))
+        elif expected == "board status":
+            projected_result = _validate_board_status_result(payload.get("result"), request=command)
+        elif expected == "board acquire":
+            projected_result = _validate_board_acquire_result(payload.get("result"), request=command)
         else:
             raise LauncherError("CONTROL_OUTPUT_INVALID")
         output = {"command": expected, "result": projected_result, **_output_warnings(payload)}
@@ -1688,7 +2043,7 @@ def _validated_control_result(result: CommandResult, command: Sequence[str], *, 
         {"error"},
         {"journal_warning", "registration_record_warning"},
     )
-    expected = " ".join(command[:2]) if command and command[0] in {"portfolio", "task"} else " ".join(command)
+    expected = " ".join(command[:2]) if command and command[0] in {"portfolio", "task", "board"} else " ".join(command)
     validated_error = _validate_error_result(payload.get("error"), request=command)
     output = {
         "error": validated_error,
@@ -1701,11 +2056,11 @@ def _program_result(
     result: CommandResult,
     *,
     command: Sequence[str],
-    credentials: Credentials,
+    credentials: Credentials | None,
     protected_paths: Sequence[Path | str],
     build_host: str,
 ) -> ProgramResult:
-    canaries = [credentials.project, credentials.repository, credentials.notion]
+    canaries = [] if credentials is None else [credentials.project, credentials.repository, credentials.notion]
     canaries.extend(os.fspath(path) for path in protected_paths)
     byte_canaries: set[bytes] = set()
     hex_canaries: set[bytes] = set()
@@ -1833,6 +2188,35 @@ def run_program(
         config_path = selected_home / ".config" / "jhw-control" / "control.env"
         config = read_control_config(config_path, uid=selected_uid)
         selected_tools = resolve_host_tools(selected_home, uid=selected_uid) if tools is None else tools
+        if _board_invocation(argv):
+            board_env = _board_environment(
+                selected_home,
+                source_environment,
+                config,
+                uid=selected_uid,
+            )
+            board_protected_paths: tuple[Path | str, ...] = (
+                config_path,
+                config["JHW_REGISTRY_DIR"],
+                config["JHW_WORKTREE_ROOT"],
+                config["JHW_CONTROL_STATE_DIR"],
+                *(value for value in (board_env.get("SSH_AUTH_SOCK"),) if value),
+            )
+            if tuple(argv[:2]) == ("board", "with"):
+                try:
+                    return ProgramResult(run_streaming(
+                        (selected_tools.node, selected_tools.control, *argv),
+                        env=board_env,
+                    ))
+                except CommandStartFailed:
+                    raise LauncherError("CONTROL_UNAVAILABLE") from None
+            return _program_result(
+                _control_call(runner, selected_tools, tuple(argv), board_env),
+                command=tuple(argv),
+                credentials=None,
+                protected_paths=board_protected_paths,
+                build_host=config["JHW_BUILD_HOST"],
+            )
         provider_env = _provider_environment(selected_home, source_environment, uid=selected_uid)
         keyring_env = _keyring_environment(selected_home, source_environment, uid=selected_uid)
         initial_owner = _probe_credential_store(
