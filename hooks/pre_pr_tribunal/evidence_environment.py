@@ -23,11 +23,12 @@ MAX_FILE_BYTES = 128 * 1024 * 1024
 PYTHON_INLINE_FLAGS = frozenset({'-c'})
 NODE_INLINE_FLAGS = frozenset({'-e', '--eval', '-p', '--print'})
 # Only flags that cannot themselves load code from outside the snapshot may
-# precede inline program text.
+# surround inline program text; node honours -r and --experimental-loader both
+# before and after the inline flag.
 NODE_PRE_INLINE_FLAGS = frozenset({'--input-type=module', '--input-type=commonjs'})
 
 
-def _local_script_chain(command, directory, tracked):
+def _local_script_chain(command, directory, tracked, root):
     """Bounded declared local scope, not a proof of arbitrary program purity."""
     if not isinstance(command, str) or len(command.encode('utf-8')) > 4096:
         return False
@@ -46,7 +47,8 @@ def _local_script_chain(command, directory, tracked):
             script = Path(words[1])
             if script.is_absolute() or '..' in script.parts or script.suffix not in {'.js', '.cjs', '.mjs'}:
                 return False
-            if (Path(directory) / script).as_posix() in tracked:
+            relative = Path(directory) / script
+            if relative.as_posix() in tracked and _regular_in_tree(root, relative):
                 continue
         if words[0:2] == ['chmod', '+x'] and len(words) > 2:
             if all(not Path(path).is_absolute() and '..' not in Path(path).parts and not path.startswith('-') for path in words[2:]):
@@ -55,30 +57,33 @@ def _local_script_chain(command, directory, tracked):
     return True
 
 
-def _snapshot_bound_program(root, command_cwd, operand, suffixes):
-    """A program file is declared scope only when the snapshot tracks it."""
-    script = Path(operand)
-    if script.is_absolute() or '..' in script.parts or script.suffix not in suffixes:
+def _regular_in_tree(root, relative):
+    """Git binds a symlink's target string, never the bytes it points at, so a
+    tracked path is declared scope only when it is a real file inside the tree."""
+    root = Path(root).resolve()
+    path = root / relative
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        return path.resolve(strict=True).is_relative_to(root)
+    except OSError:
         return False
-    tracked = set(_command_output(Path(root), ('ls-files', '-z')).decode('utf-8').split('\0'))
-    return (Path(command_cwd) / script).as_posix() in tracked
 
 
-def _interpreter_freshness(root, command_cwd, words, inline_flags, preceding_flags, suffixes):
-    """Inline program text is carried by the recorded command; a file operand is
-    bound only when tracked. An unbound program is captured but never reused."""
+def _interpreter_freshness(words, inline_flags, preceding_flags):
+    """Only inline program text is reusable, because it is carried verbatim in
+    the recorded command. A file operand is never reusable: a tracked path may be
+    a symlink whose target lives outside the snapshot, so head_sha pins the link
+    and not the executed bytes. Any option after the inline text is refused too,
+    since node honours -r and --experimental-loader there."""
     index = 0
     while index < len(words) and words[index] in preceding_flags:
         index += 1
-    if index >= len(words):
+    if index >= len(words) or words[index] not in inline_flags:
         return 'always-fresh'
-    if words[index] in inline_flags:
-        return 'deterministic'
-    if words[index].startswith('-'):
+    if any(word.startswith('-') for word in words[index + 2:]):
         return 'always-fresh'
-    if _snapshot_bound_program(root, command_cwd, words[index], suffixes):
-        return 'deterministic'
-    return 'always-fresh'
+    return 'deterministic'
 
 
 @contextmanager
@@ -256,12 +261,9 @@ def validate_command(root, profile, command_cwd, argv):
         # Require exact leading isolation flags; do not claim arbitrary pytest.
         if argv[1:3] != ['-I', '-S']:
             raise SchemaError('EVIDENCE_COMMAND_UNSUPPORTED')
-        return _interpreter_freshness(root, command_cwd, argv[3:],
-                                      PYTHON_INLINE_FLAGS, frozenset(), {'.py'})
+        return _interpreter_freshness(argv[3:], PYTHON_INLINE_FLAGS, frozenset())
     if name == 'node':
-        return _interpreter_freshness(root, command_cwd, argv[1:],
-                                      NODE_INLINE_FLAGS, NODE_PRE_INLINE_FLAGS,
-                                      {'.js', '.cjs', '.mjs'})
+        return _interpreter_freshness(argv[1:], NODE_INLINE_FLAGS, NODE_PRE_INLINE_FLAGS)
     words = argv[1:]
     # npm configuration flags are not caller-declared environment facts. Only
     # the small advisory presentation flags below may precede the '--' boundary.
@@ -284,6 +286,6 @@ def validate_command(root, profile, command_cwd, argv):
         package = json.loads(raw)
         command = package.get('scripts', {}).get(script, '')
         tracked = set(_command_output(Path(root), ('ls-files', '-z')).decode('utf-8').split('\0'))
-        if _local_script_chain(command, command_cwd, tracked):
+        if _local_script_chain(command, command_cwd, tracked, root):
             return 'deterministic'
     return 'always-fresh'

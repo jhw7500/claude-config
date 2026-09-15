@@ -415,23 +415,30 @@ def _freshness(repo, profile, argv):
     return validate_command(repo, profile, '.', argv)
 
 
+def _programs(repo, suffix, outside):
+    """Tracked regular file, tracked symlink pointing outside, and an untracked file."""
+    (repo / ('bound' + suffix)).write_text('print(1)' if suffix == '.py' else 'console.log(1)')
+    (repo / ('untracked' + suffix)).write_text('print(1)' if suffix == '.py' else 'console.log(1)')
+    os.symlink(str(outside), repo / ('link' + suffix))
+    subprocess.run(['git', '-C', str(repo), 'add', '-A'], check=True)
+    subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'programs'], check=True)
+
+
 @pytest.mark.parametrize('argv', [
     ['python3', '-I', '-S', '/tmp/outside-the-snapshot.py'],
     ['python3', '-I', '-S', '../outside.py'],
     ['python3', '-I', '-S', 'untracked.py'],
+    ['python3', '-I', '-S', 'bound.py'],
+    ['python3', '-I', '-S', 'link.py'],
     ['python3', '-I', '-S', '-m', 'pytest'],
     ['python3', '-I', '-S'],
+    ['python3', '-I', '-S', '-c', "print('ok')", '-X', 'faulthandler'],
 ])
-def test_unbound_python_program_is_never_reusable(git_repo, argv):
-    (git_repo / 'untracked.py').write_text("print('untracked')")
+def test_python_program_operand_is_never_reusable(git_repo, tmp_path, argv):
+    outside = tmp_path / 'outside-target.py'
+    outside.write_text("print('outside')")
+    _programs(git_repo, '.py', outside)
     assert _freshness(git_repo, 'python-v1', argv) == 'always-fresh'
-
-
-def test_tracked_python_program_stays_deterministic(git_repo):
-    (git_repo / 'bound.py').write_text("print('bound')")
-    subprocess.run(['git', '-C', str(git_repo), 'add', 'bound.py'], check=True)
-    subprocess.run(['git', '-C', str(git_repo), 'commit', '-qm', 'bound script'], check=True)
-    assert _freshness(git_repo, 'python-v1', ['python3', '-I', '-S', 'bound.py']) == 'deterministic'
 
 
 def test_inline_python_program_stays_deterministic(git_repo):
@@ -443,20 +450,20 @@ def test_inline_python_program_stays_deterministic(git_repo):
     ['node', '/tmp/outside-the-snapshot.js'],
     ['node', '../outside.js'],
     ['node', 'untracked.js'],
+    ['node', 'bound.js'],
+    ['node', 'link.js'],
     ['node', 'not-a-script.txt'],
     ['node', '--experimental-loader=/tmp/loader.mjs', '-e', '0'],
+    ['node', '-e', '0', '-r', '/tmp/preload.cjs'],
+    ['node', '-p', '1', '-r', '/tmp/preload.cjs'],
+    ['node', '-e', '0', '--experimental-loader=/tmp/loader.mjs'],
     ['node'],
 ])
-def test_unbound_node_program_is_never_reusable(node_repo, argv):
-    (node_repo / 'untracked.js').write_text('console.log(1)')
+def test_node_program_operand_is_never_reusable(node_repo, tmp_path, argv):
+    outside = tmp_path / 'outside-target.js'
+    outside.write_text("console.log('outside')")
+    _programs(node_repo, '.js', outside)
     assert _freshness(node_repo, 'node-lock-v1', argv) == 'always-fresh'
-
-
-def test_tracked_node_program_stays_deterministic(node_repo):
-    (node_repo / 'bound.mjs').write_text("console.log('bound')")
-    subprocess.run(['git', '-C', str(node_repo), 'add', 'bound.mjs'], check=True)
-    subprocess.run(['git', '-C', str(node_repo), 'commit', '-qm', 'bound script'], check=True)
-    assert _freshness(node_repo, 'node-lock-v1', ['node', 'bound.mjs']) == 'deterministic'
 
 
 @pytest.mark.parametrize('argv', [
@@ -465,3 +472,25 @@ def test_tracked_node_program_stays_deterministic(node_repo):
 ])
 def test_inline_node_program_stays_deterministic(node_repo, argv):
     assert _freshness(node_repo, 'node-lock-v1', argv) == 'deterministic'
+
+
+def test_npm_script_body_rejects_a_tracked_symlink(node_repo, tmp_path):
+    outside = tmp_path / 'runner-outside.js'
+    outside.write_text("console.log('outside runner')")
+    os.symlink(str(outside), node_repo / 'runner.js')
+    package = json.loads((node_repo / 'package.json').read_text())
+    package['scripts']['build'] = 'node runner.js'
+    (node_repo / 'package.json').write_text(json.dumps(package))
+    subprocess.run(['git', '-C', str(node_repo), 'add', '-A'], check=True)
+    subprocess.run(['git', '-C', str(node_repo), 'commit', '-qm', 'symlink runner'], check=True)
+    assert _freshness(node_repo, 'node-lock-v1', ['npm', 'run', 'build']) == 'always-fresh'
+
+
+def test_npm_script_body_keeps_a_tracked_regular_file(node_repo):
+    (node_repo / 'runner.mjs').write_text("console.log('local runner')")
+    package = json.loads((node_repo / 'package.json').read_text())
+    package['scripts']['build'] = 'node runner.mjs'
+    (node_repo / 'package.json').write_text(json.dumps(package))
+    subprocess.run(['git', '-C', str(node_repo), 'add', '-A'], check=True)
+    subprocess.run(['git', '-C', str(node_repo), 'commit', '-qm', 'regular runner'], check=True)
+    assert _freshness(node_repo, 'node-lock-v1', ['npm', 'run', 'build']) == 'deterministic'
