@@ -20,6 +20,11 @@ TOOL_PATH = '/usr/bin:/bin'
 MAX_TREE_FILES = 50000
 MAX_TREE_BYTES = 512 * 1024 * 1024
 MAX_FILE_BYTES = 128 * 1024 * 1024
+PYTHON_INLINE_FLAGS = frozenset({'-c'})
+NODE_INLINE_FLAGS = frozenset({'-e', '--eval', '-p', '--print'})
+# Only flags that cannot themselves load code from outside the snapshot may
+# precede inline program text.
+NODE_PRE_INLINE_FLAGS = frozenset({'--input-type=module', '--input-type=commonjs'})
 
 
 def _local_script_chain(command, directory, tracked):
@@ -48,6 +53,32 @@ def _local_script_chain(command, directory, tracked):
                 continue
         return False
     return True
+
+
+def _snapshot_bound_program(root, command_cwd, operand, suffixes):
+    """A program file is declared scope only when the snapshot tracks it."""
+    script = Path(operand)
+    if script.is_absolute() or '..' in script.parts or script.suffix not in suffixes:
+        return False
+    tracked = set(_command_output(Path(root), ('ls-files', '-z')).decode('utf-8').split('\0'))
+    return (Path(command_cwd) / script).as_posix() in tracked
+
+
+def _interpreter_freshness(root, command_cwd, words, inline_flags, preceding_flags, suffixes):
+    """Inline program text is carried by the recorded command; a file operand is
+    bound only when tracked. An unbound program is captured but never reused."""
+    index = 0
+    while index < len(words) and words[index] in preceding_flags:
+        index += 1
+    if index >= len(words):
+        return 'always-fresh'
+    if words[index] in inline_flags:
+        return 'deterministic'
+    if words[index].startswith('-'):
+        return 'always-fresh'
+    if _snapshot_bound_program(root, command_cwd, words[index], suffixes):
+        return 'deterministic'
+    return 'always-fresh'
 
 
 @contextmanager
@@ -225,9 +256,12 @@ def validate_command(root, profile, command_cwd, argv):
         # Require exact leading isolation flags; do not claim arbitrary pytest.
         if argv[1:3] != ['-I', '-S']:
             raise SchemaError('EVIDENCE_COMMAND_UNSUPPORTED')
-        return 'deterministic'
+        return _interpreter_freshness(root, command_cwd, argv[3:],
+                                      PYTHON_INLINE_FLAGS, frozenset(), {'.py'})
     if name == 'node':
-        return 'deterministic'
+        return _interpreter_freshness(root, command_cwd, argv[1:],
+                                      NODE_INLINE_FLAGS, NODE_PRE_INLINE_FLAGS,
+                                      {'.js', '.cjs', '.mjs'})
     words = argv[1:]
     # npm configuration flags are not caller-declared environment facts. Only
     # the small advisory presentation flags below may precede the '--' boundary.

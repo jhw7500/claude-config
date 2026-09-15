@@ -408,3 +408,60 @@ def test_evidence_cli_usage_is_json_for_top_level_and_subparser_errors(git_repo,
     assert result.returncode == 2
     assert result.stdout == '{"reason_code":"EVIDENCE_USAGE"}\n'
     assert result.stderr == ''
+
+
+def _freshness(repo, profile, argv):
+    from pre_pr_tribunal.evidence_environment import validate_command
+    return validate_command(repo, profile, '.', argv)
+
+
+@pytest.mark.parametrize('argv', [
+    ['python3', '-I', '-S', '/tmp/outside-the-snapshot.py'],
+    ['python3', '-I', '-S', '../outside.py'],
+    ['python3', '-I', '-S', 'untracked.py'],
+    ['python3', '-I', '-S', '-m', 'pytest'],
+    ['python3', '-I', '-S'],
+])
+def test_unbound_python_program_is_never_reusable(git_repo, argv):
+    (git_repo / 'untracked.py').write_text("print('untracked')")
+    assert _freshness(git_repo, 'python-v1', argv) == 'always-fresh'
+
+
+def test_tracked_python_program_stays_deterministic(git_repo):
+    (git_repo / 'bound.py').write_text("print('bound')")
+    subprocess.run(['git', '-C', str(git_repo), 'add', 'bound.py'], check=True)
+    subprocess.run(['git', '-C', str(git_repo), 'commit', '-qm', 'bound script'], check=True)
+    assert _freshness(git_repo, 'python-v1', ['python3', '-I', '-S', 'bound.py']) == 'deterministic'
+
+
+def test_inline_python_program_stays_deterministic(git_repo):
+    argv = ['python3', '-I', '-S', '-c', "print('ok')"]
+    assert _freshness(git_repo, 'python-v1', argv) == 'deterministic'
+
+
+@pytest.mark.parametrize('argv', [
+    ['node', '/tmp/outside-the-snapshot.js'],
+    ['node', '../outside.js'],
+    ['node', 'untracked.js'],
+    ['node', 'not-a-script.txt'],
+    ['node', '--experimental-loader=/tmp/loader.mjs', '-e', '0'],
+    ['node'],
+])
+def test_unbound_node_program_is_never_reusable(node_repo, argv):
+    (node_repo / 'untracked.js').write_text('console.log(1)')
+    assert _freshness(node_repo, 'node-lock-v1', argv) == 'always-fresh'
+
+
+def test_tracked_node_program_stays_deterministic(node_repo):
+    (node_repo / 'bound.mjs').write_text("console.log('bound')")
+    subprocess.run(['git', '-C', str(node_repo), 'add', 'bound.mjs'], check=True)
+    subprocess.run(['git', '-C', str(node_repo), 'commit', '-qm', 'bound script'], check=True)
+    assert _freshness(node_repo, 'node-lock-v1', ['node', 'bound.mjs']) == 'deterministic'
+
+
+@pytest.mark.parametrize('argv', [
+    ['node', '-e', "console.log('ok')"],
+    ['node', '--input-type=module', '-e', "console.log('ok')"],
+])
+def test_inline_node_program_stays_deterministic(node_repo, argv):
+    assert _freshness(node_repo, 'node-lock-v1', argv) == 'deterministic'
