@@ -435,7 +435,7 @@ def test_pending_recovery_uses_status_driven_command_sequence():
 def test_pending_recovery_documents_exact_migration_route_by_schema():
     migration_command_by_schema = {}
     for line in pending_recovery_contract().splitlines():
-        match = re.match(r"- If `verdict_schema == ([123])`, (.*)", line)
+        match = re.match(r"- If `verdict_schema == ([1234])`, (.*)", line)
         if match is None:
             continue
         command = re.search(r"run `([^`]+)`", match.group(2))
@@ -446,6 +446,7 @@ def test_pending_recovery_documents_exact_migration_route_by_schema():
         1: "migrate-legacy-pending",
         2: "migrate-v2-pending",
         3: None,
+        4: None,
     }
 
 
@@ -485,14 +486,15 @@ def test_observation_and_terminal_cleanup_failures_are_warnings_only():
         assert token in skill
 
 
-def test_report_reference_documents_v3_shapes_and_real_controller_commands():
+def test_report_reference_documents_v4_shapes_and_real_controller_commands():
     schema = text("references/report-schema.md")
-    status = json_example(schema, "v3-status")
+    status = json_example(schema, "v4-status")
     assert set(status) == {
         "round", "gate_status", "blocking_count", "verdict_path",
         "verdict_schema", "reviewers",
     }
-    assert status["verdict_schema"] == 3
+    assert status["verdict_schema"] == 4
+    assert status['reviewers']['A']['report_contract_version'] == 3
     assert status["reviewers"]["A"]["state"] == "sealed"
     assert set(status["reviewers"]["A"]) == {
         "state", "attempt_count", "last_error", "raw_sha256",
@@ -502,12 +504,13 @@ def test_report_reference_documents_v3_shapes_and_real_controller_commands():
         "state", "attempt_count", "last_error",
     }
 
-    receipt = json_example(schema, "v3-submit-receipt")
+    receipt = json_example(schema, "v4-submit-receipt")
     assert set(receipt) == {
         "reviewer", "round", "state", "raw_sha256", "context_sha256",
         "report_contract_version", "attempt", "provenance",
     }
     assert receipt["state"] == "sealed"
+    assert receipt['report_contract_version'] == 3
 
     match = re.search(
         r"<!-- controller-command-examples -->(.*?)"
@@ -536,11 +539,13 @@ def test_report_reference_documents_v3_shapes_and_real_controller_commands():
     assert reasons == {"DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"}
 
 
-def test_report_reference_documents_internal_v3_lifecycle_identity():
+def test_report_reference_documents_internal_v4_lifecycle_identity():
     stored_verdict = json_example(
-        text("references/report-schema.md"), "v3-stored-verdict",
+        text("references/report-schema.md"), "v4-stored-verdict",
     )
-    assert stored_verdict["schema"] == 3
+    assert stored_verdict["schema"] == 4
+    assert stored_verdict['evidence_binding'] is None
+    assert stored_verdict['evidence_fallback_reason'] is None
     assert re.fullmatch(r"[0-9a-f]{32}", stored_verdict["lifecycle_id"])
 
 

@@ -66,7 +66,7 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
         for item in verdict.decisions
         if item.reviewer is reviewer
     ]
-    return {
+    body = {
         "schema": 1,
         "round": verdict.round,
         "reviewer": reviewer.value,
@@ -87,6 +87,11 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
             "executions": MAX_EXECUTIONS_PER_REVIEWER,
         },
     }
+    if (reviewer is Reviewer.B and verdict.schema == VERDICT_SCHEMA_VERSION
+        and (verdict.evidence_binding is not None or verdict.evidence_fallback_reason is not None)):
+        body['evidence'] = verdict.evidence_binding.to_json() if verdict.evidence_binding else None
+        body['evidence_fallback_reason'] = verdict.evidence_fallback_reason
+    return body
 
 
 def context_sha256(verdict: Verdict, reviewer: Reviewer) -> str:
@@ -100,7 +105,7 @@ def context_sha256(verdict: Verdict, reviewer: Reviewer) -> str:
 def reviewer_context_envelope(
     verdict: Verdict, reviewer: Reviewer
 ) -> dict[str, object]:
-    if verdict.contract != current_contract_binding():
+    if verdict.schema != VERDICT_SCHEMA_VERSION or verdict.contract != current_contract_binding():
         raise SchemaError("CONTRACT_DRIFT")
     if verdict.reviewers[reviewer.value].status != "pending":
         raise SchemaError("REVIEWER_SLOT_SEALED")

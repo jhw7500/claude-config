@@ -215,6 +215,8 @@ class _VerdictFields:
     created_at: str
     lifecycle_id: str | None
     snapshot: Snapshot
+    evidence_binding: m.EvidenceBinding | None
+    evidence_fallback_reason: str | None
 
 
 def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFields:
@@ -237,8 +239,10 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
     }
     if schema in m.MIXED_SLOT_VERDICT_SCHEMAS:
         verdict_keys.add("contract")
-        if schema == m.VERDICT_SCHEMA_VERSION:
+        if schema in m.LIFECYCLE_VERDICT_SCHEMAS:
             verdict_keys.add("lifecycle_id")
+        if schema == m.VERDICT_SCHEMA_VERSION:
+            verdict_keys.update(('evidence_binding', 'evidence_fallback_reason'))
         valid_shapes = {frozenset(verdict_keys)}
     else:
         valid_shapes = {
@@ -294,7 +298,7 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
     except ValueError:
         raise SchemaError("VERDICT_INVALID") from None
     lifecycle_id: str | None = None
-    if schema == m.VERDICT_SCHEMA_VERSION:
+    if schema in m.LIFECYCLE_VERDICT_SCHEMAS:
         lifecycle_id = data["lifecycle_id"]
         if (
             not isinstance(lifecycle_id, str)
@@ -344,6 +348,13 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         initial_paths,
         created_at,
     )
+    from .evidence_lifecycle import parse_selection, parse_fallback
+    selection = parse_selection(data.get('evidence_binding'))
+    fallback = parse_fallback(data.get('evidence_fallback_reason'), selection)
+    if selection is not None:
+        from .evidence_runtime import snapshot_binding
+        if selection.to_json()['expected_binding']['snapshot'] != snapshot_binding(snapshot):
+            raise SchemaError('EVIDENCE_BINDING_MISMATCH')
     return _VerdictFields(
         schema,
         repository,
@@ -363,6 +374,8 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         created_at,
         lifecycle_id,
         snapshot,
+        selection,
+        fallback,
     )
 
 
@@ -391,6 +404,7 @@ def _parse_embedded_report(
         expected_reviewer=Reviewer(reviewer),
         expected_round=fields.round,
         snapshot=fields.snapshot,
+        report_contract_version=3 if fields.schema == m.VERDICT_SCHEMA_VERSION else 2,
     )
 
 
@@ -430,6 +444,8 @@ def _verdict_from_fields(
         fields.created_at,
         contract,
         lifecycle_id,
+        fields.evidence_binding,
+        fields.evidence_fallback_reason,
     )
 
 
@@ -543,6 +559,11 @@ def _parse_v2_receipt(
 def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
     fields = _parse_verdict_fields(data, schema=schema)
     contract = _parse_contract(data["contract"])
+    if fields.evidence_binding is not None and (
+        fields.evidence_binding.to_json()['expected_binding']['contract']
+        != {**contract.to_json(), 'evidence': 1}
+    ):
+        raise SchemaError('EVIDENCE_BINDING_MISMATCH')
     reviewers: dict[str, ReviewerSlot] = {}
     for key in "ABC":
         raw_slot = fields.reviewers[key]
@@ -881,6 +902,8 @@ def submit_reviewer_report(
                     snapshot=snapshot,
                 )
                 _validate_reviewer_closure(pending, parsed)
+                from .evidence_lifecycle import authenticate_report
+                authenticate_report(root, pending, parsed)
             else:
                 if len(raw) > MAX_ATTEMPT_RAW_BYTES:
                     raise SchemaError("REPORT_TOO_LARGE")
@@ -890,6 +913,8 @@ def submit_reviewer_report(
                         snapshot=snapshot,
                     )
                     _validate_reviewer_closure(pending, parsed)
+                    from .evidence_lifecycle import authenticate_report
+                    authenticate_report(root, pending, parsed)
                 except SchemaError as error:
                     if error.code in REPORT_RETRYABLE_CODES:
                         _record_failure_locked(review_fd, pending, reviewer, error.code, raw)
@@ -1018,7 +1043,7 @@ def validate_stored_reviewer_report(
         if not _snapshot_equal(verdict, snapshot):
             raise SchemaError("SNAPSHOT_CHANGED")
         if verdict.schema in m.MIXED_SLOT_VERDICT_SCHEMAS and slot.status == "sealed":
-            parsed = _read_sealed_report(review_fd, verdict, reviewer)
+            parsed = _read_sealed_report(review_fd, verdict, reviewer, root=root)
             if slot.receipt is None:
                 raise SchemaError("VERDICT_INVALID")
             return parsed, slot.receipt.raw_sha256
@@ -1034,12 +1059,15 @@ def validate_stored_reviewer_report(
             )
         finally:
             os.close(round_fd)
-        return m.validate_report_bytes(
+        parsed, digest = m.validate_report_bytes(
             raw,
             expected_reviewer=reviewer,
             expected_round=verdict.round,
             snapshot=snapshot,
         )
+        from .evidence_lifecycle import authenticate_report
+        authenticate_report(root, verdict, parsed)
+        return parsed, digest
 
 
 def _blockers(verdict: Verdict) -> tuple[m.Finding, ...]:
@@ -1125,6 +1153,7 @@ def begin_round(
     runtime: str,
     round_number: int,
     decisions_path: Path | None = None,
+    evidence_bundle_sha256: str | None = None,
     now: Callable[[], str] = utc_now,
     token_hex: Callable[[int], str] = secrets.token_hex,
 ) -> Verdict:
@@ -1219,6 +1248,9 @@ def begin_round(
             round_number=round_number, decisions=decisions, history=history,
             contract=current_contract_binding(), lifecycle_id=_lifecycle_id(token_hex),
         )
+        from .evidence_lifecycle import select_evidence
+        selection, fallback = select_evidence(root, snapshot, evidence_bundle_sha256)
+        pending = replace(pending, evidence_binding=selection, evidence_fallback_reason=fallback)
         _atomic_write(review_fd, pending)
         return pending
 
@@ -1269,7 +1301,7 @@ def _validate_closure(verdict: Verdict, reports: Mapping[str, ReviewerReport]) -
 
 
 def _read_sealed_report(
-    review_fd: int, verdict: Verdict, reviewer: Reviewer
+    review_fd: int, verdict: Verdict, reviewer: Reviewer, *, root: Path
 ) -> ReviewerReport:
     slot = verdict.reviewers[reviewer.value]
     if slot.status != "sealed" or slot.report is None or slot.receipt is None:
@@ -1294,6 +1326,8 @@ def _read_sealed_report(
         raise SchemaError("REPORT_RECEIPT_MISMATCH")
     if slot.receipt.context_sha256 != context_sha256(verdict, reviewer):
         raise SchemaError("CONTEXT_DRIFT")
+    from .evidence_lifecycle import authenticate_report
+    authenticate_report(root, verdict, parsed)
     return parsed
 
 
@@ -1324,7 +1358,7 @@ def finalize_round(
             raise SchemaError("SNAPSHOT_CHANGED")
         reports: dict[str, ReviewerReport] = {}
         for key in "ABC":
-            reports[key] = _read_sealed_report(review_fd, pending, Reviewer(key))
+            reports[key] = _read_sealed_report(review_fd, pending, Reviewer(key), root=root)
         _validate_closure(pending, reports)
         blockers = tuple(
             finding
@@ -1388,7 +1422,7 @@ def migrate_v2_pending_round(
             raise SchemaError("CONTRACT_DRIFT")
         for key in "ABC":
             if legacy.reviewers[key].status == "sealed":
-                _read_sealed_report(review_fd, legacy, Reviewer(key))
+                _read_sealed_report(review_fd, legacy, Reviewer(key), root=root)
         migrated = replace(
             legacy,
             schema=m.VERDICT_SCHEMA_VERSION,

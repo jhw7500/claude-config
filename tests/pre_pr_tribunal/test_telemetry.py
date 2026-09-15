@@ -40,6 +40,8 @@ def test_legacy_telemetry_cannot_authorize_current_report_bytes(git_repo, teleme
     legacy["schema"] = 1
     del legacy["contract"]
     del legacy["lifecycle_id"]
+    del legacy['evidence_binding']
+    del legacy['evidence_fallback_reason']
     legacy["reviewers"] = {key: {"status": "pending"} for key in "ABC"}
     (git_repo / ".review/verdict.json").write_text(json.dumps(legacy))
     value = {"schema": 1, "reviewer": "A", "round": 1,
@@ -628,17 +630,17 @@ def test_bound_run_records_terminal_span_and_sanitized_summary(git_repo):
     assert summary["reviewers"]["B"]["total_ms"] == 4000
     assert summary["outcomes"]["success"] == 1
     assert summary["binding"]["contract"] == {
-        "report_text": 2, "diff_recipe": 1, "telemetry_schema": 3,
+        "report_text": 3, "diff_recipe": 1, "telemetry_schema": 3,
     }
     assert summary["stages"]["reviewer_total"] == {"count": 1, "total_ms": 4000}
     assert summary["early_detection"] is None
     assert set(summary) == {
         "schema", "binding", "reviewers", "stages", "outcomes",
         "telemetry_incomplete", "anomaly_reason_codes", "early_detection",
-        "recovery", "invocation_elapsed_ms",
+        "recovery", "invocation_elapsed_ms", "evidence",
     }
     assert set(summary["binding"]) == {"contract", "diff_sha256"}
-    for forbidden in ("command", "/home/", "monotonic", "started_at", span.span_id):
+    for forbidden in ('"command":', "/home/", "monotonic", "started_at", span.span_id):
         assert forbidden not in json.dumps(summary)
     with pytest.raises(FrozenInstanceError):
         terminal.duration_ms = 0
@@ -700,6 +702,29 @@ def test_schema_two_new_round_invocation_remains_readable(git_repo):
     path.write_bytes(raw)
     parsed = read_ledger(git_repo).runs[0]
     assert parsed.invocation == telemetry_module.Invocation("new_round", (), ())
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.parametrize('schema', [1, 2, 3])
+def test_historical_report_two_observations_remain_readable_without_rewrite(git_repo, schema):
+    snapshot = capture_snapshot(git_repo, 'master', now=NOW)
+    run = new_run(git_repo)
+    bind_run(git_repo, run_id=run.run_id, snapshot=snapshot, lifecycle_id=LIFECYCLE)
+    path = ledger_path(git_repo)
+    value = json.loads(path.read_bytes())
+    value['schema'] = schema
+    stored = value['runs'][0]
+    stored['binding']['contract']['report_text'] = 2
+    stored['binding']['contract']['telemetry_schema'] = schema
+    if schema < 3:
+        stored.pop('lifecycle_id')
+    if schema < 2:
+        stored.pop('invocation')
+        stored.pop('ended_monotonic_ns')
+    raw = json.dumps(value).encode()
+    path.write_bytes(raw)
+    assert read_ledger(git_repo).runs[0].binding.contract['report_text'] == 2
+    assert summarize_run(git_repo, run_id=run.run_id)['binding']['contract']['report_text'] == 2
     assert path.read_bytes() == raw
 
 

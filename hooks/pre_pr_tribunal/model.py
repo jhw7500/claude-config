@@ -14,15 +14,17 @@ from urllib.parse import urlsplit
 
 SCHEMA_VERSION = 1
 SLOT_VERDICT_SCHEMA_VERSION = 2
-VERDICT_SCHEMA_VERSION = 3
+LIFECYCLE_VERDICT_SCHEMA_VERSION = 3
+VERDICT_SCHEMA_VERSION = 4
+LIFECYCLE_VERDICT_SCHEMAS = frozenset((LIFECYCLE_VERDICT_SCHEMA_VERSION, VERDICT_SCHEMA_VERSION))
 MIXED_SLOT_VERDICT_SCHEMAS = frozenset(
-    (SLOT_VERDICT_SCHEMA_VERSION, VERDICT_SCHEMA_VERSION)
+    (SLOT_VERDICT_SCHEMA_VERSION, *LIFECYCLE_VERDICT_SCHEMAS)
 )
 SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 2
+REPORT_TEXT_CONTRACT_VERSION = 3
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -125,6 +127,25 @@ class Snapshot:
 
 
 @dataclass(frozen=True)
+class EvidenceReference:
+    bundle_sha256: str
+    entry_id: str
+
+    def to_json(self):
+        return {"bundle_sha256": self.bundle_sha256, "entry_id": self.entry_id}
+
+
+@dataclass(frozen=True)
+class EvidenceBinding:
+    bundle_sha256: str
+    expected_binding_json: bytes
+
+    def to_json(self):
+        return {"bundle_sha256": self.bundle_sha256,
+                "expected_binding": json.loads(self.expected_binding_json)}
+
+
+@dataclass(frozen=True)
 class Execution:
     id: str
     command: str
@@ -133,9 +154,10 @@ class Execution:
     stderr_excerpt: str
     capture_sha256: str
     truncated: bool
+    evidence_ref: EvidenceReference | None = None
 
     def to_json(self) -> dict[str, object]:
-        return {
+        value = {
             "id": self.id,
             "command": self.command,
             "exit_code": self.exit_code,
@@ -144,6 +166,9 @@ class Execution:
             "capture_sha256": self.capture_sha256,
             "truncated": self.truncated,
         }
+        if self.evidence_ref is not None:
+            value["evidence_ref"] = self.evidence_ref.to_json()
+        return value
 
 
 @dataclass(frozen=True)
@@ -399,6 +424,8 @@ class Verdict:
     created_at: str
     contract: ContractBinding | None = None
     lifecycle_id: str | None = None
+    evidence_binding: EvidenceBinding | None = None
+    evidence_fallback_reason: str | None = None
 
     @property
     def snapshot(self) -> Snapshot:
@@ -423,7 +450,7 @@ class Verdict:
             if (
                 self.contract is None
                 or (
-                    self.schema == VERDICT_SCHEMA_VERSION
+                    self.schema in LIFECYCLE_VERDICT_SCHEMAS
                     and (
                         not isinstance(self.lifecycle_id, str)
                         or _LIFECYCLE_ID.fullmatch(self.lifecycle_id) is None
@@ -473,8 +500,13 @@ class Verdict:
         }
         if self.schema in MIXED_SLOT_VERDICT_SCHEMAS:
             value["contract"] = self.contract.to_json()
-        if self.schema == VERDICT_SCHEMA_VERSION:
+        if self.schema in LIFECYCLE_VERDICT_SCHEMAS:
             value["lifecycle_id"] = self.lifecycle_id
+        if self.schema == VERDICT_SCHEMA_VERSION:
+            value["evidence_binding"] = self.evidence_binding.to_json() if self.evidence_binding else None
+            value["evidence_fallback_reason"] = self.evidence_fallback_reason
+        elif self.evidence_binding is not None or self.evidence_fallback_reason is not None:
+            raise SchemaError("VERDICT_INVALID")
         return value
 
 
@@ -810,8 +842,19 @@ def _integer(
 
 
 def _parse_execution(
-    value: object, *, reviewer: Reviewer | None, round_number: int
+    value: object, *, reviewer: Reviewer | None, round_number: int,
+    report_contract_version: int = REPORT_TEXT_CONTRACT_VERSION,
 ) -> Execution:
+    reference = None
+    if isinstance(value, dict) and "evidence_ref" in value:
+        if reviewer is not Reviewer.B or report_contract_version < 3:
+            raise SchemaError("EXECUTION_SCHEMA_INVALID")
+        ref = _object(value["evidence_ref"], {"bundle_sha256", "entry_id"}, "EXECUTION_SCHEMA_INVALID")
+        if (not isinstance(ref["bundle_sha256"], str) or _SHA256.fullmatch(ref["bundle_sha256"]) is None
+            or not isinstance(ref["entry_id"], str) or re.fullmatch(r"E(?:00[1-9]|0[1-5][0-9]|06[0-4])", ref["entry_id"]) is None):
+            raise SchemaError("EXECUTION_SCHEMA_INVALID")
+        reference = EvidenceReference(ref["bundle_sha256"], ref["entry_id"])
+        value = {key: item for key, item in value.items() if key != "evidence_ref"}
     obj = _object(
         value,
         {
@@ -852,7 +895,7 @@ def _parse_execution(
     truncated = obj["truncated"]
     if not isinstance(truncated, bool):
         raise SchemaError("EXECUTION_SCHEMA_INVALID")
-    return Execution(identifier, command, exit_code, stdout, stderr, capture, truncated)
+    return Execution(identifier, command, exit_code, stdout, stderr, capture, truncated, reference)
 
 
 def _parse_finding(value: object, *, reviewer: Reviewer, round_number: int) -> Finding:
@@ -982,7 +1025,8 @@ def _parse_prior_response(value: object) -> PriorDecisionResponse:
 
 
 def parse_reviewer_report(
-    raw: bytes, *, expected_reviewer: Reviewer, expected_round: int, snapshot: Snapshot
+    raw: bytes, *, expected_reviewer: Reviewer, expected_round: int, snapshot: Snapshot,
+    report_contract_version: int = REPORT_TEXT_CONTRACT_VERSION,
 ) -> ReviewerReport:
     if not isinstance(expected_reviewer, Reviewer) or not isinstance(
         snapshot, Snapshot
@@ -1021,7 +1065,8 @@ def parse_reviewer_report(
     ):
         raise SchemaError("REPORT_SNAPSHOT_MISMATCH")
     executions = tuple(
-        _parse_execution(item, reviewer=expected_reviewer, round_number=expected_round)
+        _parse_execution(item, reviewer=expected_reviewer, round_number=expected_round,
+                         report_contract_version=report_contract_version)
         for item in _array(
             obj["executions"], MAX_EXECUTIONS_PER_REVIEWER, "EXECUTION_LIMIT_EXCEEDED"
         )

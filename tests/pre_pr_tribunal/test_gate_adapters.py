@@ -140,12 +140,15 @@ def _passing_verdict(repo: Path):
     return _finish_round(repo)
 
 
-@pytest.mark.parametrize("version", (1, 2, 3))
+@pytest.mark.parametrize("version", (1, 2, 3, 4))
 def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo, version):
     _passing_verdict(git_repo)
     path = git_repo / ".review/verdict.json"
     value = json.loads(path.read_bytes())
-    assert value["schema"] == 3
+    assert value["schema"] == 4
+    if version < 4:
+        del value['evidence_binding']
+        del value['evidence_fallback_reason']
     if version == 1:
         value["schema"] = 1
         del value["contract"]
@@ -158,9 +161,15 @@ def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo,
         value["contract"]["verdict_schema"] = 2
         del value["lifecycle_id"]
         _write_json(path, value)
-    expected = GateCode.VERDICT_STALE if version == 2 else GateCode.PASS
+    elif version == 3:
+        value['schema'] = 3
+        value['contract'] = {'report_text': 2, 'diff_recipe': 1, 'verdict_schema': 3}
+        for slot in value['reviewers'].values():
+            slot['receipt']['report_contract_version'] = 2
+        _write_json(path, value)
+    expected = GateCode.VERDICT_STALE if version in (2, 3) else GateCode.PASS
     assert evaluate_gate(git_repo, BOUND_COMMAND).code is expected
-    if version == 3:
+    if version == 4:
         value["contract"]["diff_recipe"] = 99
         _write_json(path, value)
         assert evaluate_gate(git_repo, BOUND_COMMAND).code is GateCode.VERDICT_STALE
@@ -170,7 +179,7 @@ def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo,
 @pytest.mark.parametrize("state", ("pass", "fail", "contract_drift"))
 def test_hook_adapter_consumes_native_current_terminal_contract(installed_package, git_repo, name, state):
     terminal = _finish_round(git_repo, finding_id="A-R1-001" if state == "fail" else None)
-    assert terminal.schema == 3
+    assert terminal.schema == 4
     if state == "contract_drift":
         value = terminal.to_json()
         value["contract"]["diff_recipe"] = 99

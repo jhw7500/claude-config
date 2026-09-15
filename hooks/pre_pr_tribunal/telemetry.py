@@ -267,6 +267,9 @@ def _parse_binding(value: object) -> TelemetryBinding:
     contract = _object(obj["contract"], "report_text diff_recipe telemetry_schema")
     for name, expected in _contract().items():
         supported = SUPPORTED_TELEMETRY_SCHEMAS if name == "telemetry_schema" else (expected,)
+        if name == 'report_text':
+            # Historical observation reading never upgrades pending round authority.
+            supported = (2, REPORT_TEXT_CONTRACT_VERSION)
         _require(type(contract[name]) is int and contract[name] in supported)
     for name in ("repository", "base_sha", "head_ref", "head_sha", "merge_base_sha", "diff_sha256"):
         value = obj[name]
@@ -572,7 +575,7 @@ def resume_run(cwd: Path, *, runtime: str, started_at: str, started_monotonic_ns
             for reviewer in Reviewer:
                 slot = verdict.reviewers[reviewer.value]
                 if slot.status == "sealed":
-                    _read_sealed_report(directory, verdict, reviewer)
+                    _read_sealed_report(directory, verdict, reviewer, root=cwd)
                     reused.append(reviewer)
                 elif slot.attempt_count or reviewer in observed:
                     attempted.append(reviewer)
@@ -757,6 +760,7 @@ def _early_detection(run: TelemetryRun) -> dict[str, object] | None:
 
 
 def summarize_run(cwd: Path, *, run_id: str | None = None) -> dict[str, object]:
+    from .evidence_telemetry import summarize as summarize_evidence
     ledger = read_ledger(cwd)
     _require(bool(ledger.runs))
     run = _find_run(ledger, run_id) if run_id is not None else ledger.runs[-1]
@@ -781,6 +785,7 @@ def summarize_run(cwd: Path, *, run_id: str | None = None) -> dict[str, object]:
         "early_detection": _early_detection(run),
         "recovery": _recovery(run),
         "invocation_elapsed_ms": _invocation_elapsed(run),
+        "evidence": summarize_evidence(cwd, run),
     }
 
 

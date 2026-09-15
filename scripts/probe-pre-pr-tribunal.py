@@ -1435,17 +1435,20 @@ def _create_pass_verdict(
                                 "--runtime", runtime, "--round", "1")
         status = _tribunal_cli(cli, repo, home, "status")
     verdict_schema = status.get("verdict_schema")
+    if verdict_schema == 3:
+        # Readable historical state does not authorize a current pending round.
+        raise ProbeFailure("CONTRACT_DRIFT")
     migration_command = {
         1: "migrate-legacy-pending",
         2: "migrate-v2-pending",
-        3: None,
+        4: None,
     }.get(verdict_schema)
-    if verdict_schema not in {1, 2, 3}:
+    if verdict_schema not in {1, 2, 4}:
         raise ProbeFailure("SETUP_FAILED")
     if migration_command is not None:
         _tribunal_cli(cli, repo, home, migration_command)
         status = _tribunal_cli(cli, repo, home, "status")
-    if status.get("verdict_schema") != 3:
+    if status.get("verdict_schema") != 4:
         raise ProbeFailure("SETUP_FAILED")
     observation = payload.get("telemetry", {})
     if not isinstance(observation, dict):
