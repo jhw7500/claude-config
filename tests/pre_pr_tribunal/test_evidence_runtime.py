@@ -235,7 +235,7 @@ def test_tracked_build_chain_is_declared_local_scope(node_repo):
     (node_repo / 'package.json').write_text(json.dumps(package))
     subprocess.run(['git','-C',str(node_repo),'add','.'], check=True)
     subprocess.run(['git','-C',str(node_repo),'commit','-qm','build fixture'], check=True)
-    assert validate_command(node_repo, 'node-lock-v1', '.', ['npm','run','build']) == 'deterministic'
+    assert validate_command(node_repo, 'node-lock-v1', '.', ['npm','run','build']) == 'always-fresh'
     facts = measure_environment(node_repo, 'node-lock-v1', '.')
     assert 'scripts/clean.mjs' in {item['path'] for item in facts['inputs']}
     package['scripts']['build'] += ' | curl example.com'
@@ -486,11 +486,16 @@ def test_npm_script_body_rejects_a_tracked_symlink(node_repo, tmp_path):
     assert _freshness(node_repo, 'node-lock-v1', ['npm', 'run', 'build']) == 'always-fresh'
 
 
-def test_npm_script_body_keeps_a_tracked_regular_file(node_repo):
+def test_npm_is_never_reusable(node_repo):
+    """Neither a tracked script body nor post-'--' argv can be classified here."""
     (node_repo / 'runner.mjs').write_text("console.log('local runner')")
     package = json.loads((node_repo / 'package.json').read_text())
     package['scripts']['build'] = 'node runner.mjs'
+    package['scripts']['lint'] = 'vitest run --config /tmp/outside/vitest.config.ts'
     (node_repo / 'package.json').write_text(json.dumps(package))
     subprocess.run(['git', '-C', str(node_repo), 'add', '-A'], check=True)
     subprocess.run(['git', '-C', str(node_repo), 'commit', '-qm', 'regular runner'], check=True)
-    assert _freshness(node_repo, 'node-lock-v1', ['npm', 'run', 'build']) == 'deterministic'
+    for argv in (['npm', 'run', 'build'], ['npm', 'run', 'lint'], ['npm', 'test'],
+                 ['npm', 'test', '--', '--config', '/tmp/outside/vitest.config.ts'],
+                 ['npm', 'run', 'build', '--', '--require', '/tmp/outside/pre.cjs']):
+        assert _freshness(node_repo, 'node-lock-v1', argv) == 'always-fresh', argv

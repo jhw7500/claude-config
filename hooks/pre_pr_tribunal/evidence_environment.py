@@ -28,48 +28,6 @@ NODE_INLINE_FLAGS = frozenset({'-e', '--eval', '-p', '--print'})
 NODE_PRE_INLINE_FLAGS = frozenset({'--input-type=module', '--input-type=commonjs'})
 
 
-def _local_script_chain(command, directory, tracked, root):
-    """Bounded declared local scope, not a proof of arbitrary program purity."""
-    if not isinstance(command, str) or len(command.encode('utf-8')) > 4096:
-        return False
-    chains = command.split('&&')
-    if not 1 <= len(chains) <= 16:
-        return False
-    for chain in chains:
-        if re.fullmatch(r'[A-Za-z0-9_./=*,:+ \t-]+', chain) is None:
-            return False
-        words = chain.split()
-        if not words:
-            return False
-        if words[0] in {'vitest', 'tsc', 'eslint', 'prettier'}:
-            continue
-        if words[0] == 'node' and len(words) >= 2:
-            script = Path(words[1])
-            if script.is_absolute() or '..' in script.parts or script.suffix not in {'.js', '.cjs', '.mjs'}:
-                return False
-            relative = Path(directory) / script
-            if relative.as_posix() in tracked and _regular_in_tree(root, relative):
-                continue
-        if words[0:2] == ['chmod', '+x'] and len(words) > 2:
-            if all(not Path(path).is_absolute() and '..' not in Path(path).parts and not path.startswith('-') for path in words[2:]):
-                continue
-        return False
-    return True
-
-
-def _regular_in_tree(root, relative):
-    """Git binds a symlink's target string, never the bytes it points at, so a
-    tracked path is declared scope only when it is a real file inside the tree."""
-    root = Path(root).resolve()
-    path = root / relative
-    try:
-        if path.is_symlink() or not path.is_file():
-            return False
-        return path.resolve(strict=True).is_relative_to(root)
-    except OSError:
-        return False
-
-
 def _interpreter_freshness(words, inline_flags, preceding_flags):
     """Only inline program text is reusable, because it is carried verbatim in
     the recorded command. A file operand is never reusable: a tracked path may be
@@ -271,21 +229,8 @@ def validate_command(root, profile, command_cwd, argv):
     for word in npm_words:
         if word.startswith('-') and word not in {'--json', '--omit=dev', '--omit=optional', '--production'} and re.fullmatch(r'--audit-level=(?:info|low|moderate|high|critical|none)', word) is None:
             raise SchemaError('EVIDENCE_CONFIG_UNSUPPORTED')
-    if any(word in {'audit', 'install', 'i', 'ci', 'update', 'up', 'outdated', 'view', 'info', 'search', 'exec', 'x'} for word in words):
-        return 'always-fresh'
-    # Script contents can invoke live services or aliases; only literal local
-    # validation tools are supported, with shell metacharacters rejected.
-    if words and words[0] in {'run', 'run-script', 'test', 't', 'tst'}:
-        script = words[1] if words[0] in {'run', 'run-script'} and len(words) > 1 else 'test'
-        package_path = Path(root) / command_cwd / 'package.json'
-        _hash_file(package_path, 1024 * 1024)
-        with package_path.open('rb') as source:
-            raw = source.read(1024 * 1024 + 1)
-        if len(raw) > 1024 * 1024:
-            raise SchemaError('EVIDENCE_ENVIRONMENT_TOO_LARGE')
-        package = json.loads(raw)
-        command = package.get('scripts', {}).get(script, '')
-        tracked = set(_command_output(Path(root), ('ls-files', '-z')).decode('utf-8').split('\0'))
-        if _local_script_chain(command, command_cwd, tracked, root):
-            return 'deterministic'
+    # No npm invocation is reusable. A script body is tracked content but the
+    # files its tools read are not bound by the snapshot, and npm appends every
+    # word after '--' to the executed script, so neither form can be classified
+    # from what is visible here.
     return 'always-fresh'
