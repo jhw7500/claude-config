@@ -1,9 +1,107 @@
 # Reviewer evidence bundle validation
 
-> Historical contract-1 evidence only. The current implementation uses evidence contract 2 and
-> `node-sandbox-v1`; none of the native timing/count results or the 3849-test run below establishes
-> current acceptance. A fresh contract-2 native comparison, full suite, and whole-branch review
-> remain required after the final implementation commit.
+## Contract-2 acceptance (2026-09-16)
+
+Evidence contract 2 and `node-sandbox-v1` passed the final fixed-snapshot
+acceptance run. The accepted implementation commits are
+`2a485b026170427c2d465a84e3b50cb30be3e3fb` and
+`a0dd248f779bb537646839cc7976a8ce5251f29a`. The latter binds the selected
+current-PATH Node/npm runtime by copying the Node binary and complete npm package
+tree into the private sandbox, mounting that copy read-only, and hiding the
+original host runtime path. Python current-PATH binding remains covered.
+
+The disposable installed candidate contained 25 changed files. Its selected
+Node v22.23.1/npm 10.9.8 runtime digest was
+`a288cf16ba05cbb023323210ba2798c6e59d161c1681f2e3936e2d1f71c084ac`;
+both bundles used dependency digest
+`9c8de72c3cb1a8ffb786d0fb232a19b49d7197bccea6306dbfb3bb204d456724`.
+The normal bundle was
+`29af2dfeb65c2820e0e398df37d86b767c12606ef10724ee53c35fefa8aff0bb`;
+the blocker bundle was
+`3303439d6a1b932597ae55921714226aef5711926df201e95096e579030ecec8`.
+These are evidence-contract-2 bundles; the submitted reviewer reports use report
+contract 3.
+
+The comparison fixed the same historical repository identity used below:
+
+| Identity | Value |
+| --- | --- |
+| Source | jhw-notion PR #140 |
+| Reviewed HEAD | `47df3a80bfb97778812b3c094957701cb335687b` |
+| Base | `b4bf525e50e5117833cb1d245357a0a85008408c` |
+| Merge-base | `439ddc35170df27bf74a056f48f28e7c07e4c384` |
+| Diff SHA-256 | `d2314a60f32b1ad04ebd644cc5879f58b48b85d865254e60e313a1f07052cbd9` |
+
+All four B arms used fresh gpt-6-astra/medium native sessions. Bundle arms alone
+received authenticated evidence. Independent arms received no `.review`
+projection. Normal arms agreed on C001-C009 as supported, C010 as unverified,
+and no finding. Blocker arms additionally agreed that C011 was refuted by
+TS5023/exit1 and produced the same normalized HIGH finding `B-R1-001` at
+`mcp-server/package.json:12`.
+
+| Observation | Independent normal | Bundle normal | Independent blocker | Bundle blocker |
+| --- | ---: | ---: | ---: | ---: |
+| Fresh report executions | 10 | 9 | 11 | 8 |
+| Eligible evidence entries | 0 | 2 | 0 | 2 |
+| Reused entries | 0 | 2 | 0 | 2 |
+| Claim-cited reused entries | 0 | 2 | 0 | 2 |
+| Evidence verification, seconds | n/a | 1.066 | n/a | 1.066 |
+| Selected capture command time, seconds | 0 | 48.731 | 0 | 48.475 |
+| First native B response, seconds | 684.315 | 683.980 | 768.144 | 774.851 |
+| Findings | None | None | One HIGH | Same normalized HIGH |
+
+The normal bundle response required one same-handle formatting retry because a
+manually copied reused excerpt was 8197 bytes while the authenticated limit was
+8192. The rejected exact response is preserved separately. Including that
+format-only retry, bundle-normal reviewer time was 972.695 seconds and two
+dispatch requests. The other three arms used one request each. The matched first
+normal responses differ by only 0.335 seconds in favor of the bundle; the
+blocker bundle was 6.707 seconds slower. This one sequential sample establishes
+deterministic command avoidance and result parity, not a native elapsed-time
+speedup or a general performance estimate.
+
+Each accepted terminal response was preserved without a trailing newline as a
+current-user-owned, non-symlink regular file with mode `0600`. The submit receipt
+and immediate stored validation reproduced the same digest:
+
+| Exact accepted B report | SHA-256 |
+| --- | --- |
+| independent-normal | `2efd5da1578dbb18a847464cccc923810171c8c9d195a7da5e3618e1208f7710` |
+| bundle-normal, attempt 2 | `7bc4d7a383bc14621ad4336bf7ef604b8578185db525e68826720837237b7ed6` |
+| independent-blocker | `f871f346edd0e11e4241cf1b837b774a9b35e8f4dbf148fd78dc0c28775b60f5` |
+| bundle-blocker | `33e09e4c48f9a6b66aaa77c5916dff5063cbb5d74b118afb7f23a7c3885e8d4b` |
+
+The bundle-normal rejected attempt is also preserved at digest
+`9fdafae85e607ad34aad7ff25b2a6ba9798e13915db86552f743f9d89d82bcfc`.
+All four rounds intentionally dispatched only B. A/C remain pending, each run
+was closed incomplete after evidence collection, and no round was finalized.
+Therefore these benchmark rounds are parity/blocker evidence, not Tribunal PASS
+authority.
+
+The final candidate passed the unchanged CI dependency lock with **3913 passed
+in 876.56s**, exit 0, using Python 3.10.12 and `requirements-test.lock`:
+
+```sh
+rtk uv run --python /usr/bin/python3 --isolated --no-project \
+  --with-requirements requirements-test.lock python -m pytest -q
+```
+
+The evidence-focused suite passed 199 tests and the final runtime-binding target
+passed 6 tests. Independent architectural and code reviews both approved the
+implementation with no remaining findings. Final document verification and the
+post-document whole-branch review are required before this record is committed.
+
+Private final evidence root:
+`.review/benchmarks/2026-09-16-issue113-contract2-final-dgnHpdHD/`. It contains
+the disposable installed runtime, four controllers, contexts, exact reports,
+stored receipts, telemetry, and command observations. The root is intentionally
+ignored and remains local acceptance evidence.
+
+## Historical contract-1 record
+
+> The current contract-2 acceptance is recorded above. The sections below retain
+> the earlier contract-1 run and pre-final contract-2 checkpoints as historical
+> design evidence; their pending statuses and older test counts are not current.
 
 The contract-1 completed pairs preserved claim outcomes and normalized blockers while
 avoiding deterministic validations. Bundle B was 6.589 seconds slower for the
@@ -12,7 +110,7 @@ fixture. The CI-lock whole-repository suite passed 3849 tests. Final document
 verification and whole-branch review were pending. This section is retained as
 historical design evidence, not an overall acceptance PASS or a guaranteed saving claim.
 
-## Fixed comparison
+### Fixed comparison
 
 | Identity | Value |
 | --- | --- |
@@ -31,7 +129,7 @@ bundle arms receive evidence. This is a current-time historical-snapshot
 comparison, not a replay of old elapsed time. The candidate is uncommitted and
 installed only in a disposable prefix, not global PR authority.
 
-## Observed native results
+### Observed native results
 
 | Observation | Independent normal | Bundle normal | Independent blocker | Bundle blocker |
 | --- | ---: | ---: | ---: | ---: |
@@ -98,7 +196,7 @@ native rounds: A/C were not dispatched and no native round was finalized PASS.
 The separate installed automated integration exercises the complete A/B/C
 lifecycle and post-seal mutation rejection.
 
-## Preparation cost and reproducibility
+### Preparation cost and reproducibility
 
 The first complete test exited0 in 42.525 seconds but correctly declined reuse
 with `EVIDENCE_ENVIRONMENT_CHANGED`: Vitest created an empty
@@ -128,7 +226,7 @@ typecheck plus audit; all updated-guide samples selected authenticated typecheck
 reuse with provenance plus fresh audit. These hypothetical action selections
 are guidance evidence only, not historical execution or timing measurements.
 
-## Evidence index
+### Evidence index
 
 Private evidence root: `.review/benchmarks/2026-09-12-issue113-ht84d27f/`.
 `installed-candidate.json` records all 21 installed module hashes/modes and tested
@@ -150,7 +248,7 @@ acceptance summaries.
 | independent-blocker | `4e4efa63edae16e69e7b2198e47ba01afe30fc284587c68ba281bd4ea55733f0` |
 | bundle-blocker | `c99769a9142281087f92c9dc47ea1c570d2921edca3b9d9974c30114b9e7cfc3` |
 
-## Reproducible command observations
+### Reproducible command observations
 
 Run `scripts/measure-pre-pr-evidence.py` with `/usr/bin/python3`. Supply:
 
@@ -216,7 +314,7 @@ duration and verifier duration are observations; previous capture durations do
 not measure saved elapsed. Actual B elapsed/model/effort come from matched native
 session observations.
 
-## Whole-repository validation
+### Whole-repository validation
 
 The current contract-2 candidate worktree passed the unchanged CI dependency
 lock on 2026-09-16 after the final process-containment fix: **3908 passed in
@@ -250,7 +348,7 @@ rtk proxy uv pip install --python "$TASK_TEST_VENV/bin/python" --require-hashes 
 rtk proxy env -u LD_LIBRARY_PATH "$TASK_TEST_VENV/bin/python" -m pytest -q
 ```
 
-## Acceptance status
+### Historical acceptance status
 
 | Check | Status |
 | --- | --- |
