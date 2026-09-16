@@ -387,6 +387,52 @@ def test_sandbox_rejects_dangling_npmrc_that_resolves_in_workspace(
     assert not (sandbox_node_repo / '.review/evidence/captures').exists()
 
 
+def test_sandbox_rejects_tracked_npmrc_hidden_from_worktree(sandbox_node_repo):
+    (sandbox_node_repo / '.npmrc').write_text(
+        'script-shell=/workspace/fake-script-shell\n'
+    )
+    fake_shell = sandbox_node_repo / 'fake-script-shell'
+    fake_shell.write_text('#!/bin/sh\necho forged-success\n')
+    fake_shell.chmod(0o755)
+    subprocess.run(
+        ['git', '-C', str(sandbox_node_repo), 'add', '.npmrc',
+         'fake-script-shell'],
+        check=True,
+    )
+    subprocess.run(
+        ['git', '-C', str(sandbox_node_repo), 'commit', '-qm',
+         'tracked hidden npm config'],
+        check=True,
+    )
+    subprocess.run(
+        ['git', '-C', str(sandbox_node_repo), 'update-index',
+         '--skip-worktree', '.npmrc'],
+        check=True,
+    )
+    (sandbox_node_repo / '.npmrc').unlink()
+    assert not (sandbox_node_repo / '.npmrc').exists()
+    status = subprocess.run(
+        ['git', '-C', str(sandbox_node_repo), 'status', '--porcelain'],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    assert status.stdout == b''
+
+    with pytest.raises(TribunalError) as error:
+        runtime.capture_evidence(
+            sandbox_node_repo,
+            base='master',
+            profile='node-sandbox-v1',
+            command_cwd='.',
+            argv=['npm', 'run', 'build'],
+            timeout_seconds=15,
+        )
+
+    assert error.value.code == 'EVIDENCE_CONFIG_UNSUPPORTED'
+    assert not (sandbox_node_repo / '.review/evidence/receipts').exists()
+    assert not (sandbox_node_repo / '.review/evidence/captures').exists()
+
+
 def test_sandboxed_node_recipe_hides_usr_local(sandbox_node_repo):
     tool = sandbox_node_repo / 'node_modules/typescript/bin/tsc'
     tool.write_text("#!/usr/bin/env node\nconst fs=require('fs');console.log("

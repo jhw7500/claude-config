@@ -282,7 +282,8 @@ def _tool(name, root, env):
 
 
 @evidence.bounded_errors
-def measure_environment(root, profile, command_cwd, *, dependency_proof=None):
+def measure_environment(root, profile, command_cwd, *, dependency_proof=None,
+                        head_sha=None):
     """dependency_proof is an authenticated capture fact, never local availability.
 
     Omit it for strict controller verification. Detached B may pass the pinned
@@ -310,9 +311,12 @@ def measure_environment(root, profile, command_cwd, *, dependency_proof=None):
                 or Path(p).name.startswith(('vitest.config.', 'vite.config.')))
         })
         # Project/ancestor config can override npm command behavior: unsupported.
+        config_paths = []
         for parent in (directory, *directory.parents):
+            config_path = parent / '.npmrc'
+            config_paths.append(config_path.relative_to(root).as_posix())
             try:
-                (parent / '.npmrc').lstat()
+                config_path.lstat()
             except FileNotFoundError:
                 pass
             except OSError:
@@ -321,6 +325,18 @@ def measure_environment(root, profile, command_cwd, *, dependency_proof=None):
                 raise SchemaError('EVIDENCE_CONFIG_UNSUPPORTED')
             if parent == root:
                 break
+        if head_sha is None:
+            head_sha = _command_output(
+                root, ('rev-parse', '--verify', 'HEAD^{commit}')
+            ).decode('ascii').strip()
+        if (not isinstance(head_sha, str)
+                or re.fullmatch(r'[0-9a-f]{40}', head_sha) is None):
+            raise SchemaError('EVIDENCE_ENVIRONMENT_UNSUPPORTED')
+        pathspecs = tuple(f':(literal){path}' for path in config_paths)
+        if _command_output(
+                root,
+                ('ls-tree', '-r', '-z', '--name-only', head_sha, '--', *pathspecs)):
+            raise SchemaError('EVIDENCE_CONFIG_UNSUPPORTED')
         tools = ('node', 'npm', 'bwrap') if profile == 'node-sandbox-v1' else ('node', 'npm')
         config = {'node_env': 'test', 'npm_ignore_scripts': True,
                   'dependency_proof_kind': 'installed-tree-v1'}

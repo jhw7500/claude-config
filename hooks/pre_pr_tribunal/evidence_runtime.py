@@ -172,9 +172,11 @@ def snapshot_binding(snapshot):
 
 
 def _binding(root, base, profile, command_cwd):
-    return {'snapshot': snapshot_binding(capture_snapshot(root, base)),
+    snapshot = capture_snapshot(root, base)
+    return {'snapshot': snapshot_binding(snapshot),
             'contract': contract_binding(),
-            'environment': measure_environment(root, profile, command_cwd)}
+            'environment': measure_environment(
+                root, profile, command_cwd, head_sha=snapshot.head_sha)}
 
 
 def _entry(argv, command_cwd, result, freshness):
@@ -226,13 +228,15 @@ def capture_evidence(cwd, *, base, profile, command_cwd, argv, timeout_seconds):
     if result['overflow']:
         return {**payload, 'reason_code': 'EVIDENCE_CAPTURE_TOO_LARGE'}
     try:
-        after_snapshot = snapshot_binding(capture_snapshot(root, base))
+        captured_after = capture_snapshot(root, base)
+        after_snapshot = snapshot_binding(captured_after)
         if after_snapshot != before['snapshot']:
             raise SchemaError('EVIDENCE_SNAPSHOT_CHANGED')
     except (TribunalError, OSError, ValueError):
         return {**payload, 'reason_code': 'EVIDENCE_SNAPSHOT_CHANGED'}
     try:
-        after = measure_environment(root, profile, command_cwd)
+        after = measure_environment(
+            root, profile, command_cwd, head_sha=captured_after.head_sha)
         if after != before['environment']:
             raise SchemaError('EVIDENCE_ENVIRONMENT_CHANGED')
     except (TribunalError, OSError, ValueError, TypeError, UnicodeError):
