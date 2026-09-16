@@ -40,7 +40,7 @@ if __package__ in {None, ""}:
         submit_reviewer_report,
         validate_stored_reviewer_report,
     )
-    from pre_pr_tribunal import telemetry  # type: ignore
+    from pre_pr_tribunal import telemetry, evidence_runtime, evidence_store, evidence_lifecycle  # type: ignore
 else:
     from .model import (
         MAX_REPORT_BYTES,
@@ -66,22 +66,49 @@ else:
         submit_reviewer_report,
         validate_stored_reviewer_report,
     )
-    from . import telemetry
+    from . import telemetry, evidence_runtime, evidence_store, evidence_lifecycle
 
 
 class _Parser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        values = sys.argv[1:] if args is None else list(args)
+        # Trailing unknown options are reported by the top-level parser, whose
+        # prog does not contain the selected subcommand.
+        self._evidence_command = bool(values and values[0].startswith('evidence-'))
+        return super().parse_args(values, namespace)
+
     def error(self, message: str) -> None:
+        if getattr(self, '_evidence_command', False) or 'evidence-' in self.prog:
+            sys.stdout.write('{"reason_code":"EVIDENCE_USAGE"}\n')
+            self.exit(2)
         self.exit(2, "PRE_PR_TRIBUNAL:USAGE\n")
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(add_help=False)
     commands = parser.add_subparsers(dest="command", required=True)
+    capture = commands.add_parser('evidence-capture', add_help=False)
+    capture.add_argument('--base', required=True)
+    capture.add_argument('--profile', required=True,
+                         choices=('python-v1', 'node-lock-v1', 'node-sandbox-v1'))
+    capture.add_argument('--cwd', required=True)
+    capture.add_argument('--timeout', required=True, type=float)
+    capture.add_argument('argv', nargs=argparse.REMAINDER)
+    freeze = commands.add_parser('evidence-freeze', add_help=False)
+    freeze.add_argument('--base', required=True)
+    freeze.add_argument('--receipt', required=True, action='append')
+    verify = commands.add_parser('evidence-verify', add_help=False)
+    verify.add_argument('--bundle', required=True)
+    verify.add_argument('--context', type=Path)
+    verify.add_argument('--context-sha')
+    project = commands.add_parser('evidence-project', add_help=False)
+    project.add_argument('--reviewer-root', type=Path, required=True)
     begin = commands.add_parser("begin", add_help=False)
     begin.add_argument("--base", required=True)
     begin.add_argument("--runtime", required=True, choices=("claude", "codex"))
     begin.add_argument("--round", required=True, type=int, choices=(1, 2, 3))
     begin.add_argument("--decisions", type=Path)
+    begin.add_argument('--evidence-bundle')
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -165,6 +192,7 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
         verdict = begin_round(
             cwd, base=arguments.base, runtime=arguments.runtime,
             round_number=arguments.round, decisions_path=arguments.decisions,
+            evidence_bundle_sha256=getattr(arguments, 'evidence_bundle', None),
         )
     except TribunalError as primary_error:
         try:
@@ -325,8 +353,39 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
         ):
             parser.error("all reviewer paths must be supplied together")
     cwd = Path.cwd()
+    exit_status = 0
     try:
-        if arguments.command == "begin":
+        if arguments.command == 'evidence-capture':
+            argv = arguments.argv
+            if argv[:1] == ['--']:
+                argv = argv[1:]
+            payload = evidence_runtime.capture_evidence(cwd, base=arguments.base,
+                profile=arguments.profile, command_cwd=arguments.cwd, argv=argv,
+                timeout_seconds=arguments.timeout)
+            payload['reusable'] = 'receipt_sha256' in payload and payload.get('freshness') == 'deterministic'
+            actual_exit = payload['exit_code']
+            exit_status = (min(255, actual_exit) if actual_exit > 0 else min(255, 128 - actual_exit)) if actual_exit else (1 if actual_exit is None else 0)
+            if payload['timed_out']:
+                exit_status = 124
+            elif 'receipt_sha256' not in payload:
+                exit_status = exit_status or 1
+        elif arguments.command == 'evidence-freeze':
+            payload = evidence_runtime.freeze_evidence(cwd, base=arguments.base, receipt_sha256s=arguments.receipt)
+        elif arguments.command == 'evidence-project':
+            payload = evidence_lifecycle.project_evidence(cwd, reviewer_root=arguments.reviewer_root)
+        elif arguments.command == 'evidence-verify' and (arguments.context is not None or arguments.context_sha is not None):
+            if arguments.context is None or arguments.context_sha is None:
+                raise TribunalError('EVIDENCE_CONTEXT_REQUIRED')
+            payload = evidence_lifecycle.verify_detached_evidence(cwd, bundle_sha256=arguments.bundle,
+                context_path=arguments.context, expected_context_sha256=arguments.context_sha)
+        elif arguments.command == 'evidence-verify':
+            # Standalone facts can establish eligibility, never round authority.
+            bundle = evidence_store.read_bundle(cwd, arguments.bundle)
+            verified = evidence_runtime.verify_evidence(cwd, bundle_sha256=arguments.bundle,
+                expected_binding=bundle['binding'])
+            payload = {'bundle_sha256': arguments.bundle, 'round_authority': False,
+                'eligible': [entry['id'] for entry in verified['eligible']], 'rejected': verified['rejected']}
+        elif arguments.command == "begin":
             verdict, observation = _begin_with_telemetry(
                 cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns,
             )
@@ -441,15 +500,21 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
             and error.code.replace("_", "").isalnum()
             else "VERDICT_INVALID"
         )
-        sys.stderr.write(f"PRE_PR_TRIBUNAL:{code[:64]}\n")
+        if arguments.command.startswith('evidence-'):
+            sys.stdout.write(json.dumps({'reason_code': code[:64]}) + '\n')
+        else:
+            sys.stderr.write(f"PRE_PR_TRIBUNAL:{code[:64]}\n")
         return 1
     except Exception:
-        sys.stderr.write("PRE_PR_TRIBUNAL:VERDICT_INVALID\n")
+        if arguments.command.startswith('evidence-'):
+            sys.stdout.write('{"reason_code":"EVIDENCE_INVALID"}\n')
+        else:
+            sys.stderr.write("PRE_PR_TRIBUNAL:VERDICT_INVALID\n")
         return 1
     sys.stdout.write(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
     )
-    return 0
+    return exit_status
 
 
 if __name__ == "__main__":

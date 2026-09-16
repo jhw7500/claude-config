@@ -10,30 +10,33 @@ A finding path may be any normalized repository-relative path, including outside
 
 ## Controller receipt and recovery contract
 
-The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. Native schema-3 slots are either `pending` or `sealed`; only `submit-report` can turn a pending native slot into a sealed slot. `store-report`, including its legacy replacement option, is v1-only.
+The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. Current verdict schema 4 uses report text contract 3, diff recipe 1 and evidence contract 2; reviewer report JSON still has `schema: 1`. Native schema-4 slots are either `pending` or `sealed`; only `submit-report` can turn a pending native slot into a sealed slot. `store-report`, including its legacy replacement option, is v1-only.
 
-`status.verdict_schema` selects the workflow. Schema 1 requires an explicit all-slot `migrate-legacy-pending`; schema 2 requires an explicit `migrate-v2-pending`; schema 3 must not be migrated. Neither migration accepts a reviewer subset. Legacy schema-1 migration preserves available exact raw evidence but leaves slots pending when receipt provenance is unavailable; `LEGACY_PROVENANCE_UNAVAILABLE` never means a fictional native receipt was adopted. Schema-2 migration preserves sealed evidence only after exact receipt/file validation and assigns a new lifecycle identity, so its first telemetry resume reports prior request accounting unknown.
+`status.verdict_schema` selects the workflow. Schema 1 requires an explicit all-slot `migrate-legacy-pending`; compatible schema 2 requires an explicit `migrate-v2-pending`; schema 3 has no automatic current-contract migration; schema 4 is current. Neither migration accepts a reviewer subset. Legacy schema-1 migration preserves available exact raw evidence but leaves slots pending when receipt provenance is unavailable; `LEGACY_PROVENANCE_UNAVAILABLE` never means a fictional native receipt was adopted. Schema-2 migration requires its report/diff contract to match the installed runtime: historical report-contract-2 rounds fail with `CONTRACT_DRIFT`. Compatible migration validates sealed evidence and assigns a new lifecycle identity, so its first telemetry resume reports prior request accounting unknown. Preserve incompatible old rounds for explicit abandonment/restart judgment; readable historical state never upgrades pending authority.
 
-The following stored-verdict excerpt records the schema-3 lifecycle identity for
+The following stored-verdict excerpt records the schema-4 lifecycle identity for
 internal telemetry binding. It is not reviewer report content or review
 authority input.
 
-<!-- v3-stored-verdict -->
+<!-- v4-stored-verdict -->
 ```json
 {
-  "schema": 3,
-  "lifecycle_id": "0123456789abcdef0123456789abcdef"
+  "schema": 4,
+  "lifecycle_id": "0123456789abcdef0123456789abcdef",
+  "evidence_contract": 2,
+  "evidence_binding": null,
+  "evidence_fallback_reason": null
 }
 ```
 
-<!-- v3-status -->
+<!-- v4-status -->
 ```json
 {
   "round": 1,
   "gate_status": "in_progress",
   "blocking_count": 0,
   "verdict_path": ".review/verdict.json",
-  "verdict_schema": 3,
+  "verdict_schema": 4,
   "reviewers": {
     "A": {
       "state": "sealed",
@@ -41,7 +44,7 @@ authority input.
       "last_error": null,
       "raw_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "context_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "report_contract_version": 2,
+      "report_contract_version": 3,
       "provenance": "native_submit"
     },
     "B": {
@@ -58,7 +61,7 @@ authority input.
 }
 ```
 
-<!-- v3-submit-receipt -->
+<!-- v4-submit-receipt -->
 ```json
 {
   "reviewer": "A",
@@ -66,7 +69,7 @@ authority input.
   "state": "sealed",
   "raw_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "context_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "report_contract_version": 2,
+  "report_contract_version": 3,
   "attempt": 1,
   "provenance": "native_submit"
 }
@@ -89,7 +92,15 @@ The exact controller command shapes are below. `submit-report` reads exact repor
 | authenticate all three and aggregate | `finalize` |
 <!-- controller-command-examples-end -->
 
-Schema-1 and schema-2 verdicts remain readable without rewrite; pending recovery requires explicit migration. New rounds and both migration commands write schema 3. A schema-2 migration validates every sealed report and receipt before one atomic verdict replacement; it never rewrites report bytes or infers pre-migration telemetry identity.
+Schema-1, schema-2 and schema-3 verdicts remain readable without rewrite. A schema-4 verdict without the explicit current `evidence_contract` marker is likewise readable only as historical state: current context, submit, stored validation, finalize and terminal gate authority reject it as contract drift or stale authority. New rounds and successful migration commands write schema 4 with `evidence_contract: 2`. A compatible schema-2 migration validates every sealed report and receipt before one atomic verdict replacement; it never rewrites report bytes or infers pre-migration telemetry identity.
+
+## Execution provenance under report contract 3
+
+Fresh executions keep the seven fields shown in the B example below. Only Reviewer B may add `evidence_ref`, and it is REQUIRED for reused evidence: exactly `{"bundle_sha256":"<64 lowercase hex>","entry_id":"E001"}` with an entry ID from E001 through E064. A/C executions and controller decision executions keep the legacy shape. The report parser accepts explicit B references only under contract 3; sealing then authenticates each against the round's selected evidence binding and exact verifier-returned execution fields. A reference alone grants no authority.
+
+For reuse, assign the round-local `id` and copy the trusted verifier's `execution` object unchanged. The command is `cd -- <quoted repository-relative cwd> && <shlex-joined argv>`. Report `capture_sha256` hashes stdout bytes followed by stderr bytes; the immutable store's framed capture has a different digest. Claims cite these report execution IDs only when the inspected command scope, exit, excerpts and truncation support their result. All unique reused entries and the subset cited by claims are distinct telemetry counts.
+
+No bundle or invalid unused evidence permits independent fresh validation. A sealed reused reference makes the selected bundle and capture bytes dependencies: changed evidence rejects stored validation, recovery, finalize and the terminal gate. Preserve exact report bytes and do not replace that sealed report with a new fallback report.
 
 ### Format failures
 

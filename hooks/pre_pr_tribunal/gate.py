@@ -210,6 +210,10 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
         and verdict.contract != current_contract_binding()
     ):
         return _decision(True, GateCode.VERDICT_STALE)
+    if verdict.schema in MIXED_SLOT_VERDICT_SCHEMAS:
+        from .evidence_lifecycle import has_current_evidence_contract
+        if not has_current_evidence_contract(verdict):
+            return _decision(True, GateCode.VERDICT_STALE)
 
     bound_scan = scan_pr_create(command, expected_base=verdict.base_ref)
     if bound_scan.kind is not ScanKind.PR_CREATE:
@@ -236,6 +240,17 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
         return _decision(True, GateCode.BLOCKERS_OPEN)
     if verdict.gate.status is not GateStatus.PASS or verdict.gate.blocking_count != 0:
         return _decision(True, GateCode.VERDICT_INVALID)
+    if any(execution.evidence_ref is not None
+           for slot in verdict.reviewers.values() for execution in slot.report.executions):
+        from .verdict_store import validate_stored_reviewer_report
+        from .model import Reviewer
+        try:
+            report, digest = validate_stored_reviewer_report(root, reviewer=Reviewer.B)
+            slot = verdict.reviewers['B']
+            if slot.receipt is None or report != slot.report or digest != slot.receipt.raw_sha256:
+                return _decision(True, GateCode.VERDICT_INVALID)
+        except Exception:
+            return _decision(True, GateCode.VERDICT_INVALID)
     return _decision(False, GateCode.PASS)
 
 

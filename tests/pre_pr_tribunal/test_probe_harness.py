@@ -811,7 +811,7 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
         os.umask(previous)
     assert len(finalizations) == 1
     assert result["status"]["gate_status"] == "pass"
-    assert result["status"]["verdict_schema"] == 3
+    assert result["status"]["verdict_schema"] == 4
     summary = result["telemetry_summary"]
     assert summary["binding"]["diff_sha256"] == result["begin"]["snapshot"]["diff_sha256"]
     assert summary["stages"]["report_store"]["count"] == 3
@@ -847,6 +847,9 @@ def test_installed_probe_migrates_v2_pending_before_selective_resume(tmp_path, m
     legacy["schema"] = 2
     legacy["contract"]["verdict_schema"] = 2
     del legacy["lifecycle_id"]
+    del legacy['evidence_binding']
+    del legacy['evidence_fallback_reason']
+    del legacy['evidence_contract']
     verdict_path.write_text(json.dumps(legacy))
     verdict_path.chmod(0o600)
 
@@ -873,9 +876,25 @@ def test_installed_probe_migrates_v2_pending_before_selective_resume(tmp_path, m
     assert commands.index("migrate-v2-pending") < commands.index("telemetry-resume")
     assert requested == ["B", "C"]
     assert (repo / ".review/inbox/round-1/A.json").read_bytes() == sealed_a
-    assert result["status"]["verdict_schema"] == 3
+    assert result["status"]["verdict_schema"] == 4
     assert result["telemetry_summary"]["recovery"]["accounting_complete"] is False
     assert result["telemetry_summary"]["recovery"]["requested_slot_count"] is None
+
+
+def test_installed_probe_preserves_old_schema_three_contract_without_resume(tmp_path):
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    module._tribunal_cli(cli, repo, home, 'begin', '--base', 'master',
+        '--runtime', 'codex', '--round', '1')
+    path = repo / '.review/verdict.json'
+    value = json.loads(path.read_bytes())
+    value.update(schema=3, contract={'report_text': 2, 'diff_recipe': 1, 'verdict_schema': 3})
+    value.pop('evidence_binding'); value.pop('evidence_fallback_reason')
+    value.pop('evidence_contract')
+    raw = json.dumps(value).encode(); path.write_bytes(raw)
+    with pytest.raises(module.ProbeFailure) as error:
+        module._create_pass_verdict(cli, repo, home, 'codex')
+    assert error.value.code == 'CONTRACT_DRIFT'
+    assert path.read_bytes() == raw
 
 
 def test_installed_probe_stops_when_orphan_receipt_discards_new_blocker(tmp_path):
@@ -1252,6 +1271,9 @@ def test_installed_probe_migrates_unproven_legacy_reports_and_runs_all_slots(tmp
     verdict["schema"] = 1
     verdict.pop("contract")
     verdict.pop("lifecycle_id")
+    verdict.pop('evidence_binding')
+    verdict.pop('evidence_fallback_reason')
+    verdict.pop('evidence_contract')
     verdict["reviewers"] = {reviewer: {"status": "pending"} for reviewer in "ABC"}
     verdict_path.write_bytes(json.dumps(verdict, separators=(",", ":")).encode())
     verdict_path.chmod(0o600)
