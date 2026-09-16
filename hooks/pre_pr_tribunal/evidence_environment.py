@@ -311,7 +311,13 @@ def measure_environment(root, profile, command_cwd, *, dependency_proof=None):
         })
         # Project/ancestor config can override npm command behavior: unsupported.
         for parent in (directory, *directory.parents):
-            if (parent / '.npmrc').exists():
+            try:
+                (parent / '.npmrc').lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise SchemaError('EVIDENCE_CONFIG_UNSUPPORTED') from None
+            else:
                 raise SchemaError('EVIDENCE_CONFIG_UNSUPPORTED')
             if parent == root:
                 break

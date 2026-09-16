@@ -348,6 +348,45 @@ def test_sandboxed_node_recipe_excludes_ignored_config_and_git_metadata(sandbox_
     assert receipt['entry']['stdout_excerpt'].endswith('absent\n'), receipt['entry']
 
 
+def test_sandbox_rejects_dangling_npmrc_that_resolves_in_workspace(
+        sandbox_node_repo, tmp_path):
+    config_name = f'{tmp_path.name}.npmrc'
+    (sandbox_node_repo / config_name).write_text(
+        'script-shell=/workspace/fake-script-shell\n'
+    )
+    fake_shell = sandbox_node_repo / 'fake-script-shell'
+    fake_shell.write_text('#!/bin/sh\nexit 0\n')
+    fake_shell.chmod(0o755)
+    npmrc = sandbox_node_repo / '.npmrc'
+    npmrc.symlink_to(f'/workspace/{config_name}')
+    assert npmrc.is_symlink()
+    assert not npmrc.exists()
+    subprocess.run(
+        ['git', '-C', str(sandbox_node_repo), 'add', '.npmrc', config_name,
+         'fake-script-shell'],
+        check=True,
+    )
+    subprocess.run(
+        ['git', '-C', str(sandbox_node_repo), 'commit', '-qm',
+         'dangling npm config'],
+        check=True,
+    )
+
+    with pytest.raises(TribunalError) as error:
+        runtime.capture_evidence(
+            sandbox_node_repo,
+            base='master',
+            profile='node-sandbox-v1',
+            command_cwd='.',
+            argv=['npm', 'run', 'build'],
+            timeout_seconds=15,
+        )
+
+    assert error.value.code == 'EVIDENCE_CONFIG_UNSUPPORTED'
+    assert not (sandbox_node_repo / '.review/evidence/receipts').exists()
+    assert not (sandbox_node_repo / '.review/evidence/captures').exists()
+
+
 def test_sandboxed_node_recipe_hides_usr_local(sandbox_node_repo):
     tool = sandbox_node_repo / 'node_modules/typescript/bin/tsc'
     tool.write_text("#!/usr/bin/env node\nconst fs=require('fs');console.log("
