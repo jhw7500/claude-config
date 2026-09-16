@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,22 @@ def test_capture_real_exit_and_literal_argv(git_repo):
     assert entry['stdout_excerpt'] == '$(touch PWNED);\n'
     assert entry['exit_code'] == 7
     assert not (git_repo / 'PWNED').exists()
+
+
+def test_python_profile_binds_the_selected_runtime(git_repo, tmp_path, monkeypatch):
+    from pre_pr_tribunal.evidence_environment import PYTHON_TRACKED_READ_PROGRAM
+    selected = tmp_path / 'python3'
+    selected.write_text('#!/bin/sh\nexec /usr/bin/python3 "$@"\n')
+    selected.chmod(0o700)
+    monkeypatch.setenv('PATH', str(tmp_path))
+    result = runtime.capture_evidence(git_repo, base='master', profile='python-v1',
+        command_cwd='.', argv=[str(selected), '-I', '-S', '-c',
+                               PYTHON_TRACKED_READ_PROGRAM, 'tracked.txt'],
+        timeout_seconds=3)
+    receipt = read_receipt(git_repo, result['receipt_sha256'])
+    tool = next(item for item in receipt['binding']['environment']['tools']
+                if item['name'] == 'python3')
+    assert tool['executable_sha256'] == hashlib.sha256(selected.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize('timeout', [0, -1, float('nan'), float('inf'), True])
@@ -201,6 +218,7 @@ def test_sandboxed_node_recipes_capture_and_reuse(sandbox_node_repo, argv, expec
     assert captured['exit_code'] == 0 and captured['freshness'] == 'deterministic'
     receipt = read_receipt(sandbox_node_repo, captured['receipt_sha256'])
     assert receipt['entry']['stdout_excerpt'].endswith(expected)
+    assert len(receipt['binding']['environment']['config']['node_runtime_sha256']) == 64
     frozen = runtime.freeze_evidence(sandbox_node_repo, base='master',
         receipt_sha256s=[captured['receipt_sha256']])
     verified = runtime.verify_evidence(sandbox_node_repo,
@@ -340,6 +358,75 @@ def test_sandboxed_node_recipe_hides_usr_local(sandbox_node_repo):
         timeout_seconds=15)
     receipt = read_receipt(sandbox_node_repo, captured['receipt_sha256'])
     assert receipt['entry']['stdout_excerpt'].endswith('empty\n'), receipt['entry']
+
+
+def test_sandbox_hides_selected_host_node_path(sandbox_node_repo, monkeypatch):
+    import shutil
+    from pre_pr_tribunal.evidence_environment import selected_node_runtime
+    source_node, source_npm, _digest = selected_node_runtime(os.environ)
+    private = sandbox_node_repo.parent / 'private-node-runtime'
+    private_bin = private / 'bin'
+    private_npm = private / 'lib/node_modules/npm'
+    private_bin.mkdir(parents=True)
+    private_npm.parent.mkdir(parents=True)
+    shutil.copy2(source_node, private_bin / 'node')
+    shutil.copytree(source_npm, private_npm, symlinks=True, copy_function=shutil.copy2)
+    (private_bin / 'npm').symlink_to('../lib/node_modules/npm/bin/npm-cli.js')
+    selected = str((private_bin / 'node').resolve())
+    monkeypatch.setenv('PATH', str(private_bin) + ':/usr/bin:/bin')
+    tool = sandbox_node_repo / 'node_modules/typescript/bin/tsc'
+    tool.write_text("#!/usr/bin/env node\nconst fs=require('fs');console.log("
+                    + repr(selected) + "===process.execPath?'host':'copied',"
+                    "fs.existsSync(" + repr(selected) + ")?'visible':'hidden')\n")
+    tool.chmod(0o755)
+    captured = runtime.capture_evidence(sandbox_node_repo, base='master',
+        profile='node-sandbox-v1', command_cwd='.', argv=['npm', 'run', 'build'],
+        timeout_seconds=15)
+    receipt = read_receipt(sandbox_node_repo, captured['receipt_sha256'])
+    assert receipt['entry']['stdout_excerpt'].endswith('copied hidden\n'), receipt['entry']
+
+
+def test_selected_node_runtime_binds_the_complete_npm_tree(tmp_path):
+    from pre_pr_tribunal.evidence_environment import selected_node_runtime
+    runtime_root = tmp_path / 'runtime'
+    runtime_bin = runtime_root / 'bin'
+    npm_root = runtime_root / 'lib/node_modules/npm'
+    (npm_root / 'bin').mkdir(parents=True)
+    nested = npm_root / 'node_modules/dependency.js'
+    nested.parent.mkdir()
+    node = runtime_bin / 'node'
+    runtime_bin.mkdir()
+    node.write_text('#!/bin/sh\nexit 0\n')
+    node.chmod(0o700)
+    npm_cli = npm_root / 'bin/npm-cli.js'
+    npm_cli.write_text('console.log("npm")\n')
+    npm_cli.chmod(0o700)
+    nested.write_text('before\n')
+    (runtime_bin / 'npm').symlink_to('../lib/node_modules/npm/bin/npm-cli.js')
+    env = {'PATH': str(runtime_bin)}
+    before = selected_node_runtime(env)[2]
+    nested.write_text('after\n')
+    assert selected_node_runtime(env)[2] != before
+
+
+def test_sandbox_rejects_copied_node_runtime_drift(sandbox_node_repo, monkeypatch):
+    from pre_pr_tribunal.evidence_environment import selected_node_runtime
+    selected_node = selected_node_runtime(os.environ)[0]
+    original = runtime.shutil.copy2
+
+    def mutate_node_copy(source, destination, *args, **kwargs):
+        result = original(source, destination, *args, **kwargs)
+        if Path(source).resolve() == selected_node and Path(destination).name == 'node':
+            with Path(destination).open('ab') as file:
+                file.write(b'copy-time-drift')
+        return result
+
+    monkeypatch.setattr(runtime.shutil, 'copy2', mutate_node_copy)
+    with pytest.raises(TribunalError, match='^EVIDENCE_ENVIRONMENT_CHANGED$'):
+        runtime.capture_evidence(sandbox_node_repo, base='master',
+            profile='node-sandbox-v1', command_cwd='.', argv=['npm', 'run', 'build'],
+            timeout_seconds=15)
+    assert not (sandbox_node_repo / '.review/evidence/receipts').exists()
 
 
 def test_sandbox_rejects_controller_root_inside_system_mount():

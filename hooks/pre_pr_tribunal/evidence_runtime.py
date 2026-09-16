@@ -13,7 +13,7 @@ import tempfile
 
 from . import evidence, evidence_store, model
 from .evidence_environment import (installed_tree, measure_environment,
-    sanitized_environment, validate_command)
+    sanitized_environment, selected_node_runtime, validate_command)
 from .evidence_process import run_owned
 from .git_state import DIFF_RECIPE_VERSION, _physical_root, capture_snapshot
 from .model import SchemaError, TribunalError
@@ -108,8 +108,28 @@ def _sandboxed_node_command(root, command_cwd, argv, env, binding):
             raise SchemaError('EVIDENCE_SANDBOX_UNAVAILABLE') from None
         if installed_tree(target_modules) != binding['environment']['config']['dependency_tree_sha256']:
             raise SchemaError('EVIDENCE_ENVIRONMENT_CHANGED')
+        try:
+            selected_node, selected_npm, _digest = selected_node_runtime(env)
+            node_runtime = temporary / 'node-runtime'
+            runtime_bin = node_runtime / 'bin'
+            runtime_npm = node_runtime / 'lib/node_modules/npm'
+            runtime_bin.mkdir(parents=True)
+            runtime_npm.parent.mkdir(parents=True)
+            shutil.copy2(selected_node, runtime_bin / 'node')
+            shutil.copytree(selected_npm, runtime_npm, symlinks=True,
+                            copy_function=shutil.copy2)
+            (runtime_bin / 'npm').symlink_to('../lib/node_modules/npm/bin/npm-cli.js')
+            copied_env = {'PATH': str(runtime_bin) + ':/usr/bin:/bin'}
+            if selected_node_runtime(copied_env)[2] != binding['environment']['config'][
+                    'node_runtime_sha256']:
+                raise SchemaError('EVIDENCE_ENVIRONMENT_CHANGED')
+        except SchemaError:
+            raise
+        except OSError:
+            raise SchemaError('EVIDENCE_SANDBOX_UNAVAILABLE') from None
         host_home = Path(env['HOME'])
-        sandbox_env = dict(env, PATH='/usr/bin:/bin', HOME='/home/evidence', TMPDIR='/tmp',
+        sandbox_env = dict(env, PATH='/opt/evidence-node/bin:/usr/bin:/bin',
+            HOME='/home/evidence', TMPDIR='/tmp',
             npm_config_userconfig='/home/evidence/user.npmrc',
             npm_config_globalconfig='/home/evidence/global.npmrc',
             npm_config_cache='/home/evidence/npm-cache')
@@ -124,6 +144,7 @@ def _sandboxed_node_command(root, command_cwd, argv, env, binding):
         if os.path.exists('/usr/local'):
             wrapped.extend(('--tmpfs', '/usr/local'))
         wrapped.extend(('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+                        '--dir', '/opt', '--ro-bind', str(node_runtime), '/opt/evidence-node',
                         '--dir', '/home', '--bind', str(host_home), '/home/evidence',
                         '--bind', str(view), '/workspace', '--chdir',
                         str(Path('/workspace') / command_cwd)))

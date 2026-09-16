@@ -39,6 +39,10 @@ def has_current_evidence_contract(verdict):
     if verdict.evidence_binding is None:
         return True
     expected = verdict.evidence_binding.to_json()['expected_binding']
+    environment = expected['environment']
+    if (environment['profile'] == 'node-sandbox-v1'
+            and 'node_runtime_sha256' not in environment['config']):
+        return False
     return expected['contract'] == runtime.contract_binding()
 
 

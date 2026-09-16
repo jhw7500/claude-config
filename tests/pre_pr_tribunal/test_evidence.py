@@ -274,13 +274,18 @@ def test_node_sandbox_environment_requires_exact_contract(api):
                     for name in ('node', 'npm', 'bwrap')]
     env['config'] = {'dependency_tree_sha256': 'b'*64,
                      'dependency_proof_kind': 'installed-tree-v1',
-                     'sandbox_kind': 'bubblewrap-clean-clone-v1'}
+                     'sandbox_kind': 'bubblewrap-clean-clone-v1',
+                     'node_runtime_sha256': 'c'*64}
     evidence.validate_environment(env)
 
     missing = copy.deepcopy(env)
     del missing['config']['sandbox_kind']
     with pytest.raises(SchemaError, match='^EVIDENCE_'):
         evidence.validate_environment(missing)
+
+    missing_runtime = copy.deepcopy(env)
+    del missing_runtime['config']['node_runtime_sha256']
+    evidence.validate_environment(missing_runtime)  # Historical contract-2 readability.
 
     legacy = copy.deepcopy(env)
     legacy['profile'] = 'node-lock-v1'

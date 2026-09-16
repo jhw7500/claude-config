@@ -158,7 +158,8 @@ def sanitized_environment(profile):
     )
     selected = {}
     for name in names:
-        found = shutil.which(name, path=TOOL_PATH) if profile == 'node-sandbox-v1' else shutil.which(name)
+        fixed_system_tool = name == 'bwrap'
+        found = shutil.which(name, path=TOOL_PATH) if fixed_system_tool else shutil.which(name)
         if found is None:
             raise SchemaError('EVIDENCE_TOOL_UNAVAILABLE')
         selected[name] = Path(found).resolve(strict=True)
@@ -242,6 +243,28 @@ def installed_tree(root):
     return hashlib.sha256(evidence.canonical_json(sorted(records))).hexdigest()
 
 
+def selected_node_runtime(env):
+    """Return the measured Node executable, npm package tree and their digest."""
+    node_found = shutil.which('node', path=env['PATH'])
+    npm_found = shutil.which('npm', path=env['PATH'])
+    if node_found is None or npm_found is None:
+        raise SchemaError('EVIDENCE_TOOL_UNAVAILABLE')
+    try:
+        node = Path(node_found).resolve(strict=True)
+        npm_cli = Path(npm_found).resolve(strict=True)
+    except OSError:
+        raise SchemaError('EVIDENCE_TOOL_UNAVAILABLE') from None
+    npm_root = npm_cli.parent.parent
+    if (npm_cli != npm_root / 'bin' / 'npm-cli.js' or not node.is_file()
+            or not os.access(node, os.X_OK) or not npm_root.is_dir()):
+        raise SchemaError('EVIDENCE_TOOL_UNAVAILABLE')
+    identity = {
+        'node_sha256': _hash_file(node)[0],
+        'npm_tree_sha256': installed_tree(npm_root),
+    }
+    return node, npm_root, hashlib.sha256(evidence.canonical_json(identity)).hexdigest()
+
+
 def _tool(name, root, env):
     found = shutil.which(name, path=env['PATH'])
     if found is None:
@@ -313,6 +336,8 @@ def measure_environment(root, profile, command_cwd, *, dependency_proof=None):
         facts.append({'path': name, 'sha256': _hash_file(path)[0]})
     with sanitized_environment(profile) as env:
         records = [_tool(name, directory, env) for name in tools]
+        if profile == 'node-sandbox-v1':
+            config['node_runtime_sha256'] = selected_node_runtime(env)[2]
     result = {'profile': profile, 'cwd': command_cwd, 'inputs': facts,
               'tools': records, 'config': config}
     evidence.validate_environment(result)
@@ -327,9 +352,17 @@ def validate_command(root, profile, command_cwd, argv, *, require_local_tools=Tr
     allowed = ('python3',) if profile == 'python-v1' else ('node', 'npm')
     if name not in allowed:
         raise SchemaError('EVIDENCE_COMMAND_UNSUPPORTED')
-    expected = shutil.which(name, path=TOOL_PATH) if profile == 'node-sandbox-v1' else shutil.which(name)
-    if expected is None or (executable.is_absolute() and executable.resolve() != Path(expected).resolve()) or (
-            not executable.is_absolute() and '/' in argv[0]):
+    expected = shutil.which(name)
+    if expected is None:
+        raise SchemaError('EVIDENCE_COMMAND_UNSUPPORTED')
+    if profile == 'node-sandbox-v1':
+        invalid_executable = executable.is_absolute() or '/' in argv[0]
+    else:
+        invalid_executable = (
+            executable.is_absolute() and executable.resolve() != Path(expected).resolve()
+            or not executable.is_absolute() and '/' in argv[0]
+        )
+    if invalid_executable:
         raise SchemaError('EVIDENCE_COMMAND_UNSUPPORTED')
     if profile == 'python-v1':
         # Require exact leading isolation flags; do not claim arbitrary pytest.

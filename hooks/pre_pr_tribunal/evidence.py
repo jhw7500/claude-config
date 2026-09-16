@@ -131,7 +131,7 @@ def validate_environment(value: dict) -> None:
     config = env['config']
     allowed = ({'python_isolated', 'python_no_user_site'} if profile == 'python-v1' else
                {'node_env', 'npm_ignore_scripts', 'dependency_tree_sha256',
-                'dependency_proof_kind', 'sandbox_kind'})
+                'dependency_proof_kind', 'sandbox_kind', 'node_runtime_sha256'})
     if not isinstance(config, dict) or not set(config).issubset(allowed):
         raise SchemaError('EVIDENCE_CONFIG_INVALID')
     for key, value in config.items():
@@ -141,7 +141,7 @@ def validate_environment(value: dict) -> None:
         elif key == 'node_env':
             if not isinstance(value, str) or value not in {'test', 'development', 'production'}:
                 raise SchemaError('EVIDENCE_CONFIG_INVALID')
-        elif key == 'dependency_tree_sha256':
+        elif key in {'dependency_tree_sha256', 'node_runtime_sha256'}:
             _digest(value)
         elif key == 'dependency_proof_kind' and value != 'installed-tree-v1':
             raise SchemaError('EVIDENCE_CONFIG_INVALID')
@@ -150,6 +150,8 @@ def validate_environment(value: dict) -> None:
     if ('dependency_tree_sha256' in config) != ('dependency_proof_kind' in config):
         raise SchemaError('EVIDENCE_CONFIG_INVALID')
     if (profile == 'node-sandbox-v1') != ('sandbox_kind' in config):
+        raise SchemaError('EVIDENCE_CONFIG_INVALID')
+    if 'node_runtime_sha256' in config and profile != 'node-sandbox-v1':
         raise SchemaError('EVIDENCE_CONFIG_INVALID')
 
 

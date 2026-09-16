@@ -35,6 +35,8 @@ history. Current authority uses evidence contract 2:
   recipes backed by measured local `tsc`/`vitest`, rejects lifecycle hooks and caller overrides,
   and runs in a Git-metadata-free clean committed clone with the measured dependency tree copied
   into a Bubblewrap network/home/tmp sandbox.
+- The selected Node executable and complete npm package tree are measured, copied, rehashed, and
+  mounted read-only at `/opt/evidence-node`; the original host installation path is not projected.
 - Contract-1 bundles remain parseable as history but cannot satisfy the installed current binding.
   Schema-4 verdicts without the explicit `evidence_contract: 2` marker are also historical-only and
   cannot authorize current context, submission, finalization, or the terminal PR gate.

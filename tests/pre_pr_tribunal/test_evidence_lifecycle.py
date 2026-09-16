@@ -74,6 +74,37 @@ def test_contract1_verdict_is_readable_but_has_no_current_authority(git_repo):
         validate_stored_reviewer_report(git_repo, reviewer=Reviewer.A)
 
 
+def test_historical_node_sandbox_binding_is_readable_but_not_current(git_repo):
+    frozen = bundle(git_repo)
+    begin(git_repo, frozen['bundle_sha256'])
+    path = git_repo / '.review/verdict.json'
+    value = json.loads(path.read_text())
+    environment = value['evidence_binding']['expected_binding']['environment']
+    environment['profile'] = 'node-sandbox-v1'
+    environment['tools'] = [
+        {'name': name, 'version': '1.0.0', 'executable_sha256': hashlib.sha256(
+            name.encode()).hexdigest()}
+        for name in ('node', 'npm', 'bwrap')
+    ]
+    environment['config'] = {
+        'node_env': 'test',
+        'npm_ignore_scripts': True,
+        'dependency_tree_sha256': 'a' * 64,
+        'dependency_proof_kind': 'installed-tree-v1',
+        'sandbox_kind': 'bubblewrap-clean-clone-v1',
+    }
+    path.write_text(json.dumps(value))
+    path.chmod(0o600)
+
+    historical = read_verdict(git_repo)
+    assert 'node_runtime_sha256' not in historical.evidence_binding.to_json()[
+        'expected_binding']['environment']['config']
+    with pytest.raises(TribunalError, match='^CONTRACT_DRIFT$'):
+        require_current_in_progress(historical)
+    with pytest.raises(TribunalError, match='^CONTRACT_DRIFT$'):
+        reviewer_context_envelope(historical, Reviewer.B)
+
+
 def test_unmarked_contract1_without_selection_is_readable_but_not_current(git_repo):
     begin(git_repo)
     path = git_repo / '.review/verdict.json'

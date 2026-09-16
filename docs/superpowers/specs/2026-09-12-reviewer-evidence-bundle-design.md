@@ -130,10 +130,16 @@ network namespace, private home, empty temporary directory 안에서 실행되�
 dirty/ignored file, credential-bearing Git config와 host temporary state를 볼 수 없다.
 Bubblewrap 또는 정확한 recipe proof가 없으면 reusable evidence를 만들지 않는다.
 
+선택된 Node executable과 npm package tree 전체도 digest에 결속한다. Capture 시 이 runtime을
+private temporary tree로 복사하고 다시 측정한 뒤 `/opt/evidence-node`에 read-only mount한다.
+따라서 현재 PATH에서 선택한 Node 버전을 사용하되 원래 home/NVM/mise 설치 경로 자체는
+sandbox에 노출하지 않으며, 복사 전후 runtime identity가 다르면 재사용을 거부한다.
+
 Controller repository가 `/usr`, `/bin`, `/lib`, `/lib64` 아래에 있으면 sandbox 구성을
 거부하고 `/usr/local`은 빈 tmpfs로 가린다. 나머지 `/usr`와 `/bin`, `/lib*` mount는
 read-only이지만 완전히 fingerprint된 OS image가 아니라 신뢰하는 host runtime surface다.
-따라서 이 profile의 재현성 주장은 명시적으로 결속한 tool/script/input/dependency tree로
+따라서 이 profile의 재현성 주장은 명시적으로 결속한 tool/script/input/dependency tree와
+복사한 Node runtime으로
 한정하며, 전체 운영체제 상태의 결정성을 주장하지 않는다.
 
 `npm audit` 같은 live advisory 결과는 항상 `always-fresh`이며 캐시 재사용을 허용하지
