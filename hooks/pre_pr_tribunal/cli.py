@@ -89,7 +89,8 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     capture = commands.add_parser('evidence-capture', add_help=False)
     capture.add_argument('--base', required=True)
-    capture.add_argument('--profile', required=True, choices=('python-v1', 'node-lock-v1'))
+    capture.add_argument('--profile', required=True,
+                         choices=('python-v1', 'node-lock-v1', 'node-sandbox-v1'))
     capture.add_argument('--cwd', required=True)
     capture.add_argument('--timeout', required=True, type=float)
     capture.add_argument('argv', nargs=argparse.REMAINDER)

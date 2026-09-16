@@ -7,11 +7,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
 import tempfile
 
-from . import evidence
+from . import evidence, model
 from .evidence_process import run_owned
 from .git_state import _command_output
 from .model import SchemaError
@@ -20,36 +21,144 @@ TOOL_PATH = '/usr/bin:/bin'
 MAX_TREE_FILES = 50000
 MAX_TREE_BYTES = 512 * 1024 * 1024
 MAX_FILE_BYTES = 128 * 1024 * 1024
-PYTHON_INLINE_FLAGS = frozenset({'-c'})
-NODE_INLINE_FLAGS = frozenset({'-e', '--eval', '-p', '--print'})
-# Only flags that cannot themselves load code from outside the snapshot may
-# surround inline program text; node honours -r and --experimental-loader both
-# before and after the inline flag.
-NODE_PRE_INLINE_FLAGS = frozenset({'--input-type=module', '--input-type=commonjs'})
+PYTHON_TRACKED_READ_PROGRAM = (
+    "from pathlib import Path; import sys; "
+    "[Path(value).read_bytes() for value in sys.argv[1:]]"
+)
+NODE_PROFILES = frozenset({'node-lock-v1', 'node-sandbox-v1'})
+NPM_RECIPE_SCRIPTS = frozenset({'build', 'typecheck', 'test'})
+_TSC_FLAGS = frozenset({
+    '--build', '-b', '--noEmit', '--strict', '--skipLibCheck',
+    '--declaration', '--emitDeclarationOnly', '--sourceMap', '--declarationMap',
+})
+_TSC_EQUALS_FLAGS = frozenset({'--pretty', '--incremental', '--composite'})
+_VITEST_FLAGS = frozenset({
+    '--no-cache', '--coverage', '--passWithNoTests',
+    '--reporter=dot', '--reporter=default', '--pool=forks', '--pool=threads',
+})
 
 
-def _interpreter_freshness(words, inline_flags, preceding_flags):
-    """Only inline program text is reusable, because it is carried verbatim in
-    the recorded command. A file operand is never reusable: a tracked path may be
-    a symlink whose target lives outside the snapshot, so head_sha pins the link
-    and not the executed bytes. Any option after the inline text is refused too,
-    since node honours -r and --experimental-loader there."""
-    index = 0
-    while index < len(words) and words[index] in preceding_flags:
-        index += 1
-    if index >= len(words) or words[index] not in inline_flags:
-        return 'always-fresh'
-    if any(word.startswith('-') for word in words[index + 2:]):
-        return 'always-fresh'
-    return 'deterministic'
+def _tracked_regular(root, command_cwd, operand, *, suffixes=None):
+    candidate = Path(operand)
+    if candidate.is_absolute() or '..' in candidate.parts or not candidate.parts:
+        return False
+    relative = Path(command_cwd) / candidate
+    if suffixes is not None and relative.suffix not in suffixes:
+        return False
+    tracked = set(_command_output(Path(root), ('ls-files', '-z')).decode('utf-8').split('\0'))
+    if relative.as_posix() not in tracked:
+        return False
+    path = Path(root) / relative
+    try:
+        return (not path.is_symlink() and path.is_file()
+                and path.resolve(strict=True).is_relative_to(Path(root).resolve()))
+    except OSError:
+        return False
+
+
+def _local_dependency_tool(root, command_cwd, name):
+    try:
+        modules = (Path(root) / command_cwd / 'node_modules').resolve(strict=True)
+        executable = modules / '.bin' / name
+        target = executable.resolve(strict=True)
+        return target.is_relative_to(modules) and target.is_file() and os.access(target, os.X_OK)
+    except OSError:
+        return False
+
+
+def _read_package(root, command_cwd):
+    path = Path(root) / command_cwd / 'package.json'
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 1024 * 1024:
+            raise SchemaError('EVIDENCE_ENVIRONMENT_UNSUPPORTED')
+        raw = bytearray()
+        while chunk := os.read(fd, 65536):
+            raw.extend(chunk)
+            if len(raw) > 1024 * 1024:
+                raise SchemaError('EVIDENCE_ENVIRONMENT_TOO_LARGE')
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size,
+                                        after.st_mtime_ns, after.st_ctime_ns):
+            raise SchemaError('EVIDENCE_ENVIRONMENT_CHANGED')
+    finally:
+        os.close(fd)
+    package = model._load_json(bytes(raw), limit=1024 * 1024,
+                               too_large='EVIDENCE_ENVIRONMENT_TOO_LARGE')
+    if not isinstance(package, dict):
+        raise SchemaError('EVIDENCE_ENVIRONMENT_UNSUPPORTED')
+    return package
+
+
+def _tsc_recipe(root, command_cwd, script, *, require_local_tools):
+    if re.fullmatch(r'[A-Za-z0-9_./=,+ \t-]{1,4096}', script) is None:
+        return False
+    try:
+        words = shlex.split(script, posix=True)
+    except ValueError:
+        return False
+    if not words or words[0] != 'tsc' or (require_local_tools and not _local_dependency_tool(
+            root, command_cwd, 'tsc')):
+        return False
+    project = 'tsconfig.json'
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word in {'--project', '-p'}:
+            if index + 1 >= len(words):
+                return False
+            project = words[index + 1]
+            index += 2
+            continue
+        if word in _TSC_FLAGS or any(word == flag + '=true' or word == flag + '=false'
+                                     for flag in _TSC_EQUALS_FLAGS):
+            index += 1
+            continue
+        return False
+    return _tracked_regular(root, command_cwd, project, suffixes={'.json'})
+
+
+def _vitest_recipe(root, command_cwd, script, *, require_local_tools):
+    if re.fullmatch(r'[A-Za-z0-9_=,+ \t-]{1,4096}', script) is None:
+        return False
+    try:
+        words = shlex.split(script, posix=True)
+    except ValueError:
+        return False
+    return (len(words) >= 2 and words[:2] == ['vitest', 'run']
+            and all(word in _VITEST_FLAGS for word in words[2:])
+            and (not require_local_tools or _local_dependency_tool(root, command_cwd, 'vitest')))
+
+
+def _npm_recipe(root, command_cwd, words, *, require_local_tools):
+    if words == ['test']:
+        script_name = 'test'
+    elif len(words) == 2 and words[0] == 'run' and words[1] in NPM_RECIPE_SCRIPTS:
+        script_name = words[1]
+    else:
+        return False
+    package = _read_package(root, command_cwd)
+    scripts = package.get('scripts')
+    if not isinstance(scripts, dict) or not isinstance(scripts.get(script_name), str):
+        return False
+    if any(name in scripts for name in ('pre' + script_name, 'post' + script_name)):
+        return False
+    script = scripts[script_name]
+    if script_name in {'build', 'typecheck'}:
+        return _tsc_recipe(root, command_cwd, script, require_local_tools=require_local_tools)
+    return _vitest_recipe(root, command_cwd, script, require_local_tools=require_local_tools)
 
 
 @contextmanager
 def sanitized_environment(profile):
-    names = ('python3',) if profile == 'python-v1' else ('node', 'npm')
+    names = ('python3',) if profile == 'python-v1' else (
+        ('node', 'npm', 'bwrap') if profile == 'node-sandbox-v1' else ('node', 'npm')
+    )
     selected = {}
     for name in names:
-        found = shutil.which(name)
+        found = shutil.which(name, path=TOOL_PATH) if profile == 'node-sandbox-v1' else shutil.which(name)
         if found is None:
             raise SchemaError('EVIDENCE_TOOL_UNAVAILABLE')
         selected[name] = Path(found).resolve(strict=True)
@@ -63,7 +172,7 @@ def sanitized_environment(profile):
             (home / name).write_bytes(b'')
         env = {'PATH': str(private_bin) + ':' + TOOL_PATH, 'HOME': directory, 'LC_ALL': 'C', 'LANG': 'C',
                'TZ': 'UTC', 'TMPDIR': directory}
-        if profile == 'node-lock-v1':
+        if profile in NODE_PROFILES:
             env.update(NODE_ENV='test', CI='1', NO_COLOR='1', npm_config_ignore_scripts='true',
                 npm_config_userconfig=str(home / 'user.npmrc'),
                 npm_config_globalconfig=str(home / 'global.npmrc'),
@@ -144,7 +253,7 @@ def _tool(name, root, env):
     if output['exit_code'] != 0 or output['timed_out'] or output['overflow'] or output['cleanup_failed'] or output['intervention']:
         raise SchemaError('EVIDENCE_TOOL_UNAVAILABLE')
     version = output['stdout'].decode('ascii').strip()
-    if re.fullmatch(r'(?:Python )?v?\d+\.\d+\.\d+(?:[-+.][A-Za-z0-9.]+)?', version) is None:
+    if re.fullmatch(r'(?:Python |bubblewrap )?v?\d+\.\d+\.\d+(?:[-+.][A-Za-z0-9.]+)?', version) is None:
         raise SchemaError('EVIDENCE_TOOL_UNAVAILABLE')
     return {'name': name, 'version': version, 'executable_sha256': digest}
 
@@ -165,22 +274,29 @@ def measure_environment(root, profile, command_cwd, *, dependency_proof=None):
         inputs = sorted(p for p in tracked if Path(p).name in names or
                         Path(p).name.startswith('requirements') and Path(p).suffix in {'.txt', '.in'})
         tools, config = ('python3',), {'python_isolated': True, 'python_no_user_site': True}
-    elif profile == 'node-lock-v1':
+    elif profile in NODE_PROFILES:
         inputs = [(Path(command_cwd) / name).as_posix() for name in ('package.json', 'package-lock.json')]
         if not set(inputs).issubset(tracked):
             raise SchemaError('EVIDENCE_DEPENDENCIES_UNSUPPORTED')
         # Bind tracked local script bodies as declared source inputs. The full
         # committed snapshot additionally binds every other source/config file.
-        inputs = sorted(set(inputs) | {p for p in tracked if Path(p).suffix in {'.js', '.mjs', '.cjs'}})
+        inputs = sorted(set(inputs) | {
+            p for p in tracked
+            if (Path(p).suffix in {'.js', '.mjs', '.cjs'}
+                or Path(p).name.startswith('tsconfig') and Path(p).suffix == '.json'
+                or Path(p).name.startswith(('vitest.config.', 'vite.config.')))
+        })
         # Project/ancestor config can override npm command behavior: unsupported.
         for parent in (directory, *directory.parents):
             if (parent / '.npmrc').exists():
                 raise SchemaError('EVIDENCE_CONFIG_UNSUPPORTED')
             if parent == root:
                 break
-        tools = ('node', 'npm')
+        tools = ('node', 'npm', 'bwrap') if profile == 'node-sandbox-v1' else ('node', 'npm')
         config = {'node_env': 'test', 'npm_ignore_scripts': True,
                   'dependency_proof_kind': 'installed-tree-v1'}
+        if profile == 'node-sandbox-v1':
+            config['sandbox_kind'] = 'bubblewrap-clean-clone-v1'
         if dependency_proof is None:
             config['dependency_tree_sha256'] = installed_tree(directory / 'node_modules')
         else:
@@ -204,14 +320,14 @@ def measure_environment(root, profile, command_cwd, *, dependency_proof=None):
 
 
 @evidence.bounded_errors
-def validate_command(root, profile, command_cwd, argv):
+def validate_command(root, profile, command_cwd, argv, *, require_local_tools=True):
     """Return fixed freshness. Python scope is isolated stdlib; Node is declared."""
     executable = Path(argv[0])
     name = executable.name
     allowed = ('python3',) if profile == 'python-v1' else ('node', 'npm')
     if name not in allowed:
         raise SchemaError('EVIDENCE_COMMAND_UNSUPPORTED')
-    expected = shutil.which(name)
+    expected = shutil.which(name, path=TOOL_PATH) if profile == 'node-sandbox-v1' else shutil.which(name)
     if expected is None or (executable.is_absolute() and executable.resolve() != Path(expected).resolve()) or (
             not executable.is_absolute() and '/' in argv[0]):
         raise SchemaError('EVIDENCE_COMMAND_UNSUPPORTED')
@@ -219,9 +335,12 @@ def validate_command(root, profile, command_cwd, argv):
         # Require exact leading isolation flags; do not claim arbitrary pytest.
         if argv[1:3] != ['-I', '-S']:
             raise SchemaError('EVIDENCE_COMMAND_UNSUPPORTED')
-        return _interpreter_freshness(argv[3:], PYTHON_INLINE_FLAGS, frozenset())
+        if (argv[3:5] == ['-c', PYTHON_TRACKED_READ_PROGRAM] and len(argv) >= 6
+                and all(_tracked_regular(root, command_cwd, operand) for operand in argv[5:])):
+            return 'deterministic'
+        return 'always-fresh'
     if name == 'node':
-        return _interpreter_freshness(argv[1:], NODE_INLINE_FLAGS, NODE_PRE_INLINE_FLAGS)
+        return 'always-fresh'
     words = argv[1:]
     # npm configuration flags are not caller-declared environment facts. Only
     # the small advisory presentation flags below may precede the '--' boundary.
@@ -229,8 +348,9 @@ def validate_command(root, profile, command_cwd, argv):
     for word in npm_words:
         if word.startswith('-') and word not in {'--json', '--omit=dev', '--omit=optional', '--production'} and re.fullmatch(r'--audit-level=(?:info|low|moderate|high|critical|none)', word) is None:
             raise SchemaError('EVIDENCE_CONFIG_UNSUPPORTED')
-    # No npm invocation is reusable. A script body is tracked content but the
-    # files its tools read are not bound by the snapshot, and npm appends every
-    # word after '--' to the executed script, so neither form can be classified
-    # from what is visible here.
+    if profile == 'node-sandbox-v1' and _npm_recipe(
+            root, command_cwd, words, require_local_tools=require_local_tools):
+        return 'deterministic'
+    # node-lock-v1 remains capture-only. Reuse requires the clean-clone sandbox
+    # contract in node-sandbox-v1.
     return 'always-fresh'

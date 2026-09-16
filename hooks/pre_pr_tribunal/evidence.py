@@ -20,7 +20,8 @@ MAX_ENTRIES = 64
 CAPTURE_MAGIC = b'TRIBUNAL-EVIDENCE\x00\x01'
 CAPTURE_OVERHEAD = len(CAPTURE_MAGIC) + 16
 PROFILES = {'python-v1': frozenset({'python3', 'pytest'}),
-            'node-lock-v1': frozenset({'node', 'npm'})}
+            'node-lock-v1': frozenset({'node', 'npm'}),
+            'node-sandbox-v1': frozenset({'node', 'npm', 'bwrap'})}
 ENTRY_KEYS = {'id', 'argv', 'cwd', 'exit_code', 'captured_at', 'duration_ms',
               'stdout_excerpt', 'stderr_excerpt', 'truncated', 'stdout_sha256',
               'stderr_sha256', 'capture_sha256', 'capture_bytes', 'freshness'}
@@ -123,12 +124,14 @@ def validate_environment(value: dict) -> None:
         if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 .+_()\-]{0,127}', version) is None:
             raise SchemaError('EVIDENCE_TOOL_INVALID')
         _digest(tool['executable_sha256'])
-    required = {'python3'} if profile == 'python-v1' else {'node', 'npm'}
+    required = ({'python3'} if profile == 'python-v1' else
+                ({'node', 'npm', 'bwrap'} if profile == 'node-sandbox-v1' else {'node', 'npm'}))
     if not required.issubset(names):
         raise SchemaError('EVIDENCE_TOOL_INVALID')
     config = env['config']
     allowed = ({'python_isolated', 'python_no_user_site'} if profile == 'python-v1' else
-               {'node_env', 'npm_ignore_scripts', 'dependency_tree_sha256', 'dependency_proof_kind'})
+               {'node_env', 'npm_ignore_scripts', 'dependency_tree_sha256',
+                'dependency_proof_kind', 'sandbox_kind'})
     if not isinstance(config, dict) or not set(config).issubset(allowed):
         raise SchemaError('EVIDENCE_CONFIG_INVALID')
     for key, value in config.items():
@@ -142,7 +145,11 @@ def validate_environment(value: dict) -> None:
             _digest(value)
         elif key == 'dependency_proof_kind' and value != 'installed-tree-v1':
             raise SchemaError('EVIDENCE_CONFIG_INVALID')
+        elif key == 'sandbox_kind' and value != 'bubblewrap-clean-clone-v1':
+            raise SchemaError('EVIDENCE_CONFIG_INVALID')
     if ('dependency_tree_sha256' in config) != ('dependency_proof_kind' in config):
+        raise SchemaError('EVIDENCE_CONFIG_INVALID')
+    if (profile == 'node-sandbox-v1') != ('sandbox_kind' in config):
         raise SchemaError('EVIDENCE_CONFIG_INVALID')
 
 
@@ -170,7 +177,7 @@ def _validate_binding(value):
     contract = _object(value['contract'], {'report_text', 'diff_recipe', 'verdict_schema', 'evidence'})
     for key in ('report_text', 'diff_recipe', 'verdict_schema'):
         _integer(contract[key], 1, 2**31-1)
-    _integer(contract['evidence'], 1, 1)
+    _integer(contract['evidence'], 1, 2)
     validate_environment(value['environment'])
 
 

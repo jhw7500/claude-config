@@ -23,6 +23,24 @@
 - Profiles bind declared source/tool/config facts, not all possible external state. Never assume dependencies are installed in B's detached view. Require an explicit supported profile and recompute the facts available to the verifier; unsupported/unverifiable facts mean no reuse.
 - Do not silently migrate an old pending contract or reuse its receipts. Preserve historical reading separately from current authority.
 
+## Contract-2 hardening addendum
+
+The original task bullets below describe evidence contract 1 and are retained as implementation
+history. Current authority uses evidence contract 2:
+
+- `python-v1` and `node-lock-v1` are capture-only, apart from the fixed code-owned Python
+  tracked-file plumbing probe. Arbitrary inline/file interpreter programs and general npm commands
+  are `always-fresh`.
+- `node-sandbox-v1` is the sole reusable Node profile. It accepts exact build/typecheck/test npm
+  recipes backed by measured local `tsc`/`vitest`, rejects lifecycle hooks and caller overrides,
+  and runs in a Git-metadata-free clean committed clone with the measured dependency tree copied
+  into a Bubblewrap network/home/tmp sandbox.
+- Contract-1 bundles remain parseable as history but cannot satisfy the installed current binding.
+  Schema-4 verdicts without the explicit `evidence_contract: 2` marker are also historical-only and
+  cannot authorize current context, submission, finalization, or the terminal PR gate.
+  The native comparison and whole-suite evidence recorded for contract 1 must not be presented as
+  contract-2 acceptance; rerun those gates after the final contract-2 commit.
+
 ## Task 1: Strict evidence format and secure immutable store
 
 **Files:** Create `hooks/pre_pr_tribunal/evidence.py`, `hooks/pre_pr_tribunal/evidence_store.py`, and `tests/pre_pr_tribunal/test_evidence.py`. Reuse `model.py` validation policies and `review_store.py` secure primitives; do not modify existing lifecycle/model contracts in this task.

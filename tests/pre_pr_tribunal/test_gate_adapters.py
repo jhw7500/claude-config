@@ -149,6 +149,7 @@ def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo,
     if version < 4:
         del value['evidence_binding']
         del value['evidence_fallback_reason']
+        del value['evidence_contract']
     if version == 1:
         value["schema"] = 1
         del value["contract"]

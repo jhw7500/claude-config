@@ -264,3 +264,37 @@ def test_node_dependency_config_and_complete_secret_scan(api):
     for secret in (b'ghp_abcdefghijk', b'/home/user/secret'):
         with pytest.raises(SchemaError, match='^EVIDENCE_'):
             evidence.encode_capture(b'a'*9000+secret, b'')
+
+
+def test_node_sandbox_environment_requires_exact_contract(api):
+    evidence, _ = api
+    env = binding()['environment']
+    env['profile'] = 'node-sandbox-v1'
+    env['tools'] = [{'name': name, 'version': 'v22.0.0', 'executable_sha256': 'a'*64}
+                    for name in ('node', 'npm', 'bwrap')]
+    env['config'] = {'dependency_tree_sha256': 'b'*64,
+                     'dependency_proof_kind': 'installed-tree-v1',
+                     'sandbox_kind': 'bubblewrap-clean-clone-v1'}
+    evidence.validate_environment(env)
+
+    missing = copy.deepcopy(env)
+    del missing['config']['sandbox_kind']
+    with pytest.raises(SchemaError, match='^EVIDENCE_'):
+        evidence.validate_environment(missing)
+
+    legacy = copy.deepcopy(env)
+    legacy['profile'] = 'node-lock-v1'
+    legacy['tools'] = legacy['tools'][:2]
+    with pytest.raises(SchemaError, match='^EVIDENCE_'):
+        evidence.validate_environment(legacy)
+
+
+def test_evidence_contract_reads_v1_and_v2_only(api):
+    for version in (1, 2):
+        obj = bundle(api)
+        obj['binding']['contract']['evidence'] = version
+        parse(api, obj)
+    obj = bundle(api)
+    obj['binding']['contract']['evidence'] = 3
+    with pytest.raises(SchemaError, match='^EVIDENCE_'):
+        parse(api, obj)

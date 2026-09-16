@@ -1,14 +1,19 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 
 
 def test_disposable_installed_cli_reuse_lifecycle_and_sealed_mutation(git_repo, home, tmp_path):
+    if not shutil.which('bwrap', path='/usr/bin:/bin'):
+        pytest.skip('bubblewrap unavailable')
     installed = subprocess.run([sys.executable, str(REPO / 'scripts/install-pre-pr-tribunal.py'),
         '--repo', str(REPO), '--home', str(home)], capture_output=True, text=True)
     assert installed.returncode == 0, installed.stderr
@@ -30,8 +35,20 @@ def test_disposable_installed_cli_reuse_lifecycle_and_sealed_mutation(git_repo, 
         assert result.returncode != 0
         return result
 
-    captured = cli('evidence-capture', '--base', 'master', '--profile', 'python-v1',
-        '--cwd', '.', '--timeout', '3', '--', 'python3', '-I', '-S', '-c', "print('ok')")
+    (git_repo / 'package.json').write_text(json.dumps({'name': 'fixture', 'version': '1.0.0',
+        'scripts': {'typecheck': 'tsc --noEmit --project tsconfig.json'}}))
+    (git_repo / 'package-lock.json').write_text('{"lockfileVersion":3}')
+    (git_repo / 'tsconfig.json').write_text('{"compilerOptions":{"noEmit":true}}')
+    with (git_repo / '.gitignore').open('a') as file:
+        file.write('node_modules/\n')
+    subprocess.run(['git', '-C', str(git_repo), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(git_repo), 'commit', '-qm', 'sandbox recipe'], check=True)
+    modules = git_repo / 'node_modules'; (modules / '.bin').mkdir(parents=True)
+    tool = modules / 'typescript/bin/tsc'; tool.parent.mkdir(parents=True)
+    tool.write_text("#!/usr/bin/env node\nconsole.log('ok')\n"); tool.chmod(0o755)
+    (modules / '.bin/tsc').symlink_to('../typescript/bin/tsc')
+    captured = cli('evidence-capture', '--base', 'master', '--profile', 'node-sandbox-v1',
+        '--cwd', '.', '--timeout', '15', '--', 'npm', 'run', 'typecheck')
     frozen = cli('evidence-freeze', '--base', 'master', '--receipt', captured['receipt_sha256'])
     cli('begin', '--base', 'master', '--runtime', 'codex', '--round', '1',
         '--evidence-bundle', frozen['bundle_sha256'])

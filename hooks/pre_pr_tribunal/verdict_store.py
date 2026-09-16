@@ -217,6 +217,7 @@ class _VerdictFields:
     snapshot: Snapshot
     evidence_binding: m.EvidenceBinding | None
     evidence_fallback_reason: str | None
+    evidence_contract: int | None
 
 
 def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFields:
@@ -244,6 +245,8 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         if schema == m.VERDICT_SCHEMA_VERSION:
             verdict_keys.update(('evidence_binding', 'evidence_fallback_reason'))
         valid_shapes = {frozenset(verdict_keys)}
+        if schema == m.VERDICT_SCHEMA_VERSION:
+            valid_shapes.add(frozenset((*verdict_keys, 'evidence_contract')))
     else:
         valid_shapes = {
             frozenset(verdict_keys),
@@ -351,6 +354,10 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
     from .evidence_lifecycle import parse_selection, parse_fallback
     selection = parse_selection(data.get('evidence_binding'))
     fallback = parse_fallback(data.get('evidence_fallback_reason'), selection)
+    evidence_contract = None
+    if 'evidence_contract' in data:
+        evidence_contract = m._integer(
+            data['evidence_contract'], 'VERDICT_INVALID', minimum=1, maximum=2)
     if selection is not None:
         from .evidence_runtime import snapshot_binding
         if selection.to_json()['expected_binding']['snapshot'] != snapshot_binding(snapshot):
@@ -376,6 +383,7 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         snapshot,
         selection,
         fallback,
+        evidence_contract,
     )
 
 
@@ -446,6 +454,7 @@ def _verdict_from_fields(
         lifecycle_id,
         fields.evidence_binding,
         fields.evidence_fallback_reason,
+        fields.evidence_contract,
     )
 
 
@@ -559,11 +568,13 @@ def _parse_v2_receipt(
 def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
     fields = _parse_verdict_fields(data, schema=schema)
     contract = _parse_contract(data["contract"])
-    if fields.evidence_binding is not None and (
-        fields.evidence_binding.to_json()['expected_binding']['contract']
-        != {**contract.to_json(), 'evidence': 1}
-    ):
-        raise SchemaError('EVIDENCE_BINDING_MISMATCH')
+    if fields.evidence_binding is not None:
+        evidence_contract = fields.evidence_binding.to_json()['expected_binding']['contract']
+        if ({key: evidence_contract[key] for key in contract.to_json()} != contract.to_json()
+                or evidence_contract['evidence'] not in (1, 2)
+                or (fields.evidence_contract is not None
+                    and fields.evidence_contract != evidence_contract['evidence'])):
+            raise SchemaError('EVIDENCE_BINDING_MISMATCH')
     reviewers: dict[str, ReviewerSlot] = {}
     for key in "ABC":
         raw_slot = fields.reviewers[key]
@@ -825,6 +836,9 @@ def require_current_in_progress(verdict: Verdict) -> Verdict:
         or verdict.gate.status is not GateStatus.IN_PROGRESS
     ):
         raise SchemaError("ROUND_NOT_IN_PROGRESS")
+    from .evidence_lifecycle import has_current_evidence_contract
+    if not has_current_evidence_contract(verdict):
+        raise SchemaError("CONTRACT_DRIFT")
     return verdict
 
 
@@ -1032,7 +1046,9 @@ def validate_stored_reviewer_report(
         if verdict.schema == m.SCHEMA_VERSION:
             _require_all_pending(verdict)
         elif verdict.schema in m.MIXED_SLOT_VERDICT_SCHEMAS:
-            if verdict.contract != current_contract_binding():
+            from .evidence_lifecycle import has_current_evidence_contract
+            if (verdict.contract != current_contract_binding()
+                    or not has_current_evidence_contract(verdict)):
                 raise SchemaError("CONTRACT_DRIFT")
             slot = verdict.reviewers[reviewer.value]
             if slot.status == "pending" and verdict.gate.status is not GateStatus.IN_PROGRESS:
@@ -1133,6 +1149,7 @@ def _new_current_pending(
         snapshot.created_at,
         contract,
         lifecycle_id,
+        evidence_contract=2,
     )
 
 
@@ -1428,6 +1445,7 @@ def migrate_v2_pending_round(
             schema=m.VERDICT_SCHEMA_VERSION,
             contract=current,
             lifecycle_id=_lifecycle_id(token_hex),
+            evidence_contract=2,
         )
         _atomic_write(review_fd, migrated)
         return PendingMigrationResult(

@@ -105,7 +105,10 @@ def context_sha256(verdict: Verdict, reviewer: Reviewer) -> str:
 def reviewer_context_envelope(
     verdict: Verdict, reviewer: Reviewer
 ) -> dict[str, object]:
-    if verdict.schema != VERDICT_SCHEMA_VERSION or verdict.contract != current_contract_binding():
+    from .evidence_lifecycle import has_current_evidence_contract
+    if (verdict.schema != VERDICT_SCHEMA_VERSION
+            or verdict.contract != current_contract_binding()
+            or not has_current_evidence_contract(verdict)):
         raise SchemaError("CONTRACT_DRIFT")
     if verdict.reviewers[reviewer.value].status != "pending":
         raise SchemaError("REVIEWER_SLOT_SEALED")

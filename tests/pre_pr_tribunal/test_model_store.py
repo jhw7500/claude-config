@@ -125,6 +125,7 @@ def report_paths(repo, snapshot, *, round_number=1, overrides=None):
 def legacy_pending(repo):
     pending = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     legacy = replace(pending, schema=1, contract=None, lifecycle_id=None,
+                     evidence_contract=None,
                      reviewers={key: ReviewerSlot("pending") for key in "ABC"})
     write_json(repo / ".review/verdict.json", legacy.to_json())
     return legacy
@@ -133,6 +134,7 @@ def legacy_pending(repo):
 def begin_legacy_round(repo, **kwargs):
     pending = begin_round(repo, **kwargs)
     legacy = replace(pending, schema=1, contract=None, lifecycle_id=None,
+                     evidence_contract=None,
                      reviewers={key: ReviewerSlot("pending") for key in "ABC"})
     write_json(repo / ".review/verdict.json", legacy.to_json())
     return legacy
@@ -359,6 +361,7 @@ def test_legacy_migration_refuses_subset_and_terminal_v1(git_repo):
     report_paths(git_repo, pending.snapshot)
     native = finalize_round(git_repo, now=NOW)
     terminal = replace(native, schema=1, contract=None, lifecycle_id=None,
+                       evidence_contract=None,
                        reviewers={key: ReviewerSlot("complete", slot.report)
                                   for key, slot in native.reviewers.items()})
     write_json(git_repo / ".review/verdict.json", terminal.to_json())
@@ -1595,6 +1598,7 @@ def test_verdict_schema_two_does_not_change_report_or_snapshot_schema(git_repo):
             SLOT_VERDICT_SCHEMA_VERSION,
         ),
         lifecycle_id=None,
+        evidence_contract=None,
     )
     assert pending.schema == SLOT_VERDICT_SCHEMA_VERSION == 2
     assert pending.snapshot.schema == SCHEMA_VERSION == 1
@@ -1631,6 +1635,7 @@ def _schema_two_mixed_verdict(git_repo):
             SLOT_VERDICT_SCHEMA_VERSION,
         ),
         lifecycle_id=None,
+        evidence_contract=None,
         reviewers={
             "A": ReviewerSlot(
                 "sealed",
@@ -1669,6 +1674,7 @@ def _v2_mixed_pending(git_repo):
         schema=SLOT_VERDICT_SCHEMA_VERSION,
         contract=replace(native.contract, verdict_schema=SLOT_VERDICT_SCHEMA_VERSION),
         lifecycle_id=None,
+        evidence_contract=None,
     )
     write_json(git_repo / ".review/verdict.json", legacy.to_json())
     return legacy, raw
@@ -1859,6 +1865,7 @@ def test_schema_one_terminal_verdict_remains_readable_without_rewrite(git_repo):
     path = git_repo / ".review/verdict.json"
     native = read_verdict(git_repo)
     legacy = replace(native, schema=1, contract=None, lifecycle_id=None,
+                     evidence_contract=None,
                      reviewers={key: ReviewerSlot("complete", slot.report)
                                 for key, slot in native.reviewers.items()})
     write_json(path, legacy.to_json())
@@ -2292,6 +2299,7 @@ def test_failed_legacy_verdict_without_head_ref_migrates_on_next_round(git_repo)
     del legacy["lifecycle_id"]
     del legacy['evidence_binding']
     del legacy['evidence_fallback_reason']
+    del legacy['evidence_contract']
     legacy["reviewers"] = {key: slot["report"] for key, slot in legacy["reviewers"].items()}
     del legacy["head_ref"]
     write_json(verdict_path, legacy)
@@ -3507,6 +3515,7 @@ def test_cli_status_discriminates_all_pending_v1_from_v2(git_repo):
         schema=1,
         contract=None,
         lifecycle_id=None,
+        evidence_contract=None,
         reviewers={key: ReviewerSlot("pending") for key in "ABC"},
     )
     write_json(git_repo / ".review/verdict.json", legacy.to_json())

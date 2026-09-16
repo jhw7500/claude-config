@@ -116,8 +116,27 @@ Round에는 검증 대상의 기대 profile을 결속한다. Verifier는 source/
 Profile은 명시된 입력에 대한 결속이다. 선언하지 않은 외부 상태까지 완전히 재현한다는
 보증으로 표현하지 않는다. 지원할 수 없는 환경이나 외부 의존 조건은 독립 검증으로 보낸다.
 
-Build/typecheck/test는 지원되는 deterministic profile에서만 재사용한다. `npm audit`
-같은 live advisory 결과는 기본 정책을 `always-fresh`로 정해 캐시 재사용을 허용하지
+Evidence contract 2에서 `python-v1`과 `node-lock-v1`은 capture-only다. 예외는 evidence
+plumbing 자체를 검증하는 code-owned Python tracked-file probe뿐이다. 임의 Python/Node
+program 또는 일반 npm invocation을 deterministic으로 분류하지 않는다.
+
+Reusable Node build/typecheck/test는 `node-sandbox-v1`에서만 허용한다. 이 profile은
+Bubblewrap이 있는 Linux controller에서 정확한 `npm run build`, `npm run typecheck`,
+`npm test` recipe만 받는다. `package.json` script는 local measured dependency tree의
+`tsc` 또는 `vitest run`으로 제한하고, pre/post lifecycle hook, caller flag, shell chain,
+외부 config path와 local-tool escape를 거부한다. Runtime은 bound HEAD의 clean clone을
+만들고 Git metadata를 제거한 뒤 측정한 `node_modules` tree를 복사·재검증한다. Command는
+network namespace, private home, empty temporary directory 안에서 실행되므로 controller의
+dirty/ignored file, credential-bearing Git config와 host temporary state를 볼 수 없다.
+Bubblewrap 또는 정확한 recipe proof가 없으면 reusable evidence를 만들지 않는다.
+
+Controller repository가 `/usr`, `/bin`, `/lib`, `/lib64` 아래에 있으면 sandbox 구성을
+거부하고 `/usr/local`은 빈 tmpfs로 가린다. 나머지 `/usr`와 `/bin`, `/lib*` mount는
+read-only이지만 완전히 fingerprint된 OS image가 아니라 신뢰하는 host runtime surface다.
+따라서 이 profile의 재현성 주장은 명시적으로 결속한 tool/script/input/dependency tree로
+한정하며, 전체 운영체제 상태의 결정성을 주장하지 않는다.
+
+`npm audit` 같은 live advisory 결과는 항상 `always-fresh`이며 캐시 재사용을 허용하지
 않는다. 임의 TTL을 추정하지 않는다. Fresh 실행이 안전하게 불가능하면 기존 B 규칙에
 따라 `unverified`로 남긴다.
 
@@ -131,8 +150,10 @@ Submit와 finalize에서 참조한 entry의 원본 결속을 검증한다. Evide
 독립 검증 report도 허용한다. 잘못된 재사용 참조가 있는 report를 통과시키지 않으며,
 sealed report가 의존하는 artifact가 변조됐을 때 자동으로 새 증거로 교체하지 않는다.
 
-버전 변경은 명시적이다. 새 optional evidence binding과 report provenance에 필요한
-schema/contract version을 갱신하고, 기존 기록의 읽기와 현재 판정 권한을 구분한다.
+버전 변경은 명시적이다. 현재 evidence contract는 2다. Contract 1 evidence와 명시적
+`evidence_contract: 2` marker가 없는 schema-4 verdict는 역사 기록으로 읽을 수 있지만
+현재 round authority가 될 수 없다. 새 optional evidence binding과
+report provenance에 필요한 schema/contract version을 갱신하고, 기존 기록의 읽기와 현재 판정 권한을 구분한다.
 구 contract의 pending round를 묵시적으로 재해석하거나 receipt를 재사용하지 않는다.
 불일치 시 원본을 보존하고 기존 명시적 recovery/abandon 경계로 돌아간다.
 

@@ -1,22 +1,146 @@
 """Capture explicit caller commands, freeze receipts, and verify pinned facts."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import math
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 
 from . import evidence, evidence_store, model
-from .evidence_environment import measure_environment, sanitized_environment, validate_command
+from .evidence_environment import (installed_tree, measure_environment,
+    sanitized_environment, validate_command)
 from .evidence_process import run_owned
 from .git_state import DIFF_RECIPE_VERSION, _physical_root, capture_snapshot
 from .model import SchemaError, TribunalError
 
 
+EVIDENCE_CONTRACT_VERSION = 2
+_SANDBOX_LAUNCHER_SOURCE = """import os, signal, sys
+status = int(sys.argv[1])
+command = sys.argv[2:]
+os.set_inheritable(status, False)
+read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+child = os.fork()
+if child == 0:
+    os.close(read_fd)
+    try:
+        os.execvpe(command[0], command, os.environ)
+    except BaseException:
+        try:
+            os.write(write_fd, b'F')
+        finally:
+            os._exit(127)
+os.close(write_fd)
+failure = os.read(read_fd, 1)
+os.close(read_fd)
+os.write(status, b'F' if failure else b'S')
+os.close(status)
+_, state = os.waitpid(child, 0)
+if os.WIFEXITED(state):
+    raise SystemExit(os.WEXITSTATUS(state))
+if os.WIFSIGNALED(state):
+    signum = os.WTERMSIG(state)
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+raise SystemExit(127)
+"""
+
+
 def contract_binding():
     return {'report_text': model.REPORT_TEXT_CONTRACT_VERSION,
             'diff_recipe': DIFF_RECIPE_VERSION, 'verdict_schema': model.VERDICT_SCHEMA_VERSION,
-            'evidence': 1}
+            'evidence': EVIDENCE_CONTRACT_VERSION}
+
+
+def _fixed_command(argv, *, cwd, env=None, timeout=60):
+    try:
+        result = subprocess.run(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        raise SchemaError('EVIDENCE_SANDBOX_UNAVAILABLE') from None
+    if result.returncode != 0:
+        raise SchemaError('EVIDENCE_SANDBOX_UNAVAILABLE')
+
+
+@contextmanager
+def _sandboxed_node_command(root, command_cwd, argv, env, binding):
+    """Execute a deterministic Node recipe in a clean committed clone.
+
+    The clone excludes ignored/generated source state. Its dependency tree is a
+    byte-for-byte copy of the measured tree. Bubblewrap removes network access
+    and hides the controller's home and temporary directories.
+    """
+    resolved_root = Path(root).resolve(strict=True)
+    for system_path in ('/usr', '/bin', '/lib', '/lib64'):
+        if os.path.exists(system_path) and resolved_root.is_relative_to(
+                Path(system_path).resolve(strict=True)):
+            raise SchemaError('EVIDENCE_SANDBOX_UNAVAILABLE')
+    with tempfile.TemporaryDirectory(prefix='tribunal-sandbox-') as directory:
+        temporary = Path(directory)
+        view = temporary / 'repo'
+        git_home = temporary / 'git-home'
+        git_home.mkdir(mode=0o700)
+        git_env = {'PATH': '/usr/bin:/bin', 'HOME': str(git_home), 'TMPDIR': str(temporary),
+                   'LC_ALL': 'C', 'LANG': 'C', 'GIT_PAGER': 'cat',
+                   'GIT_OPTIONAL_LOCKS': '0', 'GIT_CONFIG_NOSYSTEM': '1',
+                   'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_ATTR_NOSYSTEM': '1'}
+        _fixed_command(['/usr/bin/git', 'clone', '--no-checkout', '--no-local',
+                        '--no-hardlinks', '--quiet', '--config', 'core.hooksPath=/dev/null',
+                        str(root), str(view)], cwd=temporary, env=git_env)
+        head = binding['snapshot']['head_sha']
+        _fixed_command(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null', '-C', str(view),
+                        'checkout', '--quiet', '--detach', head], cwd=temporary, env=git_env)
+        try:
+            shutil.rmtree(view / '.git')
+        except OSError:
+            raise SchemaError('EVIDENCE_SANDBOX_UNAVAILABLE') from None
+        source_modules = Path(root) / command_cwd / 'node_modules'
+        target_modules = view / command_cwd / 'node_modules'
+        try:
+            shutil.copytree(source_modules, target_modules, symlinks=True,
+                            copy_function=shutil.copy2)
+        except OSError:
+            raise SchemaError('EVIDENCE_SANDBOX_UNAVAILABLE') from None
+        if installed_tree(target_modules) != binding['environment']['config']['dependency_tree_sha256']:
+            raise SchemaError('EVIDENCE_ENVIRONMENT_CHANGED')
+        host_home = Path(env['HOME'])
+        sandbox_env = dict(env, PATH='/usr/bin:/bin', HOME='/home/evidence', TMPDIR='/tmp',
+            npm_config_userconfig='/home/evidence/user.npmrc',
+            npm_config_globalconfig='/home/evidence/global.npmrc',
+            npm_config_cache='/home/evidence/npm-cache')
+        bwrap = shutil.which('bwrap', path=env['PATH'])
+        if bwrap is None:
+            raise SchemaError('EVIDENCE_SANDBOX_UNAVAILABLE')
+        wrapped = [str(Path(bwrap).resolve()), '--die-with-parent', '--new-session',
+                   '--unshare-all', '--ro-bind', '/usr', '/usr']
+        for system_path in ('/bin', '/lib', '/lib64'):
+            if os.path.exists(system_path):
+                wrapped.extend(('--ro-bind', system_path, system_path))
+        if os.path.exists('/usr/local'):
+            wrapped.extend(('--tmpfs', '/usr/local'))
+        wrapped.extend(('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+                        '--dir', '/home', '--bind', str(host_home), '/home/evidence',
+                        '--bind', str(view), '/workspace', '--chdir',
+                        str(Path('/workspace') / command_cwd)))
+        for key, value in sorted(sandbox_env.items()):
+            wrapped.extend(('--setenv', key, value))
+        status_read, status_write = os.pipe()
+        try:
+            wrapped.extend(('--', '/usr/bin/python3', '-I', '-S', '-c',
+                            _SANDBOX_LAUNCHER_SOURCE, str(status_write), *argv))
+            yield (wrapped, root, {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'LANG': 'C'},
+                   (status_read, status_write))
+        finally:
+            for fd in (status_read, status_write):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def snapshot_binding(snapshot):
@@ -57,13 +181,22 @@ def capture_evidence(cwd, *, base, profile, command_cwd, argv, timeout_seconds):
     directory = root / command_cwd
     if not directory.is_dir() or directory.resolve() != directory or not directory.is_relative_to(root):
         raise SchemaError('EVIDENCE_CWD_INVALID')
-    if profile not in ('python-v1', 'node-lock-v1'):
+    if profile not in evidence.PROFILES:
         raise SchemaError('EVIDENCE_PROFILE_UNSUPPORTED')
     freshness = validate_command(root, profile, command_cwd, argv)
     before = _binding(root, base, profile, command_cwd)
     with sanitized_environment(profile) as env:
-        result = run_owned(argv, cwd=directory, env=env, timeout_seconds=timeout_seconds,
-                           limit=evidence.MAX_CAPTURE_BYTES)
+        if profile == 'node-sandbox-v1' and freshness == 'deterministic':
+            with _sandboxed_node_command(root, command_cwd, argv, env, before) as execution:
+                command, execution_cwd, execution_env, control_pipe = execution
+                result = run_owned(command, cwd=execution_cwd, env=execution_env,
+                    timeout_seconds=timeout_seconds, limit=evidence.MAX_CAPTURE_BYTES,
+                    control_pipe=control_pipe, pid_namespace_contained=True)
+            if result['control'] != b'S':
+                raise SchemaError('EVIDENCE_SANDBOX_UNAVAILABLE')
+        else:
+            result = run_owned(argv, cwd=directory, env=env, timeout_seconds=timeout_seconds,
+                               limit=evidence.MAX_CAPTURE_BYTES)
     payload = {key: result[key] for key in ('exit_code', 'timed_out', 'duration_ms')}
     if result['timed_out']:
         return {**payload, 'reason_code': 'EVIDENCE_TIMEOUT'}
@@ -132,7 +265,8 @@ def verify_source_tool_environment(cwd, *, expected_environment):
     root = _physical_root(Path(cwd))
     profile = expected_environment['profile']
     current = measure_environment(root, profile, expected_environment['cwd'],
-        dependency_proof=expected_environment['config'] if profile == 'node-lock-v1' else None)
+        dependency_proof=expected_environment['config'] if profile in {
+            'node-lock-v1', 'node-sandbox-v1'} else None)
     if current != expected_environment:
         raise SchemaError('EVIDENCE_ENVIRONMENT_CHANGED')
     return {'environment': current, 'dependency_availability': 'not-checked',

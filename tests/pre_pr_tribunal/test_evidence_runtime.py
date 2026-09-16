@@ -11,9 +11,12 @@ from pre_pr_tribunal import evidence_runtime as runtime
 from pre_pr_tribunal.model import TribunalError
 
 
-def capture(repo, code="print('ok')", **kwargs):
+def capture(repo, code=None, **kwargs):
+    from pre_pr_tribunal.evidence_environment import PYTHON_TRACKED_READ_PROGRAM
+    argv = (['python3', '-I', '-S', '-c', PYTHON_TRACKED_READ_PROGRAM, 'tracked.txt']
+            if code is None else ['python3', '-I', '-S', '-c', code])
     return runtime.capture_evidence(repo, base='master', profile='python-v1',
-        command_cwd='.', argv=['python3', '-I', '-S', '-c', code],
+        command_cwd='.', argv=argv,
         timeout_seconds=kwargs.pop('timeout_seconds', 3), **kwargs)
 
 
@@ -153,6 +156,269 @@ def node_repo(git_repo):
     modules.mkdir()
     (modules / 'dependency.js').write_text('module.exports=42;')
     return git_repo
+
+
+@pytest.fixture
+def sandbox_node_repo(node_repo):
+    import shutil
+    if not shutil.which('bwrap', path='/usr/bin:/bin'):
+        pytest.skip('bubblewrap unavailable')
+    package = json.loads((node_repo / 'package.json').read_text())
+    package['scripts'].update({
+        'build': 'tsc',
+        'typecheck': 'tsc --noEmit --project tsconfig.json',
+        'test': 'vitest run',
+    })
+    (node_repo / 'package.json').write_text(json.dumps(package))
+    (node_repo / 'tsconfig.json').write_text('{"compilerOptions":{"noEmit":true}}')
+    modules = node_repo / 'node_modules'
+    bin_dir = modules / '.bin'
+    tsc = modules / 'typescript/bin/tsc'
+    vitest = modules / 'vitest/vitest.mjs'
+    bin_dir.mkdir(parents=True)
+    tsc.parent.mkdir(parents=True)
+    vitest.parent.mkdir(parents=True)
+    tsc.write_text("#!/usr/bin/env node\nconsole.log('tsc-ok')\n")
+    vitest.write_text("#!/usr/bin/env node\nconsole.log('vitest-ok')\n")
+    tsc.chmod(0o755); vitest.chmod(0o755)
+    (bin_dir / 'tsc').symlink_to('../typescript/bin/tsc')
+    (bin_dir / 'vitest').symlink_to('../vitest/vitest.mjs')
+    subprocess.run(['git', '-C', str(node_repo), 'add', 'package.json', 'tsconfig.json'], check=True)
+    subprocess.run(['git', '-C', str(node_repo), 'commit', '-qm', 'sandbox recipes'], check=True)
+    return node_repo
+
+
+@pytest.mark.parametrize(('argv', 'expected'), [
+    (['npm', 'run', 'build'], 'tsc-ok\n'),
+    (['npm', 'run', 'typecheck'], 'tsc-ok\n'),
+    (['npm', 'test'], 'vitest-ok\n'),
+])
+def test_sandboxed_node_recipes_capture_and_reuse(sandbox_node_repo, argv, expected):
+    from pre_pr_tribunal.evidence_environment import validate_command
+    assert validate_command(sandbox_node_repo, 'node-sandbox-v1', '.', argv) == 'deterministic'
+    captured = runtime.capture_evidence(sandbox_node_repo, base='master',
+        profile='node-sandbox-v1', command_cwd='.', argv=argv, timeout_seconds=15)
+    assert captured['exit_code'] == 0 and captured['freshness'] == 'deterministic'
+    receipt = read_receipt(sandbox_node_repo, captured['receipt_sha256'])
+    assert receipt['entry']['stdout_excerpt'].endswith(expected)
+    frozen = runtime.freeze_evidence(sandbox_node_repo, base='master',
+        receipt_sha256s=[captured['receipt_sha256']])
+    verified = runtime.verify_evidence(sandbox_node_repo,
+        bundle_sha256=frozen['bundle_sha256'], expected_binding=frozen['binding'])
+    assert [entry['id'] for entry in verified['eligible']] == ['E001']
+
+
+def test_sandboxed_node_preserves_actual_recipe_failure(sandbox_node_repo):
+    tool = sandbox_node_repo / 'node_modules/typescript/bin/tsc'
+    tool.write_text("#!/usr/bin/env node\nconsole.error('type-error');process.exit(7)\n")
+    tool.chmod(0o755)
+    captured = runtime.capture_evidence(sandbox_node_repo, base='master',
+        profile='node-sandbox-v1', command_cwd='.', argv=['npm', 'run', 'typecheck'],
+        timeout_seconds=15)
+    receipt = read_receipt(sandbox_node_repo, captured['receipt_sha256'])
+    assert receipt['entry']['exit_code'] == 7
+    assert receipt['entry']['stderr_excerpt'].endswith('type-error\n')
+    assert receipt['entry']['freshness'] == 'deterministic'
+
+
+def test_sandbox_setup_failure_never_publishes_receipt(sandbox_node_repo, monkeypatch):
+    def denied(*_args, **_kwargs):
+        return {'stdout': b'', 'stderr': b'bwrap setup denied', 'exit_code': 1,
+                'timed_out': False, 'overflow': False, 'cleanup_failed': False,
+                'intervention': False, 'duration_ms': 1, 'control': b''}
+
+    monkeypatch.setattr(runtime, 'run_owned', denied)
+    with pytest.raises(TribunalError) as error:
+        runtime.capture_evidence(sandbox_node_repo, base='master',
+            profile='node-sandbox-v1', command_cwd='.', argv=['npm', 'run', 'typecheck'],
+            timeout_seconds=15)
+    assert error.value.code == 'EVIDENCE_SANDBOX_UNAVAILABLE'
+    assert not (sandbox_node_repo / '.review/evidence/receipts').exists()
+    assert not (sandbox_node_repo / '.review/evidence/captures').exists()
+
+
+def test_sandboxed_node_recipe_hides_host_tmp(sandbox_node_repo, tmp_path):
+    outside = tmp_path / 'outside-input'
+    outside.write_text('host-data')
+    tool = sandbox_node_repo / 'node_modules/typescript/bin/tsc'
+    tool.write_text("#!/usr/bin/env node\nconst fs=require('fs');console.log(fs.existsSync("
+                    + repr(str(outside)) + ")?'visible':'absent')\n")
+    tool.chmod(0o755)
+    captured = runtime.capture_evidence(sandbox_node_repo, base='master',
+        profile='node-sandbox-v1', command_cwd='.', argv=['npm', 'run', 'build'],
+        timeout_seconds=15)
+    receipt = read_receipt(sandbox_node_repo, captured['receipt_sha256'])
+    assert receipt['entry']['stdout_excerpt'].endswith('absent\n'), receipt['entry']
+
+
+def test_sandboxed_node_recipe_cannot_reach_host_network(sandbox_node_repo):
+    import socket
+    server = socket.socket()
+    server.bind(('127.0.0.1', 0))
+    server.listen()
+    port = server.getsockname()[1]
+    tool = sandbox_node_repo / 'node_modules/typescript/bin/tsc'
+    tool.write_text("#!/usr/bin/env node\nconst net=require('net');"
+                    f"const socket=net.connect({port},'127.0.0.1');"
+                    "socket.on('connect',()=>{console.log('visible');socket.destroy()});"
+                    "socket.on('error',()=>console.log('absent'));"
+                    "socket.setTimeout(1000,()=>{console.log('absent');socket.destroy()})\n")
+    tool.chmod(0o755)
+    try:
+        captured = runtime.capture_evidence(sandbox_node_repo, base='master',
+            profile='node-sandbox-v1', command_cwd='.', argv=['npm', 'run', 'build'],
+            timeout_seconds=15)
+    finally:
+        server.close()
+    assert 'receipt_sha256' in captured, captured
+    receipt = read_receipt(sandbox_node_repo, captured['receipt_sha256'])
+    assert receipt['entry']['stdout_excerpt'].endswith('absent\n'), receipt['entry']
+
+
+def test_sandbox_pid_namespace_reaps_detached_grandchild(sandbox_node_repo):
+    import secrets
+    import signal
+    token = f'tribunal-sandbox-grandchild-{secrets.token_hex(16)}'
+    tool = sandbox_node_repo / 'node_modules/typescript/bin/tsc'
+    tool.write_text(
+        "#!/usr/bin/env node\nconst {spawn}=require('child_process');"
+        "const child=spawn(process.execPath,['-e','setTimeout(()=>{},60000)',"
+        + repr(token)
+        + "],{detached:true,stdio:'ignore'});child.unref();console.log('spawned')\n"
+    )
+    tool.chmod(0o755)
+    captured = runtime.capture_evidence(sandbox_node_repo, base='master',
+        profile='node-sandbox-v1', command_cwd='.', argv=['npm', 'run', 'build'],
+        timeout_seconds=15)
+    survivors = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if token.encode() in (entry / 'cmdline').read_bytes():
+                survivors.append(int(entry.name))
+        except OSError:
+            continue
+    try:
+        assert 'receipt_sha256' in captured, captured
+        assert not survivors
+    finally:
+        for pid in survivors:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_sandboxed_node_recipe_excludes_ignored_config_and_git_metadata(sandbox_node_repo):
+    with (sandbox_node_repo / '.gitignore').open('a') as file:
+        file.write('vitest.config.js\n')
+    (sandbox_node_repo / 'vitest.config.js').write_text('throw new Error("host-only")\n')
+    subprocess.run(['git', '-C', str(sandbox_node_repo), 'add', '.gitignore'], check=True)
+    subprocess.run(['git', '-C', str(sandbox_node_repo), 'commit', '-qm', 'ignore host config'],
+                   check=True)
+    tool = sandbox_node_repo / 'node_modules/vitest/vitest.mjs'
+    tool.write_text("#!/usr/bin/env node\nimport fs from 'fs';console.log("
+                    "fs.existsSync('vitest.config.js') || fs.existsSync('.git')"
+                    "?'visible':'absent')\n")
+    tool.chmod(0o755)
+    captured = runtime.capture_evidence(sandbox_node_repo, base='master',
+        profile='node-sandbox-v1', command_cwd='.', argv=['npm', 'test'],
+        timeout_seconds=15)
+    receipt = read_receipt(sandbox_node_repo, captured['receipt_sha256'])
+    assert receipt['entry']['exit_code'] == 0, receipt['entry']['stderr_excerpt']
+    assert receipt['entry']['stdout_excerpt'].endswith('absent\n'), receipt['entry']
+
+
+def test_sandboxed_node_recipe_hides_usr_local(sandbox_node_repo):
+    tool = sandbox_node_repo / 'node_modules/typescript/bin/tsc'
+    tool.write_text("#!/usr/bin/env node\nconst fs=require('fs');console.log("
+                    "fs.readdirSync('/usr/local').length?'visible':'empty')\n")
+    tool.chmod(0o755)
+    captured = runtime.capture_evidence(sandbox_node_repo, base='master',
+        profile='node-sandbox-v1', command_cwd='.', argv=['npm', 'run', 'build'],
+        timeout_seconds=15)
+    receipt = read_receipt(sandbox_node_repo, captured['receipt_sha256'])
+    assert receipt['entry']['stdout_excerpt'].endswith('empty\n'), receipt['entry']
+
+
+def test_sandbox_rejects_controller_root_inside_system_mount():
+    with pytest.raises(TribunalError) as error:
+        with runtime._sandboxed_node_command(Path('/usr'), '.', ['npm', 'test'], {}, {}):
+            pass
+    assert error.value.code == 'EVIDENCE_SANDBOX_UNAVAILABLE'
+
+
+def test_sandbox_recipe_requires_local_tool_only_during_controller_checks(sandbox_node_repo):
+    from pre_pr_tribunal.evidence_environment import validate_command
+    modules = sandbox_node_repo / 'node_modules'
+    moved = sandbox_node_repo / 'dependencies-away'
+    modules.rename(moved)
+    try:
+        assert validate_command(sandbox_node_repo, 'node-sandbox-v1', '.',
+            ['npm', 'run', 'typecheck']) == 'always-fresh'
+        assert validate_command(sandbox_node_repo, 'node-sandbox-v1', '.',
+            ['npm', 'run', 'typecheck'], require_local_tools=False) == 'deterministic'
+    finally:
+        moved.rename(modules)
+
+
+@pytest.mark.parametrize('argv', [
+    ['node', '-e', "require('child_process').spawnSync('npm',['audit'])"],
+    ['npm', 'audit'],
+    ['npm', 'run-script', 'build'],
+    ['npm', 'test', '--', '--config', '/tmp/outside.ts'],
+])
+def test_sandbox_profile_rejects_non_recipe_commands(sandbox_node_repo, argv):
+    from pre_pr_tribunal.evidence_environment import validate_command
+    assert validate_command(sandbox_node_repo, 'node-sandbox-v1', '.', argv) == 'always-fresh'
+
+
+@pytest.mark.parametrize('script', [
+    'vitest',
+    'vitest run run --passWithNoTests',
+    'vitest run --config=/tmp/outside.ts',
+    'vitest run && node -e 0',
+])
+def test_sandbox_profile_rejects_unsafe_test_script(sandbox_node_repo, script):
+    from pre_pr_tribunal.evidence_environment import validate_command
+    package = json.loads((sandbox_node_repo / 'package.json').read_text())
+    package['scripts']['test'] = script
+    (sandbox_node_repo / 'package.json').write_text(json.dumps(package))
+    assert validate_command(sandbox_node_repo, 'node-sandbox-v1', '.',
+                            ['npm', 'test']) == 'always-fresh'
+
+
+@pytest.mark.parametrize('hook', ['prebuild', 'postbuild', 'pretest', 'posttest'])
+def test_sandbox_profile_rejects_lifecycle_hooks(sandbox_node_repo, hook):
+    from pre_pr_tribunal.evidence_environment import validate_command
+    package = json.loads((sandbox_node_repo / 'package.json').read_text())
+    package['scripts'][hook] = 'node -e 0'
+    (sandbox_node_repo / 'package.json').write_text(json.dumps(package))
+    command = ['npm', 'test'] if hook.endswith('test') else ['npm', 'run', 'build']
+    assert validate_command(sandbox_node_repo, 'node-sandbox-v1', '.', command) == 'always-fresh'
+
+
+def test_sandbox_profile_rejects_local_tool_escape(sandbox_node_repo):
+    from pre_pr_tribunal.evidence_environment import validate_command
+    executable = sandbox_node_repo / 'node_modules/.bin/tsc'
+    executable.unlink()
+    executable.symlink_to('/usr/bin/node')
+    assert validate_command(sandbox_node_repo, 'node-sandbox-v1', '.',
+                            ['npm', 'run', 'build']) == 'always-fresh'
+
+
+def test_sandbox_profile_rejects_non_system_command_path(sandbox_node_repo, tmp_path,
+                                                         monkeypatch):
+    from pre_pr_tribunal.evidence_environment import validate_command
+    from pre_pr_tribunal.model import TribunalError
+    fake = tmp_path / 'npm'
+    fake.write_text('#!/bin/sh\nexit 0\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv('PATH', str(tmp_path))
+    with pytest.raises(TribunalError):
+        validate_command(sandbox_node_repo, 'node-sandbox-v1', '.',
+                         [str(fake), 'run', 'build'])
 
 
 def test_node_tree_and_detached_source_tool_proof(node_repo):
@@ -330,6 +596,28 @@ def test_live_descendant_cleanup_is_not_ordinary_completion(git_repo):
     assert 'receipt_sha256' not in result
 
 
+def test_generic_descendant_cannot_use_sandbox_settle_to_escape(tmp_path):
+    from pre_pr_tribunal import evidence_process
+    import time
+    marker = tmp_path / 'escaped-pid'
+    grandchild = 'import time;time.sleep(60)'
+    child = ("import subprocess,time;time.sleep(.12);"
+             f"p=subprocess.Popen(['python3','-I','-S','-c',{grandchild!r}],"
+             "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True);"
+             f"open({str(marker)!r},'w').write(str(p.pid));time.sleep(.01)")
+    code = ("import subprocess,time;"
+            f"subprocess.Popen(['python3','-I','-S','-c',{child!r}],"
+            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);time.sleep(.1)")
+    result = evidence_process.run_owned(
+        ['python3', '-I', '-S', '-c', code], cwd=tmp_path,
+        env={'PATH': '/usr/bin:/bin'}, timeout_seconds=1, limit=100)
+    assert result['exit_code'] == 0
+    assert result['intervention']
+    assert not result['cleanup_failed']
+    time.sleep(.15)
+    assert not marker.exists()
+
+
 def test_selector_register_failure_reaps_started_child(tmp_path, monkeypatch):
     from pre_pr_tribunal import evidence_process
     children = []
@@ -350,6 +638,17 @@ def test_selector_register_failure_reaps_started_child(tmp_path, monkeypatch):
             cwd=tmp_path, env={'PATH':'/usr/bin:/bin'}, timeout_seconds=1, limit=100)
     assert len(children) == 1
     assert children[0].returncode is not None
+
+
+def test_owned_process_captures_private_control_pipe(tmp_path):
+    from pre_pr_tribunal import evidence_process
+    read_fd, write_fd = os.pipe()
+    result = evidence_process.run_owned(
+        ['python3', '-I', '-S', '-c',
+         'import os,sys;os.write(int(sys.argv[1]),b"S")', str(write_fd)],
+        cwd=tmp_path, env={'PATH': '/usr/bin:/bin'}, timeout_seconds=1, limit=100,
+        control_pipe=(read_fd, write_fd))
+    assert result['control'] == b'S'
 
 
 def test_pidfd_signal_failure_still_reaps_root(tmp_path, monkeypatch):
@@ -441,9 +740,9 @@ def test_python_program_operand_is_never_reusable(git_repo, tmp_path, argv):
     assert _freshness(git_repo, 'python-v1', argv) == 'always-fresh'
 
 
-def test_inline_python_program_stays_deterministic(git_repo):
+def test_arbitrary_inline_python_program_is_always_fresh(git_repo):
     argv = ['python3', '-I', '-S', '-c', "print('ok')"]
-    assert _freshness(git_repo, 'python-v1', argv) == 'deterministic'
+    assert _freshness(git_repo, 'python-v1', argv) == 'always-fresh'
 
 
 @pytest.mark.parametrize('argv', [
@@ -470,8 +769,8 @@ def test_node_program_operand_is_never_reusable(node_repo, tmp_path, argv):
     ['node', '-e', "console.log('ok')"],
     ['node', '--input-type=module', '-e', "console.log('ok')"],
 ])
-def test_inline_node_program_stays_deterministic(node_repo, argv):
-    assert _freshness(node_repo, 'node-lock-v1', argv) == 'deterministic'
+def test_inline_node_program_is_always_fresh(node_repo, argv):
+    assert _freshness(node_repo, 'node-lock-v1', argv) == 'always-fresh'
 
 
 def test_npm_script_body_rejects_a_tracked_symlink(node_repo, tmp_path):

@@ -210,6 +210,10 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
         and verdict.contract != current_contract_binding()
     ):
         return _decision(True, GateCode.VERDICT_STALE)
+    if verdict.schema in MIXED_SLOT_VERDICT_SCHEMAS:
+        from .evidence_lifecycle import has_current_evidence_contract
+        if not has_current_evidence_contract(verdict):
+            return _decision(True, GateCode.VERDICT_STALE)
 
     bound_scan = scan_pr_create(command, expected_base=verdict.base_ref)
     if bound_scan.kind is not ScanKind.PR_CREATE:

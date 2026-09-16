@@ -544,6 +544,7 @@ def test_report_reference_documents_internal_v4_lifecycle_identity():
         text("references/report-schema.md"), "v4-stored-verdict",
     )
     assert stored_verdict["schema"] == 4
+    assert stored_verdict['evidence_contract'] == 2
     assert stored_verdict['evidence_binding'] is None
     assert stored_verdict['evidence_fallback_reason'] is None
     assert re.fullmatch(r"[0-9a-f]{32}", stored_verdict["lifecycle_id"])

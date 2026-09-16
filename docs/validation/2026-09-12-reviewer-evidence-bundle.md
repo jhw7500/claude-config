@@ -1,11 +1,16 @@
 # Reviewer evidence bundle validation
 
-Both completed pairs preserved claim outcomes and normalized blockers while
+> Historical contract-1 evidence only. The current implementation uses evidence contract 2 and
+> `node-sandbox-v1`; none of the native timing/count results or the 3849-test run below establishes
+> current acceptance. A fresh contract-2 native comparison, full suite, and whole-branch review
+> remain required after the final implementation commit.
+
+The contract-1 completed pairs preserved claim outcomes and normalized blockers while
 avoiding deterministic validations. Bundle B was 6.589 seconds slower for the
 normal fixture and 9.570 seconds slower for the blocker fixture. Reuse varied by
 fixture. The CI-lock whole-repository suite passed 3849 tests. Final document
-verification and whole-branch review remain pending; this is not an overall
-acceptance PASS or a guaranteed saving claim.
+verification and whole-branch review were pending. This section is retained as
+historical design evidence, not an overall acceptance PASS or a guaranteed saving claim.
 
 ## Fixed comparison
 
@@ -159,11 +164,13 @@ Run `scripts/measure-pre-pr-evidence.py` with `/usr/bin/python3`. Supply:
 | `--category inspection -- <argv>` | Caller-selected inspection command from the view root |
 | `--category verification -- <argv>` | Caller-selected installed verifier command from the view root |
 
-Select Node v22.23.1/npm 10.9.8 on PATH before invocation. The helper uses the
-explicit installed runtime's `sanitized_environment('node-lock-v1')` and bounded
-`run_owned`. The wrapper is identical in both arms and does not grant execution
-permission or provide a sandbox. Run helper, installed runtime and private
-context files under paths compatible with the existing home-path policy.
+Select Node v22.23.1/npm 10.9.8 on PATH before invocation. This historical helper
+uses the explicit contract-1 installed runtime's
+`sanitized_environment('node-lock-v1')` and bounded `run_owned`. The wrapper is
+identical in both arms and does not grant execution permission or provide a
+sandbox. It is not a contract-2 reusable-evidence path. Run helper, installed
+runtime and private context files under paths compatible with the existing
+home-path policy.
 
 | Case | Command in `mcp-server`, except runtime-scope |
 | --- | --- |
@@ -211,6 +218,15 @@ session observations.
 
 ## Whole-repository validation
 
+The current contract-2 candidate worktree passed the unchanged CI dependency
+lock on 2026-09-16 after the final process-containment fix: **3908 passed in
+854.78s**, exit 0. The exact command was
+`rtk proxy env -u LD_LIBRARY_PATH "$TASK_TEST_VENV/bin/python" -m pytest -q`
+with the disposable Python 3.10.12 environment populated from
+`requirements-test.lock --require-hashes`. This proves the present uncommitted
+candidate's repository regression suite; it is not a substitute for the
+post-final-commit native comparison required below.
+
 The existing CI dependency lock passed: **3849 passed in 575.32s**, exit 0,
 with wrapper elapsed 575773.659957ms. Exact evidence is
 `.superpowers/sdd/2026-09-12-reviewer-evidence-bundle/full-suite-ci-lock.log`
@@ -242,10 +258,10 @@ rtk proxy env -u LD_LIBRARY_PATH "$TASK_TEST_VENV/bin/python" -m pytest -q
 | Disposable installed CLI capture/freeze/begin/project/verify/A-B-C submit/finalize | Focused local test |
 | Exact native-format report bytes and post-seal evidence mutation | Focused local test |
 | Helper exact capture, fixed false exit, timeout, path and text rejection | Synthetic local tests |
-| Current independent B vs bundle B: normal claim outcomes | Preserved; partial reuse, no measured speedup |
-| False required assertion: refutation and blocker identity preservation | All eleven claims and normalized HIGH blocker preserved |
-| Command counts, native elapsed and matched model/environment | Four audited arms above; no measured elapsed speedup |
-| Local implementation independent task review | Approved, no findings |
-| Whole repository pytest with unchanged CI lock | 3849 passed; exact log and wrapper metadata preserved |
-| Scoped four-arm result-document review | Approved; LOW historical-warning disclosure addressed above |
-| Final document verification and whole-branch review | Pending |
+| Current independent B vs bundle B: normal claim outcomes | Historical contract-1 result; contract-2 rerun pending |
+| False required assertion: refutation and blocker identity preservation | Historical contract-1 result; contract-2 rerun pending |
+| Command counts, native elapsed and matched model/environment | Historical four-arm audit only; contract-2 measurement pending |
+| Local implementation independent task review | Contract-2 code defects resolved; final acceptance re-review pending native comparison |
+| Whole repository pytest with unchanged CI lock | Current contract-2 candidate: 3908 passed in 854.78s |
+| Scoped four-arm result-document review | Historical contract-1 review only |
+| Final document verification and whole-branch review | Pending for contract 2 |

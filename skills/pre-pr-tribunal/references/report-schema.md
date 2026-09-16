@@ -10,7 +10,7 @@ A finding path may be any normalized repository-relative path, including outside
 
 ## Controller receipt and recovery contract
 
-The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. Current verdict schema 4 uses report text contract 3, diff recipe 1 and evidence contract 1; reviewer report JSON still has `schema: 1`. Native schema-4 slots are either `pending` or `sealed`; only `submit-report` can turn a pending native slot into a sealed slot. `store-report`, including its legacy replacement option, is v1-only.
+The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. Current verdict schema 4 uses report text contract 3, diff recipe 1 and evidence contract 2; reviewer report JSON still has `schema: 1`. Native schema-4 slots are either `pending` or `sealed`; only `submit-report` can turn a pending native slot into a sealed slot. `store-report`, including its legacy replacement option, is v1-only.
 
 `status.verdict_schema` selects the workflow. Schema 1 requires an explicit all-slot `migrate-legacy-pending`; compatible schema 2 requires an explicit `migrate-v2-pending`; schema 3 has no automatic current-contract migration; schema 4 is current. Neither migration accepts a reviewer subset. Legacy schema-1 migration preserves available exact raw evidence but leaves slots pending when receipt provenance is unavailable; `LEGACY_PROVENANCE_UNAVAILABLE` never means a fictional native receipt was adopted. Schema-2 migration requires its report/diff contract to match the installed runtime: historical report-contract-2 rounds fail with `CONTRACT_DRIFT`. Compatible migration validates sealed evidence and assigns a new lifecycle identity, so its first telemetry resume reports prior request accounting unknown. Preserve incompatible old rounds for explicit abandonment/restart judgment; readable historical state never upgrades pending authority.
 
@@ -23,6 +23,7 @@ authority input.
 {
   "schema": 4,
   "lifecycle_id": "0123456789abcdef0123456789abcdef",
+  "evidence_contract": 2,
   "evidence_binding": null,
   "evidence_fallback_reason": null
 }
@@ -91,7 +92,7 @@ The exact controller command shapes are below. `submit-report` reads exact repor
 | authenticate all three and aggregate | `finalize` |
 <!-- controller-command-examples-end -->
 
-Schema-1, schema-2 and schema-3 verdicts remain readable without rewrite. New rounds and successful migration commands write schema 4. A compatible schema-2 migration validates every sealed report and receipt before one atomic verdict replacement; it never rewrites report bytes or infers pre-migration telemetry identity.
+Schema-1, schema-2 and schema-3 verdicts remain readable without rewrite. A schema-4 verdict without the explicit current `evidence_contract` marker is likewise readable only as historical state: current context, submit, stored validation, finalize and terminal gate authority reject it as contract drift or stale authority. New rounds and successful migration commands write schema 4 with `evidence_contract: 2`. A compatible schema-2 migration validates every sealed report and receipt before one atomic verdict replacement; it never rewrites report bytes or infers pre-migration telemetry identity.
 
 ## Execution provenance under report contract 3
 

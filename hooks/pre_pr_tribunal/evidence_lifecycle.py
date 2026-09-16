@@ -33,6 +33,15 @@ def parse_fallback(value, selection):
     return value
 
 
+def has_current_evidence_contract(verdict):
+    if verdict.evidence_contract != runtime.EVIDENCE_CONTRACT_VERSION:
+        return False
+    if verdict.evidence_binding is None:
+        return True
+    expected = verdict.evidence_binding.to_json()['expected_binding']
+    return expected['contract'] == runtime.contract_binding()
+
+
 def select_evidence(root, snapshot, digest):
     if digest is None:
         return None, None
@@ -182,7 +191,8 @@ def verify_detached_evidence(cwd, *, bundle_sha256, context_path, expected_conte
     verified = evidence_store.verify_bundle(root, bundle_sha256, expected)
     for entry in verified['bundle']['entries']:
         if entry['cwd'] != expected['environment']['cwd'] or entry['freshness'] != validate_command(
-            root, expected['environment']['profile'], entry['cwd'], entry['argv']):
+            root, expected['environment']['profile'], entry['cwd'], entry['argv'],
+            require_local_tools=False):
             raise model.SchemaError('EVIDENCE_FRESHNESS_MISMATCH')
     executions = [{'entry_id': entry['id'], 'execution': reusable_execution(root, bundle_sha256, entry)}
                   for entry in verified['eligible']]

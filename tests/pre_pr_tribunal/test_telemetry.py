@@ -42,6 +42,7 @@ def test_legacy_telemetry_cannot_authorize_current_report_bytes(git_repo, teleme
     del legacy["lifecycle_id"]
     del legacy['evidence_binding']
     del legacy['evidence_fallback_reason']
+    del legacy['evidence_contract']
     legacy["reviewers"] = {key: {"status": "pending"} for key in "ABC"}
     (git_repo / ".review/verdict.json").write_text(json.dumps(legacy))
     value = {"schema": 1, "reviewer": "A", "round": 1,

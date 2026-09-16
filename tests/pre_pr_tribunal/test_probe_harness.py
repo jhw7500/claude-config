@@ -849,6 +849,7 @@ def test_installed_probe_migrates_v2_pending_before_selective_resume(tmp_path, m
     del legacy["lifecycle_id"]
     del legacy['evidence_binding']
     del legacy['evidence_fallback_reason']
+    del legacy['evidence_contract']
     verdict_path.write_text(json.dumps(legacy))
     verdict_path.chmod(0o600)
 
@@ -888,6 +889,7 @@ def test_installed_probe_preserves_old_schema_three_contract_without_resume(tmp_
     value = json.loads(path.read_bytes())
     value.update(schema=3, contract={'report_text': 2, 'diff_recipe': 1, 'verdict_schema': 3})
     value.pop('evidence_binding'); value.pop('evidence_fallback_reason')
+    value.pop('evidence_contract')
     raw = json.dumps(value).encode(); path.write_bytes(raw)
     with pytest.raises(module.ProbeFailure) as error:
         module._create_pass_verdict(cli, repo, home, 'codex')
@@ -1271,6 +1273,7 @@ def test_installed_probe_migrates_unproven_legacy_reports_and_runs_all_slots(tmp
     verdict.pop("lifecycle_id")
     verdict.pop('evidence_binding')
     verdict.pop('evidence_fallback_reason')
+    verdict.pop('evidence_contract')
     verdict["reviewers"] = {reviewer: {"status": "pending"} for reviewer in "ABC"}
     verdict_path.write_bytes(json.dumps(verdict, separators=(",", ":")).encode())
     verdict_path.chmod(0o600)

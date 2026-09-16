@@ -426,6 +426,7 @@ class Verdict:
     lifecycle_id: str | None = None
     evidence_binding: EvidenceBinding | None = None
     evidence_fallback_reason: str | None = None
+    evidence_contract: int | None = None
 
     @property
     def snapshot(self) -> Snapshot:
@@ -505,7 +506,11 @@ class Verdict:
         if self.schema == VERDICT_SCHEMA_VERSION:
             value["evidence_binding"] = self.evidence_binding.to_json() if self.evidence_binding else None
             value["evidence_fallback_reason"] = self.evidence_fallback_reason
-        elif self.evidence_binding is not None or self.evidence_fallback_reason is not None:
+            if self.evidence_contract is not None:
+                value["evidence_contract"] = _integer(
+                    self.evidence_contract, "VERDICT_INVALID", minimum=1, maximum=2)
+        elif (self.evidence_binding is not None or self.evidence_fallback_reason is not None
+                or self.evidence_contract is not None):
             raise SchemaError("VERDICT_INVALID")
         return value
 

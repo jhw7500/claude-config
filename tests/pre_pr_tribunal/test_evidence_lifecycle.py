@@ -10,12 +10,15 @@ from pre_pr_tribunal import evidence_runtime as runtime
 from pre_pr_tribunal.model import Reviewer, TribunalError
 from pre_pr_tribunal.review_context import reviewer_context_envelope
 from pre_pr_tribunal.verdict_store import (begin_round, submit_reviewer_report,
-    finalize_round, read_verdict, validate_stored_reviewer_report)
+    finalize_round, read_verdict, require_current_in_progress,
+    validate_stored_reviewer_report)
 
 
 def bundle(repo):
+    from pre_pr_tribunal.evidence_environment import PYTHON_TRACKED_READ_PROGRAM
     captured = runtime.capture_evidence(repo, base='master', profile='python-v1',
-        command_cwd='.', argv=['python3', '-I', '-S', '-c', "print('ok')"], timeout_seconds=3)
+        command_cwd='.', argv=['python3', '-I', '-S', '-c',
+            PYTHON_TRACKED_READ_PROGRAM, 'tracked.txt'], timeout_seconds=3)
     return runtime.freeze_evidence(repo, base='master', receipt_sha256s=[captured['receipt_sha256']])
 
 
@@ -24,11 +27,67 @@ def begin(repo, digest=None):
                        evidence_bundle_sha256=digest)
 
 
+def set_evidence_contract(repo, version):
+    path = repo / '.review/verdict.json'
+    value = json.loads(path.read_text())
+    value['evidence_binding']['expected_binding']['contract']['evidence'] = version
+    if version == 1:
+        value.pop('evidence_contract', None)
+    else:
+        value['evidence_contract'] = version
+    path.write_text(json.dumps(value))
+    path.chmod(0o600)
+
+
 def raw_report(verdict, reviewer, execution=None):
     return json.dumps({'schema': 1, 'reviewer': reviewer, 'round': verdict.round,
         'snapshot': {'head_sha': verdict.head_sha, 'diff_sha256': verdict.diff_sha256},
         'status': 'complete', 'findings': [], 'executions': [execution] if execution else [],
         'claims': [], 'prior_decisions': []}, indent=2).encode()
+
+
+def test_contract1_verdict_is_readable_but_has_no_current_authority(git_repo):
+    from pre_pr_tribunal.gate import GateCode, evaluate_gate
+    frozen = bundle(git_repo)
+    verdict = begin(git_repo, frozen['bundle_sha256'])
+    set_evidence_contract(git_repo, 1)
+    historical = read_verdict(git_repo)
+    assert historical.evidence_contract is None
+    assert historical.evidence_binding.to_json()[
+        'expected_binding']['contract']['evidence'] == 1
+    with pytest.raises(TribunalError, match='^CONTRACT_DRIFT$'):
+        require_current_in_progress(historical)
+    with pytest.raises(TribunalError, match='^CONTRACT_DRIFT$'):
+        reviewer_context_envelope(historical, Reviewer.B)
+
+    set_evidence_contract(git_repo, 2)
+    verdict = read_verdict(git_repo)
+    for reviewer in 'ABC':
+        submit_reviewer_report(git_repo, reviewer=Reviewer(reviewer),
+                               raw=raw_report(verdict, reviewer))
+    finalize_round(git_repo)
+    set_evidence_contract(git_repo, 1)
+    assert read_verdict(git_repo).gate.status.value == 'pass'
+    assert evaluate_gate(git_repo,
+        'PATH=/usr/bin:/bin /usr/bin/gh pr create --base master').code is GateCode.VERDICT_STALE
+    with pytest.raises(TribunalError, match='^CONTRACT_DRIFT$'):
+        validate_stored_reviewer_report(git_repo, reviewer=Reviewer.A)
+
+
+def test_unmarked_contract1_without_selection_is_readable_but_not_current(git_repo):
+    begin(git_repo)
+    path = git_repo / '.review/verdict.json'
+    value = json.loads(path.read_text())
+    del value['evidence_contract']
+    path.write_text(json.dumps(value))
+    path.chmod(0o600)
+    historical = read_verdict(git_repo)
+    assert historical.evidence_contract is None
+    assert historical.evidence_binding is None
+    with pytest.raises(TribunalError, match='^CONTRACT_DRIFT$'):
+        require_current_in_progress(historical)
+    with pytest.raises(TribunalError, match='^CONTRACT_DRIFT$'):
+        reviewer_context_envelope(historical, Reviewer.B)
 
 
 def reused(repo, frozen):
@@ -57,19 +116,16 @@ def test_complete_reuse_round_and_private_context(git_repo):
     assert finalize_round(git_repo).gate.status.value == 'pass'
 
 
-def test_exact_report_command_boundary_captures_and_reuses_as_parser_valid_execution(git_repo):
-    from pre_pr_tribunal.evidence_lifecycle import reusable_execution
-    from pre_pr_tribunal.model import _parse_execution
+def test_exact_report_command_boundary_captures_but_rejects_arbitrary_code(git_repo):
     argv = ['python3', '-I', '-S', '-c', 'x' * 4068]
     captured = runtime.capture_evidence(git_repo, base='master', profile='python-v1',
         command_cwd='.', argv=argv, timeout_seconds=3)
     frozen = runtime.freeze_evidence(git_repo, base='master', receipt_sha256s=[captured['receipt_sha256']])
-    entry = runtime.verify_evidence(git_repo, bundle_sha256=frozen['bundle_sha256'],
-        expected_binding=frozen['binding'])['eligible'][0]
-    execution = reusable_execution(git_repo, frozen['bundle_sha256'], entry)
-    assert len(execution['command'].encode()) == 4096
-    parsed = _parse_execution({'id': 'B-R1-E001', **execution}, reviewer=Reviewer.B, round_number=1)
-    assert parsed.command == execution['command']
+    verified = runtime.verify_evidence(git_repo, bundle_sha256=frozen['bundle_sha256'],
+        expected_binding=frozen['binding'])
+    assert verified['eligible'] == []
+    assert verified['rejected'] == [
+        {'id': 'E001', 'reason': 'EVIDENCE_ALWAYS_FRESH'}]
 
 
 @pytest.mark.parametrize('selected', [False, True])
@@ -183,6 +239,7 @@ def test_old_schema_three_remains_readable_but_not_pending_authority(git_repo):
     value['schema'] = 3
     value['contract'] = {'report_text': 2, 'diff_recipe': 1, 'verdict_schema': 3}
     value.pop('evidence_binding'); value.pop('evidence_fallback_reason')
+    value.pop('evidence_contract')
     path = git_repo / '.review/verdict.json'
     path.write_text(json.dumps(value))
     loaded = read_verdict(git_repo)
@@ -257,17 +314,25 @@ def test_one_entry_supports_multiple_claims_and_counts_once(git_repo):
 
 
 def test_detached_node_proof_does_not_claim_installed_dependencies(git_repo, tmp_path):
+    import shutil
     from pre_pr_tribunal.evidence_lifecycle import project_evidence, verify_detached_evidence
-    (git_repo / 'package.json').write_text('{"name":"fixture","version":"1.0.0"}')
+    if not shutil.which('bwrap', path='/usr/bin:/bin'):
+        pytest.skip('bubblewrap unavailable')
+    (git_repo / 'package.json').write_text(json.dumps({'name': 'fixture', 'version': '1.0.0',
+        'scripts': {'typecheck': 'tsc --noEmit --project tsconfig.json'}}))
     (git_repo / 'package-lock.json').write_text('{"lockfileVersion":3}')
+    (git_repo / 'tsconfig.json').write_text('{"compilerOptions":{"noEmit":true}}')
     with (git_repo / '.gitignore').open('a') as file:
         file.write('node_modules/\n')
     subprocess.run(['git', '-C', str(git_repo), 'add', '.'], check=True)
     subprocess.run(['git', '-C', str(git_repo), 'commit', '-qm', 'node fixture'], check=True)
-    modules = git_repo / 'node_modules'
-    modules.mkdir(); (modules / 'dependency.js').write_text('module.exports=42')
-    result = runtime.capture_evidence(git_repo, base='master', profile='node-lock-v1', command_cwd='.',
-        argv=['node', '-e', "console.log(require('./node_modules/dependency.js'))"], timeout_seconds=3)
+    modules = git_repo / 'node_modules'; (modules / '.bin').mkdir(parents=True)
+    tool = modules / 'typescript/bin/tsc'; tool.parent.mkdir(parents=True)
+    tool.write_text("#!/usr/bin/env node\nconsole.log('ok')\n"); tool.chmod(0o755)
+    (modules / '.bin/tsc').symlink_to('../typescript/bin/tsc')
+    result = runtime.capture_evidence(git_repo, base='master', profile='node-sandbox-v1',
+        command_cwd='.', argv=['npm', 'run', 'typecheck'], timeout_seconds=15)
+    assert 'receipt_sha256' in result, result
     frozen = runtime.freeze_evidence(git_repo, base='master', receipt_sha256s=[result['receipt_sha256']])
     verdict = begin(git_repo, frozen['bundle_sha256'])
     view = tmp_path / 'b'
@@ -281,7 +346,7 @@ def test_detached_node_proof_does_not_claim_installed_dependencies(git_repo, tmp
     assert verified['dependency_availability'] == 'not-checked'
     assert not (view / 'node_modules').exists()
     execution = {'id': 'B-R1-E001', **verified['executions'][0]['execution']}
-    (modules / 'dependency.js').write_text('changed')
+    tool.write_text("#!/usr/bin/env node\nconsole.log('changed')\n"); tool.chmod(0o755)
     with pytest.raises(TribunalError):
         submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=raw_report(verdict, 'B', execution))
 
