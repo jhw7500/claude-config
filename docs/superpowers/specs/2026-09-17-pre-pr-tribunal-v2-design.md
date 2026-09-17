@@ -130,14 +130,15 @@ snapshot policy remains off.
 Only round 1 is valid. PASS permits PR creation. FAIL cannot be rerun on the
 same snapshot. After a committed fix changes the snapshot, a new round-1
 lifecycle is allowed. This prevents repeated sampling of identical code while
-making the mode usable after fixes.
+making the mode usable after fixes. Commit metadata alone is not a changed
+reviewed snapshot: the base or merge-base and diff digest must change.
 
 ### iterative
 
 The current round 1 -> decisions -> round 2 -> decisions -> round 3 state
 machine remains. Reviewer decisions and replacement findings are role-local.
 Round 3 failure is terminal for that snapshot. A changed snapshot may start a
-new round-1 lifecycle.
+new round-1 lifecycle. An empty commit does not reset this terminal boundary.
 
 If snapshot/config policy changes make the active reviewer set or effective
 policy incompatible with a later-round transition, the transition fails and

@@ -2931,6 +2931,22 @@ def test_round_three_failure_rejects_round_one_with_exhaustion(git_repo):
         now=NOW,
     )
     with pytest.raises(SchemaError, match="ROUND_LIMIT_EXHAUSTED"):
+        begin_round(
+            git_repo, base="master", runtime="codex", round_number=1, now=NOW
+        )
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(git_repo),
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "metadata only",
+        ],
+        check=True,
+    )
+    with pytest.raises(SchemaError, match="ROUND_LIMIT_EXHAUSTED"):
         begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
 
 

@@ -528,6 +528,10 @@ def test_inconclusive_restart_cannot_lower_same_snapshot_intensity(tmp_path):
     with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
         begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
 
+    _git(repo, "commit", "--allow-empty", "-qm", "metadata only")
+    with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+
     restarted = begin_round(
         repo,
         base="master",
@@ -554,6 +558,9 @@ def test_single_failure_requires_changed_snapshot_for_round_one_retry(tmp_path):
         repo, reviewer=Reviewer.B, raw=_report(verdict, "B"), now=NOW
     )
     assert finalize_round(repo, now=NOW).gate.status is GateStatus.FAIL
+    with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    _git(repo, "commit", "--allow-empty", "-qm", "metadata only")
     with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
         begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     _write(repo, "src/app.py", "fixed\n")

@@ -905,6 +905,20 @@ def _snapshot_equal(verdict: Verdict, snapshot: Snapshot) -> bool:
     )
 
 
+def _review_content_equal(verdict: Verdict, snapshot: Snapshot) -> bool:
+    return (
+        verdict.repository,
+        verdict.base_sha,
+        verdict.merge_base_sha,
+        verdict.diff_sha256,
+    ) == (
+        snapshot.repository,
+        snapshot.base_sha,
+        snapshot.merge_base_sha,
+        snapshot.diff_sha256,
+    )
+
+
 def _require_all_pending(verdict: Verdict) -> None:
     if verdict.gate.status is not GateStatus.IN_PROGRESS or any(
         slot.status != "pending" for slot in verdict.reviewers.values()
@@ -1351,7 +1365,7 @@ def begin_round(
         if (
             round_number == 1
             and stored is not None
-            and _snapshot_equal(stored, snapshot)
+            and _review_content_equal(stored, snapshot)
         ):
             prior_intensity = (
                 stored.policy.effective_intensity
