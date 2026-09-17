@@ -87,6 +87,15 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
             "executions": MAX_EXECUTIONS_PER_REVIEWER,
         },
     }
+    if verdict.schema == VERDICT_SCHEMA_VERSION:
+        if verdict.policy is None:
+            raise SchemaError("POLICY_INVALID")
+        selected = verdict.policy.reviewers[reviewer.value]
+        body["review_policy"] = {
+            "mode": verdict.policy.mode.value,
+            "effective_intensity": verdict.policy.effective_intensity,
+            "model": selected.model,
+        }
     if (reviewer is Reviewer.B and verdict.schema == VERDICT_SCHEMA_VERSION
         and (verdict.evidence_binding is not None or verdict.evidence_fallback_reason is not None)):
         body['evidence'] = verdict.evidence_binding.to_json() if verdict.evidence_binding else None
@@ -110,6 +119,8 @@ def reviewer_context_envelope(
             or verdict.contract != current_contract_binding()
             or not has_current_evidence_contract(verdict)):
         raise SchemaError("CONTRACT_DRIFT")
+    if verdict.reviewers[reviewer.value].status == "disabled":
+        raise SchemaError("REVIEWER_DISABLED")
     if verdict.reviewers[reviewer.value].status != "pending":
         raise SchemaError("REVIEWER_SLOT_SEALED")
     body = reviewer_context_body(verdict, reviewer)

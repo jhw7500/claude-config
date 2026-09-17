@@ -1291,8 +1291,21 @@ def _create_probe_repo(repo: Path, home: Path) -> None:
         "https://github.com/probe/pre-pr-tribunal.git",
     )
     _write(repo / ".gitignore", ".review/\n", 0o600)
+    _write(
+        repo / ".pre-pr-tribunal.toml",
+        '[policy]\n"**" = "iterative"\n'
+        '[reviewer.C]\nenabled = true\n',
+        0o600,
+    )
     _write(repo / "tracked.txt", "base\n", 0o600)
-    _git(repo, home, "add", ".gitignore", "tracked.txt")
+    _git(
+        repo,
+        home,
+        "add",
+        ".gitignore",
+        ".pre-pr-tribunal.toml",
+        "tracked.txt",
+    )
     _git(repo, home, "commit", "-qm", "base")
     _git(repo, home, "update-ref", "refs/remotes/origin/master", "HEAD")
     (repo / "tracked.txt").write_text("base\nfeature\n", encoding="utf-8")
@@ -1435,20 +1448,20 @@ def _create_pass_verdict(
                                 "--runtime", runtime, "--round", "1")
         status = _tribunal_cli(cli, repo, home, "status")
     verdict_schema = status.get("verdict_schema")
-    if verdict_schema == 3:
+    if verdict_schema in {3, 4}:
         # Readable historical state does not authorize a current pending round.
         raise ProbeFailure("CONTRACT_DRIFT")
     migration_command = {
         1: "migrate-legacy-pending",
         2: "migrate-v2-pending",
-        4: None,
+        5: None,
     }.get(verdict_schema)
-    if verdict_schema not in {1, 2, 4}:
+    if verdict_schema not in {1, 2, 5}:
         raise ProbeFailure("SETUP_FAILED")
     if migration_command is not None:
         _tribunal_cli(cli, repo, home, migration_command)
         status = _tribunal_cli(cli, repo, home, "status")
-    if status.get("verdict_schema") != 4:
+    if status.get("verdict_schema") != 5:
         raise ProbeFailure("SETUP_FAILED")
     observation = payload.get("telemetry", {})
     if not isinstance(observation, dict):
@@ -1496,12 +1509,22 @@ def _create_pass_verdict(
     failure = None
     submitted_receipts: dict[str, dict[str, object]] = {}
     reviewers = status.get("reviewers")
-    if not isinstance(reviewers, dict) or set(reviewers) != set("ABC"):
+    active = status.get("active_reviewers")
+    if (
+        not isinstance(reviewers, dict)
+        or set(reviewers) != set("ABC")
+        or not isinstance(active, list)
+        or any(reviewer not in "ABC" for reviewer in active)
+        or len(active) != len(set(active))
+    ):
         raise ProbeFailure("SETUP_FAILED")
     for reviewer in "ABC":
         slot = reviewers.get(reviewer)
-        if not isinstance(slot, dict) or slot.get("state") not in {"pending", "sealed"}:
+        expected_states = {"pending", "sealed"} if reviewer in active else {"disabled"}
+        if not isinstance(slot, dict) or slot.get("state") not in expected_states:
             raise ProbeFailure("SETUP_FAILED")
+    for reviewer in active:
+        slot = reviewers[reviewer]
         if slot["state"] == "sealed":
             continue
         local_attempts = 0
@@ -1549,9 +1572,14 @@ def _create_pass_verdict(
     def finalize():
         current = _tribunal_cli(cli, repo, home, "status")
         current_reviewers = current.get("reviewers")
-        if not isinstance(current_reviewers, dict) or set(current_reviewers) != set("ABC"):
+        current_active = current.get("active_reviewers")
+        if (
+            not isinstance(current_reviewers, dict)
+            or set(current_reviewers) != set("ABC")
+            or current_active != active
+        ):
             raise ProbeFailure("SETUP_FAILED")
-        for reviewer in "ABC":
+        for reviewer in active:
             slot = current_reviewers.get(reviewer)
             if not isinstance(slot, dict) or slot.get("state") != "sealed":
                 raise ProbeFailure("SETUP_FAILED")

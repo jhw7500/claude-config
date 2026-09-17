@@ -12,7 +12,7 @@ import pytest
 
 from pre_pr_tribunal import gate, hook_common
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
-from pre_pr_tribunal.model import Reviewer, SchemaError
+from pre_pr_tribunal.model import VERDICT_SCHEMA_VERSION, Reviewer, SchemaError
 from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict, submit_reviewer_report
 
 
@@ -140,12 +140,14 @@ def _passing_verdict(repo: Path):
     return _finish_round(repo)
 
 
-@pytest.mark.parametrize("version", (1, 2, 3, 4))
+@pytest.mark.parametrize("version", (1, 2, 3, 4, 5))
 def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo, version):
     _passing_verdict(git_repo)
     path = git_repo / ".review/verdict.json"
     value = json.loads(path.read_bytes())
-    assert value["schema"] == 4
+    assert value["schema"] == VERDICT_SCHEMA_VERSION == 5
+    if version < 5:
+        del value["policy"]
     if version < 4:
         del value['evidence_binding']
         del value['evidence_fallback_reason']
@@ -168,9 +170,13 @@ def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo,
         for slot in value['reviewers'].values():
             slot['receipt']['report_contract_version'] = 2
         _write_json(path, value)
-    expected = GateCode.VERDICT_STALE if version in (2, 3) else GateCode.PASS
+    elif version == 4:
+        value["schema"] = 4
+        value["contract"]["verdict_schema"] = 4
+        _write_json(path, value)
+    expected = GateCode.VERDICT_STALE if version < 5 else GateCode.PASS
     assert evaluate_gate(git_repo, BOUND_COMMAND).code is expected
-    if version == 4:
+    if version == 5:
         value["contract"]["diff_recipe"] = 99
         _write_json(path, value)
         assert evaluate_gate(git_repo, BOUND_COMMAND).code is GateCode.VERDICT_STALE
@@ -180,7 +186,7 @@ def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo,
 @pytest.mark.parametrize("state", ("pass", "fail", "contract_drift"))
 def test_hook_adapter_consumes_native_current_terminal_contract(installed_package, git_repo, name, state):
     terminal = _finish_round(git_repo, finding_id="A-R1-001" if state == "fail" else None)
-    assert terminal.schema == 4
+    assert terminal.schema == VERDICT_SCHEMA_VERSION
     if state == "contract_drift":
         value = terminal.to_json()
         value["contract"]["diff_recipe"] = 99

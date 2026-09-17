@@ -15,8 +15,18 @@ from urllib.parse import urlsplit
 SCHEMA_VERSION = 1
 SLOT_VERDICT_SCHEMA_VERSION = 2
 LIFECYCLE_VERDICT_SCHEMA_VERSION = 3
-VERDICT_SCHEMA_VERSION = 4
-LIFECYCLE_VERDICT_SCHEMAS = frozenset((LIFECYCLE_VERDICT_SCHEMA_VERSION, VERDICT_SCHEMA_VERSION))
+EVIDENCE_VERDICT_SCHEMA_VERSION = 4
+VERDICT_SCHEMA_VERSION = 5
+LIFECYCLE_VERDICT_SCHEMAS = frozenset(
+    (
+        LIFECYCLE_VERDICT_SCHEMA_VERSION,
+        EVIDENCE_VERDICT_SCHEMA_VERSION,
+        VERDICT_SCHEMA_VERSION,
+    )
+)
+EVIDENCE_VERDICT_SCHEMAS = frozenset(
+    (EVIDENCE_VERDICT_SCHEMA_VERSION, VERDICT_SCHEMA_VERSION)
+)
 MIXED_SLOT_VERDICT_SCHEMAS = frozenset(
     (SLOT_VERDICT_SCHEMA_VERSION, *LIFECYCLE_VERDICT_SCHEMAS)
 )
@@ -82,6 +92,14 @@ class GateStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     PASS = "pass"
     FAIL = "fail"
+    SKIPPED = "skipped"
+    INCONCLUSIVE = "inconclusive"
+
+
+class ReviewMode(str, Enum):
+    OFF = "off"
+    SINGLE = "single"
+    ITERATIVE = "iterative"
 
 
 @dataclass(frozen=True)
@@ -334,6 +352,16 @@ class ReviewerSlot:
             "attempt_count": self.attempt_count,
             "last_error": self.last_error,
         }
+        if self.status == "disabled":
+            if (
+                verdict_schema != VERDICT_SCHEMA_VERSION
+                or self.report is not None
+                or self.receipt is not None
+                or self.attempt_count != 0
+                or self.last_error is not None
+            ):
+                raise SchemaError("VERDICT_INVALID")
+            return base
         if self.status == "pending":
             if self.report is not None or self.receipt is not None:
                 raise SchemaError("VERDICT_INVALID")
@@ -405,6 +433,77 @@ class GateSummary:
 
 
 @dataclass(frozen=True)
+class IntensityRequest:
+    value: int
+    source: str
+    requester: str
+    reason: str
+    fail_closed_reason: str | None = None
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "value": self.value,
+            "source": self.source,
+            "requester": self.requester,
+            "reason": self.reason,
+            "fail_closed_reason": self.fail_closed_reason,
+        }
+
+
+@dataclass(frozen=True)
+class ReviewerPolicy:
+    enabled: bool
+    model: str
+
+    def to_json(self) -> dict[str, object]:
+        return {"enabled": self.enabled, "model": self.model}
+
+
+@dataclass(frozen=True)
+class PolicyBinding:
+    config_sha256: str
+    risk_floor: int
+    effective_intensity: int
+    mode: ReviewMode
+    reasons: Sequence[str]
+    request: IntensityRequest
+    reviewers: Mapping[str, ReviewerPolicy]
+
+    @property
+    def active_reviewers(self) -> tuple[str, ...]:
+        if self.mode is ReviewMode.OFF:
+            return ()
+        return tuple(key for key in "ABC" if self.reviewers[key].enabled)
+
+    def to_json(self) -> dict[str, object]:
+        if (
+            not isinstance(self.config_sha256, str)
+            or _SHA256.fullmatch(self.config_sha256) is None
+            or not isinstance(self.risk_floor, int)
+            or isinstance(self.risk_floor, bool)
+            or not 0 <= self.risk_floor <= 100
+            or not isinstance(self.effective_intensity, int)
+            or isinstance(self.effective_intensity, bool)
+            or not 0 <= self.effective_intensity <= 100
+            or self.effective_intensity < self.risk_floor
+            or not isinstance(self.mode, ReviewMode)
+            or set(self.reviewers) != set("ABC")
+        ):
+            raise SchemaError("POLICY_INVALID")
+        return {
+            "config_sha256": self.config_sha256,
+            "risk_floor": self.risk_floor,
+            "effective_intensity": self.effective_intensity,
+            "mode": self.mode.value,
+            "reasons": list(self.reasons),
+            "request": self.request.to_json(),
+            "reviewers": {
+                key: self.reviewers[key].to_json() for key in "ABC"
+            },
+        }
+
+
+@dataclass(frozen=True)
 class Verdict:
     schema: int
     repository: str
@@ -427,6 +526,7 @@ class Verdict:
     evidence_binding: EvidenceBinding | None = None
     evidence_fallback_reason: str | None = None
     evidence_contract: int | None = None
+    policy: PolicyBinding | None = None
 
     @property
     def snapshot(self) -> Snapshot:
@@ -503,7 +603,7 @@ class Verdict:
             value["contract"] = self.contract.to_json()
         if self.schema in LIFECYCLE_VERDICT_SCHEMAS:
             value["lifecycle_id"] = self.lifecycle_id
-        if self.schema == VERDICT_SCHEMA_VERSION:
+        if self.schema in EVIDENCE_VERDICT_SCHEMAS:
             value["evidence_binding"] = self.evidence_binding.to_json() if self.evidence_binding else None
             value["evidence_fallback_reason"] = self.evidence_fallback_reason
             if self.evidence_contract is not None:
@@ -511,6 +611,12 @@ class Verdict:
                     self.evidence_contract, "VERDICT_INVALID", minimum=1, maximum=2)
         elif (self.evidence_binding is not None or self.evidence_fallback_reason is not None
                 or self.evidence_contract is not None):
+            raise SchemaError("VERDICT_INVALID")
+        if self.schema == VERDICT_SCHEMA_VERSION:
+            if self.policy is None:
+                raise SchemaError("POLICY_INVALID")
+            value["policy"] = self.policy.to_json()
+        elif self.policy is not None:
             raise SchemaError("VERDICT_INVALID")
         return value
 

@@ -218,6 +218,7 @@ class _VerdictFields:
     evidence_binding: m.EvidenceBinding | None
     evidence_fallback_reason: str | None
     evidence_contract: int | None
+    policy: m.PolicyBinding | None
 
 
 def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFields:
@@ -242,10 +243,12 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         verdict_keys.add("contract")
         if schema in m.LIFECYCLE_VERDICT_SCHEMAS:
             verdict_keys.add("lifecycle_id")
-        if schema == m.VERDICT_SCHEMA_VERSION:
+        if schema in m.EVIDENCE_VERDICT_SCHEMAS:
             verdict_keys.update(('evidence_binding', 'evidence_fallback_reason'))
-        valid_shapes = {frozenset(verdict_keys)}
         if schema == m.VERDICT_SCHEMA_VERSION:
+            verdict_keys.add("policy")
+        valid_shapes = {frozenset(verdict_keys)}
+        if schema in m.EVIDENCE_VERDICT_SCHEMAS:
             valid_shapes.add(frozenset((*verdict_keys, 'evidence_contract')))
     else:
         valid_shapes = {
@@ -362,6 +365,11 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         from .evidence_runtime import snapshot_binding
         if selection.to_json()['expected_binding']['snapshot'] != snapshot_binding(snapshot):
             raise SchemaError('EVIDENCE_BINDING_MISMATCH')
+    policy_binding = None
+    if schema == m.VERDICT_SCHEMA_VERSION:
+        from .policy import parse_policy_binding
+
+        policy_binding = parse_policy_binding(data["policy"], runtime=runtime)
     return _VerdictFields(
         schema,
         repository,
@@ -384,6 +392,7 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         selection,
         fallback,
         evidence_contract,
+        policy_binding,
     )
 
 
@@ -412,7 +421,9 @@ def _parse_embedded_report(
         expected_reviewer=Reviewer(reviewer),
         expected_round=fields.round,
         snapshot=fields.snapshot,
-        report_contract_version=3 if fields.schema == m.VERDICT_SCHEMA_VERSION else 2,
+        report_contract_version=(
+            3 if fields.schema in m.EVIDENCE_VERDICT_SCHEMAS else 2
+        ),
     )
 
 
@@ -455,6 +466,7 @@ def _verdict_from_fields(
         fields.evidence_binding,
         fields.evidence_fallback_reason,
         fields.evidence_contract,
+        fields.policy,
     )
 
 
@@ -583,7 +595,7 @@ def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
         state = raw_slot.get("state")
         expected_keys = (
             {"state", "attempt_count", "last_error"}
-            if state == "pending"
+            if state in {"pending", "disabled"}
             else {"state", "report", "receipt", "attempt_count", "last_error"}
         )
         slot = m._object(raw_slot, expected_keys, "VERDICT_INVALID")
@@ -593,7 +605,24 @@ def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
         last_error = slot["last_error"]
         if last_error is not None:
             last_error = m._text(last_error, 128)
+        if state == "disabled":
+            if (
+                    schema != m.VERDICT_SCHEMA_VERSION
+                    or fields.policy is None
+                    or key in fields.policy.active_reviewers
+                or attempt_count != 0
+                or last_error is not None
+            ):
+                raise SchemaError("VERDICT_INVALID")
+            reviewers[key] = ReviewerSlot("disabled")
+            continue
         if state == "pending":
+            if (
+                schema == m.VERDICT_SCHEMA_VERSION
+                and fields.policy is not None
+                and not fields.policy.reviewers[key].enabled
+            ):
+                raise SchemaError("VERDICT_INVALID")
             reviewers[key] = ReviewerSlot(
                 "pending", attempt_count=attempt_count, last_error=last_error
             )
@@ -612,17 +641,53 @@ def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
             "sealed", report, receipt, attempt_count, None
         )
 
+    if schema == m.VERDICT_SCHEMA_VERSION and fields.policy is not None:
+        enabled_for_mode = set(fields.policy.active_reviewers)
+        for key in "ABC":
+            if (key in enabled_for_mode) != (reviewers[key].status != "disabled"):
+                raise SchemaError("VERDICT_INVALID")
+
     status = fields.gate.status
     count = fields.gate.blocking_count
-    all_sealed = all(slot.status == "sealed" for slot in reviewers.values())
+    active = (
+        fields.policy.active_reviewers
+        if fields.policy is not None
+        else tuple("ABC")
+    )
+    all_sealed = all(reviewers[key].status == "sealed" for key in active)
+    inactive_disabled = all(
+        reviewers[key].status == "disabled"
+        for key in set("ABC") - set(active)
+    )
     if status is GateStatus.IN_PROGRESS:
-        if count != 0:
+        if count != 0 or not inactive_disabled:
+            raise SchemaError("VERDICT_INVALID")
+    elif status is GateStatus.SKIPPED:
+        if (
+            schema != m.VERDICT_SCHEMA_VERSION
+            or fields.policy is None
+            or fields.policy.mode is not m.ReviewMode.OFF
+            or active
+            or count != 0
+            or not inactive_disabled
+        ):
             raise SchemaError("VERDICT_INVALID")
     else:
         actual = _blocking_count(reviewers)
-        if not all_sealed or count != actual:
+        if not all_sealed or not inactive_disabled or count != actual:
             raise SchemaError("VERDICT_INVALID")
-        if (status is GateStatus.PASS) != (count == 0):
+        reviewer_b = reviewers["B"].report if "B" in active else None
+        has_unverified = reviewer_b is not None and any(
+            claim.result == "unverified" for claim in reviewer_b.claims
+        )
+        expected = (
+            GateStatus.FAIL
+            if count
+            else GateStatus.INCONCLUSIVE
+            if has_unverified
+            else GateStatus.PASS
+        )
+        if status is not expected:
             raise SchemaError("VERDICT_INVALID")
     verdict = _verdict_from_fields(
         fields, reviewers, contract=contract, lifecycle_id=fields.lifecycle_id
@@ -630,7 +695,7 @@ def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
     if status is not GateStatus.IN_PROGRESS:
         _validate_closure(
             verdict,
-            {key: reviewers[key].report for key in "ABC"},
+            {key: reviewers[key].report for key in active},
         )
     return verdict
 
@@ -855,6 +920,8 @@ def _pending_slot_snapshot(
     require_current_in_progress(pending)
     if pending.contract != current_contract_binding():
         raise SchemaError("CONTRACT_DRIFT")
+    if pending.reviewers[reviewer.value].status == "disabled":
+        raise SchemaError("REVIEWER_DISABLED")
     if pending.reviewers[reviewer.value].status != "pending":
         raise SchemaError("REVIEWER_SLOT_SEALED")
     snapshot = capture_snapshot(root, pending.base_ref, now=now)
@@ -1051,6 +1118,8 @@ def validate_stored_reviewer_report(
                     or not has_current_evidence_contract(verdict)):
                 raise SchemaError("CONTRACT_DRIFT")
             slot = verdict.reviewers[reviewer.value]
+            if slot.status == "disabled":
+                raise SchemaError("REVIEWER_DISABLED")
             if slot.status == "pending" and verdict.gate.status is not GateStatus.IN_PROGRESS:
                 raise SchemaError("ROUND_NOT_IN_PROGRESS")
         else:
@@ -1129,7 +1198,14 @@ def _new_current_pending(
     history: Sequence[RoundSummary],
     contract: ContractBinding,
     lifecycle_id: str,
+    policy: m.PolicyBinding,
 ) -> Verdict:
+    active = set(policy.active_reviewers)
+    gate = (
+        GateSummary(GateStatus.SKIPPED, 0)
+        if policy.mode is m.ReviewMode.OFF
+        else GateSummary(GateStatus.IN_PROGRESS, 0)
+    )
     return Verdict(
         m.VERDICT_SCHEMA_VERSION,
         snapshot.repository,
@@ -1142,14 +1218,18 @@ def _new_current_pending(
         tuple(initial_paths),
         round_number,
         runtime,
-        {key: ReviewerSlot("pending") for key in "ABC"},
+        {
+            key: ReviewerSlot("pending" if key in active else "disabled")
+            for key in "ABC"
+        },
         tuple(decisions),
         tuple(history),
-        GateSummary(GateStatus.IN_PROGRESS, 0),
+        gate,
         snapshot.created_at,
         contract,
         lifecycle_id,
         evidence_contract=2,
+        policy=policy,
     )
 
 
@@ -1171,6 +1251,9 @@ def begin_round(
     round_number: int,
     decisions_path: Path | None = None,
     evidence_bundle_sha256: str | None = None,
+    intensity_values: Sequence[str] | None = None,
+    intensity_requester: str | None = None,
+    intensity_reason: str | None = None,
     now: Callable[[], str] = utc_now,
     token_hex: Callable[[int], str] = secrets.token_hex,
 ) -> Verdict:
@@ -1192,18 +1275,23 @@ def begin_round(
         stored = _read_optional_verdict_locked(review_fd)
         if stored is not None and stored.gate.status is GateStatus.IN_PROGRESS:
             raise SchemaError("ROUND_TRANSITION_INVALID")
+        snapshot = capture_snapshot(root, base, now=now)
         previous: Verdict | None = None
         if round_number == 1:
             if decisions_path is not None:
                 raise SchemaError("DECISIONS_NOT_ALLOWED")
-            if stored is not None and stored.gate.status is GateStatus.FAIL:
-                if stored.round == 3:
-                    raise SchemaError("ROUND_LIMIT_EXHAUSTED")
-                raise SchemaError("ROUND_TRANSITION_INVALID")
         else:
             if stored is None:
                 raise SchemaError("VERDICT_MISSING")
             previous = stored
+            if previous.schema == m.VERDICT_SCHEMA_VERSION:
+                if (
+                    previous.policy is None
+                    or previous.policy.mode is not m.ReviewMode.ITERATIVE
+                ):
+                    raise SchemaError("MODE_ROUND_INVALID")
+            elif previous.schema != m.SCHEMA_VERSION:
+                raise SchemaError("MODE_ROUND_INVALID")
             if previous.round == 3:
                 raise SchemaError("ROUND_LIMIT_EXHAUSTED")
             if (
@@ -1215,7 +1303,59 @@ def begin_round(
                 raise SchemaError("BASE_CHANGED")
             if decisions_path is None:
                 raise SchemaError("DECISIONS_REQUIRED")
-        snapshot = capture_snapshot(root, base, now=now)
+        from .policy import parse_intensity_request, resolve_policy
+
+        if previous is not None:
+            if (
+                intensity_values
+                or intensity_requester is not None
+                or intensity_reason is not None
+            ):
+                raise SchemaError("INTENSITY_NOT_ALLOWED")
+            if previous.policy is None:
+                from .policy import conservative_legacy_policy
+
+                request = conservative_legacy_policy(runtime).request
+            else:
+                request = previous.policy.request
+        else:
+            request = parse_intensity_request(
+                intensity_values,
+                requester=intensity_requester,
+                reason=intensity_reason,
+            )
+        policy = resolve_policy(root, snapshot, runtime=runtime, request=request)
+        if (
+            round_number == 1
+            and stored is not None
+            and _snapshot_equal(stored, snapshot)
+        ):
+            prior_intensity = (
+                stored.policy.effective_intensity
+                if stored.policy is not None
+                else 100
+            )
+            if (
+                stored.gate.status is GateStatus.FAIL
+                and policy.effective_intensity <= prior_intensity
+            ):
+                if stored.round == 3:
+                    raise SchemaError("ROUND_LIMIT_EXHAUSTED")
+                raise SchemaError("ROUND_TRANSITION_INVALID")
+            if (
+                stored.gate.status is GateStatus.INCONCLUSIVE
+                and policy.effective_intensity < prior_intensity
+            ):
+                raise SchemaError("ROUND_TRANSITION_INVALID")
+        if round_number > 1:
+            if policy.mode is not m.ReviewMode.ITERATIVE:
+                raise SchemaError("MODE_ROUND_INVALID")
+            if previous.policy is not None and (
+                policy.config_sha256 != previous.policy.config_sha256
+                or policy.request != previous.policy.request
+                or policy.reviewers != previous.policy.reviewers
+            ):
+                raise SchemaError("POLICY_CHANGED")
         if previous is None:
             initial_paths = tuple(snapshot.initial_paths)
             decisions: tuple[Decision, ...] = ()
@@ -1264,10 +1404,19 @@ def begin_round(
             snapshot, runtime=runtime, initial_paths=initial_paths,
             round_number=round_number, decisions=decisions, history=history,
             contract=current_contract_binding(), lifecycle_id=_lifecycle_id(token_hex),
+            policy=policy,
         )
-        from .evidence_lifecycle import select_evidence
-        selection, fallback = select_evidence(root, snapshot, evidence_bundle_sha256)
-        pending = replace(pending, evidence_binding=selection, evidence_fallback_reason=fallback)
+        if policy.mode is not m.ReviewMode.OFF:
+            from .evidence_lifecycle import select_evidence
+
+            selection, fallback = select_evidence(
+                root, snapshot, evidence_bundle_sha256
+            )
+            pending = replace(
+                pending,
+                evidence_binding=selection,
+                evidence_fallback_reason=fallback,
+            )
         _atomic_write(review_fd, pending)
         return pending
 
@@ -1307,7 +1456,7 @@ def _validate_reviewer_closure(
 
 def _validate_closure(verdict: Verdict, reports: Mapping[str, ReviewerReport]) -> None:
     seen_replacements: set[str] = set()
-    for reviewer in "ABC":
+    for reviewer in reports:
         _validate_reviewer_closure(
             verdict, reports[reviewer], seen_replacements=seen_replacements,
         )
@@ -1341,7 +1490,30 @@ def _read_sealed_report(
     )
     if digest != slot.receipt.raw_sha256 or parsed != slot.report:
         raise SchemaError("REPORT_RECEIPT_MISMATCH")
-    if slot.receipt.context_sha256 != context_sha256(verdict, reviewer):
+    accepted_contexts = {context_sha256(verdict, reviewer)}
+    if (
+        verdict.schema == m.VERDICT_SCHEMA_VERSION
+        and verdict.policy is not None
+        and verdict.policy.request.fail_closed_reason == "LEGACY_MIGRATION"
+    ):
+        # A compatible schema-v2 receipt remains bound to the exact context it
+        # actually saw. The conservative all-role migration policy may accept
+        # that old digest, but never rewrites it as a native schema-v5 receipt.
+        legacy = replace(
+            verdict,
+            schema=m.SLOT_VERDICT_SCHEMA_VERSION,
+            contract=replace(
+                verdict.contract,
+                verdict_schema=m.SLOT_VERDICT_SCHEMA_VERSION,
+            ),
+            lifecycle_id=None,
+            evidence_binding=None,
+            evidence_fallback_reason=None,
+            evidence_contract=None,
+            policy=None,
+        )
+        accepted_contexts.add(context_sha256(legacy, reviewer))
+    if slot.receipt.context_sha256 not in accepted_contexts:
         raise SchemaError("CONTEXT_DRIFT")
     from .evidence_lifecycle import authenticate_report
     authenticate_report(root, verdict, parsed)
@@ -1352,9 +1524,7 @@ def finalize_round(
     cwd: Path, *, reviewer_paths: Mapping[str, Path] | None = None,
     now: Callable[[], str] = utc_now,
 ) -> Verdict:
-    if reviewer_paths is not None and (
-        not isinstance(reviewer_paths, Mapping) or set(reviewer_paths) != set("ABC")
-    ):
+    if reviewer_paths is not None and not isinstance(reviewer_paths, Mapping):
         raise SchemaError("REVIEWER_REPORT_MISSING")
     root = repository_root(cwd)
     preflight_review_directory(root)
@@ -1362,10 +1532,15 @@ def finalize_round(
     with locked_review(root, create=False) as review_fd:
         pending = _read_verdict_locked(review_fd)
         require_current_in_progress(pending)
+        if pending.policy is None:
+            raise SchemaError("POLICY_INVALID")
+        active = pending.policy.active_reviewers
+        if reviewer_paths is not None and set(reviewer_paths) != set(active):
+            raise SchemaError("REVIEWER_REPORT_MISSING")
         if pending.contract != current_contract_binding():
             raise SchemaError("CONTRACT_DRIFT")
         if reviewer_paths is not None:
-            for key in "ABC":
+            for key in active:
                 _expected_input(
                     root, reviewer_paths[key],
                     f".review/inbox/round-{pending.round}/{key}.json", "REPORT_PATH_INVALID",
@@ -1374,7 +1549,7 @@ def finalize_round(
         if not _snapshot_equal(pending, snapshot):
             raise SchemaError("SNAPSHOT_CHANGED")
         reports: dict[str, ReviewerReport] = {}
-        for key in "ABC":
+        for key in active:
             reports[key] = _read_sealed_report(review_fd, pending, Reviewer(key), root=root)
         _validate_closure(pending, reports)
         blockers = tuple(
@@ -1383,7 +1558,17 @@ def finalize_round(
             for finding in report.findings
             if finding.severity in {Severity.CRITICAL, Severity.HIGH}
         )
-        status = GateStatus.FAIL if blockers else GateStatus.PASS
+        reviewer_b = reports.get("B")
+        has_unverified = reviewer_b is not None and any(
+            claim.result == "unverified" for claim in reviewer_b.claims
+        )
+        status = (
+            GateStatus.FAIL
+            if blockers
+            else GateStatus.INCONCLUSIVE
+            if has_unverified
+            else GateStatus.PASS
+        )
         final = replace(
             pending, gate=GateSummary(status, len(blockers)), created_at=snapshot.created_at
         )
@@ -1416,6 +1601,8 @@ def migrate_v2_pending_round(
     cwd: Path, *, token_hex: Callable[[int], str] = secrets.token_hex,
 ) -> PendingMigrationResult:
     """Atomically assign a lifecycle ID to a verified schema-2 pending verdict."""
+    from .policy import conservative_legacy_policy, resolve_policy
+
     root = repository_root(cwd)
     preflight_review_directory(root)
     check_ignored(root)
@@ -1446,6 +1633,12 @@ def migrate_v2_pending_round(
             contract=current,
             lifecycle_id=_lifecycle_id(token_hex),
             evidence_contract=2,
+            policy=resolve_policy(
+                root,
+                snapshot,
+                runtime=legacy.producer_runtime,
+                request=conservative_legacy_policy(legacy.producer_runtime).request,
+            ),
         )
         _atomic_write(review_fd, migrated)
         return PendingMigrationResult(
@@ -1463,6 +1656,8 @@ def migrate_legacy_pending_round(
     Historical telemetry has no byte/context hashes. Its successful spans cannot
     authenticate current canonical bytes, including replacements after validation.
     """
+    from .policy import conservative_legacy_policy, resolve_policy
+
     root = repository_root(cwd)
     preflight_review_directory(root)
     check_ignored(root)
@@ -1475,10 +1670,16 @@ def migrate_legacy_pending_round(
         if not _snapshot_equal(legacy, snapshot):
             raise SchemaError("SNAPSHOT_CHANGED")
         pending = _new_current_pending(
-            legacy.snapshot, runtime=legacy.producer_runtime,
+            snapshot, runtime=legacy.producer_runtime,
             initial_paths=legacy.initial_paths, round_number=legacy.round,
             decisions=legacy.decisions, history=legacy.history,
             contract=current_contract_binding(), lifecycle_id=_lifecycle_id(token_hex),
+            policy=resolve_policy(
+                root,
+                snapshot,
+                runtime=legacy.producer_runtime,
+                request=conservative_legacy_policy(legacy.producer_runtime).request,
+            ),
         )
         round_fd = _round_fd(
             review_fd, legacy.round, create=False, exact_report_directories=True

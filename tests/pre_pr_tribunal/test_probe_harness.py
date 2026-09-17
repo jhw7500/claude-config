@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import importlib.util
@@ -811,7 +811,7 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
         os.umask(previous)
     assert len(finalizations) == 1
     assert result["status"]["gate_status"] == "pass"
-    assert result["status"]["verdict_schema"] == 4
+    assert result["status"]["verdict_schema"] == 5
     summary = result["telemetry_summary"]
     assert summary["binding"]["diff_sha256"] == result["begin"]["snapshot"]["diff_sha256"]
     assert summary["stages"]["report_store"]["count"] == 3
@@ -842,14 +842,37 @@ def test_installed_probe_migrates_v2_pending_before_selective_resume(tmp_path, m
         "--outcome", "failure", "--reason-code", "CONTROLLER_INTERRUPTED",
     )
 
+    from pre_pr_tribunal.model import Reviewer
+    from pre_pr_tribunal.review_context import context_sha256
+    from pre_pr_tribunal.verdict_store import read_verdict
+
     verdict_path = repo / ".review/verdict.json"
-    legacy = json.loads(verdict_path.read_bytes())
-    legacy["schema"] = 2
-    legacy["contract"]["verdict_schema"] = 2
-    del legacy["lifecycle_id"]
-    del legacy['evidence_binding']
-    del legacy['evidence_fallback_reason']
-    del legacy['evidence_contract']
+    current = read_verdict(repo)
+    legacy_object = replace(
+        current,
+        schema=2,
+        contract=replace(current.contract, verdict_schema=2),
+        lifecycle_id=None,
+        evidence_binding=None,
+        evidence_fallback_reason=None,
+        evidence_contract=None,
+        policy=None,
+    )
+    slot = legacy_object.reviewers["A"]
+    legacy_object = replace(
+        legacy_object,
+        reviewers={
+            **legacy_object.reviewers,
+            "A": replace(
+                slot,
+                receipt=replace(
+                    slot.receipt,
+                    context_sha256=context_sha256(legacy_object, Reviewer.A),
+                ),
+            ),
+        },
+    )
+    legacy = legacy_object.to_json()
     verdict_path.write_text(json.dumps(legacy))
     verdict_path.chmod(0o600)
 
@@ -876,7 +899,7 @@ def test_installed_probe_migrates_v2_pending_before_selective_resume(tmp_path, m
     assert commands.index("migrate-v2-pending") < commands.index("telemetry-resume")
     assert requested == ["B", "C"]
     assert (repo / ".review/inbox/round-1/A.json").read_bytes() == sealed_a
-    assert result["status"]["verdict_schema"] == 4
+    assert result["status"]["verdict_schema"] == 5
     assert result["telemetry_summary"]["recovery"]["accounting_complete"] is False
     assert result["telemetry_summary"]["recovery"]["requested_slot_count"] is None
 
@@ -890,6 +913,7 @@ def test_installed_probe_preserves_old_schema_three_contract_without_resume(tmp_
     value.update(schema=3, contract={'report_text': 2, 'diff_recipe': 1, 'verdict_schema': 3})
     value.pop('evidence_binding'); value.pop('evidence_fallback_reason')
     value.pop('evidence_contract')
+    value.pop('policy')
     raw = json.dumps(value).encode(); path.write_bytes(raw)
     with pytest.raises(module.ProbeFailure) as error:
         module._create_pass_verdict(cli, repo, home, 'codex')
@@ -1274,6 +1298,7 @@ def test_installed_probe_migrates_unproven_legacy_reports_and_runs_all_slots(tmp
     verdict.pop('evidence_binding')
     verdict.pop('evidence_fallback_reason')
     verdict.pop('evidence_contract')
+    verdict.pop('policy')
     verdict["reviewers"] = {reviewer: {"status": "pending"} for reviewer in "ABC"}
     verdict_path.write_bytes(json.dumps(verdict, separators=(",", ":")).encode())
     verdict_path.chmod(0o600)

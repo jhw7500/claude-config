@@ -109,9 +109,10 @@ of a handle is insufficient. Other setup failures retain the skill's stop path.
    report or slot-status disclosure. Do not run `begin`, reset `.review`, change
    the installed contract, or rerun a sealed reviewer.
 
-When all three roles are sealed, perform every immediate pre-final check and
-pathless `finalize`. Preserved blockers still yield a non-pass verdict; there is
-no two-of-three pass. Capacity recovery does not downgrade an integrity stop.
+When every policy-active role is sealed and every other role remains disabled,
+perform every immediate pre-final check and pathless `finalize`. Preserved
+blockers still yield a non-pass verdict; there is no partial-active-set pass.
+Capacity recovery does not downgrade an integrity stop.
 
 ## Explicit resume of a retained format-retry handle
 

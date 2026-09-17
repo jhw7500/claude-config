@@ -15,6 +15,7 @@ if __package__ in {None, ""}:
     from pre_pr_tribunal.model import (  # type: ignore
         MAX_REPORT_BYTES,
         MIXED_SLOT_VERDICT_SCHEMAS,
+        VERDICT_SCHEMA_VERSION,
         Reviewer,
         TribunalError,
         validate_report_bytes,
@@ -45,6 +46,7 @@ else:
     from .model import (
         MAX_REPORT_BYTES,
         MIXED_SLOT_VERDICT_SCHEMAS,
+        VERDICT_SCHEMA_VERSION,
         Reviewer,
         TribunalError,
         validate_report_bytes,
@@ -109,6 +111,9 @@ def _parser() -> argparse.ArgumentParser:
     begin.add_argument("--round", required=True, type=int, choices=(1, 2, 3))
     begin.add_argument("--decisions", type=Path)
     begin.add_argument('--evidence-bundle')
+    begin.add_argument("--intensity", action="append")
+    begin.add_argument("--intensity-requester")
+    begin.add_argument("--intensity-reason")
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -193,6 +198,9 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
             cwd, base=arguments.base, runtime=arguments.runtime,
             round_number=arguments.round, decisions_path=arguments.decisions,
             evidence_bundle_sha256=getattr(arguments, 'evidence_bundle', None),
+            intensity_values=getattr(arguments, "intensity", None),
+            intensity_requester=getattr(arguments, "intensity_requester", None),
+            intensity_reason=getattr(arguments, "intensity_reason", None),
         )
     except TribunalError as primary_error:
         try:
@@ -292,7 +300,51 @@ def _status(verdict) -> dict[str, object]:
                 )
             reviewers[key] = projected
         payload["reviewers"] = reviewers
+    if verdict.schema == VERDICT_SCHEMA_VERSION:
+        if verdict.policy is None:
+            raise TribunalError("POLICY_INVALID")
+        payload["policy"] = verdict.policy.to_json()
+        payload["active_reviewers"] = list(verdict.policy.active_reviewers)
+        payload["pr_appendix"] = _pr_appendix(verdict)
     return payload
+
+
+def _pr_appendix(verdict) -> str:
+    lines = ["## Pre-PR tribunal advisory findings", ""]
+    count = 0
+    for key in verdict.policy.active_reviewers:
+        report = verdict.reviewers[key].report
+        if report is None:
+            continue
+        for finding in report.findings:
+            if finding.severity.value not in {"MEDIUM", "LOW"}:
+                continue
+            location = finding.path + (
+                f":{finding.line}" if finding.line is not None else ""
+            )
+            lines.append(
+                f"- [{finding.severity.value}] {_markdown_text(finding.title)} "
+                f"({_markdown_text(location)}, reviewer {key})"
+            )
+            count += 1
+    if not count:
+        return ""
+    rendered = "\n".join(lines) + "\n"
+    if len(rendered.encode("utf-8")) > 32 * 1024:
+        raise TribunalError("PR_APPENDIX_TOO_LARGE")
+    return rendered
+
+
+def _markdown_text(value: str) -> str:
+    escaped = []
+    for character in value:
+        if character in "\r\n\t":
+            escaped.append(" ")
+        elif character in "\\`*_{}[]<>()#+-.!|>":
+            escaped.append("\\" + character)
+        else:
+            escaped.append(character)
+    return "".join(escaped)
 
 
 def _report_stdin() -> bytes:
@@ -313,8 +365,13 @@ def _report_projection(
 
 
 def _require_all_pending(verdict) -> None:
+    active = (
+        verdict.policy.active_reviewers
+        if verdict.schema == VERDICT_SCHEMA_VERSION and verdict.policy is not None
+        else tuple("ABC")
+    )
     if verdict.gate.status.value != "in_progress" or any(
-        item.status != "pending" for item in verdict.reviewers.values()
+        verdict.reviewers[key].status != "pending" for key in active
     ):
         raise TribunalError("ROUND_NOT_IN_PROGRESS")
 
@@ -342,16 +399,6 @@ def _snapshot_equal(verdict, snapshot) -> bool:
 def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns) -> int:
     parser = _parser()
     arguments = parser.parse_args(argv)
-    if arguments.command == "finalize":
-        supplied = (
-            arguments.reviewer_a,
-            arguments.reviewer_b,
-            arguments.reviewer_c,
-        )
-        if any(path is not None for path in supplied) and not all(
-            path is not None for path in supplied
-        ):
-            parser.error("all reviewer paths must be supplied together")
     cwd = Path.cwd()
     exit_status = 0
     try:
@@ -397,6 +444,9 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 "gate": verdict.gate.to_json(),
                 "telemetry": observation,
             }
+            if verdict.policy is not None:
+                payload["policy"] = verdict.policy.to_json()
+                payload["active_reviewers"] = list(verdict.policy.active_reviewers)
         elif arguments.command.startswith("telemetry-"):
             payload = _telemetry_command(cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns)
         elif arguments.command == "context":
@@ -478,13 +528,16 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 )
                 payload = _report_projection(reviewer, verdict.round, "valid", digest)
         elif arguments.command == "finalize":
-            reviewer_paths = None
-            if arguments.reviewer_a is not None:
-                reviewer_paths = {
+            supplied = {
+                key: value
+                for key, value in {
                     "A": arguments.reviewer_a,
                     "B": arguments.reviewer_b,
                     "C": arguments.reviewer_c,
-                }
+                }.items()
+                if value is not None
+            }
+            reviewer_paths = supplied or None
             verdict = finalize_round(
                 cwd,
                 reviewer_paths=reviewer_paths,

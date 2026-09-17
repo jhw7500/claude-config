@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from pre_pr_tribunal import evidence_runtime as runtime
-from pre_pr_tribunal.model import Reviewer, TribunalError
+from pre_pr_tribunal.model import VERDICT_SCHEMA_VERSION, Reviewer, TribunalError
 from pre_pr_tribunal.review_context import reviewer_context_envelope
 from pre_pr_tribunal.verdict_store import (begin_round, submit_reviewer_report,
     finalize_round, read_verdict, require_current_in_progress,
@@ -138,7 +138,7 @@ def seal(repo, verdict, execution=None):
 def test_complete_reuse_round_and_private_context(git_repo):
     frozen = bundle(git_repo)
     verdict = begin(git_repo, frozen['bundle_sha256'])
-    assert verdict.schema == 4 and verdict.contract.report_text == 3
+    assert verdict.schema == VERDICT_SCHEMA_VERSION and verdict.contract.report_text == 3
     for reviewer in 'AC':
         assert 'evidence' not in reviewer_context_envelope(verdict, Reviewer(reviewer))
     context = reviewer_context_envelope(verdict, Reviewer.B)
@@ -271,6 +271,7 @@ def test_old_schema_three_remains_readable_but_not_pending_authority(git_repo):
     value['contract'] = {'report_text': 2, 'diff_recipe': 1, 'verdict_schema': 3}
     value.pop('evidence_binding'); value.pop('evidence_fallback_reason')
     value.pop('evidence_contract')
+    value.pop('policy')
     path = git_repo / '.review/verdict.json'
     path.write_text(json.dumps(value))
     loaded = read_verdict(git_repo)
