@@ -65,11 +65,28 @@ def test_disposable_installed_cli_reuse_lifecycle_and_sealed_mutation(git_repo, 
         '--context', context_path, '--context-sha', context['context_sha256'], cwd=view)
     execution = {'id': 'B-R1-E001', **verified['executions'][0]['execution']}
     for role in 'ABC':
-        raw = json.dumps({'schema': 1, 'reviewer': role, 'round': 1,
+        value = {'schema': 1, 'reviewer': role, 'round': 1,
             'snapshot': {'head_sha': context['snapshot']['head_sha'],
                          'diff_sha256': context['snapshot']['diff_sha256']},
             'status': 'complete', 'findings': [], 'executions': [execution] if role == 'B' else [],
-            'claims': [], 'prior_decisions': []}, indent=2).encode()
+            'claims': [], 'prior_decisions': []}
+        if role == 'B':
+            value.update({
+                'claims': [{
+                    'id': 'B-R1-C001',
+                    'statement': 'The documented primary entry path runs.',
+                    'result': 'supported',
+                    'execution_ids': ['B-R1-E001'],
+                    'reason': '',
+                }],
+                'coverage': {
+                    'complete': True,
+                    'primary_entry_paths': [
+                        {'path': 'tracked.txt', 'claim_id': 'B-R1-C001'}
+                    ],
+                },
+            })
+        raw = json.dumps(value, indent=2).encode()
         cli('submit-report', '--reviewer', role, raw=raw)
         path = git_repo / f'.review/inbox/round-1/{role}.json'
         assert path.read_bytes() == raw
@@ -78,7 +95,7 @@ def test_disposable_installed_cli_reuse_lifecycle_and_sealed_mutation(git_repo, 
     cli('finalize')
     observed = cli('telemetry-summary')['evidence']
     assert observed['reused_entry_count'] == 1
-    assert observed['claim_reused_entry_count'] == 0
+    assert observed['claim_reused_entry_count'] == 1
     assert observed['fresh_execution_count'] == 0
     next((git_repo / '.review/evidence/captures').iterdir()).write_bytes(b'changed')
     cli('validate-report', '--reviewer', 'B', '--source', 'stored', success=False)

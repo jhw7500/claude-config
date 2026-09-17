@@ -17,7 +17,14 @@ from .git_state import (
     _worktree_is_dirty,
     capture_snapshot,
 )
-from .model import MIXED_SLOT_VERDICT_SCHEMAS, GateStatus, SchemaError, TribunalError
+from .model import (
+    MIXED_SLOT_VERDICT_SCHEMAS,
+    VERDICT_SCHEMA_VERSION,
+    GateStatus,
+    ReviewMode,
+    SchemaError,
+    TribunalError,
+)
 from .review_context import current_contract_binding
 from .shell_scan import ScanKind, is_target_environment_name, scan_pr_create
 from .verdict_store import read_verdict
@@ -36,6 +43,7 @@ class GateCode(str, Enum):
     REVIEW_INCOMPLETE = "REVIEW_INCOMPLETE"
     BLOCKERS_OPEN = "BLOCKERS_OPEN"
     ROUND_LIMIT_EXHAUSTED = "ROUND_LIMIT_EXHAUSTED"
+    VERIFICATION_INCOMPLETE = "VERIFICATION_INCOMPLETE"
 
 
 @dataclass(frozen=True)
@@ -214,6 +222,21 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
         from .evidence_lifecycle import has_current_evidence_contract
         if not has_current_evidence_contract(verdict):
             return _decision(True, GateCode.VERDICT_STALE)
+    if verdict.schema != VERDICT_SCHEMA_VERSION or verdict.policy is None:
+        return _decision(True, GateCode.VERDICT_STALE)
+    try:
+        from .policy import resolve_policy
+
+        current_policy = resolve_policy(
+            root,
+            snapshot,
+            runtime=verdict.producer_runtime,
+            request=verdict.policy.request,
+        )
+    except Exception:
+        return _decision(True, GateCode.VERDICT_INVALID)
+    if current_policy != verdict.policy:
+        return _decision(True, GateCode.VERDICT_STALE)
 
     bound_scan = scan_pr_create(command, expected_base=verdict.base_ref)
     if bound_scan.kind is not ScanKind.PR_CREATE:
@@ -221,11 +244,26 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
             True, GateCode.COMMAND_AMBIGUOUS, bound_scan.reason
         )
 
-    if set(verdict.reviewers) != set("ABC") or any(
-        slot.status != (
-            "sealed" if verdict.schema in MIXED_SLOT_VERDICT_SCHEMAS else "complete"
-        ) or slot.report is None
-        for slot in verdict.reviewers.values()
+    active = verdict.policy.active_reviewers
+    if set(verdict.reviewers) != set("ABC"):
+        return _decision(True, GateCode.VERDICT_INVALID)
+    if verdict.policy.mode is ReviewMode.OFF:
+        if (
+            verdict.round != 1
+            or verdict.gate.status is not GateStatus.SKIPPED
+            or verdict.gate.blocking_count != 0
+            or active
+            or any(slot.status != "disabled" for slot in verdict.reviewers.values())
+        ):
+            return _decision(True, GateCode.VERDICT_INVALID)
+        return _decision(False, GateCode.PASS)
+    if any(
+        verdict.reviewers[key].status != "sealed"
+        or verdict.reviewers[key].report is None
+        for key in active
+    ) or any(
+        verdict.reviewers[key].status != "disabled"
+        for key in set("ABC") - set(active)
     ):
         return _decision(True, GateCode.REVIEW_INCOMPLETE)
     if verdict.round not in {1, 2, 3}:
@@ -238,10 +276,15 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
         if verdict.round == 3:
             return _decision(True, GateCode.ROUND_LIMIT_EXHAUSTED)
         return _decision(True, GateCode.BLOCKERS_OPEN)
+    if verdict.gate.status is GateStatus.INCONCLUSIVE:
+        return _decision(True, GateCode.VERIFICATION_INCOMPLETE)
     if verdict.gate.status is not GateStatus.PASS or verdict.gate.blocking_count != 0:
         return _decision(True, GateCode.VERDICT_INVALID)
-    if any(execution.evidence_ref is not None
-           for slot in verdict.reviewers.values() for execution in slot.report.executions):
+    if any(
+        execution.evidence_ref is not None
+        for key in active
+        for execution in verdict.reviewers[key].report.executions
+    ):
         from .verdict_store import validate_stored_reviewer_report
         from .model import Reviewer
         try:

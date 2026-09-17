@@ -15,8 +15,18 @@ from urllib.parse import urlsplit
 SCHEMA_VERSION = 1
 SLOT_VERDICT_SCHEMA_VERSION = 2
 LIFECYCLE_VERDICT_SCHEMA_VERSION = 3
-VERDICT_SCHEMA_VERSION = 4
-LIFECYCLE_VERDICT_SCHEMAS = frozenset((LIFECYCLE_VERDICT_SCHEMA_VERSION, VERDICT_SCHEMA_VERSION))
+EVIDENCE_VERDICT_SCHEMA_VERSION = 4
+VERDICT_SCHEMA_VERSION = 5
+LIFECYCLE_VERDICT_SCHEMAS = frozenset(
+    (
+        LIFECYCLE_VERDICT_SCHEMA_VERSION,
+        EVIDENCE_VERDICT_SCHEMA_VERSION,
+        VERDICT_SCHEMA_VERSION,
+    )
+)
+EVIDENCE_VERDICT_SCHEMAS = frozenset(
+    (EVIDENCE_VERDICT_SCHEMA_VERSION, VERDICT_SCHEMA_VERSION)
+)
 MIXED_SLOT_VERDICT_SCHEMAS = frozenset(
     (SLOT_VERDICT_SCHEMA_VERSION, *LIFECYCLE_VERDICT_SCHEMAS)
 )
@@ -24,7 +34,7 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 3
+REPORT_TEXT_CONTRACT_VERSION = 4
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -82,6 +92,14 @@ class GateStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     PASS = "pass"
     FAIL = "fail"
+    SKIPPED = "skipped"
+    INCONCLUSIVE = "inconclusive"
+
+
+class ReviewMode(str, Enum):
+    OFF = "off"
+    SINGLE = "single"
+    ITERATIVE = "iterative"
 
 
 @dataclass(frozen=True)
@@ -216,6 +234,29 @@ class Claim:
 
 
 @dataclass(frozen=True)
+class PrimaryEntryPath:
+    path: str
+    claim_id: str
+
+    def to_json(self) -> dict[str, str]:
+        return {"path": self.path, "claim_id": self.claim_id}
+
+
+@dataclass(frozen=True)
+class ClaimCoverage:
+    complete: bool
+    primary_entry_paths: Sequence[PrimaryEntryPath]
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "complete": self.complete,
+            "primary_entry_paths": [
+                item.to_json() for item in self.primary_entry_paths
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class PriorDecisionResponse:
     decision_id: str
     outcome: str
@@ -238,16 +279,20 @@ class ReviewerReport:
     findings: Sequence[Finding]
     executions: Sequence[Execution]
     claims: Sequence[Claim]
+    coverage: ClaimCoverage | None
     prior_decisions: Sequence[PriorDecisionResponse]
 
     def to_json(self) -> dict[str, object]:
-        return {
+        value = {
             "status": "complete",
             "findings": [item.to_json() for item in self.findings],
             "executions": [item.to_json() for item in self.executions],
             "claims": [item.to_json() for item in self.claims],
             "prior_decisions": [item.to_json() for item in self.prior_decisions],
         }
+        if self.coverage is not None:
+            value["coverage"] = self.coverage.to_json()
+        return value
 
 
 @dataclass(frozen=True)
@@ -334,6 +379,16 @@ class ReviewerSlot:
             "attempt_count": self.attempt_count,
             "last_error": self.last_error,
         }
+        if self.status == "disabled":
+            if (
+                verdict_schema != VERDICT_SCHEMA_VERSION
+                or self.report is not None
+                or self.receipt is not None
+                or self.attempt_count != 0
+                or self.last_error is not None
+            ):
+                raise SchemaError("VERDICT_INVALID")
+            return base
         if self.status == "pending":
             if self.report is not None or self.receipt is not None:
                 raise SchemaError("VERDICT_INVALID")
@@ -405,6 +460,77 @@ class GateSummary:
 
 
 @dataclass(frozen=True)
+class IntensityRequest:
+    value: int
+    source: str
+    requester: str
+    reason: str
+    fail_closed_reason: str | None = None
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "value": self.value,
+            "source": self.source,
+            "requester": self.requester,
+            "reason": self.reason,
+            "fail_closed_reason": self.fail_closed_reason,
+        }
+
+
+@dataclass(frozen=True)
+class ReviewerPolicy:
+    enabled: bool
+    model: str
+
+    def to_json(self) -> dict[str, object]:
+        return {"enabled": self.enabled, "model": self.model}
+
+
+@dataclass(frozen=True)
+class PolicyBinding:
+    config_sha256: str
+    risk_floor: int
+    effective_intensity: int
+    mode: ReviewMode
+    reasons: Sequence[str]
+    request: IntensityRequest
+    reviewers: Mapping[str, ReviewerPolicy]
+
+    @property
+    def active_reviewers(self) -> tuple[str, ...]:
+        if self.mode is ReviewMode.OFF:
+            return ()
+        return tuple(key for key in "ABC" if self.reviewers[key].enabled)
+
+    def to_json(self) -> dict[str, object]:
+        if (
+            not isinstance(self.config_sha256, str)
+            or _SHA256.fullmatch(self.config_sha256) is None
+            or not isinstance(self.risk_floor, int)
+            or isinstance(self.risk_floor, bool)
+            or not 0 <= self.risk_floor <= 100
+            or not isinstance(self.effective_intensity, int)
+            or isinstance(self.effective_intensity, bool)
+            or not 0 <= self.effective_intensity <= 100
+            or self.effective_intensity < self.risk_floor
+            or not isinstance(self.mode, ReviewMode)
+            or set(self.reviewers) != set("ABC")
+        ):
+            raise SchemaError("POLICY_INVALID")
+        return {
+            "config_sha256": self.config_sha256,
+            "risk_floor": self.risk_floor,
+            "effective_intensity": self.effective_intensity,
+            "mode": self.mode.value,
+            "reasons": list(self.reasons),
+            "request": self.request.to_json(),
+            "reviewers": {
+                key: self.reviewers[key].to_json() for key in "ABC"
+            },
+        }
+
+
+@dataclass(frozen=True)
 class Verdict:
     schema: int
     repository: str
@@ -427,6 +553,7 @@ class Verdict:
     evidence_binding: EvidenceBinding | None = None
     evidence_fallback_reason: str | None = None
     evidence_contract: int | None = None
+    policy: PolicyBinding | None = None
 
     @property
     def snapshot(self) -> Snapshot:
@@ -503,7 +630,7 @@ class Verdict:
             value["contract"] = self.contract.to_json()
         if self.schema in LIFECYCLE_VERDICT_SCHEMAS:
             value["lifecycle_id"] = self.lifecycle_id
-        if self.schema == VERDICT_SCHEMA_VERSION:
+        if self.schema in EVIDENCE_VERDICT_SCHEMAS:
             value["evidence_binding"] = self.evidence_binding.to_json() if self.evidence_binding else None
             value["evidence_fallback_reason"] = self.evidence_fallback_reason
             if self.evidence_contract is not None:
@@ -511,6 +638,12 @@ class Verdict:
                     self.evidence_contract, "VERDICT_INVALID", minimum=1, maximum=2)
         elif (self.evidence_binding is not None or self.evidence_fallback_reason is not None
                 or self.evidence_contract is not None):
+            raise SchemaError("VERDICT_INVALID")
+        if self.schema == VERDICT_SCHEMA_VERSION:
+            if self.policy is None:
+                raise SchemaError("POLICY_INVALID")
+            value["policy"] = self.policy.to_json()
+        elif self.policy is not None:
             raise SchemaError("VERDICT_INVALID")
         return value
 
@@ -1005,6 +1138,46 @@ def _parse_claim(
     return Claim(identifier, statement, result, tuple(refs_raw), reason)
 
 
+def _parse_claim_coverage(
+    value: object, *, claims: Sequence[Claim]
+) -> ClaimCoverage:
+    obj = _object(
+        value,
+        {"complete", "primary_entry_paths"},
+        "CLAIM_COVERAGE_INVALID",
+    )
+    if obj["complete"] is not True or not claims:
+        raise SchemaError("CLAIM_COVERAGE_INVALID")
+    claim_ids = {claim.id for claim in claims}
+    entries: list[PrimaryEntryPath] = []
+    paths: set[str] = set()
+    referenced_claims: set[str] = set()
+    for raw in _array(
+        obj["primary_entry_paths"],
+        MAX_FINDINGS_PER_REVIEWER,
+        "CLAIM_COVERAGE_INVALID",
+    ):
+        entry = _object(
+            raw, {"path", "claim_id"}, "CLAIM_COVERAGE_INVALID"
+        )
+        try:
+            path = _path(entry["path"])
+        except SchemaError:
+            raise SchemaError("CLAIM_COVERAGE_INVALID") from None
+        claim_id = entry["claim_id"]
+        if (
+            not isinstance(claim_id, str)
+            or claim_id not in claim_ids
+            or path in paths
+            or claim_id in referenced_claims
+        ):
+            raise SchemaError("CLAIM_COVERAGE_INVALID")
+        paths.add(path)
+        referenced_claims.add(claim_id)
+        entries.append(PrimaryEntryPath(path, claim_id))
+    return ClaimCoverage(True, tuple(entries))
+
+
 def _parse_prior_response(value: object) -> PriorDecisionResponse:
     obj = _object(
         value,
@@ -1038,19 +1211,22 @@ def parse_reviewer_report(
     ):
         raise SchemaError("REPORT_SCHEMA_INVALID")
     data = _load_json(raw, limit=MAX_REPORT_BYTES, too_large="REPORT_TOO_LARGE")
+    report_keys = {
+        "schema",
+        "reviewer",
+        "round",
+        "snapshot",
+        "status",
+        "findings",
+        "executions",
+        "claims",
+        "prior_decisions",
+    }
+    if expected_reviewer is Reviewer.B and report_contract_version >= 4:
+        report_keys.add("coverage")
     obj = _object(
         data,
-        {
-            "schema",
-            "reviewer",
-            "round",
-            "snapshot",
-            "status",
-            "findings",
-            "executions",
-            "claims",
-            "prior_decisions",
-        },
+        report_keys,
         "REPORT_SCHEMA_INVALID",
     )
     if obj["schema"] != SCHEMA_VERSION or isinstance(obj["schema"], bool):
@@ -1108,6 +1284,9 @@ def parse_reviewer_report(
         raise SchemaError("CLAIM_SCHEMA_INVALID")
     if len({item.id for item in claims}) != len(claims):
         raise SchemaError("CLAIM_ID_DUPLICATE")
+    coverage = None
+    if expected_reviewer is Reviewer.B and report_contract_version >= 4:
+        coverage = _parse_claim_coverage(obj["coverage"], claims=claims)
     responses = tuple(
         _parse_prior_response(item)
         for item in _array(
@@ -1126,6 +1305,7 @@ def parse_reviewer_report(
         findings,
         executions,
         claims,
+        coverage,
         responses,
     )
 

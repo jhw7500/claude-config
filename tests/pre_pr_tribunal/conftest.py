@@ -81,6 +81,23 @@ def git_repo(tmp_path):
         env=env,
     )
     (repo / ".gitignore").write_text(".review/\n", encoding="utf-8")
+    # Existing lifecycle/evidence tests are the three-reviewer high-risk canary.
+    # Feature-specific tests create repositories without this compatibility
+    # config to exercise the v2 A/B-on, C-off default.
+    (repo / ".pre-pr-tribunal.toml").write_text(
+        "[policy]\n"
+        '"**" = "iterative"\n'
+        "[reviewer.A]\n"
+        "enabled = true\n"
+        "model = { claude = \"inherit\", codex = \"inherit\" }\n"
+        "[reviewer.B]\n"
+        "enabled = true\n"
+        "model = { claude = \"inherit\", codex = \"inherit\" }\n"
+        "[reviewer.C]\n"
+        "enabled = true\n"
+        "model = { claude = \"inherit\", codex = \"inherit\" }\n",
+        encoding="utf-8",
+    )
     (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
     subprocess.run(
         ["/usr/bin/git", "-C", str(repo), "add", "."], check=True, env=env

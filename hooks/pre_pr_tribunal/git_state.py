@@ -328,6 +328,21 @@ def _sha(raw: bytes, code: str = "GIT_STATE_INVALID") -> str:
     return value
 
 
+def commit_tree_sha(cwd: Path, commit_sha: str) -> str:
+    """Resolve a validated commit to its immutable tree identity."""
+    if not isinstance(commit_sha, str) or _SHA1.fullmatch(commit_sha) is None:
+        raise GitStateError("GIT_STATE_INVALID")
+    root = _physical_root(_validated_cwd(cwd))
+    return _sha(
+        _command_output(
+            root,
+            ("rev-parse", "--verify", f"{commit_sha}^{{tree}}"),
+            failure="SNAPSHOT_CHANGED",
+        ),
+        "SNAPSHOT_CHANGED",
+    )
+
+
 def _valid_schema_text(value: object, maximum: int) -> bool:
     if not isinstance(value, str) or not value:
         return False
@@ -651,7 +666,14 @@ def capture_snapshot(
     revision_range = f"{merge_base_sha}..{head_sha}"
     name_status = _command_output(
         root,
-        ("diff", "--name-status", "-z", "--find-renames", revision_range),
+        (
+            "diff",
+            "--name-status",
+            "-z",
+            "--find-renames",
+            "--find-copies-harder",
+            revision_range,
+        ),
     )
     paths = _changed_paths(name_status)
     if not paths:
@@ -665,12 +687,12 @@ def capture_snapshot(
     if _DIFF_SHA256.fullmatch(diff_sha256) is None:
         raise GitStateError("GIT_STATE_INVALID")
 
-    initial_paths = {
-        path
+    initial_paths = {item.path for item in paths}
+    initial_paths.update(
+        item.old_path
         for item in paths
-        for path in (item.path, item.old_path)
-        if path is not None
-    }
+        if item.status.startswith("R") and item.old_path is not None
+    )
     if len(initial_paths) > MAX_INITIAL_PATHS:
         raise GitStateError("GIT_STATE_INVALID")
     ordered_initial_paths = tuple(

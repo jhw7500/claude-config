@@ -9,7 +9,13 @@ import pytest
 
 from pre_pr_tribunal import cli
 from pre_pr_tribunal.telemetry import read_ledger
-from pre_pr_tribunal.model import Reviewer, Snapshot, parse_decisions, parse_reviewer_report
+from pre_pr_tribunal.model import (
+    REPORT_TEXT_CONTRACT_VERSION,
+    Reviewer,
+    Snapshot,
+    parse_decisions,
+    parse_reviewer_report,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2] / "skills" / "pre-pr-tribunal"
@@ -85,18 +91,17 @@ def test_skill_encodes_the_exact_ordered_ten_step_state_machine():
     assert "Agent" in steps[2]
     assert "begin --base" in steps[3] and "--decisions" in steps[3]
     assert CLI in steps[3]
-    assert CLI in steps[4]
-    assert "context --reviewer A" in steps[4]
-    assert "context --reviewer B" in steps[4]
-    assert "context --reviewer C" in steps[4]
-    assert "exactly three" in steps[5] and "parallel" in steps[5]
+    assert "installed CLI" in steps[4]
+    assert "context --reviewer X" in steps[4]
+    assert "active_reviewers" in steps[4]
+    assert "active" in steps[5] and "parallel" in steps[5]
     assert "peer" in steps[5]
-    assert "all three" in steps[6] and "terminal" in steps[6]
+    assert "Every active role" in steps[6] and "terminal" in steps[6]
     assert "malformed" in steps[6] and "non-pass" in steps[6]
     assert 'cli.py" finalize' in steps[7]
     assert "finalize --reviewer-a" not in steps[7]
     assert CLI in steps[7]
-    assert "no decisions" in steps[7]
+    assert "active sealed receipts" in steps[7]
     assert "never execute" in steps[8] and "verbatim" in steps[8]
     assert "initial_paths" in steps[9] and "review-fix round N" in steps[9]
     assert "one decision" in steps[10] and "round 4" in steps[10]
@@ -142,7 +147,7 @@ def test_skill_requires_detached_per_reviewer_views_and_bounded_failure_cleanup(
     body = view_contract.group(1)
     assert "git worktree add --detach" in steps[5]
     assert "BOUND_HEAD" in steps[5]
-    assert "VIEW_A" in steps[5] and "VIEW_B" in steps[5] and "VIEW_C" in steps[5]
+    assert "VIEW_X" in steps[5] and "active reviewer" in steps[5]
     assert "dedicated cwd" in steps[5]
     assert "not an OS security sandbox" in body
     assert "does not expose a cwd argument" in body
@@ -260,12 +265,12 @@ def test_skill_enforces_fix_rebuttal_boundaries_and_three_round_stop():
         "Reviewer A",
         "Reviewer B",
         "Reviewer C",
-        "병렬",
+        "parallel",
         "peer",
         "최대 3",
         "CRITICAL",
         "HIGH",
-        "새 dependency",
+        "new dependency",
         "secret",
     ):
         assert token in skill
@@ -276,12 +281,12 @@ def test_skill_enforces_fix_rebuttal_boundaries_and_three_round_stop():
 def test_each_reviewer_prompt_is_read_only_self_contained_and_exactly_bounded():
     expected_mandates = {
         "references/reviewer-a.md": ("correctness", "security"),
-        "references/reviewer-b.md": ("실행", "증명"),
-        "references/reviewer-c.md": ("더 작은", "범위"),
+        "references/reviewer-b.md": ("execution", "primary entry path"),
+        "references/reviewer-c.md": ("irreversible", "scope"),
     }
     for name, mandates in expected_mandates.items():
         body = text(name)
-        assert "source를 수정하지" in body
+        assert "read-only" in body
         assert "report-schema.md 없이도" in body
         assert "128 KiB" in body
         assert "8 KiB" in body
@@ -429,13 +434,15 @@ def test_pending_recovery_uses_status_driven_command_sequence():
     assert "verdict_schema == 1" in body
     assert "verdict_schema == 2" in body
     assert "verdict_schema == 3" in body
+    assert "verdict_schema == 4" in body
+    assert "verdict_schema == 5" in body
     assert "reviewer/subset" in body
 
 
 def test_pending_recovery_documents_exact_migration_route_by_schema():
     migration_command_by_schema = {}
     for line in pending_recovery_contract().splitlines():
-        match = re.match(r"- If `verdict_schema == ([1234])`, (.*)", line)
+        match = re.match(r"- If `verdict_schema == ([12345])`, (.*)", line)
         if match is None:
             continue
         command = re.search(r"run `([^`]+)`", match.group(2))
@@ -447,6 +454,7 @@ def test_pending_recovery_documents_exact_migration_route_by_schema():
         2: "migrate-v2-pending",
         3: None,
         4: None,
+        5: None,
     }
 
 
@@ -459,7 +467,7 @@ def test_operational_failure_policy_does_not_weaken_the_gate():
         "ATTEMPTS_THIS_INVOCATION[X]",
         "maximum 3 attempts",
         "REVIEWER_UNAVAILABLE",
-        "never pass with only two sealed slots",
+        "never pass with an unsealed active slot",
         "DISPATCH_FAILED",
         "REVIEWER_FAILED",
         "REVIEWER_TIMEOUT",
@@ -486,15 +494,16 @@ def test_observation_and_terminal_cleanup_failures_are_warnings_only():
         assert token in skill
 
 
-def test_report_reference_documents_v4_shapes_and_real_controller_commands():
+def test_report_reference_documents_v5_shapes_and_real_controller_commands():
     schema = text("references/report-schema.md")
-    status = json_example(schema, "v4-status")
-    assert set(status) == {
+    status = json_example(schema, "v5-status")
+    assert {
         "round", "gate_status", "blocking_count", "verdict_path",
-        "verdict_schema", "reviewers",
-    }
-    assert status["verdict_schema"] == 4
-    assert status['reviewers']['A']['report_contract_version'] == 3
+        "verdict_schema", "reviewers", "active_reviewers",
+    }.issubset(status)
+    assert status["verdict_schema"] == 5
+    assert status["active_reviewers"] == ["A", "B"]
+    assert status['reviewers']['A']['report_contract_version'] == REPORT_TEXT_CONTRACT_VERSION
     assert status["reviewers"]["A"]["state"] == "sealed"
     assert set(status["reviewers"]["A"]) == {
         "state", "attempt_count", "last_error", "raw_sha256",
@@ -504,13 +513,13 @@ def test_report_reference_documents_v4_shapes_and_real_controller_commands():
         "state", "attempt_count", "last_error",
     }
 
-    receipt = json_example(schema, "v4-submit-receipt")
+    receipt = json_example(schema, "v5-submit-receipt")
     assert set(receipt) == {
         "reviewer", "round", "state", "raw_sha256", "context_sha256",
         "report_contract_version", "attempt", "provenance",
     }
     assert receipt["state"] == "sealed"
-    assert receipt['report_contract_version'] == 3
+    assert receipt['report_contract_version'] == REPORT_TEXT_CONTRACT_VERSION
 
     match = re.search(
         r"<!-- controller-command-examples -->(.*?)"
@@ -539,11 +548,11 @@ def test_report_reference_documents_v4_shapes_and_real_controller_commands():
     assert reasons == {"DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"}
 
 
-def test_report_reference_documents_internal_v4_lifecycle_identity():
+def test_report_reference_documents_internal_v5_lifecycle_identity():
     stored_verdict = json_example(
-        text("references/report-schema.md"), "v4-stored-verdict",
+        text("references/report-schema.md"), "v5-stored-verdict",
     )
-    assert stored_verdict["schema"] == 4
+    assert stored_verdict["schema"] == 5
     assert stored_verdict['evidence_contract'] == 2
     assert stored_verdict['evidence_binding'] is None
     assert stored_verdict['evidence_fallback_reason'] is None
@@ -709,7 +718,7 @@ def test_skill_interrupted_lifecycle_recovers_then_closes_without_changing_gate(
 def test_empirical_reviewer_forbids_unsupported_claims_and_requires_capture_fields():
     reviewer = text("references/reviewer-b.md")
     for token in (
-        "추론만으로",
+        "Inference alone",
         "command",
         "exit_code",
         "stdout_excerpt",
@@ -729,7 +738,8 @@ def test_documented_report_and_decision_examples_pass_the_real_strict_parsers():
         ("valid-reviewer-c", Reviewer.C),
     ):
         value = json_example(schema, label)
-        assert set(value) == REPORT_KEYS
+        expected_keys = REPORT_KEYS | ({"coverage"} if reviewer is Reviewer.B else set())
+        assert set(value) == expected_keys
         parsed = parse_reviewer_report(
             json.dumps(value).encode(),
             expected_reviewer=reviewer,
@@ -757,13 +767,13 @@ def test_documented_report_and_decision_examples_pass_the_real_strict_parsers():
         assert parsed[0].disposition == label.removeprefix("valid-").removesuffix("-decision")
 
 
-def test_each_reviewer_carries_a_standalone_parser_valid_empty_report():
-    for name, reviewer in (
-        ("references/reviewer-a.md", Reviewer.A),
-        ("references/reviewer-b.md", Reviewer.B),
-        ("references/reviewer-c.md", Reviewer.C),
+def test_each_reviewer_carries_a_standalone_parser_valid_report():
+    for name, reviewer, label in (
+        ("references/reviewer-a.md", Reviewer.A, "standalone-empty-report"),
+        ("references/reviewer-b.md", Reviewer.B, "standalone-complete-report"),
+        ("references/reviewer-c.md", Reviewer.C, "standalone-empty-report"),
     ):
-        value = json_example(text(name), "standalone-empty-report")
+        value = json_example(text(name), label)
         parsed = parse_reviewer_report(
             json.dumps(value).encode(),
             expected_reviewer=reviewer,
@@ -771,6 +781,7 @@ def test_each_reviewer_carries_a_standalone_parser_valid_empty_report():
             snapshot=SNAPSHOT,
         )
         assert parsed.findings == ()
+        assert bool(parsed.claims) is (reviewer is Reviewer.B)
 
 
 def test_findings_may_report_normalized_repository_paths_outside_the_diff():
