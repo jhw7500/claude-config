@@ -734,7 +734,24 @@ def _elapsed(run: TelemetryRun, span: TelemetrySpan) -> int | None:
     return (span.ended_monotonic_ns - run.started_monotonic_ns) // 1_000_000
 
 
-def _early_detection(run: TelemetryRun) -> dict[str, object] | None:
+def _active_reviewers(cwd: Path, run: TelemetryRun) -> tuple[Reviewer, ...]:
+    fallback = tuple(Reviewer)
+    if run.lifecycle_id is None:
+        return fallback
+    try:
+        from .verdict_store import read_verdict
+
+        verdict = read_verdict(cwd)
+    except (OSError, TribunalError):
+        return fallback
+    if verdict.lifecycle_id != run.lifecycle_id or verdict.policy is None:
+        return fallback
+    return tuple(Reviewer(value) for value in verdict.policy.active_reviewers)
+
+
+def _early_detection(
+    run: TelemetryRun, active_reviewers: tuple[Reviewer, ...]
+) -> dict[str, object] | None:
     # v2 submit-report validates before publication inside the report_store span.
     failures = [
         item for item in run.spans
@@ -746,11 +763,11 @@ def _early_detection(run: TelemetryRun) -> dict[str, object] | None:
     failed = min(failures, key=lambda item: item.ended_monotonic_ns)
     detected = _elapsed(run, failed)
     milestones = []
-    for reviewer in Reviewer:
+    for reviewer in active_reviewers:
         totals = [item for item in run.spans if item.stage is TelemetryStage.REVIEWER_TOTAL and item.reviewer is reviewer]
         latest = max(enumerate(totals), key=lambda pair: (pair[1].attempt, pair[0]))[1] if totals else None
         milestones.append(_elapsed(run, latest) if latest else None)
-    terminal = max(milestones) if all(item is not None for item in milestones) else None
+    terminal = max(milestones) if milestones and all(item is not None for item in milestones) else None
     delay = terminal - detected if terminal is not None and detected is not None and terminal >= detected else None
     return {
         "reviewer": failed.reviewer.value, "reason_code": failed.reason_code,
@@ -782,7 +799,7 @@ def summarize_run(cwd: Path, *, run_id: str | None = None) -> dict[str, object]:
         "anomaly_reason_codes": sorted({item.reason_code for item in run.spans if item.outcome is TelemetryOutcome.CLOCK_ANOMALY}
                                        | ({run.reason_code} if run.outcome is TelemetryOutcome.CLOCK_ANOMALY else set())
                                        | ({_ANOMALY} if _invocation_clock_anomaly(run) else set())),
-        "early_detection": _early_detection(run),
+        "early_detection": _early_detection(run, _active_reviewers(cwd, run)),
         "recovery": _recovery(run),
         "invocation_elapsed_ms": _invocation_elapsed(run),
         "evidence": summarize_evidence(cwd, run),

@@ -371,12 +371,14 @@ def _report_projection(
     }
 
 
-def _require_all_pending(verdict) -> None:
+def _require_all_pending(verdict, reviewer: Reviewer | None = None) -> None:
     active = (
         verdict.policy.active_reviewers
         if verdict.schema == VERDICT_SCHEMA_VERSION and verdict.policy is not None
         else tuple("ABC")
     )
+    if reviewer is not None and reviewer.value not in active:
+        raise TribunalError("REVIEWER_DISABLED")
     if verdict.gate.status.value != "in_progress" or any(
         verdict.reviewers[key].status != "pending" for key in active
     ):
@@ -523,7 +525,7 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 payload = _report_projection(reviewer, parsed.round, "valid", digest)
             else:
                 verdict = read_verdict(cwd)
-                _require_all_pending(verdict)
+                _require_all_pending(verdict, reviewer)
                 snapshot = capture_snapshot(cwd, verdict.base_ref)
                 if not _snapshot_equal(verdict, snapshot):
                     raise TribunalError("SNAPSHOT_CHANGED")
