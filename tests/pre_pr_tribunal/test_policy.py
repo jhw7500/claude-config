@@ -186,6 +186,24 @@ def test_only_documentation_paths_are_off(tmp_path):
         assert decision.code is GateCode.REVIEW_INCOMPLETE
 
 
+@pytest.mark.parametrize(
+    "path",
+    (
+        ".github/dependabot.yml",
+        ".github/dependabot.yaml",
+    ),
+)
+def test_dependency_control_paths_are_iterative(tmp_path, path):
+    repo = _repo(tmp_path, path=path)
+    verdict = begin_round(
+        repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+
+    assert verdict.policy.risk_floor == 100
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert f"sensitive-file:{path}" in verdict.policy.reasons
+
+
 def test_reviewer_b_requires_complete_claim_coverage_before_sealing(tmp_path):
     repo = _repo(tmp_path)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)

@@ -112,6 +112,8 @@ _HIGH_BASENAMES = frozenset(
         CONFIG_NAME,
         "cargo.lock",
         "composer.lock",
+        "dependabot.yaml",
+        "dependabot.yml",
         "gemfile.lock",
         "go.mod",
         "go.sum",
