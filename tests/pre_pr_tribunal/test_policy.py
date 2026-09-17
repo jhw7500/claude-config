@@ -8,7 +8,11 @@ import pytest
 
 from pre_pr_tribunal.cli import _parser, _status
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
-from pre_pr_tribunal.git_state import capture_snapshot
+from pre_pr_tribunal.git_state import (
+    GitStateError,
+    assert_auto_fix_scope,
+    capture_snapshot,
+)
 from pre_pr_tribunal.model import GateStatus, ReviewMode, Reviewer, SchemaError
 from pre_pr_tribunal.policy import parse_intensity_request, parse_policy_binding
 from pre_pr_tribunal.verdict_store import (
@@ -215,6 +219,13 @@ def test_copy_into_documentation_path_is_iterative(tmp_path):
     assert [(item.status, item.path, item.old_path) for item in snapshot.paths] == [
         ("C100", "docs/copied.md", "src/app.py")
     ]
+    assert snapshot.initial_paths == ("docs/copied.md",)
+    assert_auto_fix_scope(snapshot.initial_paths, ("docs/copied.md",))
+    with pytest.raises(GitStateError, match="^AUTO_FIX_SCOPE_EXPANDED$"):
+        assert_auto_fix_scope(
+            snapshot.initial_paths,
+            ("docs/copied.md", "src/app.py"),
+        )
     assert verdict.policy.risk_floor == 100
     assert verdict.policy.mode is ReviewMode.ITERATIVE
 
@@ -594,6 +605,14 @@ def test_single_failure_requires_changed_snapshot_for_round_one_retry(tmp_path):
     with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
         begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     _git(repo, "commit", "--allow-empty", "-qm", "metadata only")
+    with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    _git(repo, "branch", "base-metadata", "refs/remotes/origin/master")
+    _git(repo, "checkout", "-q", "base-metadata")
+    _git(repo, "commit", "--allow-empty", "-qm", "base metadata only")
+    _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+    _git(repo, "checkout", "-q", "feature")
+    _git(repo, "branch", "-D", "base-metadata")
     with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
         begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     _write(repo, "src/app.py", "fixed\n")

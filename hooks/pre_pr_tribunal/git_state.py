@@ -672,12 +672,12 @@ def capture_snapshot(
     if _DIFF_SHA256.fullmatch(diff_sha256) is None:
         raise GitStateError("GIT_STATE_INVALID")
 
-    initial_paths = {
-        path
+    initial_paths = {item.path for item in paths}
+    initial_paths.update(
+        item.old_path
         for item in paths
-        for path in (item.path, item.old_path)
-        if path is not None
-    }
+        if item.status.startswith("R") and item.old_path is not None
+    )
     if len(initial_paths) > MAX_INITIAL_PATHS:
         raise GitStateError("GIT_STATE_INVALID")
     ordered_initial_paths = tuple(

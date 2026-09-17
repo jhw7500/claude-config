@@ -908,12 +908,10 @@ def _snapshot_equal(verdict: Verdict, snapshot: Snapshot) -> bool:
 def _review_content_equal(verdict: Verdict, snapshot: Snapshot) -> bool:
     return (
         verdict.repository,
-        verdict.base_sha,
         verdict.merge_base_sha,
         verdict.diff_sha256,
     ) == (
         snapshot.repository,
-        snapshot.base_sha,
         snapshot.merge_base_sha,
         snapshot.diff_sha256,
     )
