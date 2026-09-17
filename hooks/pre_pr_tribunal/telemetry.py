@@ -269,7 +269,7 @@ def _parse_binding(value: object) -> TelemetryBinding:
         supported = SUPPORTED_TELEMETRY_SCHEMAS if name == "telemetry_schema" else (expected,)
         if name == 'report_text':
             # Historical observation reading never upgrades pending round authority.
-            supported = (2, REPORT_TEXT_CONTRACT_VERSION)
+            supported = range(2, REPORT_TEXT_CONTRACT_VERSION + 1)
         _require(type(contract[name]) is int and contract[name] in supported)
     for name in ("repository", "base_sha", "head_ref", "head_sha", "merge_base_sha", "diff_sha256"):
         value = obj[name]

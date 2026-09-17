@@ -397,11 +397,18 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
 
 
 def _parse_embedded_report(
-    value: object, *, reviewer: str, fields: _VerdictFields
+    value: object,
+    *,
+    reviewer: str,
+    fields: _VerdictFields,
+    report_contract_version: int,
 ) -> ReviewerReport:
+    report_keys = {"status", "findings", "executions", "claims", "prior_decisions"}
+    if reviewer == "B" and report_contract_version >= 4:
+        report_keys.add("coverage")
     completed = m._object(
         value,
-        {"status", "findings", "executions", "claims", "prior_decisions"},
+        report_keys,
         "VERDICT_INVALID",
     )
     report_value = {
@@ -421,9 +428,7 @@ def _parse_embedded_report(
         expected_reviewer=Reviewer(reviewer),
         expected_round=fields.round,
         snapshot=fields.snapshot,
-        report_contract_version=(
-            3 if fields.schema in m.EVIDENCE_VERDICT_SCHEMAS else 2
-        ),
+        report_contract_version=report_contract_version,
     )
 
 
@@ -482,8 +487,19 @@ def _parse_verdict_v1(data: dict[str, object]) -> Verdict:
         ):
             reviewers[key] = ReviewerSlot("pending")
         else:
+            report_contract_version = (
+                4
+                if key == "B" and isinstance(slot, dict) and "coverage" in slot
+                else 2
+            )
             reviewers[key] = ReviewerSlot(
-                "complete", _parse_embedded_report(slot, reviewer=key, fields=fields)
+                "complete",
+                _parse_embedded_report(
+                    slot,
+                    reviewer=key,
+                    fields=fields,
+                    report_contract_version=report_contract_version,
+                ),
             )
     pending_count = sum(slot.status == "pending" for slot in reviewers.values())
     if pending_count not in {0, 3}:
@@ -629,7 +645,12 @@ def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
             continue
         if state != "sealed" or attempt_count < 1 or last_error is not None:
             raise SchemaError("VERDICT_INVALID")
-        report = _parse_embedded_report(slot["report"], reviewer=key, fields=fields)
+        report = _parse_embedded_report(
+            slot["report"],
+            reviewer=key,
+            fields=fields,
+            report_contract_version=contract.report_text,
+        )
         receipt = _parse_v2_receipt(
             slot["receipt"],
             reviewer=key,

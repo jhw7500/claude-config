@@ -86,16 +86,26 @@ _SOURCE_SUFFIXES = frozenset(
 )
 _DOC_SUFFIXES = frozenset({".md", ".mdx", ".rst", ".txt"})
 _HIGH_PREFIXES = (
+    ".codex/",
+    ".config/",
     ".github/workflows/",
+    ".omx/",
     "auth/",
+    "claude-md/",
+    "commands/",
+    "config/",
+    "configs/",
+    "data/",
     "database/",
     "deploy/",
     "deployment/",
     "hooks/",
     "infra/",
+    "manifest/",
     "migrations/",
     "scripts/install",
     "scripts/deploy",
+    "skills/",
 )
 _HIGH_BASENAMES = frozenset(
     {
@@ -485,9 +495,7 @@ def _path_floor(path: str) -> tuple[int, str]:
         return 100, f"dependency-or-deploy:{path}"
     if any(lower.startswith(prefix) for prefix in _HIGH_PREFIXES):
         return 100, f"sensitive-path:{path}"
-    if suffix == ".md" or (
-        lower.startswith(("docs/", "doc/")) and suffix in _DOC_SUFFIXES
-    ):
+    if lower.startswith(("docs/", "doc/")) and suffix in _DOC_SUFFIXES:
         return 0, f"documentation:{path}"
     if suffix in _SOURCE_SUFFIXES:
         return 50, f"source:{path}"

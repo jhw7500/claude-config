@@ -25,6 +25,13 @@ def test_evidence_usage_is_authenticated_and_claim_subset_is_separate(git_repo):
     assert before['fresh_execution_count'] is None
     execution = reused(git_repo, frozen)
     raw = json.loads(raw_report(verdict, 'B', execution))
+    raw['claims'] = [{
+        'id': 'B-R1-C999',
+        'statement': 'The reused entry is not claimed by this report.',
+        'result': 'unverified',
+        'execution_ids': [],
+        'reason': 'This test isolates unreferenced evidence accounting.',
+    }]
     fresh = dict(execution, id='B-R1-E002'); fresh.pop('evidence_ref')
     raw['executions'].append(fresh)
     submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=json.dumps(raw).encode())
@@ -75,7 +82,16 @@ def test_always_fresh_entries_are_rejected_not_reused(node_repo):
     frozen = runtime.freeze_evidence(node_repo, base='master', receipt_sha256s=[capture['receipt_sha256']])
     verdict = begin(node_repo, frozen['bundle_sha256'])
     run_id = observed_run(node_repo, verdict)
-    submit_reviewer_report(node_repo, reviewer=Reviewer.B, raw=raw_report(verdict, 'B'))
+    raw = json.loads(raw_report(verdict, 'B'))
+    raw['executions'] = []
+    raw['claims'] = [{
+        'id': 'B-R1-C999',
+        'statement': 'The always-fresh path could not be reused.',
+        'result': 'unverified',
+        'execution_ids': [],
+        'reason': 'The evidence contract requires a fresh execution.',
+    }]
+    submit_reviewer_report(node_repo, reviewer=Reviewer.B, raw=json.dumps(raw).encode())
     result = telemetry.summarize_run(node_repo, run_id=run_id)['evidence']
     assert result['eligible_entry_count'] == 0
     assert result['rejected_entry_count'] == 1

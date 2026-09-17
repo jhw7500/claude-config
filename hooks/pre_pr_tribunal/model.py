@@ -34,7 +34,7 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 3
+REPORT_TEXT_CONTRACT_VERSION = 4
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -234,6 +234,29 @@ class Claim:
 
 
 @dataclass(frozen=True)
+class PrimaryEntryPath:
+    path: str
+    claim_id: str
+
+    def to_json(self) -> dict[str, str]:
+        return {"path": self.path, "claim_id": self.claim_id}
+
+
+@dataclass(frozen=True)
+class ClaimCoverage:
+    complete: bool
+    primary_entry_paths: Sequence[PrimaryEntryPath]
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "complete": self.complete,
+            "primary_entry_paths": [
+                item.to_json() for item in self.primary_entry_paths
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class PriorDecisionResponse:
     decision_id: str
     outcome: str
@@ -256,16 +279,20 @@ class ReviewerReport:
     findings: Sequence[Finding]
     executions: Sequence[Execution]
     claims: Sequence[Claim]
+    coverage: ClaimCoverage | None
     prior_decisions: Sequence[PriorDecisionResponse]
 
     def to_json(self) -> dict[str, object]:
-        return {
+        value = {
             "status": "complete",
             "findings": [item.to_json() for item in self.findings],
             "executions": [item.to_json() for item in self.executions],
             "claims": [item.to_json() for item in self.claims],
             "prior_decisions": [item.to_json() for item in self.prior_decisions],
         }
+        if self.coverage is not None:
+            value["coverage"] = self.coverage.to_json()
+        return value
 
 
 @dataclass(frozen=True)
@@ -1111,6 +1138,46 @@ def _parse_claim(
     return Claim(identifier, statement, result, tuple(refs_raw), reason)
 
 
+def _parse_claim_coverage(
+    value: object, *, claims: Sequence[Claim]
+) -> ClaimCoverage:
+    obj = _object(
+        value,
+        {"complete", "primary_entry_paths"},
+        "CLAIM_COVERAGE_INVALID",
+    )
+    if obj["complete"] is not True or not claims:
+        raise SchemaError("CLAIM_COVERAGE_INVALID")
+    claim_ids = {claim.id for claim in claims}
+    entries: list[PrimaryEntryPath] = []
+    paths: set[str] = set()
+    referenced_claims: set[str] = set()
+    for raw in _array(
+        obj["primary_entry_paths"],
+        MAX_FINDINGS_PER_REVIEWER,
+        "CLAIM_COVERAGE_INVALID",
+    ):
+        entry = _object(
+            raw, {"path", "claim_id"}, "CLAIM_COVERAGE_INVALID"
+        )
+        try:
+            path = _path(entry["path"])
+        except SchemaError:
+            raise SchemaError("CLAIM_COVERAGE_INVALID") from None
+        claim_id = entry["claim_id"]
+        if (
+            not isinstance(claim_id, str)
+            or claim_id not in claim_ids
+            or path in paths
+            or claim_id in referenced_claims
+        ):
+            raise SchemaError("CLAIM_COVERAGE_INVALID")
+        paths.add(path)
+        referenced_claims.add(claim_id)
+        entries.append(PrimaryEntryPath(path, claim_id))
+    return ClaimCoverage(True, tuple(entries))
+
+
 def _parse_prior_response(value: object) -> PriorDecisionResponse:
     obj = _object(
         value,
@@ -1144,19 +1211,22 @@ def parse_reviewer_report(
     ):
         raise SchemaError("REPORT_SCHEMA_INVALID")
     data = _load_json(raw, limit=MAX_REPORT_BYTES, too_large="REPORT_TOO_LARGE")
+    report_keys = {
+        "schema",
+        "reviewer",
+        "round",
+        "snapshot",
+        "status",
+        "findings",
+        "executions",
+        "claims",
+        "prior_decisions",
+    }
+    if expected_reviewer is Reviewer.B and report_contract_version >= 4:
+        report_keys.add("coverage")
     obj = _object(
         data,
-        {
-            "schema",
-            "reviewer",
-            "round",
-            "snapshot",
-            "status",
-            "findings",
-            "executions",
-            "claims",
-            "prior_decisions",
-        },
+        report_keys,
         "REPORT_SCHEMA_INVALID",
     )
     if obj["schema"] != SCHEMA_VERSION or isinstance(obj["schema"], bool):
@@ -1214,6 +1284,9 @@ def parse_reviewer_report(
         raise SchemaError("CLAIM_SCHEMA_INVALID")
     if len({item.id for item in claims}) != len(claims):
         raise SchemaError("CLAIM_ID_DUPLICATE")
+    coverage = None
+    if expected_reviewer is Reviewer.B and report_contract_version >= 4:
+        coverage = _parse_claim_coverage(obj["coverage"], claims=claims)
     responses = tuple(
         _parse_prior_response(item)
         for item in _array(
@@ -1232,6 +1305,7 @@ def parse_reviewer_report(
         findings,
         executions,
         claims,
+        coverage,
         responses,
     )
 

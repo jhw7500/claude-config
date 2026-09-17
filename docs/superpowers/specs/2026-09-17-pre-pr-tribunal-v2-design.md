@@ -154,7 +154,9 @@ intentionally distinct from both a code defect and a successful review.
 Reviewer B must enumerate primary documented entry paths and represent every
 one as supported, refuted, or unverified. Authenticated reusable evidence keeps
 its existing provenance rules; unsafe or unavailable execution never becomes
-support by inference.
+support by inference. Report contract 4 requires at least one empirical claim
+and an explicit complete primary-entry-path-to-claim mapping before Reviewer B
+can seal, so an empty report cannot authorize PASS.
 
 ## Reviewer independence and scope
 

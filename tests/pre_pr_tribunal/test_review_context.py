@@ -51,6 +51,27 @@ def _sealed_slot(verdict, reviewer):
         "claims": [],
         "prior_decisions": [],
     }
+    if reviewer is Reviewer.B:
+        stdout = "1 passed"
+        value.update({
+            "executions": [{
+                "id": f"B-R{verdict.round}-E999",
+                "command": "python3 -c print-ok",
+                "exit_code": 0,
+                "stdout_excerpt": stdout,
+                "stderr_excerpt": "",
+                "capture_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+                "truncated": False,
+            }],
+            "claims": [{
+                "id": f"B-R{verdict.round}-C999",
+                "statement": "The reviewed behavior is executable.",
+                "result": "supported",
+                "execution_ids": [f"B-R{verdict.round}-E999"],
+                "reason": "",
+            }],
+            "coverage": {"complete": True, "primary_entry_paths": []},
+        })
     raw = json.dumps(value, separators=(",", ":")).encode()
     parsed = parse_reviewer_report(
         raw,

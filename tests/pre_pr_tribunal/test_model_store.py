@@ -83,8 +83,25 @@ def report(
     executions=(),
     claims=(),
     prior_decisions=(),
+    coverage=None,
+    populate_b=True,
 ):
-    return {
+    executions = list(executions)
+    claims = list(claims)
+    if reviewer == "B" and populate_b:
+        if not claims:
+            execution_id = f"B-R{round_number}-E999"
+            executions.append(execution(execution_id))
+            claims.append({
+                "id": f"B-R{round_number}-C999",
+                "statement": "The reviewed behavior is executable.",
+                "result": "supported",
+                "execution_ids": [execution_id],
+                "reason": "",
+            })
+        if coverage is None:
+            coverage = {"complete": True, "primary_entry_paths": []}
+    value = {
         "schema": 1,
         "reviewer": reviewer,
         "round": round_number,
@@ -94,10 +111,13 @@ def report(
         },
         "status": "complete",
         "findings": list(findings),
-        "executions": list(executions),
-        "claims": list(claims),
+        "executions": executions,
+        "claims": claims,
         "prior_decisions": list(prior_decisions),
     }
+    if reviewer == "B" and coverage is not None:
+        value["coverage"] = coverage
+    return value
 
 
 def write_json(path, value):
@@ -174,7 +194,13 @@ def test_finalize_authenticates_every_sealed_receipt(git_repo, tamper, reviewer,
             payload["reviewers"][reviewer]["receipt"]["context_sha256"] = "0" * 64
             expected = "CONTEXT_DRIFT"
         elif tamper == "parsed":
-            payload["reviewers"][reviewer]["report"]["executions"] = [execution(f"{reviewer}-R1-E001")]
+            stored_executions = payload["reviewers"][reviewer]["report"]["executions"]
+            if reviewer == "B":
+                stored_executions[0]["command"] = "python3 -m pytest -q changed"
+            else:
+                payload["reviewers"][reviewer]["report"]["executions"] = [
+                    execution(f"{reviewer}-R1-E001")
+                ]
             expected = "REPORT_RECEIPT_MISMATCH"
         else:
             payload["contract"]["diff_recipe"] = 99
@@ -1078,6 +1104,10 @@ def test_non_excerpt_text_keeps_rejecting_lf_and_tab(snapshot, control, field, v
         report_value["findings"] = [finding_value]
     elif field in {"statement", "reason"}:
         report_value["reviewer"] = "B"
+        report_value["coverage"] = {
+            "complete": True,
+            "primary_entry_paths": [],
+        }
         item["id"] = "B-R1-E001"
         report_value["claims"] = [
             {
@@ -2071,7 +2101,7 @@ def test_pending_slot_recovers_from_invalid_text_preserving_sealed_blockers(
     assert all(slot.status == "sealed" for slot in recovered.reviewers.values())
 
 
-def test_empty_reports_pass_and_round_one_restart_resets_pending(git_repo):
+def test_complete_reports_pass_and_round_one_restart_resets_pending(git_repo):
     pending = begin_round(
         git_repo, base="master", runtime="claude", round_number=1, now=NOW
     )
@@ -2359,6 +2389,17 @@ def test_oversized_combined_verdict_does_not_replace_pending_state(git_repo):
             item["rationale"] = "x" * 7000
             findings.append(item)
         overrides[reviewer] = {"findings": findings, "executions": evidence}
+        if reviewer == "B":
+            overrides[reviewer].update({
+                "claims": [{
+                    "id": "B-R1-C001",
+                    "statement": "The reviewed behavior is executable.",
+                    "result": "supported",
+                    "execution_ids": ["B-R1-E001"],
+                    "reason": "",
+                }],
+                "coverage": {"complete": True, "primary_entry_paths": []},
+            })
     with pytest.raises(SchemaError, match="VERDICT_TOO_LARGE"):
         finalize_round(
             git_repo,
@@ -2987,7 +3028,10 @@ def test_cli_json_only_success_and_bounded_domain_error(git_repo):
         item["reviewer"] == "A" for item in context_payload["own_decisions"]
     )
     assert "stdout_excerpt" not in json.dumps(context_payload)
-    assert context_payload["contract"] == {"report_text": 3, "diff_recipe": 1}
+    assert context_payload["contract"] == {
+        "report_text": REPORT_TEXT_CONTRACT_VERSION,
+        "diff_recipe": 1,
+    }
     assert context_payload["diff_contract"] == {
         "version": 1,
         "digest": "sha256",

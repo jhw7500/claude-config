@@ -1,5 +1,6 @@
 import copy
 from dataclasses import FrozenInstanceError
+import hashlib
 import io
 import json
 import os
@@ -12,7 +13,7 @@ import sys
 import pytest
 
 from pre_pr_tribunal.git_state import capture_snapshot
-from pre_pr_tribunal.model import Reviewer, SchemaError
+from pre_pr_tribunal.model import REPORT_TEXT_CONTRACT_VERSION, Reviewer, SchemaError
 from pre_pr_tribunal import review_store
 from pre_pr_tribunal import cli, git_state
 from pre_pr_tribunal.telemetry import (
@@ -28,6 +29,42 @@ def NOW():
 
 
 LIFECYCLE = "1" * 32
+
+
+def complete_report(reviewer, snapshot, *, findings=()):
+    value = {
+        "schema": 1,
+        "reviewer": reviewer,
+        "round": 1,
+        "snapshot": snapshot,
+        "status": "complete",
+        "findings": list(findings),
+        "executions": [],
+        "claims": [],
+        "prior_decisions": [],
+    }
+    if reviewer == "B":
+        stdout = "1 passed"
+        value.update({
+            "executions": [{
+                "id": "B-R1-E999",
+                "command": "python3 -c print-ok",
+                "exit_code": 0,
+                "stdout_excerpt": stdout,
+                "stderr_excerpt": "",
+                "capture_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+                "truncated": False,
+            }],
+            "claims": [{
+                "id": "B-R1-C999",
+                "statement": "The reviewed behavior is executable.",
+                "result": "supported",
+                "execution_ids": ["B-R1-E999"],
+                "reason": "",
+            }],
+            "coverage": {"complete": True, "primary_entry_paths": []},
+        })
+    return value
 
 
 @pytest.mark.parametrize("telemetry_state", ("successful", "substituted", "missing", "corrupt"))
@@ -236,20 +273,20 @@ def test_cli_early_detection_includes_rejected_v2_submission(
     }
     raw = "{"
     if reason == "TEXT_INVALID":
-        raw = json.dumps({
-            "schema": 1, "reviewer": reviewer, "round": 1,
-            "snapshot": {
+        report = complete_report(
+            reviewer,
+            {
                 "head_sha": begun["snapshot"]["head_sha"],
                 "diff_sha256": begun["snapshot"]["diff_sha256"],
             },
-            "status": "complete", "executions": [], "claims": [], "prior_decisions": [],
-            "findings": [{
+            findings=[{
                 "id": f"{reviewer}-R1-001", "reviewer": reviewer, "severity": "LOW",
                 "title": "invalid\x00title", "rationale": "Invalid report text.",
                 "path": "tracked.txt", "line": 1, "execution_ids": [],
                 "acceptance_condition": "Reject the invalid text.",
             }],
-        })
+        )
+        raw = json.dumps(report)
     store = call(("telemetry-start", "--run-id", run_id, "--stage", "report_store",
                   "--reviewer", reviewer, "--attempt", "1"), 9)["span_id"]
     rejected = run_cli(git_repo, "submit-report", "--reviewer", reviewer, input=raw)
@@ -373,9 +410,13 @@ def test_telemetry_cannot_alter_tribunal_result(git_repo, tmp_path, monkeypatch,
         validation_results = []
         report_bytes = {}
         for reviewer in "ABC":
-            raw = json.dumps({"schema": 1, "reviewer": reviewer, "round": 1,
-                "snapshot": {"head_sha": value["snapshot"]["head_sha"], "diff_sha256": value["snapshot"]["diff_sha256"]},
-                "status": "complete", "findings": [], "executions": [], "claims": [], "prior_decisions": []})
+            raw = json.dumps(complete_report(
+                reviewer,
+                {
+                    "head_sha": value["snapshot"]["head_sha"],
+                    "diff_sha256": value["snapshot"]["diff_sha256"],
+                },
+            ))
             if invalid_report and reviewer == "A":
                 raw = "{"
             submitted = command(
@@ -632,7 +673,9 @@ def test_bound_run_records_terminal_span_and_sanitized_summary(git_repo):
     assert summary["reviewers"]["B"]["total_ms"] == 4000
     assert summary["outcomes"]["success"] == 1
     assert summary["binding"]["contract"] == {
-        "report_text": 3, "diff_recipe": 1, "telemetry_schema": 3,
+        "report_text": REPORT_TEXT_CONTRACT_VERSION,
+        "diff_recipe": 1,
+        "telemetry_schema": 3,
     }
     assert summary["stages"]["reviewer_total"] == {"count": 1, "total_ms": 4000}
     assert summary["early_detection"] is None

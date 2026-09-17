@@ -1379,7 +1379,7 @@ def _tribunal_cli(
 def _synthetic_report_bytes(
     reviewer: str, attempt: int, snapshot: Mapping[str, object]
 ) -> bytes:
-    """Build one deterministic empty report for an installed pending slot."""
+    """Build one deterministic complete report for an installed pending slot."""
     try:
         head_sha = snapshot["head_sha"]
         diff_sha256 = snapshot["diff_sha256"]
@@ -1408,6 +1408,27 @@ def _synthetic_report_bytes(
         "claims": [],
         "prior_decisions": [],
     }
+    if reviewer == "B":
+        stdout = "1 passed"
+        report.update({
+            "executions": [{
+                "id": "B-R1-E999",
+                "command": "python3 -c print-ok",
+                "exit_code": 0,
+                "stdout_excerpt": stdout,
+                "stderr_excerpt": "",
+                "capture_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+                "truncated": False,
+            }],
+            "claims": [{
+                "id": "B-R1-C999",
+                "statement": "The reviewed behavior is executable.",
+                "result": "supported",
+                "execution_ids": ["B-R1-E999"],
+                "reason": "",
+            }],
+            "coverage": {"complete": True, "primary_entry_paths": []},
+        })
     return (json.dumps(report, separators=(",", ":")) + "\n").encode("utf-8")
 
 
@@ -1415,7 +1436,8 @@ _REPORT_RETRYABLE_CODES = frozenset((
     "FINDING_SCHEMA_INVALID", "FINDING_LIMIT_EXCEEDED", "EXECUTION_LIMIT_EXCEEDED",
     "CLAIM_LIMIT_EXCEEDED", "PRIOR_DECISION_RESPONSE_MISSING", "REPLACEMENT_FINDING_INVALID",
     "BEHAVIOR_EVIDENCE_REQUIRED", "CLAIM_EVIDENCE_REQUIRED",
-    "CLAIM_ID_DUPLICATE", "CLAIM_SCHEMA_INVALID", "EVIDENCE_SECRET_DETECTED",
+    "CLAIM_COVERAGE_INVALID", "CLAIM_ID_DUPLICATE", "CLAIM_SCHEMA_INVALID",
+    "EVIDENCE_SECRET_DETECTED",
     "EXECUTION_ID_DUPLICATE", "EXECUTION_ID_INVALID",
     "EXECUTION_REFERENCE_INVALID", "EXECUTION_SCHEMA_INVALID",
     "FINDING_ID_DUPLICATE", "FINDING_ID_INVALID",

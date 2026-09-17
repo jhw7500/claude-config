@@ -64,22 +64,47 @@ def _repo(tmp_path, *, path="src/app.py", config=None, binary=False):
     return repo
 
 
-def _report(verdict, reviewer, *, findings=(), claims=(), executions=()):
-    return json.dumps(
-        {
-            "schema": 1,
-            "reviewer": reviewer,
-            "round": verdict.round,
-            "snapshot": {
-                "head_sha": verdict.head_sha,
-                "diff_sha256": verdict.diff_sha256,
-            },
-            "status": "complete",
-            "findings": list(findings),
-            "executions": list(executions),
-            "claims": list(claims),
-            "prior_decisions": [],
+def _report(
+    verdict,
+    reviewer,
+    *,
+    findings=(),
+    claims=(),
+    executions=(),
+    coverage=None,
+    populate_b=True,
+):
+    if reviewer == "B" and populate_b:
+        if not claims:
+            execution_id = f"B-R{verdict.round}-E999"
+            executions = executions or (_execution(execution_id),)
+            claims = ({
+                "id": f"B-R{verdict.round}-C999",
+                "statement": "The reviewed behavior is executable.",
+                "result": "supported",
+                "execution_ids": [execution_id],
+                "reason": "",
+            },)
+        if coverage is None:
+            coverage = {"complete": True, "primary_entry_paths": []}
+    value = {
+        "schema": 1,
+        "reviewer": reviewer,
+        "round": verdict.round,
+        "snapshot": {
+            "head_sha": verdict.head_sha,
+            "diff_sha256": verdict.diff_sha256,
         },
+        "status": "complete",
+        "findings": list(findings),
+        "executions": list(executions),
+        "claims": list(claims),
+        "prior_decisions": [],
+    }
+    if reviewer == "B" and coverage is not None:
+        value["coverage"] = coverage
+    return json.dumps(
+        value,
         separators=(",", ":"),
     ).encode()
 
@@ -134,20 +159,108 @@ def test_docs_only_is_snapshot_bound_skipped_verdict(tmp_path):
     assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.PASS
 
 
-def test_markdown_anywhere_is_off_unless_path_is_sensitive(tmp_path):
-    notes = _repo(tmp_path / "notes-case", path="notes/guide.md")
-    notes_verdict = begin_round(
-        notes, base="master", runtime="codex", round_number=1, now=NOW
+def test_only_documentation_paths_are_off(tmp_path):
+    docs = _repo(tmp_path / "docs-case", path="docs/guide.md")
+    docs_verdict = begin_round(
+        docs, base="master", runtime="codex", round_number=1, now=NOW
     )
-    assert notes_verdict.policy.risk_floor == 0
-    assert notes_verdict.policy.mode is ReviewMode.OFF
+    assert docs_verdict.policy.risk_floor == 0
+    assert docs_verdict.policy.mode is ReviewMode.OFF
+    assert evaluate_gate(docs, BOUND_COMMAND).code is GateCode.PASS
 
-    hooks = _repo(tmp_path / "hooks-case", path="hooks/guide.md")
-    hooks_verdict = begin_round(
-        hooks, base="master", runtime="codex", round_number=1, now=NOW
+    for index, path in enumerate((
+        "notes/guide.md",
+        "README.md",
+        "skills/pre-pr-tribunal/SKILL.md",
+        "commands/review.md",
+        "config/security.yaml",
+    )):
+        repo = _repo(tmp_path / f"operational-case-{index}", path=path)
+        verdict = begin_round(
+            repo, base="master", runtime="codex", round_number=1, now=NOW
+        )
+        assert verdict.policy.risk_floor == 100
+        assert verdict.policy.mode is ReviewMode.ITERATIVE
+        decision = evaluate_gate(repo, BOUND_COMMAND)
+        assert decision.block is True
+        assert decision.code is GateCode.REVIEW_INCOMPLETE
+
+
+def test_reviewer_b_requires_complete_claim_coverage_before_sealing(tmp_path):
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+    with pytest.raises(SchemaError, match="^CLAIM_COVERAGE_INVALID$"):
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_report(
+                verdict,
+                "B",
+                coverage={"complete": True, "primary_entry_paths": []},
+                populate_b=False,
+            ),
+            now=NOW,
+        )
+
+    execution = _execution("B-R1-E001")
+    claim = {
+        "id": "B-R1-C001",
+        "statement": "The documented entry path runs.",
+        "result": "supported",
+        "execution_ids": ["B-R1-E001"],
+        "reason": "",
+    }
+    with pytest.raises(SchemaError, match="^CLAIM_COVERAGE_INVALID$"):
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_report(
+                verdict,
+                "B",
+                claims=(claim,),
+                executions=(execution,),
+                coverage={"complete": False, "primary_entry_paths": []},
+            ),
+            now=NOW,
+        )
+
+    with pytest.raises(SchemaError, match="^CLAIM_COVERAGE_INVALID$"):
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_report(
+                verdict,
+                "B",
+                claims=(claim,),
+                executions=(execution,),
+                coverage={
+                    "complete": True,
+                    "primary_entry_paths": [
+                        {"path": "scripts/entry.py", "claim_id": "B-R1-C002"}
+                    ],
+                },
+            ),
+            now=NOW,
+        )
+
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_report(
+            verdict,
+            "B",
+            claims=(claim,),
+            executions=(execution,),
+            coverage={
+                "complete": True,
+                "primary_entry_paths": [
+                    {"path": "scripts/entry.py", "claim_id": "B-R1-C001"}
+                ],
+            },
+        ),
+        now=NOW,
     )
-    assert hooks_verdict.policy.risk_floor == 100
-    assert hooks_verdict.policy.mode is ReviewMode.ITERATIVE
 
 
 def test_root_build_configuration_cannot_be_classified_as_documentation(tmp_path):

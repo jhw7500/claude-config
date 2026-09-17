@@ -9,7 +9,13 @@ import pytest
 
 from pre_pr_tribunal import cli
 from pre_pr_tribunal.telemetry import read_ledger
-from pre_pr_tribunal.model import Reviewer, Snapshot, parse_decisions, parse_reviewer_report
+from pre_pr_tribunal.model import (
+    REPORT_TEXT_CONTRACT_VERSION,
+    Reviewer,
+    Snapshot,
+    parse_decisions,
+    parse_reviewer_report,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2] / "skills" / "pre-pr-tribunal"
@@ -497,7 +503,7 @@ def test_report_reference_documents_v5_shapes_and_real_controller_commands():
     }.issubset(status)
     assert status["verdict_schema"] == 5
     assert status["active_reviewers"] == ["A", "B"]
-    assert status['reviewers']['A']['report_contract_version'] == 3
+    assert status['reviewers']['A']['report_contract_version'] == REPORT_TEXT_CONTRACT_VERSION
     assert status["reviewers"]["A"]["state"] == "sealed"
     assert set(status["reviewers"]["A"]) == {
         "state", "attempt_count", "last_error", "raw_sha256",
@@ -513,7 +519,7 @@ def test_report_reference_documents_v5_shapes_and_real_controller_commands():
         "report_contract_version", "attempt", "provenance",
     }
     assert receipt["state"] == "sealed"
-    assert receipt['report_contract_version'] == 3
+    assert receipt['report_contract_version'] == REPORT_TEXT_CONTRACT_VERSION
 
     match = re.search(
         r"<!-- controller-command-examples -->(.*?)"
@@ -732,7 +738,8 @@ def test_documented_report_and_decision_examples_pass_the_real_strict_parsers():
         ("valid-reviewer-c", Reviewer.C),
     ):
         value = json_example(schema, label)
-        assert set(value) == REPORT_KEYS
+        expected_keys = REPORT_KEYS | ({"coverage"} if reviewer is Reviewer.B else set())
+        assert set(value) == expected_keys
         parsed = parse_reviewer_report(
             json.dumps(value).encode(),
             expected_reviewer=reviewer,
@@ -760,13 +767,13 @@ def test_documented_report_and_decision_examples_pass_the_real_strict_parsers():
         assert parsed[0].disposition == label.removeprefix("valid-").removesuffix("-decision")
 
 
-def test_each_reviewer_carries_a_standalone_parser_valid_empty_report():
-    for name, reviewer in (
-        ("references/reviewer-a.md", Reviewer.A),
-        ("references/reviewer-b.md", Reviewer.B),
-        ("references/reviewer-c.md", Reviewer.C),
+def test_each_reviewer_carries_a_standalone_parser_valid_report():
+    for name, reviewer, label in (
+        ("references/reviewer-a.md", Reviewer.A, "standalone-empty-report"),
+        ("references/reviewer-b.md", Reviewer.B, "standalone-complete-report"),
+        ("references/reviewer-c.md", Reviewer.C, "standalone-empty-report"),
     ):
-        value = json_example(text(name), "standalone-empty-report")
+        value = json_example(text(name), label)
         parsed = parse_reviewer_report(
             json.dumps(value).encode(),
             expected_reviewer=reviewer,
@@ -774,6 +781,7 @@ def test_each_reviewer_carries_a_standalone_parser_valid_empty_report():
             snapshot=SNAPSHOT,
         )
         assert parsed.findings == ()
+        assert bool(parsed.claims) is (reviewer is Reviewer.B)
 
 
 def test_findings_may_report_normalized_repository_paths_outside_the_diff():

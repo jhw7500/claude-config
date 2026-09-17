@@ -1,5 +1,6 @@
 """Recovery accounting is observational, invocation-bound, and never a verdict."""
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -31,12 +32,34 @@ def payload(repo, *args, raw=None):
 
 
 def report(begun, reviewer):
-    return json.dumps({
+    value = {
         "schema": 1, "reviewer": reviewer, "round": 1,
         "snapshot": {key: begun["snapshot"][key] for key in ("head_sha", "diff_sha256")},
         "status": "complete", "findings": [], "executions": [], "claims": [],
         "prior_decisions": [],
-    }, indent=2).encode() + b"\n \n"
+    }
+    if reviewer == "B":
+        stdout = "1 passed"
+        value.update({
+            "executions": [{
+                "id": "B-R1-E999",
+                "command": "python3 -c print-ok",
+                "exit_code": 0,
+                "stdout_excerpt": stdout,
+                "stderr_excerpt": "",
+                "capture_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+                "truncated": False,
+            }],
+            "claims": [{
+                "id": "B-R1-C999",
+                "statement": "The reviewed behavior is executable.",
+                "result": "supported",
+                "execution_ids": ["B-R1-E999"],
+                "reason": "",
+            }],
+            "coverage": {"complete": True, "primary_entry_paths": []},
+        })
+    return json.dumps(value, indent=2).encode() + b"\n \n"
 
 
 def pending_b(repo, *, close=True):

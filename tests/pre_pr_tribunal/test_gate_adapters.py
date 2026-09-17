@@ -109,6 +109,27 @@ def _reports(
                 else []
             ),
         }
+        if reviewer == "B":
+            stdout = "1 passed"
+            value.update({
+                "executions": [{
+                    "id": f"B-R{round_number}-E999",
+                    "command": "python3 -c print-ok",
+                    "exit_code": 0,
+                    "stdout_excerpt": stdout,
+                    "stderr_excerpt": "",
+                    "capture_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+                    "truncated": False,
+                }],
+                "claims": [{
+                    "id": f"B-R{round_number}-C999",
+                    "statement": "The reviewed behavior is executable.",
+                    "result": "supported",
+                    "execution_ids": [f"B-R{round_number}-E999"],
+                    "reason": "",
+                }],
+                "coverage": {"complete": True, "primary_entry_paths": []},
+            })
         submit_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=json.dumps(value).encode())
         result[reviewer] = repo / f".review/inbox/round-{round_number}/{reviewer}.json"
     return result
@@ -169,6 +190,7 @@ def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo,
         value['contract'] = {'report_text': 2, 'diff_recipe': 1, 'verdict_schema': 3}
         for slot in value['reviewers'].values():
             slot['receipt']['report_contract_version'] = 2
+        value['reviewers']['B']['report'].pop('coverage')
         _write_json(path, value)
     elif version == 4:
         value["schema"] = 4
