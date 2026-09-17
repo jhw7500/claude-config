@@ -112,8 +112,8 @@ def _parser() -> argparse.ArgumentParser:
     begin.add_argument("--decisions", type=Path)
     begin.add_argument('--evidence-bundle')
     begin.add_argument("--intensity", action="append")
-    begin.add_argument("--intensity-requester")
-    begin.add_argument("--intensity-reason")
+    begin.add_argument("--intensity-requester", action="append")
+    begin.add_argument("--intensity-reason", action="append")
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -310,8 +310,8 @@ def _status(verdict) -> dict[str, object]:
 
 
 def _pr_appendix(verdict) -> str:
-    lines = ["## Pre-PR tribunal advisory findings", ""]
-    count = 0
+    header = ["## Pre-PR tribunal advisory findings", ""]
+    advisory_lines = []
     for key in verdict.policy.active_reviewers:
         report = verdict.reviewers[key].report
         if report is None:
@@ -322,17 +322,24 @@ def _pr_appendix(verdict) -> str:
             location = finding.path + (
                 f":{finding.line}" if finding.line is not None else ""
             )
-            lines.append(
+            advisory_lines.append(
                 f"- [{finding.severity.value}] {_markdown_text(finding.title)} "
                 f"({_markdown_text(location)}, reviewer {key})"
             )
-            count += 1
-    if not count:
+    if not advisory_lines:
         return ""
-    rendered = "\n".join(lines) + "\n"
-    if len(rendered.encode("utf-8")) > 32 * 1024:
-        raise TribunalError("PR_APPENDIX_TOO_LARGE")
-    return rendered
+    maximum = 32 * 1024
+    rendered = "\n".join((*header, *advisory_lines)) + "\n"
+    if len(rendered.encode("utf-8")) <= maximum:
+        return rendered
+
+    marker = "- Additional advisory findings were omitted to keep this appendix within 32 KiB."
+    bounded = list(header)
+    for line in advisory_lines:
+        candidate = "\n".join((*bounded, line, marker)) + "\n"
+        if len(candidate.encode("utf-8")) <= maximum:
+            bounded.append(line)
+    return "\n".join((*bounded, marker)) + "\n"
 
 
 def _markdown_text(value: str) -> str:

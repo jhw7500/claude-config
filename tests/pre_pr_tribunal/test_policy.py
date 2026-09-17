@@ -6,10 +6,10 @@ import subprocess
 
 import pytest
 
-from pre_pr_tribunal.cli import _status
+from pre_pr_tribunal.cli import _parser, _status
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
 from pre_pr_tribunal.model import GateStatus, ReviewMode, Reviewer, SchemaError
-from pre_pr_tribunal.policy import parse_policy_binding
+from pre_pr_tribunal.policy import parse_intensity_request, parse_policy_binding
 from pre_pr_tribunal.verdict_store import (
     begin_round,
     finalize_round,
@@ -134,6 +134,32 @@ def test_docs_only_is_snapshot_bound_skipped_verdict(tmp_path):
     assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.PASS
 
 
+def test_markdown_anywhere_is_off_unless_path_is_sensitive(tmp_path):
+    notes = _repo(tmp_path / "notes-case", path="notes/guide.md")
+    notes_verdict = begin_round(
+        notes, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    assert notes_verdict.policy.risk_floor == 0
+    assert notes_verdict.policy.mode is ReviewMode.OFF
+
+    hooks = _repo(tmp_path / "hooks-case", path="hooks/guide.md")
+    hooks_verdict = begin_round(
+        hooks, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    assert hooks_verdict.policy.risk_floor == 100
+    assert hooks_verdict.policy.mode is ReviewMode.ITERATIVE
+
+
+def test_root_build_configuration_cannot_be_classified_as_documentation(tmp_path):
+    repo = _repo(tmp_path, path="CMakeLists.txt")
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    decision = evaluate_gate(repo, BOUND_COMMAND)
+    assert verdict.policy.risk_floor == 100
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert decision.block is True
+    assert decision.code is GateCode.REVIEW_INCOMPLETE
+
+
 def test_default_source_is_single_with_a_b_only(tmp_path):
     repo = _repo(tmp_path)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
@@ -196,6 +222,14 @@ def test_repository_config_cannot_lower_builtin_floor(tmp_path):
     assert verdict.policy.mode is ReviewMode.SINGLE
 
 
+def test_overlapping_repository_rules_use_highest_matching_intensity(tmp_path):
+    config = '[policy]\n"**" = "iterative"\n"src/**" = "single"\n'
+    repo = _repo(tmp_path, config=config)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.risk_floor == 100
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+
+
 def test_invalid_or_repeated_intensity_fails_closed_to_three_reviewers(tmp_path):
     repo = _repo(tmp_path, path="docs/guide.md")
     verdict = begin_round(
@@ -209,6 +243,60 @@ def test_invalid_or_repeated_intensity_fails_closed_to_three_reviewers(tmp_path)
     assert verdict.policy.request.source == "fail_closed"
     assert verdict.policy.effective_intensity == 100
     assert verdict.policy.active_reviewers == ("A", "B", "C")
+
+
+@pytest.mark.parametrize(
+    "duplicate_flag",
+    ("--intensity-requester", "--intensity-reason"),
+)
+def test_cli_repeated_intensity_attribution_fails_closed(duplicate_flag):
+    arguments = [
+        "begin",
+        "--base",
+        "master",
+        "--runtime",
+        "codex",
+        "--round",
+        "1",
+        "--intensity",
+        "0",
+        "--intensity-requester",
+        "maintainer",
+        "--intensity-reason",
+        "bounded review",
+        duplicate_flag,
+        "duplicate",
+    ]
+    parsed = _parser().parse_args(arguments)
+    request = parse_intensity_request(
+        parsed.intensity,
+        requester=parsed.intensity_requester,
+        reason=parsed.intensity_reason,
+    )
+    assert request.source == "fail_closed"
+    assert request.value == 100
+    assert request.fail_closed_reason == "INTENSITY_ATTRIBUTION_MULTIPLE"
+
+
+def test_all_reviewers_may_be_disabled_only_for_off_mode(tmp_path):
+    config = """
+[reviewer.A]
+enabled = false
+[reviewer.B]
+enabled = false
+[reviewer.C]
+enabled = false
+""".lstrip()
+    docs = _repo(tmp_path / "docs-case", path="docs/guide.md", config=config)
+    docs_verdict = begin_round(
+        docs, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    assert docs_verdict.policy.mode is ReviewMode.OFF
+    assert docs_verdict.policy.active_reviewers == ()
+
+    source = _repo(tmp_path / "source-case", config=config)
+    with pytest.raises(SchemaError, match="^CONFIG_INVALID$"):
+        begin_round(source, base="master", runtime="codex", round_number=1, now=NOW)
 
 
 def test_persisted_request_source_semantics_are_strict(tmp_path):
@@ -374,6 +462,42 @@ def test_same_snapshot_can_be_re_requested_at_higher_intensity(tmp_path):
     assert elevated.policy.request.value == 80
 
 
+def test_failed_iterative_round_cannot_restart_at_higher_iterative_intensity(tmp_path):
+    repo = _repo(tmp_path, path="docs/guide.md")
+    verdict = begin_round(
+        repo,
+        base="master",
+        runtime="codex",
+        round_number=1,
+        intensity_values=("67",),
+        intensity_requester="maintainer",
+        intensity_reason="run iterative review",
+        now=NOW,
+    )
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.A,
+        raw=_report(verdict, "A", findings=(_finding("A-R1-001", "A"),)),
+        now=NOW,
+    )
+    submit_reviewer_report(
+        repo, reviewer=Reviewer.B, raw=_report(verdict, "B"), now=NOW
+    )
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.FAIL
+
+    with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
+        begin_round(
+            repo,
+            base="master",
+            runtime="codex",
+            round_number=1,
+            intensity_values=("68",),
+            intensity_requester="maintainer",
+            intensity_reason="retry iterative review",
+            now=NOW,
+        )
+
+
 def test_pr_appendix_contains_only_nonblocking_findings(tmp_path):
     repo = _repo(tmp_path)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
@@ -399,3 +523,29 @@ def test_pr_appendix_contains_only_nonblocking_findings(tmp_path):
     assert "[link](relative)" not in status["pr_appendix"]
     assert r"\[link\]\(relative\)" in status["pr_appendix"]
     assert r"src/\[app\]\.py" in status["pr_appendix"]
+
+
+def test_pr_appendix_is_visibly_truncated_before_byte_limit(tmp_path):
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    findings = tuple(
+        {
+            **_finding(f"A-R1-{index:03d}", "A", severity="MEDIUM"),
+            "title": "x" * 8000,
+        }
+        for index in range(1, 6)
+    )
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.A,
+        raw=_report(verdict, "A", findings=findings),
+        now=NOW,
+    )
+    submit_reviewer_report(
+        repo, reviewer=Reviewer.B, raw=_report(verdict, "B"), now=NOW
+    )
+    final = finalize_round(repo, now=NOW)
+    appendix = _status(final)["pr_appendix"]
+    assert final.gate.status is GateStatus.PASS
+    assert len(appendix.encode("utf-8")) <= 32 * 1024
+    assert "Additional advisory findings were omitted" in appendix

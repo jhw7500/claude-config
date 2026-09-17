@@ -164,11 +164,28 @@ def _request_fail_closed(reason: str) -> model.IntensityRequest:
 def parse_intensity_request(
     values: Sequence[str] | None,
     *,
-    requester: str | None,
-    reason: str | None,
+    requester: str | Sequence[str] | None,
+    reason: str | Sequence[str] | None,
 ) -> model.IntensityRequest:
+    def single_attribution(
+        value: str | Sequence[str] | None,
+    ) -> tuple[str | None, bool]:
+        if value is None or isinstance(value, str):
+            return value, False
+        if isinstance(value, Sequence) and not isinstance(
+            value, (bytes, bytearray)
+        ):
+            if len(value) == 1:
+                return value[0], False
+            return None, True
+        return None, True
+
+    requester_value, requester_multiple = single_attribution(requester)
+    reason_value, reason_multiple = single_attribution(reason)
+    if requester_multiple or reason_multiple:
+        return _request_fail_closed("INTENSITY_ATTRIBUTION_MULTIPLE")
     if not values:
-        if requester is not None or reason is not None:
+        if requester_value is not None or reason_value is not None:
             return _request_fail_closed("INTENSITY_ATTRIBUTION_WITHOUT_VALUE")
         return model.IntensityRequest(0, "default", "system", "policy-default")
     if len(values) != 1:
@@ -180,8 +197,12 @@ def parse_intensity_request(
     if value > 100:
         return _request_fail_closed("INTENSITY_OUT_OF_RANGE")
     try:
-        bound_requester = _bounded_text(requester, MAX_REQUESTER_BYTES, "INTENSITY_INVALID")
-        bound_reason = _bounded_text(reason, MAX_REASON_BYTES, "INTENSITY_INVALID")
+        bound_requester = _bounded_text(
+            requester_value, MAX_REQUESTER_BYTES, "INTENSITY_INVALID"
+        )
+        bound_reason = _bounded_text(
+            reason_value, MAX_REASON_BYTES, "INTENSITY_INVALID"
+        )
     except model.SchemaError:
         return _request_fail_closed("INTENSITY_ATTRIBUTION_REQUIRED")
     return model.IntensityRequest(value, "cli", bound_requester, bound_reason)
@@ -413,8 +434,6 @@ def _validate_config(raw: bytes) -> _RepositoryConfig:
                 raise model.SchemaError("MODEL_UNKNOWN")
             models[runtime] = name
         reviewers[key] = {"enabled": enabled, "model": models}
-    if not any(bool(value["enabled"]) for value in reviewers.values()):
-        raise model.SchemaError("CONFIG_INVALID")
     return _RepositoryConfig(hashlib.sha256(raw).hexdigest(), rules, reviewers)
 
 
@@ -446,13 +465,13 @@ def _pattern_matches(pattern: str, path: str) -> bool:
 
 def _pattern_floor(rules: Sequence[tuple[str, int]], path: str) -> tuple[int, str | None]:
     matches = [
-        (sum(character not in "*?[]" for character in pattern), -index, value, pattern)
+        (value, sum(character not in "*?[]" for character in pattern), -index, pattern)
         for index, (pattern, value) in enumerate(rules)
         if _pattern_matches(pattern, path)
     ]
     if not matches:
         return 0, None
-    _specificity, _order, value, pattern = max(matches)
+    value, _specificity, _order, pattern = max(matches)
     return value, pattern
 
 
@@ -466,9 +485,9 @@ def _path_floor(path: str) -> tuple[int, str]:
         return 100, f"dependency-or-deploy:{path}"
     if any(lower.startswith(prefix) for prefix in _HIGH_PREFIXES):
         return 100, f"sensitive-path:{path}"
-    if lower.startswith(("docs/", "doc/")) and suffix in _DOC_SUFFIXES:
-        return 0, f"documentation:{path}"
-    if "/" not in lower and suffix in _DOC_SUFFIXES:
+    if suffix == ".md" or (
+        lower.startswith(("docs/", "doc/")) and suffix in _DOC_SUFFIXES
+    ):
         return 0, f"documentation:{path}"
     if suffix in _SOURCE_SUFFIXES:
         return 50, f"source:{path}"
@@ -549,6 +568,7 @@ def resolve_policy(
         reasons.append("binary-change")
     risk_floor = max(floors)
     effective = max(risk_floor, request.value)
+    mode = intensity_mode(effective)
     reviewers = {
         key: model.ReviewerPolicy(
             enabled=(True if request.fail_closed_reason is not None else bool(value["enabled"])),
@@ -556,6 +576,10 @@ def resolve_policy(
         )
         for key, value in config.reviewers.items()
     }
+    if mode is not model.ReviewMode.OFF and not any(
+        reviewer.enabled for reviewer in reviewers.values()
+    ):
+        raise model.SchemaError("CONFIG_INVALID")
     unique_reasons = tuple(dict.fromkeys(reasons))
     if len(unique_reasons) > MAX_POLICY_REASONS:
         unique_reasons = (*unique_reasons[: MAX_POLICY_REASONS - 1], "reason-limit")
@@ -563,7 +587,7 @@ def resolve_policy(
         config.digest,
         risk_floor,
         effective,
-        intensity_mode(effective),
+        mode,
         unique_reasons,
         request,
         reviewers,

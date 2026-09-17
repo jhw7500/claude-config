@@ -1252,8 +1252,8 @@ def begin_round(
     decisions_path: Path | None = None,
     evidence_bundle_sha256: str | None = None,
     intensity_values: Sequence[str] | None = None,
-    intensity_requester: str | None = None,
-    intensity_reason: str | None = None,
+    intensity_requester: str | Sequence[str] | None = None,
+    intensity_reason: str | Sequence[str] | None = None,
     now: Callable[[], str] = utc_now,
     token_hex: Callable[[int], str] = secrets.token_hex,
 ) -> Verdict:
@@ -1335,13 +1335,15 @@ def begin_round(
                 if stored.policy is not None
                 else 100
             )
-            if (
-                stored.gate.status is GateStatus.FAIL
-                and policy.effective_intensity <= prior_intensity
-            ):
+            if stored.gate.status is GateStatus.FAIL:
                 if stored.round == 3:
                     raise SchemaError("ROUND_LIMIT_EXHAUSTED")
-                raise SchemaError("ROUND_TRANSITION_INVALID")
+                if not (
+                    stored.policy is not None
+                    and stored.policy.mode is m.ReviewMode.SINGLE
+                    and policy.mode is m.ReviewMode.ITERATIVE
+                ):
+                    raise SchemaError("ROUND_TRANSITION_INVALID")
             if (
                 stored.gate.status is GateStatus.INCONCLUSIVE
                 and policy.effective_intensity < prior_intensity
