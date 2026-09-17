@@ -434,7 +434,9 @@ def test_single_failure_requires_changed_snapshot_for_round_one_retry(tmp_path):
     assert restarted.head_sha != verdict.head_sha
 
 
-def test_same_snapshot_can_be_re_requested_at_higher_intensity(tmp_path):
+def test_failed_single_mode_cannot_restart_same_snapshot_at_iterative_intensity(
+    tmp_path,
+):
     repo = _repo(tmp_path)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     submit_reviewer_report(
@@ -447,19 +449,17 @@ def test_same_snapshot_can_be_re_requested_at_higher_intensity(tmp_path):
         repo, reviewer=Reviewer.B, raw=_report(verdict, "B"), now=NOW
     )
     assert finalize_round(repo, now=NOW).gate.status is GateStatus.FAIL
-    elevated = begin_round(
-        repo,
-        base="master",
-        runtime="codex",
-        round_number=1,
-        intensity_values=("80",),
-        intensity_requester="maintainer",
-        intensity_reason="escalate after blocker",
-        now=NOW,
-    )
-    assert elevated.head_sha == verdict.head_sha
-    assert elevated.policy.mode is ReviewMode.ITERATIVE
-    assert elevated.policy.request.value == 80
+    with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
+        begin_round(
+            repo,
+            base="master",
+            runtime="codex",
+            round_number=1,
+            intensity_values=("80",),
+            intensity_requester="maintainer",
+            intensity_reason="escalate after blocker",
+            now=NOW,
+        )
 
 
 def test_failed_iterative_round_cannot_restart_at_higher_iterative_intensity(tmp_path):

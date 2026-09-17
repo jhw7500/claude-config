@@ -2533,7 +2533,7 @@ def test_two_round_originating_reviewer_closure_and_round_limit(git_repo):
     second = begin_round(
         git_repo,
         base="master",
-        runtime="claude",
+        runtime="codex",
         round_number=2,
         decisions_path=decisions_path,
         now=NOW,
@@ -2756,6 +2756,53 @@ def test_failed_round_cannot_be_reset_through_round_one(git_repo):
     )
     with pytest.raises(SchemaError, match="ROUND_TRANSITION_INVALID"):
         begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+
+def test_later_round_cannot_switch_runtime_when_models_are_inherit(git_repo):
+    config = """
+[reviewer.A]
+model = { claude = "inherit", codex = "inherit" }
+[reviewer.B]
+model = { claude = "inherit", codex = "inherit" }
+[reviewer.C]
+enabled = true
+model = { claude = "inherit", codex = "inherit" }
+""".lstrip()
+    (git_repo / ".pre-pr-tribunal.toml").write_text(config, encoding="utf-8")
+    subprocess.run(
+        ["/usr/bin/git", "-C", str(git_repo), "add", ".pre-pr-tribunal.toml"],
+        check=True,
+    )
+    subprocess.run(
+        ["/usr/bin/git", "-C", str(git_repo), "commit", "-qm", "configure models"],
+        check=True,
+    )
+    first = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    finalize_round(
+        git_repo,
+        reviewer_paths=report_paths(
+            git_repo, first.snapshot, overrides={"A": {"findings": [finding()]}}
+        ),
+        now=NOW,
+    )
+    commit_fix(git_repo)
+    decisions_path = write_json(
+        git_repo / ".review/inbox/round-1/decisions.json", [decision()]
+    )
+    before = (git_repo / ".review/verdict.json").read_bytes()
+
+    with pytest.raises(SchemaError, match="^RUNTIME_CHANGED$"):
+        begin_round(
+            git_repo,
+            base="master",
+            runtime="claude",
+            round_number=2,
+            decisions_path=decisions_path,
+            now=NOW,
+        )
+    assert (git_repo / ".review/verdict.json").read_bytes() == before
 
 
 def test_round_three_failure_rejects_round_one_with_exhaustion(git_repo):

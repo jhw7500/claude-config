@@ -1284,6 +1284,8 @@ def begin_round(
             if stored is None:
                 raise SchemaError("VERDICT_MISSING")
             previous = stored
+            if runtime != previous.producer_runtime:
+                raise SchemaError("RUNTIME_CHANGED")
             if previous.schema == m.VERDICT_SCHEMA_VERSION:
                 if (
                     previous.policy is None
@@ -1338,12 +1340,7 @@ def begin_round(
             if stored.gate.status is GateStatus.FAIL:
                 if stored.round == 3:
                     raise SchemaError("ROUND_LIMIT_EXHAUSTED")
-                if not (
-                    stored.policy is not None
-                    and stored.policy.mode is m.ReviewMode.SINGLE
-                    and policy.mode is m.ReviewMode.ITERATIVE
-                ):
-                    raise SchemaError("ROUND_TRANSITION_INVALID")
+                raise SchemaError("ROUND_TRANSITION_INVALID")
             if (
                 stored.gate.status is GateStatus.INCONCLUSIVE
                 and policy.effective_intensity < prior_intensity
