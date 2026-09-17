@@ -19,6 +19,7 @@ from .git_state import (
     GitStateError,
     assert_auto_fix_scope,
     capture_snapshot,
+    commit_tree_sha,
 )
 from . import model as m
 from .attempt_store import (
@@ -905,14 +906,14 @@ def _snapshot_equal(verdict: Verdict, snapshot: Snapshot) -> bool:
     )
 
 
-def _review_content_equal(verdict: Verdict, snapshot: Snapshot) -> bool:
+def _review_content_equal(root: Path, verdict: Verdict, snapshot: Snapshot) -> bool:
     return (
         verdict.repository,
-        verdict.merge_base_sha,
+        commit_tree_sha(root, verdict.merge_base_sha),
         verdict.diff_sha256,
     ) == (
         snapshot.repository,
-        snapshot.merge_base_sha,
+        commit_tree_sha(root, snapshot.merge_base_sha),
         snapshot.diff_sha256,
     )
 
@@ -1363,7 +1364,7 @@ def begin_round(
         if (
             round_number == 1
             and stored is not None
-            and _review_content_equal(stored, snapshot)
+            and _review_content_equal(root, stored, snapshot)
         ):
             prior_intensity = (
                 stored.policy.effective_intensity

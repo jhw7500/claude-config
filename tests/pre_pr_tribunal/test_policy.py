@@ -612,6 +612,7 @@ def test_single_failure_requires_changed_snapshot_for_round_one_retry(tmp_path):
     _git(repo, "commit", "--allow-empty", "-qm", "base metadata only")
     _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
     _git(repo, "checkout", "-q", "feature")
+    _git(repo, "rebase", "base-metadata")
     _git(repo, "branch", "-D", "base-metadata")
     with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
         begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
