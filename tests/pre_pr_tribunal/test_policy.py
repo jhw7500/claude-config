@@ -8,6 +8,7 @@ import pytest
 
 from pre_pr_tribunal.cli import _parser, _status
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
+from pre_pr_tribunal.git_state import capture_snapshot
 from pre_pr_tribunal.model import GateStatus, ReviewMode, Reviewer, SchemaError
 from pre_pr_tribunal.policy import parse_intensity_request, parse_policy_binding
 from pre_pr_tribunal.verdict_store import (
@@ -184,6 +185,38 @@ def test_only_documentation_paths_are_off(tmp_path):
         decision = evaluate_gate(repo, BOUND_COMMAND)
         assert decision.block is True
         assert decision.code is GateCode.REVIEW_INCOMPLETE
+
+
+def test_copy_into_documentation_path_is_iterative(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "feature")
+    _git(
+        repo,
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/jhw7500/claude-config.git",
+    )
+    _write(repo, ".gitignore", ".review/\n")
+    _write(repo, "src/app.py", "shared content\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+    _write(repo, "docs/copied.md", "shared content\n")
+    _git(repo, "add", "docs/copied.md")
+    _git(repo, "commit", "-qm", "copy into docs")
+
+    snapshot = capture_snapshot(repo, "master", now=NOW)
+    verdict = begin_round(
+        repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+
+    assert [(item.status, item.path, item.old_path) for item in snapshot.paths] == [
+        ("C100", "docs/copied.md", "src/app.py")
+    ]
+    assert verdict.policy.risk_floor == 100
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
 
 
 @pytest.mark.parametrize(

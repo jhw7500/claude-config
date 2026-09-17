@@ -651,7 +651,14 @@ def capture_snapshot(
     revision_range = f"{merge_base_sha}..{head_sha}"
     name_status = _command_output(
         root,
-        ("diff", "--name-status", "-z", "--find-renames", revision_range),
+        (
+            "diff",
+            "--name-status",
+            "-z",
+            "--find-renames",
+            "--find-copies-harder",
+            revision_range,
+        ),
     )
     paths = _changed_paths(name_status)
     if not paths:
