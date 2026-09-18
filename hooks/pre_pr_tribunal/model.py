@@ -7,6 +7,7 @@ from enum import Enum
 import hashlib
 import json
 import re
+import shlex
 from typing import Mapping, Sequence
 import unicodedata
 from urllib.parse import urlsplit
@@ -34,7 +35,7 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 4
+REPORT_TEXT_CONTRACT_VERSION = 5
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -63,6 +64,9 @@ _HTTP_URL_START = re.compile(r"https?://", re.IGNORECASE)
 _SHELL_CONTROL = frozenset(";|&()<>`")
 _EXCERPT_CONTROLS = frozenset(("\n", "\t"))
 _MAX_SHELL_NESTING = 64
+_SHELL_COMMAND_SEPARATORS = frozenset({";", "&&", "||", "|", "&"})
+_DRY_RUN_BUILD_TOOLS = frozenset({"make", "gmake", "ninja"})
+_DRY_RUN_LONG_OPTIONS = frozenset({"--dry-run", "--just-print", "--recon"})
 
 
 class TribunalError(Exception):
@@ -1178,6 +1182,59 @@ def _parse_claim_coverage(
     return ClaimCoverage(True, tuple(entries))
 
 
+def _is_dry_run_only_execution(command: str) -> bool:
+    try:
+        words = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    found_dry_run = False
+    found_live_run = False
+    for index, word in enumerate(words):
+        executable = word.rsplit("/", 1)[-1]
+        if executable not in _DRY_RUN_BUILD_TOOLS:
+            continue
+        arguments: list[str] = []
+        for argument in words[index + 1 :]:
+            if argument in _SHELL_COMMAND_SEPARATORS:
+                break
+            arguments.append(argument)
+        dry_run = any(argument in _DRY_RUN_LONG_OPTIONS for argument in arguments)
+        if executable in {"make", "gmake"}:
+            dry_run = dry_run or any(
+                argument.startswith("-")
+                and not argument.startswith("--")
+                and "n" in argument[1:]
+                for argument in arguments
+            )
+        elif executable == "ninja":
+            dry_run = dry_run or "-n" in arguments
+        if dry_run:
+            found_dry_run = True
+        else:
+            found_live_run = True
+    return found_dry_run and not found_live_run
+
+
+def _validate_primary_entry_path_evidence(
+    *,
+    claims: Sequence[Claim],
+    coverage: ClaimCoverage,
+    executions: Sequence[Execution],
+) -> None:
+    claims_by_id = {claim.id: claim for claim in claims}
+    executions_by_id = {execution.id: execution for execution in executions}
+    for entry in coverage.primary_entry_paths:
+        claim = claims_by_id[entry.claim_id]
+        if claim.result != "supported":
+            continue
+        referenced = tuple(executions_by_id[item] for item in claim.execution_ids)
+        if referenced and all(
+            _is_dry_run_only_execution(execution.command)
+            for execution in referenced
+        ):
+            raise SchemaError("DRY_RUN_EVIDENCE_INSUFFICIENT")
+
+
 def _parse_prior_response(value: object) -> PriorDecisionResponse:
     obj = _object(
         value,
@@ -1287,6 +1344,16 @@ def parse_reviewer_report(
     coverage = None
     if expected_reviewer is Reviewer.B and report_contract_version >= 4:
         coverage = _parse_claim_coverage(obj["coverage"], claims=claims)
+    if (
+        expected_reviewer is Reviewer.B
+        and report_contract_version >= 5
+        and coverage is not None
+    ):
+        _validate_primary_entry_path_evidence(
+            claims=claims,
+            coverage=coverage,
+            executions=executions,
+        )
     responses = tuple(
         _parse_prior_response(item)
         for item in _array(

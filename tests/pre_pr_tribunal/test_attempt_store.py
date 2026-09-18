@@ -58,6 +58,20 @@ def test_timeout_stores_metadata_without_a_raw_file(git_repo):
     }
 
 
+def test_dry_run_evidence_failure_preserves_retryable_raw_report(git_repo):
+    raw = b'{"status":"complete"}'
+    with locked_review(git_repo, create=True) as review_fd:
+        evidence = append(
+            review_fd,
+            raw=raw,
+            reason_code="DRY_RUN_EVIDENCE_INSUFFICIENT",
+        )
+    assert (git_repo / evidence.raw_path).read_bytes() == raw
+    assert json.loads((git_repo / evidence.metadata_path).read_bytes())["reason_code"] == (
+        "DRY_RUN_EVIDENCE_INSUFFICIENT"
+    )
+
+
 def test_rotation_retains_only_latest_three_complete_attempts_and_preserves_peers(git_repo):
     with locked_review(git_repo, create=True) as review_fd:
         peer = append(review_fd, reviewer=Reviewer.A)

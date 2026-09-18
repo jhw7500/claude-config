@@ -114,12 +114,17 @@ def _report(
     ).encode()
 
 
-def _execution(identifier):
-    stdout = "ok"
+def _execution(
+    identifier,
+    *,
+    command="python3 -m pytest -q",
+    stdout="ok",
+    exit_code=0,
+):
     return {
         "id": identifier,
-        "command": "python3 -m pytest -q",
-        "exit_code": 0,
+        "command": command,
+        "exit_code": exit_code,
         "stdout_excerpt": stdout,
         "stderr_excerpt": "",
         "capture_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
@@ -538,6 +543,182 @@ def test_active_only_finalize_and_unverified_is_inconclusive(tmp_path):
     final = finalize_round(repo, now=NOW)
     assert final.gate.status is GateStatus.INCONCLUSIVE
     assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.VERIFICATION_INCOMPLETE
+
+
+def test_kbuild_entry_path_rejects_dry_run_only_support_and_stays_inconclusive(
+    tmp_path,
+):
+    repo = tmp_path / "kbuild-regression"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "feature")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(
+        repo,
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/jhw7500/claude-config.git",
+    )
+    _write(repo, ".gitignore", ".review/\n.env\n")
+    _write(
+        repo,
+        "README.md",
+        "Run the documented module build with `make modules`.\n",
+    )
+    _write(
+        repo,
+        "fake-kernel/Makefile",
+        ".PHONY: modules\nmodules:\n\t$(MAKE) -f $(M)/Makefile KERNELRELEASE=1\n",
+    )
+    guarded = """\
+ifeq ($(KERNELRELEASE),)
+-include .env
+ifndef KERNEL_SRC
+$(error KERNEL_SRC is empty)
+endif
+endif
+
+.PHONY: help modules
+help:
+\t@:
+modules:
+\t$(MAKE) -C $(KERNEL_SRC) M=$(CURDIR) modules
+"""
+    _write(repo, "Makefile", guarded)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+    _write(
+        repo,
+        "Makefile",
+        guarded.replace(
+            "ifeq ($(KERNELRELEASE),)\n",
+            "",
+        ).replace("endif\n\n.PHONY", "\n.PHONY", 1),
+    )
+    _git(repo, "commit", "-qam", "regress kbuild guard")
+    _write(repo, ".env", f"KERNEL_SRC={repo / 'fake-kernel'}\n")
+
+    dry_run = subprocess.run(
+        ["make", "-p", "-n"],
+        cwd=repo,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    actual = subprocess.run(
+        ["make", "modules"],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert dry_run.returncode == 0, dry_run.stderr
+    assert actual.returncode != 0
+    assert "KERNEL_SRC is empty" in actual.stderr
+
+    verdict = begin_round(
+        repo,
+        base="master",
+        runtime="codex",
+        round_number=1,
+        now=NOW,
+    )
+    execution = _execution(
+        "B-R1-E001",
+        command="cd -- . && make -p -n",
+        stdout="dry-run exited zero",
+    )
+    supported = {
+        "id": "B-R1-C001",
+        "statement": "The documented module build succeeds.",
+        "result": "supported",
+        "execution_ids": ["B-R1-E001"],
+        "reason": "",
+    }
+    coverage = {
+        "complete": True,
+        "primary_entry_paths": [
+            {"path": "README.md", "claim_id": "B-R1-C001"}
+        ],
+    }
+    with pytest.raises(SchemaError, match="^DRY_RUN_EVIDENCE_INSUFFICIENT$"):
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_report(
+                verdict,
+                "B",
+                claims=(supported,),
+                executions=(execution,),
+                coverage=coverage,
+            ),
+            now=NOW,
+        )
+
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.A,
+        raw=_report(verdict, "A"),
+        now=NOW,
+    )
+    unverified = {
+        **supported,
+        "result": "unverified",
+        "execution_ids": [],
+        "reason": "Only a dry-run was available; the documented build failed live.",
+    }
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_report(
+            verdict,
+            "B",
+            claims=(unverified,),
+            executions=(execution,),
+            coverage=coverage,
+        ),
+        now=NOW,
+    )
+    final = finalize_round(repo, now=NOW)
+    assert final.gate.status is GateStatus.INCONCLUSIVE
+    assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.VERIFICATION_INCOMPLETE
+
+
+def test_primary_entry_path_accepts_live_execution_alongside_dry_run(tmp_path):
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    claim = {
+        "id": "B-R1-C001",
+        "statement": "The documented build succeeds.",
+        "result": "supported",
+        "execution_ids": ["B-R1-E001", "B-R1-E002"],
+        "reason": "",
+    }
+    coverage = {
+        "complete": True,
+        "primary_entry_paths": [
+            {"path": "README.md", "claim_id": "B-R1-C001"}
+        ],
+    }
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_report(
+            verdict,
+            "B",
+            claims=(claim,),
+            executions=(
+                _execution("B-R1-E001", command="make -n"),
+                _execution("B-R1-E002", command="make modules"),
+            ),
+            coverage=coverage,
+        ),
+        now=NOW,
+    )
 
 
 def test_inconclusive_restart_cannot_lower_same_snapshot_intensity(tmp_path):

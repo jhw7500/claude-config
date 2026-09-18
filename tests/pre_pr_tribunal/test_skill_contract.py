@@ -719,6 +719,8 @@ def test_empirical_reviewer_forbids_unsupported_claims_and_requires_capture_fiel
     reviewer = text("references/reviewer-b.md")
     for token in (
         "Inference alone",
+        "dry-run",
+        "cannot support",
         "command",
         "exit_code",
         "stdout_excerpt",

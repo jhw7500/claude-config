@@ -10,7 +10,7 @@ A finding path may be any normalized repository-relative path, including outside
 
 ## Controller receipt and recovery contract
 
-The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. Current verdict schema 5 uses report text contract 4, diff recipe 1 and evidence contract 2; reviewer report JSON still has `schema: 1`. Native schema-5 slots are `disabled`, `pending`, or `sealed`; only `submit-report` can turn an active pending slot into a sealed slot. Disabled slots reject context, report, failure, and validation operations. `store-report`, including its legacy replacement option, is v1-only.
+The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. Current verdict schema 5 uses report text contract 5, diff recipe 1 and evidence contract 2; reviewer report JSON still has `schema: 1`. Native schema-5 slots are `disabled`, `pending`, or `sealed`; only `submit-report` can turn an active pending slot into a sealed slot. Disabled slots reject context, report, failure, and validation operations. `store-report`, including its legacy replacement option, is v1-only.
 
 `status.verdict_schema` selects the workflow. Schema 1 requires an explicit all-slot `migrate-legacy-pending`; compatible schema 2 requires an explicit `migrate-v2-pending`; schemas 3 and 4 have no automatic current-contract migration; schema 5 is current. Neither migration accepts a reviewer subset and both migrate conservatively to iterative A/B/C review. Legacy schema-1 migration preserves available exact raw evidence but leaves slots pending when receipt provenance is unavailable; `LEGACY_PROVENANCE_UNAVAILABLE` never means a fictional native receipt was adopted. Schema-2 migration requires its report/diff contract to match the installed runtime: historical report-contract-2 rounds fail with `CONTRACT_DRIFT`. Compatible migration validates sealed evidence and assigns a new lifecycle identity, so its first telemetry resume reports prior request accounting unknown. Preserve incompatible old rounds for explicit abandonment/restart judgment; readable historical state never upgrades pending authority.
 
@@ -50,7 +50,7 @@ authority input.
       "last_error": null,
       "raw_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "context_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "report_contract_version": 4,
+      "report_contract_version": 5,
       "provenance": "native_submit"
     },
     "B": {
@@ -75,7 +75,7 @@ authority input.
   "state": "sealed",
   "raw_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "context_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "report_contract_version": 4,
+  "report_contract_version": 5,
   "attempt": 1,
   "provenance": "native_submit"
 }
@@ -98,13 +98,13 @@ The exact controller command shapes are below. `submit-report` reads exact repor
 | authenticate active reviewers and aggregate | `finalize` |
 <!-- controller-command-examples-end -->
 
-Schema-1 through schema-4 verdicts remain readable without rewrite. Schema-4 evidence semantics remain verifiable as historical state, but current context, submit, stored validation, finalize and terminal gate authority reject its old contract as drift or stale authority. New rounds and successful migration commands write schema 5 with `evidence_contract: 2` and a snapshot-bound policy record. A compatible schema-2 migration validates every sealed report and receipt before one atomic verdict replacement; it never rewrites report bytes or infers pre-migration telemetry identity.
+Schema-1 through schema-4 verdicts remain readable without rewrite. Schema-4 evidence semantics remain verifiable as historical state, but current context, submit, stored validation, finalize and terminal gate authority reject its old contract as drift or stale authority. Historical schema-5 verdicts with report contract 4 are also readable, but current context, submission, stored validation, finalization, and terminal gate checks reject them as contract drift; restart the round under report contract 5. New rounds and successful migration commands write schema 5 with `evidence_contract: 2` and a snapshot-bound policy record. A compatible schema-2 migration validates every sealed report and receipt before one atomic verdict replacement; it never rewrites report bytes or infers pre-migration telemetry identity.
 
 ## Execution provenance under report contract 3 or later
 
 Fresh executions keep the seven fields shown in the B example below. Only Reviewer B may add `evidence_ref`, and it is REQUIRED for reused evidence: exactly `{"bundle_sha256":"<64 lowercase hex>","entry_id":"E001"}` with an entry ID from E001 through E064. A/C executions and controller decision executions keep the legacy shape. The report parser accepts explicit B references under contract 3 or later; sealing then authenticates each against the round's selected evidence binding and exact verifier-returned execution fields. A reference alone grants no authority.
 
-Report contract 4 requires Reviewer B to submit at least one claim plus `coverage: {"complete": true, "primary_entry_paths": [...]}`. Each primary-entry-path item has exactly `path` and `claim_id`; paths and claim IDs are unique, normalized, and every claim ID must resolve to a B claim in the same report. This makes the reviewer's completeness assertion and entry-path-to-claim mapping explicit before sealing. An empty path list is valid only when the reviewer found no affected documented primary entry path; the non-empty claim requirement still prevents an empty empirical authorization.
+Report contract 4 requires Reviewer B to submit at least one claim plus `coverage: {"complete": true, "primary_entry_paths": [...]}`. Each primary-entry-path item has exactly `path` and `claim_id`; paths and claim IDs are unique, normalized, and every claim ID must resolve to a B claim in the same report. This makes the reviewer's completeness assertion and entry-path-to-claim mapping explicit before sealing. An empty path list is valid only when the reviewer found no affected documented primary entry path; the non-empty claim requirement still prevents an empty empirical authorization. Report contract 5 retains that shape and rejects a `supported` primary-entry-path claim when every cited execution is an explicit build-system dry-run. Dry-run-only evidence must remain `unverified`, making finalization inconclusive instead of PASS.
 
 For reuse, assign the round-local `id` and copy the trusted verifier's `execution` object unchanged. The command is `cd -- <quoted repository-relative cwd> && <shlex-joined argv>`. Report `capture_sha256` hashes stdout bytes followed by stderr bytes; the immutable store's framed capture has a different digest. Claims cite these report execution IDs only when the inspected command scope, exit, excerpts and truncation support their result. All unique reused entries and the subset cited by claims are distinct telemetry counts.
 
@@ -114,7 +114,7 @@ No bundle or invalid unused evidence permits independent fresh validation. A sea
 
 `JSON_INVALID`, `REPORT_TOO_LARGE`, `TEXT_INVALID`, `REPORT_SCHEMA_INVALID`, `REPORT_REVIEWER_MISMATCH`, `REPORT_ROUND_MISMATCH`, `REPORT_SNAPSHOT_MISMATCH`, and `REPORT_NOT_TERMINAL` describe rejected report content. Preserve the full original response in a controller-private current-user-owned regular non-symlink exact-`0600` file, independent of ambient `umask`; do not trim, reserialize, repair, or silently truncate it. A format-only retry stays on the same reviewer handle when that handle can accept a follow-up.
 
-Bounded content failures also include `FINDING_SCHEMA_INVALID`, `FINDING_LIMIT_EXCEEDED`, `EXECUTION_LIMIT_EXCEEDED`, `CLAIM_LIMIT_EXCEEDED`, `CLAIM_COVERAGE_INVALID`, `PRIOR_DECISION_RESPONSE_MISSING`, `PRIOR_DECISION_RESPONSE_INVALID`, `REPLACEMENT_FINDING_REQUIRED`, and `REPLACEMENT_FINDING_INVALID`. Fresh submission checks the reviewer's own decision responses and replacement references before canonical publication and sealing. Rejected content remains pending with exact bounded failure evidence; corrected same-role submission leaves sealed peers unchanged. Finalization repeats the full closure validation. Count/byte limits remain enforced, and invalid existing canonical orphans remain hard integrity failures outside fresh-input retry handling.
+Bounded content failures also include `FINDING_SCHEMA_INVALID`, `FINDING_LIMIT_EXCEEDED`, `EXECUTION_LIMIT_EXCEEDED`, `CLAIM_LIMIT_EXCEEDED`, `CLAIM_COVERAGE_INVALID`, `DRY_RUN_EVIDENCE_INSUFFICIENT`, `PRIOR_DECISION_RESPONSE_MISSING`, `PRIOR_DECISION_RESPONSE_INVALID`, `REPLACEMENT_FINDING_REQUIRED`, and `REPLACEMENT_FINDING_INVALID`. Fresh submission checks the reviewer's own decision responses and replacement references before canonical publication and sealing. Rejected content remains pending with exact bounded failure evidence; corrected same-role submission leaves sealed peers unchanged. Finalization repeats the full closure validation. Count/byte limits remain enforced, and invalid existing canonical orphans remain hard integrity failures outside fresh-input retry handling.
 
 ### Operational failures
 
