@@ -721,6 +721,91 @@ def test_primary_entry_path_accepts_live_execution_alongside_dry_run(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "commands",
+    (
+        ("sh -c 'make -n'",),
+        ("rtk proxy bash -lc 'make -n'",),
+        ("make -n && printf make",),
+        ("ninja -n; true",),
+        ("make -n || make modules",),
+        ("make -n", "python3 -m pytest -q"),
+        ("make -kn modules",),
+    ),
+)
+def test_primary_entry_path_rejects_wrapped_or_padded_dry_runs(tmp_path, commands):
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    executions = tuple(
+        _execution(f"B-R1-E{index:03d}", command=command)
+        for index, command in enumerate(commands, start=1)
+    )
+    claim = {
+        "id": "B-R1-C001",
+        "statement": "The documented build succeeds.",
+        "result": "supported",
+        "execution_ids": [execution["id"] for execution in executions],
+        "reason": "",
+    }
+    coverage = {
+        "complete": True,
+        "primary_entry_paths": [
+            {"path": "README.md", "claim_id": "B-R1-C001"}
+        ],
+    }
+    with pytest.raises(SchemaError, match="^DRY_RUN_EVIDENCE_INSUFFICIENT$"):
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_report(
+                verdict,
+                "B",
+                claims=(claim,),
+                executions=executions,
+                coverage=coverage,
+            ),
+            now=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "make -fplugin.mk modules",
+        "make -Cengine modules",
+        "make -fn modules",
+    ),
+)
+def test_primary_entry_path_accepts_live_make_option_operands(tmp_path, command):
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    claim = {
+        "id": "B-R1-C001",
+        "statement": "The documented build succeeds.",
+        "result": "supported",
+        "execution_ids": ["B-R1-E001"],
+        "reason": "",
+    }
+    coverage = {
+        "complete": True,
+        "primary_entry_paths": [
+            {"path": "README.md", "claim_id": "B-R1-C001"}
+        ],
+    }
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_report(
+            verdict,
+            "B",
+            claims=(claim,),
+            executions=(_execution("B-R1-E001", command=command),),
+            coverage=coverage,
+        ),
+        now=NOW,
+    )
+
+
 def test_inconclusive_restart_cannot_lower_same_snapshot_intensity(tmp_path):
     repo = _repo(tmp_path, path="docs/guide.md")
     verdict = begin_round(

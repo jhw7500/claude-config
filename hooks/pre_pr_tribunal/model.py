@@ -64,9 +64,11 @@ _HTTP_URL_START = re.compile(r"https?://", re.IGNORECASE)
 _SHELL_CONTROL = frozenset(";|&()<>`")
 _EXCERPT_CONTROLS = frozenset(("\n", "\t"))
 _MAX_SHELL_NESTING = 64
-_SHELL_COMMAND_SEPARATORS = frozenset({";", "&&", "||", "|", "&"})
 _DRY_RUN_BUILD_TOOLS = frozenset({"make", "gmake", "ninja"})
 _DRY_RUN_LONG_OPTIONS = frozenset({"--dry-run", "--just-print", "--recon"})
+_MAKE_OPTIONS_WITH_ARGUMENT = frozenset({"C", "f", "I", "j", "l", "O", "W"})
+_SHELL_EXECUTABLES = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
+_ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
 class TribunalError(Exception):
@@ -1182,37 +1184,146 @@ def _parse_claim_coverage(
     return ClaimCoverage(True, tuple(entries))
 
 
-def _is_dry_run_only_execution(command: str) -> bool:
+def _make_is_dry_run(arguments: Sequence[str]) -> bool:
+    consume_operand = False
+    options_ended = False
+    for argument in arguments:
+        if consume_operand:
+            consume_operand = False
+            continue
+        if options_ended:
+            continue
+        if argument == "--":
+            options_ended = True
+            continue
+        if argument in _DRY_RUN_LONG_OPTIONS:
+            return True
+        if not argument.startswith("-") or argument.startswith("--"):
+            continue
+        cluster = argument[1:]
+        for offset, option in enumerate(cluster):
+            if option == "n":
+                return True
+            if option in _MAKE_OPTIONS_WITH_ARGUMENT:
+                consume_operand = offset == len(cluster) - 1
+                break
+    return False
+
+
+def _shell_command_argument(arguments: Sequence[str]) -> str | None:
+    for index, argument in enumerate(arguments):
+        if argument == "--":
+            continue
+        if (
+            argument.startswith("-")
+            and not argument.startswith("--")
+            and "c" in argument[1:]
+        ):
+            if index + 1 < len(arguments):
+                return arguments[index + 1]
+            return None
+    return None
+
+
+def _command_executable(words: Sequence[str]) -> tuple[str, tuple[str, ...]] | None:
+    index = 0
+    while index < len(words) and _ENV_ASSIGNMENT.match(words[index]):
+        index += 1
+    while index < len(words):
+        executable = words[index].rsplit("/", 1)[-1]
+        if executable == "rtk":
+            index += 1
+            if index < len(words) and words[index] == "proxy":
+                index += 1
+            continue
+        if executable == "command":
+            index += 1
+            while index < len(words) and words[index].startswith("-"):
+                index += 1
+            continue
+        if executable == "env":
+            index += 1
+            while index < len(words):
+                word = words[index]
+                if word == "--":
+                    index += 1
+                    break
+                if _ENV_ASSIGNMENT.match(word):
+                    index += 1
+                    continue
+                if word in {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}:
+                    index += 2
+                    continue
+                if word.startswith("-"):
+                    index += 1
+                    continue
+                break
+            continue
+        return executable, tuple(words[index + 1 :])
+    return None
+
+
+def _classify_build_evidence(
+    command: str,
+    *,
+    depth: int = 0,
+) -> tuple[frozenset[str], frozenset[str]]:
+    if depth >= _MAX_SHELL_NESTING:
+        return frozenset(), frozenset()
     try:
-        words = shlex.split(command, posix=True)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="();&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        words = tuple(lexer)
     except ValueError:
-        return False
-    found_dry_run = False
-    found_live_run = False
-    for index, word in enumerate(words):
-        executable = word.rsplit("/", 1)[-1]
+        return frozenset(), frozenset()
+    dry_runs: set[str] = set()
+    live_runs: set[str] = set()
+    segment: list[str] = []
+    separator: str | None = None
+    parts: list[tuple[str | None, tuple[str, ...]]] = []
+    for word in words:
+        if word and all(character in "();&|" for character in word):
+            if segment:
+                parts.append((separator, tuple(segment)))
+                segment = []
+            separator = word
+            continue
+        segment.append(word)
+    if segment:
+        parts.append((separator, tuple(segment)))
+
+    for preceding, part in parts:
+        resolved = _command_executable(part)
+        if resolved is None:
+            continue
+        executable, arguments = resolved
+        unambiguous = preceding not in {"&&", "||", "|"}
+        if executable in _SHELL_EXECUTABLES:
+            nested = _shell_command_argument(arguments)
+            if nested is None:
+                continue
+            nested_dry, nested_live = _classify_build_evidence(
+                nested,
+                depth=depth + 1,
+            )
+            dry_runs.update(nested_dry)
+            if unambiguous:
+                live_runs.update(nested_live)
+            continue
         if executable not in _DRY_RUN_BUILD_TOOLS:
             continue
-        arguments: list[str] = []
-        for argument in words[index + 1 :]:
-            if argument in _SHELL_COMMAND_SEPARATORS:
-                break
-            arguments.append(argument)
-        dry_run = any(argument in _DRY_RUN_LONG_OPTIONS for argument in arguments)
-        if executable in {"make", "gmake"}:
-            dry_run = dry_run or any(
-                argument.startswith("-")
-                and not argument.startswith("--")
-                and "n" in argument[1:]
-                for argument in arguments
-            )
-        elif executable == "ninja":
-            dry_run = dry_run or "-n" in arguments
-        if dry_run:
-            found_dry_run = True
-        else:
-            found_live_run = True
-    return found_dry_run and not found_live_run
+        family = "make" if executable in {"make", "gmake"} else "ninja"
+        is_dry_run = (
+            _make_is_dry_run(arguments)
+            if family == "make"
+            else any(argument in {"-n", "--dry-run"} for argument in arguments)
+        )
+        if is_dry_run:
+            dry_runs.add(family)
+        elif unambiguous:
+            live_runs.add(family)
+    return frozenset(dry_runs), frozenset(live_runs)
 
 
 def _validate_primary_entry_path_evidence(
@@ -1227,11 +1338,15 @@ def _validate_primary_entry_path_evidence(
         claim = claims_by_id[entry.claim_id]
         if claim.result != "supported":
             continue
-        referenced = tuple(executions_by_id[item] for item in claim.execution_ids)
-        if referenced and all(
-            _is_dry_run_only_execution(execution.command)
-            for execution in referenced
-        ):
+        dry_runs: set[str] = set()
+        live_runs: set[str] = set()
+        for execution_id in claim.execution_ids:
+            execution_dry, execution_live = _classify_build_evidence(
+                executions_by_id[execution_id].command
+            )
+            dry_runs.update(execution_dry)
+            live_runs.update(execution_live)
+        if dry_runs - live_runs:
             raise SchemaError("DRY_RUN_EVIDENCE_INSUFFICIENT")
 
 
