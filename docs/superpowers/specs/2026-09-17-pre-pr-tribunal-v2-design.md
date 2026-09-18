@@ -158,8 +158,12 @@ its existing provenance rules; unsafe or unavailable execution never becomes
 support by inference. Report contract 5 requires at least one empirical claim
 and an explicit complete primary-entry-path-to-claim mapping before Reviewer B
 can seal, so an empty report cannot authorize PASS. A primary entry path cannot
-be marked supported when all cited build evidence is an explicit dry-run; that
-case remains unverified and therefore inconclusive.
+be marked supported when a cited build dry-run is not matched by a cited
+successful live build of the same tool, working directory and target signature;
+that case remains unverified and therefore inconclusive. Machine enforcement
+covers make, gmake and ninja only, and fails closed on environment-supplied
+build options it cannot statically resolve and on covered tools nested inside
+unmodeled wrappers.
 
 ## Reviewer independence and scope
 

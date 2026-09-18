@@ -776,6 +776,14 @@ def test_grouped_fallback_does_not_turn_a_successful_dry_run_into_live_evidence(
         ("env MAKEFLAGS=-n sh -c 'make modules'",),
         ("(cd child && make -n modules) && make modules",),
         ("make -n -j modules", "make -j help"),
+        ("GNUMAKEFLAGS=-n make modules",),
+        ("make -n modules", "GNUMAKEFLAGS=-n make modules"),
+        ("export GNUMAKEFLAGS=--recon; make modules",),
+        ("MAKEFLAGS=$FLAGS make modules",),
+        ("ssh buildhost 'make -n modules'",),
+        ("nice sh -c 'make -n modules'",),
+        ("docker run img bash -lc 'make -n modules'",),
+        ("nix-shell --run 'make -n modules'",),
     ),
 )
 def test_dry_run_bypass_cannot_seal_or_reach_pass(tmp_path, commands):

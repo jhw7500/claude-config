@@ -79,8 +79,11 @@ _MAKE_IGNORED_LONG_OPTIONS = frozenset((
     "--jobs", "--load-average", "--max-load", "--output-sync",
 ))
 _NINJA_ARGUMENT_OPTIONS = frozenset({"C", "d", "f", "j", "k", "l", "t", "w"})
+_MAKE_ENV_OPTION_VARIABLES = frozenset({"MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS"})
 _SHELL_EXECUTABLES = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
 _ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_DYNAMIC_ENV_VALUE = re.compile(r"[$`]")
+_NESTED_COMMAND_HINT = re.compile(r"\s")
 _DYNAMIC_DIRECTORY = re.compile(r"[$`*?\[~]")
 _AMBIGUOUS_CWD = "<ambiguous>"
 
@@ -1338,8 +1341,10 @@ def _ninja_evidence(
 def _makeflags_are_dry_run(words: Sequence[str], *, cwd: str) -> bool:
     for word in words:
         name, separator, value = word.partition("=")
-        if not separator or name not in {"MAKEFLAGS", "MFLAGS"}:
+        if not separator or name not in _MAKE_ENV_OPTION_VARIABLES:
             continue
+        if _DYNAMIC_ENV_VALUE.search(value):
+            return True
         try:
             arguments = list(shlex.split(value, posix=True))
         except ValueError:
@@ -1353,7 +1358,7 @@ def _makeflags_are_dry_run(words: Sequence[str], *, cwd: str) -> bool:
 
 def _makeflag_assignment(word: str, *, cwd: str) -> tuple[str, bool] | None:
     name, separator, value = word.partition("=")
-    if not separator or name not in {"MAKEFLAGS", "MFLAGS"}:
+    if not separator or name not in _MAKE_ENV_OPTION_VARIABLES:
         return None
     return name, _makeflags_are_dry_run((word,), cwd=cwd)
 
@@ -1548,16 +1553,35 @@ def _embedded_dry_runs(
     words: Sequence[str],
     *,
     cwd: str,
+    dry_env: frozenset[str] = frozenset(),
+    depth: int = 0,
 ) -> set[BuildEvidenceKey]:
     found: set[BuildEvidenceKey] = set()
     for index, word in enumerate(words):
         executable = word.rsplit("/", 1)[-1]
         if executable in {"make", "gmake"}:
             dry_run, key = _make_evidence(words[index + 1 :], cwd=cwd)
-            dry_run = dry_run or _makeflags_are_dry_run(words, cwd=cwd)
+            dry_run = (
+                dry_run
+                or bool(dry_env)
+                or _makeflags_are_dry_run(words, cwd=cwd)
+            )
         elif executable == "ninja":
             dry_run, key = _ninja_evidence(words[index + 1 :], cwd=cwd)
+            dry_run = dry_run or bool(dry_env)
         else:
+            if (
+                depth + 1 < _MAX_SHELL_NESTING
+                and _NESTED_COMMAND_HINT.search(word) is not None
+            ):
+                nested_dry, _ = _classify_build_evidence(
+                    word,
+                    depth=depth + 1,
+                    cwd=None,
+                    dry_env=dry_env,
+                    successful=False,
+                )
+                found.update(nested_dry)
             continue
         if dry_run:
             found.add(key)
@@ -1667,7 +1691,14 @@ def _classify_build_evidence(
             dry_env=frozenset(state_dry_env),
         )
         if resolved is None:
-            dry_runs.update(_embedded_dry_runs(part, cwd=_AMBIGUOUS_CWD))
+            dry_runs.update(
+                _embedded_dry_runs(
+                    part,
+                    cwd=_AMBIGUOUS_CWD,
+                    dry_env=frozenset(state_dry_env),
+                    depth=depth,
+                )
+            )
             continue
         executable, arguments, command_cwd, command_dry_env = resolved
         following = tuple(
@@ -1726,6 +1757,8 @@ def _classify_build_evidence(
                 _embedded_dry_runs(
                     part,
                     cwd=command_cwd or _AMBIGUOUS_CWD,
+                    dry_env=command_dry_env,
+                    depth=depth,
                 )
             )
             continue
@@ -1757,6 +1790,9 @@ def _validate_primary_entry_path_evidence(
 ) -> None:
     claims_by_id = {claim.id: claim for claim in claims}
     executions_by_id = {execution.id: execution for execution in executions}
+    classified: dict[
+        str, tuple[frozenset[BuildEvidenceKey], frozenset[BuildEvidenceKey]]
+    ] = {}
     for entry in coverage.primary_entry_paths:
         claim = claims_by_id[entry.claim_id]
         if claim.result != "supported":
@@ -1764,11 +1800,15 @@ def _validate_primary_entry_path_evidence(
         dry_runs: set[BuildEvidenceKey] = set()
         live_runs: set[BuildEvidenceKey] = set()
         for execution_id in claim.execution_ids:
-            execution = executions_by_id[execution_id]
-            execution_dry, execution_live = _classify_build_evidence(
-                execution.command,
-                successful=execution.exit_code == 0,
-            )
+            cached = classified.get(execution_id)
+            if cached is None:
+                execution = executions_by_id[execution_id]
+                cached = _classify_build_evidence(
+                    execution.command,
+                    successful=execution.exit_code == 0,
+                )
+                classified[execution_id] = cached
+            execution_dry, execution_live = cached
             dry_runs.update(execution_dry)
             live_runs.update(execution_live)
         if dry_runs - live_runs:
