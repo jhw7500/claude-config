@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
+import posixpath
 import re
 import shlex
 from typing import Mapping, Sequence
@@ -80,6 +81,8 @@ _MAKE_IGNORED_LONG_OPTIONS = frozenset((
 _NINJA_ARGUMENT_OPTIONS = frozenset({"C", "d", "f", "j", "k", "l", "t", "w"})
 _SHELL_EXECUTABLES = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
 _ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_DYNAMIC_DIRECTORY = re.compile(r"[$`*?\[~]")
+_AMBIGUOUS_CWD = "<ambiguous>"
 
 
 class TribunalError(Exception):
@@ -1355,7 +1358,19 @@ def _shell_command_argument(arguments: Sequence[str]) -> str | None:
     return None
 
 
-def _command_executable(words: Sequence[str]) -> tuple[str, tuple[str, ...]] | None:
+def _compose_static_cwd(cwd: str | None, directory: str) -> str | None:
+    if cwd is None or _DYNAMIC_DIRECTORY.search(directory):
+        return None
+    if posixpath.isabs(directory):
+        return posixpath.normpath(directory)
+    return posixpath.normpath(posixpath.join(cwd, directory))
+
+
+def _command_executable(
+    words: Sequence[str],
+    *,
+    cwd: str | None,
+) -> tuple[str, tuple[str, ...], str | None] | None:
     current = tuple(words)
     index = 0
     unwrap_count = 0
@@ -1378,6 +1393,7 @@ def _command_executable(words: Sequence[str]) -> tuple[str, tuple[str, ...]] | N
             continue
         if executable == "env":
             index += 1
+            chdir_seen = False
             while index < len(current):
                 word = current[index]
                 if word == "--":
@@ -1407,7 +1423,36 @@ def _command_executable(words: Sequence[str]) -> tuple[str, tuple[str, ...]] | N
                     current = expanded + current[index + 1 :]
                     index = 0
                     break
-                if word in {"-u", "--unset", "-C", "--chdir"}:
+                if word in {"-C", "--chdir"}:
+                    if index + 1 >= len(current):
+                        return None
+                    cwd = (
+                        None
+                        if chdir_seen
+                        else _compose_static_cwd(cwd, current[index + 1])
+                    )
+                    chdir_seen = True
+                    index += 2
+                    continue
+                if word.startswith("--chdir="):
+                    cwd = (
+                        None
+                        if chdir_seen
+                        else _compose_static_cwd(cwd, word.split("=", 1)[1])
+                    )
+                    chdir_seen = True
+                    index += 1
+                    continue
+                if word.startswith("-C") and len(word) > 2:
+                    cwd = (
+                        None
+                        if chdir_seen
+                        else _compose_static_cwd(cwd, word[2:])
+                    )
+                    chdir_seen = True
+                    index += 1
+                    continue
+                if word in {"-u", "--unset"}:
                     index += 2
                     continue
                 if word.startswith("-"):
@@ -1431,7 +1476,7 @@ def _command_executable(words: Sequence[str]) -> tuple[str, tuple[str, ...]] | N
                 index += 1
                 break
             continue
-        return executable, tuple(current[index + 1 :])
+        return executable, tuple(current[index + 1 :]), cwd
     return None
 
 
@@ -1466,7 +1511,7 @@ def _classify_build_evidence(
     command: str,
     *,
     depth: int = 0,
-    cwd: str = "",
+    cwd: str | None = ".",
     successful: bool = True,
 ) -> tuple[frozenset[BuildEvidenceKey], frozenset[BuildEvidenceKey]]:
     if depth >= _MAX_SHELL_NESTING:
@@ -1483,16 +1528,29 @@ def _classify_build_evidence(
     segment: list[str] = []
     separator: str | None = None
     trailing_separator: str | None = None
-    parts: list[tuple[str | None, tuple[str, ...]]] = []
+    ancestry: list[str | None] = []
+    parts: list[tuple[str | None, tuple[str | None, ...], tuple[str, ...]]] = []
     for word in words:
-        if word in {"(", ")"}:
+        if word == "(":
             if segment:
-                parts.append((separator, tuple(segment)))
+                parts.append((separator, tuple(ancestry), tuple(segment)))
                 segment = []
+            ancestry.append(separator)
+            separator = None
+            trailing_separator = None
+            continue
+        if word == ")":
+            if segment:
+                parts.append((separator, tuple(ancestry), tuple(segment)))
+                segment = []
+            if ancestry:
+                ancestry.pop()
+            separator = None
+            trailing_separator = None
             continue
         if word and all(character in ";&|" for character in word):
             if segment:
-                parts.append((separator, tuple(segment)))
+                parts.append((separator, tuple(ancestry), tuple(segment)))
                 segment = []
             separator = word
             trailing_separator = word
@@ -1500,13 +1558,14 @@ def _classify_build_evidence(
         segment.append(word)
         trailing_separator = None
     if segment:
-        parts.append((separator, tuple(segment)))
+        parts.append((separator, tuple(ancestry), tuple(segment)))
 
-    for part_index, (preceding, part) in enumerate(parts):
-        resolved = _command_executable(part)
+    for part_index, (preceding, conditional_ancestry, part) in enumerate(parts):
+        resolved = _command_executable(part, cwd=cwd)
         if resolved is None:
+            dry_runs.update(_embedded_dry_runs(part, cwd=_AMBIGUOUS_CWD))
             continue
-        executable, arguments = resolved
+        executable, arguments, command_cwd = resolved
         following = tuple(
             item[0] for item in parts[part_index + 1 :]
             if item[0] is not None
@@ -1516,12 +1575,15 @@ def _classify_build_evidence(
         unambiguous = (
             successful
             and preceding not in {"||", "|"}
+            and all(item in {None, "&&"} for item in conditional_ancestry)
             and all(item == "&&" for item in following)
         )
         if executable == "cd":
             next_cwd = _static_cd(arguments)
-            if next_cwd is not None and preceding not in {"||", "|"}:
-                cwd = next_cwd
+            if next_cwd is not None and unambiguous:
+                cwd = _compose_static_cwd(command_cwd, next_cwd)
+            else:
+                cwd = None
             continue
         if executable in _SHELL_EXECUTABLES:
             nested = _shell_command_argument(arguments)
@@ -1530,7 +1592,7 @@ def _classify_build_evidence(
             nested_dry, nested_live = _classify_build_evidence(
                 nested,
                 depth=depth + 1,
-                cwd=cwd,
+                cwd=command_cwd,
                 successful=successful,
             )
             dry_runs.update(nested_dry)
@@ -1538,21 +1600,27 @@ def _classify_build_evidence(
                 live_runs.update(nested_live)
             continue
         if executable not in _DRY_RUN_BUILD_TOOLS:
-            dry_runs.update(_embedded_dry_runs(part, cwd=cwd))
+            dry_runs.update(
+                _embedded_dry_runs(
+                    part,
+                    cwd=command_cwd or _AMBIGUOUS_CWD,
+                )
+            )
             continue
+        evidence_cwd = command_cwd or _AMBIGUOUS_CWD
         is_dry_run, key = (
-            _make_evidence(arguments, cwd=cwd)
+            _make_evidence(arguments, cwd=evidence_cwd)
             if executable in {"make", "gmake"}
-            else _ninja_evidence(arguments, cwd=cwd)
+            else _ninja_evidence(arguments, cwd=evidence_cwd)
         )
         if executable in {"make", "gmake"} and _makeflags_are_dry_run(
             part,
-            cwd=cwd,
+            cwd=evidence_cwd,
         ):
             is_dry_run = True
         if is_dry_run:
             dry_runs.add(key)
-        elif unambiguous:
+        elif unambiguous and command_cwd is not None:
             live_runs.add(key)
     return frozenset(dry_runs), frozenset(live_runs)
 

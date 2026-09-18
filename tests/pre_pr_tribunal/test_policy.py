@@ -688,6 +688,85 @@ modules:
     assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.VERIFICATION_INCOMPLETE
 
 
+def test_grouped_fallback_does_not_turn_a_successful_dry_run_into_live_evidence(
+    tmp_path,
+):
+    repo = _repo(tmp_path)
+    _write(repo, "Makefile", ".PHONY: all\nall:\n\ttouch built.marker\n")
+    _git(repo, "add", "Makefile")
+    _git(repo, "commit", "-qm", "add build entry path")
+    command = "make -f Makefile -n || (true && make -f Makefile)"
+    observed = subprocess.run(
+        ["/bin/sh", "-c", command],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    assert observed.returncode == 0, observed.stderr
+    assert not (repo / "built.marker").exists()
+
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    execution = _execution(
+        "B-R1-E001",
+        command=command,
+        stdout=observed.stdout,
+    )
+    supported = {
+        "id": "B-R1-C001",
+        "statement": "The documented build succeeds.",
+        "result": "supported",
+        "execution_ids": ["B-R1-E001"],
+        "reason": "",
+    }
+    coverage = {
+        "complete": True,
+        "primary_entry_paths": [
+            {"path": "README.md", "claim_id": "B-R1-C001"}
+        ],
+    }
+    with pytest.raises(SchemaError, match="^DRY_RUN_EVIDENCE_INSUFFICIENT$"):
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_report(
+                verdict,
+                "B",
+                claims=(supported,),
+                executions=(execution,),
+                coverage=coverage,
+            ),
+            now=NOW,
+        )
+
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.A,
+        raw=_report(verdict, "A"),
+        now=NOW,
+    )
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_report(
+            verdict,
+            "B",
+            claims=({
+                **supported,
+                "result": "unverified",
+                "execution_ids": [],
+                "reason": "The fallback was skipped after the dry-run succeeded.",
+            },),
+            executions=(execution,),
+            coverage=coverage,
+        ),
+        now=NOW,
+    )
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.INCONCLUSIVE
+    assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.VERIFICATION_INCOMPLETE
+
+
 def test_primary_entry_path_accepts_live_execution_alongside_dry_run(tmp_path):
     repo = _repo(tmp_path)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
@@ -735,10 +814,32 @@ def test_primary_entry_path_accepts_live_execution_alongside_dry_run(tmp_path):
         ("timeout 30 make -n modules",),
         ("make -n || (make modules)",),
         ("make -n || ( make modules )",),
+        ("make -n || (true && make)",),
         ("env -S 'make -n'",),
         ("make -j -n",),
         ("make -j 8 -n modules",),
         ("cd -- source-a && make -n modules", "cd -- source-b && make modules"),
+        (
+            "cd source-a && cd build && make -n modules",
+            "cd source-b && cd build && make modules",
+        ),
+        (
+            "env -C source-a make -n modules",
+            "env -C source-b make modules",
+        ),
+        (
+            "env --chdir=source-a make -n modules",
+            "env --chdir=source-b make modules",
+        ),
+        (
+            "env -Csource-a make -n modules",
+            "env -Csource-b make modules",
+        ),
+        ("cd '$BUILD_DIR' && make -n modules", "cd '$BUILD_DIR' && make modules"),
+        (
+            "env -C source-a -C build make -n modules",
+            "env -C source-a -C build make modules",
+        ),
         ("MAKEFLAGS=-n make modules",),
         ("env MAKEFLAGS=-n make modules",),
         ("make -q modules",),
@@ -822,7 +923,32 @@ def test_primary_entry_path_accepts_live_make_option_operands(tmp_path, command)
     )
 
 
-def test_primary_entry_path_matches_dry_and_live_context_and_target(tmp_path):
+@pytest.mark.parametrize(
+    ("dry_command", "live_command"),
+    (
+        (
+            "cd -- source && make -j -n modules",
+            "cd -- source && make modules",
+        ),
+        (
+            "cd source && cd build && make -j -n modules",
+            "cd source && cd build && make modules",
+        ),
+        (
+            "env -C source make -j -n modules",
+            "env --chdir=source make modules",
+        ),
+        (
+            "env -C source env --chdir build make -j -n modules",
+            "env --chdir=source env -Cbuild make modules",
+        ),
+    ),
+)
+def test_primary_entry_path_matches_dry_and_live_context_and_target(
+    tmp_path,
+    dry_command,
+    live_command,
+):
     repo = _repo(tmp_path)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     claim = {
@@ -848,11 +974,11 @@ def test_primary_entry_path_matches_dry_and_live_context_and_target(tmp_path):
             executions=(
                 _execution(
                     "B-R1-E001",
-                    command="cd -- source && make -j -n modules",
+                    command=dry_command,
                 ),
                 _execution(
                     "B-R1-E002",
-                    command="cd -- source && make modules",
+                    command=live_command,
                 ),
             ),
             coverage=coverage,
