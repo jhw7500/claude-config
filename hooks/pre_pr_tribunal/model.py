@@ -1221,7 +1221,7 @@ def _make_evidence(
             options_ended = True
             index += 1
             continue
-        if argument in _DRY_RUN_LONG_OPTIONS:
+        if any(option.startswith(argument) for option in _DRY_RUN_LONG_OPTIONS):
             dry_run = True
             index += 1
             continue
@@ -1233,10 +1233,9 @@ def _make_evidence(
                     value = arguments[index]
                 signature.append(f"{option}={value}")
             elif option in _MAKE_IGNORED_LONG_OPTIONS:
-                if (
-                    not separator
-                    and index + 1 < len(arguments)
-                    and not arguments[index + 1].startswith("-")
+                if not separator and index + 1 < len(arguments) and (
+                    option in {"--jobs", "--load-average", "--max-load"}
+                    and _numeric_make_operand(arguments[index + 1])
                 ):
                     index += 1
             else:
@@ -1267,7 +1266,8 @@ def _make_evidence(
                 if (
                     not value
                     and index + 1 < len(arguments)
-                    and not arguments[index + 1].startswith("-")
+                    and option in {"j", "l"}
+                    and _numeric_make_operand(arguments[index + 1])
                 ):
                     index += 1
                 if preserved:
@@ -1281,6 +1281,14 @@ def _make_evidence(
     signature.append("--targets")
     signature.extend(targets)
     return dry_run, ("make", cwd, tuple(signature))
+
+
+def _numeric_make_operand(value: str) -> bool:
+    try:
+        number = float(value)
+    except ValueError:
+        return False
+    return number >= 0
 
 
 def _ninja_evidence(
@@ -1343,6 +1351,13 @@ def _makeflags_are_dry_run(words: Sequence[str], *, cwd: str) -> bool:
     return False
 
 
+def _makeflag_assignment(word: str, *, cwd: str) -> tuple[str, bool] | None:
+    name, separator, value = word.partition("=")
+    if not separator or name not in {"MAKEFLAGS", "MFLAGS"}:
+        return None
+    return name, _makeflags_are_dry_run((word,), cwd=cwd)
+
+
 def _shell_command_argument(arguments: Sequence[str]) -> str | None:
     for index, argument in enumerate(arguments):
         if argument == "--":
@@ -1370,11 +1385,23 @@ def _command_executable(
     words: Sequence[str],
     *,
     cwd: str | None,
-) -> tuple[str, tuple[str, ...], str | None] | None:
+    dry_env: frozenset[str],
+) -> tuple[str, tuple[str, ...], str | None, frozenset[str]] | None:
     current = tuple(words)
     index = 0
     unwrap_count = 0
+    command_dry_env = set(dry_env)
     while index < len(current) and _ENV_ASSIGNMENT.match(current[index]):
+        assignment = _makeflag_assignment(
+            current[index],
+            cwd=cwd or _AMBIGUOUS_CWD,
+        )
+        if assignment is not None:
+            name, is_dry = assignment
+            if is_dry:
+                command_dry_env.add(name)
+            else:
+                command_dry_env.discard(name)
         index += 1
     while index < len(current):
         unwrap_count += 1
@@ -1389,6 +1416,14 @@ def _command_executable(
         if executable == "command":
             index += 1
             while index < len(current) and current[index].startswith("-"):
+                option = current[index]
+                if option == "--":
+                    index += 1
+                    break
+                if "v" in option[1:] or "V" in option[1:]:
+                    return None
+                if any(character != "p" for character in option[1:]):
+                    return None
                 index += 1
             continue
         if executable == "env":
@@ -1400,6 +1435,16 @@ def _command_executable(
                     index += 1
                     break
                 if _ENV_ASSIGNMENT.match(word):
+                    assignment = _makeflag_assignment(
+                        word,
+                        cwd=cwd or _AMBIGUOUS_CWD,
+                    )
+                    if assignment is not None:
+                        name, is_dry = assignment
+                        if is_dry:
+                            command_dry_env.add(name)
+                        else:
+                            command_dry_env.discard(name)
                     index += 1
                     continue
                 if word in {"-S", "--split-string"}:
@@ -1453,7 +1498,14 @@ def _command_executable(
                     index += 1
                     continue
                 if word in {"-u", "--unset"}:
+                    if index + 1 >= len(current):
+                        return None
+                    command_dry_env.discard(current[index + 1])
                     index += 2
+                    continue
+                if word.startswith("--unset="):
+                    command_dry_env.discard(word.split("=", 1)[1])
+                    index += 1
                     continue
                 if word.startswith("-"):
                     index += 1
@@ -1476,7 +1528,12 @@ def _command_executable(
                 index += 1
                 break
             continue
-        return executable, tuple(current[index + 1 :]), cwd
+        return (
+            executable,
+            tuple(current[index + 1 :]),
+            cwd,
+            frozenset(command_dry_env),
+        )
     return None
 
 
@@ -1512,6 +1569,7 @@ def _classify_build_evidence(
     *,
     depth: int = 0,
     cwd: str | None = ".",
+    dry_env: frozenset[str] = frozenset(),
     successful: bool = True,
 ) -> tuple[frozenset[BuildEvidenceKey], frozenset[BuildEvidenceKey]]:
     if depth >= _MAX_SHELL_NESTING:
@@ -1529,28 +1587,47 @@ def _classify_build_evidence(
     separator: str | None = None
     trailing_separator: str | None = None
     ancestry: list[str | None] = []
-    parts: list[tuple[str | None, tuple[str | None, ...], tuple[str, ...]]] = []
+    scope_path: list[int] = []
+    next_scope_id = 0
+    parts: list[
+        tuple[
+            str | None,
+            tuple[str | None, ...],
+            tuple[int, ...],
+            tuple[str, ...],
+        ]
+    ] = []
     for word in words:
         if word == "(":
             if segment:
-                parts.append((separator, tuple(ancestry), tuple(segment)))
+                parts.append(
+                    (separator, tuple(ancestry), tuple(scope_path), tuple(segment))
+                )
                 segment = []
             ancestry.append(separator)
+            next_scope_id += 1
+            scope_path.append(next_scope_id)
             separator = None
             trailing_separator = None
             continue
         if word == ")":
             if segment:
-                parts.append((separator, tuple(ancestry), tuple(segment)))
+                parts.append(
+                    (separator, tuple(ancestry), tuple(scope_path), tuple(segment))
+                )
                 segment = []
             if ancestry:
                 ancestry.pop()
+            if scope_path:
+                scope_path.pop()
             separator = None
             trailing_separator = None
             continue
         if word and all(character in ";&|" for character in word):
             if segment:
-                parts.append((separator, tuple(ancestry), tuple(segment)))
+                parts.append(
+                    (separator, tuple(ancestry), tuple(scope_path), tuple(segment))
+                )
                 segment = []
             separator = word
             trailing_separator = word
@@ -1558,14 +1635,41 @@ def _classify_build_evidence(
         segment.append(word)
         trailing_separator = None
     if segment:
-        parts.append((separator, tuple(ancestry), tuple(segment)))
+        parts.append((separator, tuple(ancestry), tuple(scope_path), tuple(segment)))
 
-    for part_index, (preceding, conditional_ancestry, part) in enumerate(parts):
-        resolved = _command_executable(part, cwd=cwd)
+    current_scope: tuple[int, ...] = ()
+    state_stack: list[tuple[str | None, set[str]]] = [(cwd, set(dry_env))]
+    for part_index, (
+        preceding,
+        conditional_ancestry,
+        part_scope,
+        part,
+    ) in enumerate(parts):
+        common = 0
+        while (
+            common < len(current_scope)
+            and common < len(part_scope)
+            and current_scope[common] == part_scope[common]
+        ):
+            common += 1
+        while len(current_scope) > common:
+            state_stack.pop()
+            current_scope = current_scope[:-1]
+        while len(current_scope) < len(part_scope):
+            parent_cwd, parent_dry_env = state_stack[-1]
+            state_stack.append((parent_cwd, set(parent_dry_env)))
+            current_scope = part_scope[: len(current_scope) + 1]
+
+        state_cwd, state_dry_env = state_stack[-1]
+        resolved = _command_executable(
+            part,
+            cwd=state_cwd,
+            dry_env=frozenset(state_dry_env),
+        )
         if resolved is None:
             dry_runs.update(_embedded_dry_runs(part, cwd=_AMBIGUOUS_CWD))
             continue
-        executable, arguments, command_cwd = resolved
+        executable, arguments, command_cwd, command_dry_env = resolved
         following = tuple(
             item[0] for item in parts[part_index + 1 :]
             if item[0] is not None
@@ -1581,9 +1685,26 @@ def _classify_build_evidence(
         if executable == "cd":
             next_cwd = _static_cd(arguments)
             if next_cwd is not None and unambiguous:
-                cwd = _compose_static_cwd(command_cwd, next_cwd)
+                next_cwd = _compose_static_cwd(command_cwd, next_cwd)
             else:
-                cwd = None
+                next_cwd = None
+            state_stack[-1] = (next_cwd, state_dry_env)
+            continue
+        if executable == "export":
+            exported = set(state_dry_env)
+            for argument in arguments:
+                assignment = _makeflag_assignment(
+                    argument,
+                    cwd=command_cwd or _AMBIGUOUS_CWD,
+                )
+                if assignment is None:
+                    continue
+                name, is_dry = assignment
+                if is_dry:
+                    exported.add(name)
+                else:
+                    exported.discard(name)
+            state_stack[-1] = (state_cwd, exported)
             continue
         if executable in _SHELL_EXECUTABLES:
             nested = _shell_command_argument(arguments)
@@ -1593,6 +1714,7 @@ def _classify_build_evidence(
                 nested,
                 depth=depth + 1,
                 cwd=command_cwd,
+                dry_env=command_dry_env,
                 successful=successful,
             )
             dry_runs.update(nested_dry)
@@ -1617,6 +1739,8 @@ def _classify_build_evidence(
             part,
             cwd=evidence_cwd,
         ):
+            is_dry_run = True
+        if command_dry_env:
             is_dry_run = True
         if is_dry_run:
             dry_runs.add(key)

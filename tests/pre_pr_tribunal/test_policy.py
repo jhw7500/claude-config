@@ -767,6 +767,78 @@ def test_grouped_fallback_does_not_turn_a_successful_dry_run_into_live_evidence(
     assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.VERIFICATION_INCOMPLETE
 
 
+@pytest.mark.parametrize(
+    "commands",
+    (
+        ("make --dry-r modules",),
+        ("make -n", "command -v make"),
+        ("export MAKEFLAGS=-n; make modules",),
+        ("env MAKEFLAGS=-n sh -c 'make modules'",),
+        ("(cd child && make -n modules) && make modules",),
+        ("make -n -j modules", "make -j help"),
+    ),
+)
+def test_dry_run_bypass_cannot_seal_or_reach_pass(tmp_path, commands):
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    executions = tuple(
+        _execution(f"B-R1-E{index:03d}", command=command)
+        for index, command in enumerate(commands, start=1)
+    )
+    supported = {
+        "id": "B-R1-C001",
+        "statement": "The documented build succeeds.",
+        "result": "supported",
+        "execution_ids": [execution["id"] for execution in executions],
+        "reason": "",
+    }
+    coverage = {
+        "complete": True,
+        "primary_entry_paths": [
+            {"path": "README.md", "claim_id": "B-R1-C001"}
+        ],
+    }
+    with pytest.raises(SchemaError, match="^DRY_RUN_EVIDENCE_INSUFFICIENT$"):
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_report(
+                verdict,
+                "B",
+                claims=(supported,),
+                executions=executions,
+                coverage=coverage,
+            ),
+            now=NOW,
+        )
+
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.A,
+        raw=_report(verdict, "A"),
+        now=NOW,
+    )
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_report(
+            verdict,
+            "B",
+            claims=({
+                **supported,
+                "result": "unverified",
+                "execution_ids": [],
+                "reason": "No successful live build was established.",
+            },),
+            executions=executions,
+            coverage=coverage,
+        ),
+        now=NOW,
+    )
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.INCONCLUSIVE
+    assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.VERIFICATION_INCOMPLETE
+
+
 def test_primary_entry_path_accepts_live_execution_alongside_dry_run(tmp_path):
     repo = _repo(tmp_path)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
@@ -815,6 +887,13 @@ def test_primary_entry_path_accepts_live_execution_alongside_dry_run(tmp_path):
         ("make -n || (make modules)",),
         ("make -n || ( make modules )",),
         ("make -n || (true && make)",),
+        ("make --dry-r modules",),
+        ("make -n", "command -v make"),
+        ("make -n", "command -V make"),
+        ("export MAKEFLAGS=-n; make modules",),
+        ("env MAKEFLAGS=-n sh -c 'make modules'",),
+        ("(cd child && make -n modules) && make modules",),
+        ("make -n -j modules", "make -j help"),
         ("env -S 'make -n'",),
         ("make -j -n",),
         ("make -j 8 -n modules",),
@@ -941,6 +1020,22 @@ def test_primary_entry_path_accepts_live_make_option_operands(tmp_path, command)
         (
             "env -C source env --chdir build make -j -n modules",
             "env --chdir=source env -Cbuild make modules",
+        ),
+        (
+            "(cd child && make -n modules)",
+            "(cd child && make modules)",
+        ),
+        (
+            "make -n -j modules",
+            "make -j modules",
+        ),
+        (
+            "make -n modules",
+            "command -p make modules",
+        ),
+        (
+            "make -n modules",
+            "env MAKEFLAGS= sh -c 'make modules'",
         ),
     ),
 )
