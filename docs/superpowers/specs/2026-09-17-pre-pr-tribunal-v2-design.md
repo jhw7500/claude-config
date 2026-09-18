@@ -162,8 +162,14 @@ be marked supported when a cited build dry-run is not matched by a cited
 successful live build of the same tool, working directory and target signature;
 that case remains unverified and therefore inconclusive. Machine enforcement
 covers make, gmake and ninja only, and fails closed on environment-supplied
-build options it cannot statically resolve and on covered tools nested inside
-unmodeled wrappers.
+build options it cannot statically resolve. It reads a quoted operand as a
+nested command only for executables documented to take a command string (a
+shell with -c, ssh, nix-shell --run, su -c); elsewhere a quoted operand is
+data, so a dry run wrapped in any other command is not detected and rests on
+reviewer discipline. Redirection is stripped before the signature is computed
+and a command substitution is dropped, so capturing a log or passing
+-j$(nproc) does not change the recorded build and a build that appears only
+inside a substitution records no evidence.
 
 ## Reviewer independence and scope
 

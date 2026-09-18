@@ -69,21 +69,30 @@ _DRY_RUN_BUILD_TOOLS = frozenset({"make", "gmake", "ninja"})
 _DRY_RUN_LONG_OPTIONS = frozenset((
     "--dry-run", "--just-print", "--question", "--recon", "--touch",
 ))
-_MAKE_REQUIRED_ARGUMENT_OPTIONS = frozenset({"C", "f", "I", "W"})
+# Derived from `make --help` (GNU Make 4.3): every short option documented as
+# taking a required argument. Omitting one lets the argument's own characters be
+# read as separate short flags, which misclassifies a live build as a dry run.
+_MAKE_REQUIRED_ARGUMENT_OPTIONS = frozenset({"C", "E", "f", "I", "o", "W"})
 _MAKE_OPTIONAL_ARGUMENT_OPTIONS = frozenset({"j", "l", "O"})
 _MAKE_RELEVANT_LONG_OPTIONS = frozenset((
-    "--assume-new", "--directory", "--file", "--include-dir", "--makefile",
-    "--new-file", "--what-if",
+    "--assume-new", "--assume-old", "--directory", "--eval", "--file",
+    "--include-dir", "--makefile", "--new-file", "--old-file", "--what-if",
 ))
 _MAKE_IGNORED_LONG_OPTIONS = frozenset((
-    "--jobs", "--load-average", "--max-load", "--output-sync",
+    "--debug", "--jobs", "--load-average", "--max-load", "--output-sync",
 ))
 _NINJA_ARGUMENT_OPTIONS = frozenset({"C", "d", "f", "j", "k", "l", "t", "w"})
 _MAKE_ENV_OPTION_VARIABLES = frozenset({"MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS"})
 _SHELL_EXECUTABLES = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
 _ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _DYNAMIC_ENV_VALUE = re.compile(r"[$`]")
-_NESTED_COMMAND_HINT = re.compile(r"\s")
+# Executables documented to take a command as a single string argument. Only
+# these have their quoted operands re-lexed as nested commands; a quoted operand
+# of anything else is data (a search pattern, a message) and must not be scanned.
+_COMMAND_STRING_WRAPPERS = frozenset({"ssh", "nix-shell", "su"})
+_REDIRECTION = re.compile(
+    r"^(?P<operator>\d*(?:>>|>|<<<|<<|<>|<))(?P<duplicate>&\d*-?)?(?P<target>.*)$"
+)
 _DYNAMIC_DIRECTORY = re.compile(r"[$`*?\[~]")
 _AMBIGUOUS_CWD = "<ambiguous>"
 
@@ -1549,6 +1558,92 @@ def _static_cd(arguments: Sequence[str]) -> str | None:
     return None
 
 
+def _collapse_substitutions(words: Sequence[str]) -> tuple[str, ...]:
+    """Drop `$( ... )` groups so they neither open a subshell scope nor become
+    operands. A command inside a substitution did not run as the cited command,
+    so it must not mint evidence; its text cannot be compared either, so it is
+    removed from the signature rather than kept as an opaque operand."""
+    collapsed: list[str] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word.endswith("$") and index + 1 < len(words) and words[index + 1] == "(":
+            depth = 0
+            scan = index + 1
+            while scan < len(words):
+                if words[scan] == "(":
+                    depth += 1
+                elif words[scan] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                scan += 1
+            prefix = word[:-1]
+            if prefix:
+                collapsed.append(prefix)
+            index = scan + 1
+            continue
+        collapsed.append(word)
+        index += 1
+    return tuple(collapsed)
+
+
+def _strip_redirections(words: Sequence[str]) -> tuple[str, ...]:
+    """Remove shell redirection operators and their targets. Redirection is a
+    closed syntax and never changes which build a command performs, so it must
+    not enter the evidence signature."""
+    stripped: list[str] = []
+    index = 0
+    while index < len(words):
+        match = _REDIRECTION.match(words[index])
+        if match is not None and match.group("operator"):
+            if match.group("duplicate") or match.group("target"):
+                index += 1
+            elif (
+                index + 2 < len(words)
+                and words[index + 1] == "&"
+                and (words[index + 2].isdigit() or words[index + 2] == "-")
+            ):
+                # The lexer splits a descriptor duplication such as 2>&1 on "&".
+                index += 3
+            else:
+                index += 2
+            continue
+        stripped.append(words[index])
+        index += 1
+    return tuple(stripped)
+
+
+def _wrapper_command_argument(
+    executable: str,
+    arguments: Sequence[str],
+) -> str | None:
+    if executable in _SHELL_EXECUTABLES:
+        return _shell_command_argument(arguments)
+    if executable not in _COMMAND_STRING_WRAPPERS:
+        return None
+    if executable == "nix-shell":
+        for index, argument in enumerate(arguments):
+            if argument == "--run" and index + 1 < len(arguments):
+                return arguments[index + 1]
+            if argument.startswith("--run="):
+                return argument.split("=", 1)[1]
+        return None
+    if executable == "su":
+        for index, argument in enumerate(arguments):
+            if argument in {"-c", "--command"} and index + 1 < len(arguments):
+                return arguments[index + 1]
+            if argument.startswith("--command="):
+                return argument.split("=", 1)[1]
+        return None
+    for argument in reversed(tuple(arguments)):
+        if argument.startswith("-"):
+            break
+        if any(character.isspace() for character in argument):
+            return argument
+    return None
+
+
 def _embedded_dry_runs(
     words: Sequence[str],
     *,
@@ -1570,12 +1665,10 @@ def _embedded_dry_runs(
             dry_run, key = _ninja_evidence(words[index + 1 :], cwd=cwd)
             dry_run = dry_run or bool(dry_env)
         else:
-            if (
-                depth + 1 < _MAX_SHELL_NESTING
-                and _NESTED_COMMAND_HINT.search(word) is not None
-            ):
+            nested = _wrapper_command_argument(executable, words[index + 1 :])
+            if nested is not None and depth + 1 < _MAX_SHELL_NESTING:
                 nested_dry, _ = _classify_build_evidence(
-                    word,
+                    nested,
                     depth=depth + 1,
                     cwd=None,
                     dry_env=dry_env,
@@ -1605,6 +1698,7 @@ def _classify_build_evidence(
         words = tuple(lexer)
     except ValueError:
         return frozenset(), frozenset()
+    words = _strip_redirections(_collapse_substitutions(words))
     dry_runs: set[BuildEvidenceKey] = set()
     live_runs: set[BuildEvidenceKey] = set()
     segment: list[str] = []

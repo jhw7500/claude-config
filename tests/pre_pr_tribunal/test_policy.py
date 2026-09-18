@@ -784,6 +784,9 @@ def test_grouped_fallback_does_not_turn_a_successful_dry_run_into_live_evidence(
         ("nice sh -c 'make -n modules'",),
         ("docker run img bash -lc 'make -n modules'",),
         ("nix-shell --run 'make -n modules'",),
+        ("su -c 'make -n modules'",),
+        ("make -n modules", "echo $(make modules)"),
+        ("make -n modules", "echo `make modules`"),
     ),
 )
 def test_dry_run_bypass_cannot_seal_or_reach_pass(tmp_path, commands):
@@ -978,6 +981,11 @@ def test_primary_entry_path_rejects_wrapped_or_padded_dry_runs(tmp_path, command
         "make -fplugin.mk modules",
         "make -Cengine modules",
         "make -fn modules",
+        "make -oconfig.mk modules",
+        "make -o config.mk modules",
+        "make --old-file=config.mk modules",
+        "make --assume-old=notquiet.mk modules",
+        "make -Enotquiet modules",
     ),
 )
 def test_primary_entry_path_accepts_live_make_option_operands(tmp_path, command):
@@ -1004,6 +1012,51 @@ def test_primary_entry_path_accepts_live_make_option_operands(tmp_path, command)
             "B",
             claims=(claim,),
             executions=(_execution("B-R1-E001", command=command),),
+            coverage=coverage,
+        ),
+        now=NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "quoting_command",
+    (
+        "grep -rn 'make -n modules' tests",
+        "git log -1 --format=%s --grep 'make -n first'",
+        'echo "run make -n all first"',
+        'python3 -m pytest -q -k "make -n"',
+    ),
+)
+def test_primary_entry_path_ignores_quoted_dry_run_text(tmp_path, quoting_command):
+    """A quoted operand of an executable that does not take a command string is
+    data, not a nested command, so its text must not manufacture a dry-run key
+    that no live build can match."""
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    claim = {
+        "id": "B-R1-C001",
+        "statement": "The documented module build succeeds.",
+        "result": "supported",
+        "execution_ids": ["B-R1-E001", "B-R1-E002"],
+        "reason": "",
+    }
+    coverage = {
+        "complete": True,
+        "primary_entry_paths": [
+            {"path": "README.md", "claim_id": "B-R1-C001"}
+        ],
+    }
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_report(
+            verdict,
+            "B",
+            claims=(claim,),
+            executions=(
+                _execution("B-R1-E001", command=quoting_command),
+                _execution("B-R1-E002", command="make modules"),
+            ),
             coverage=coverage,
         ),
         now=NOW,
@@ -1044,6 +1097,30 @@ def test_primary_entry_path_accepts_live_make_option_operands(tmp_path, command)
         (
             "make -n modules",
             "env MAKEFLAGS= sh -c 'make modules'",
+        ),
+        (
+            "make -n modules",
+            "make modules > build.log",
+        ),
+        (
+            "make -n modules",
+            "make modules >> build.log",
+        ),
+        (
+            "make -n modules",
+            "make modules 2> build.err",
+        ),
+        (
+            "make -n modules",
+            "make modules 2>&1",
+        ),
+        (
+            "make -n modules",
+            "make -j$(nproc) modules",
+        ),
+        (
+            "make -n modules",
+            "make -j $(nproc) modules",
         ),
     ),
 )
