@@ -315,6 +315,9 @@ def test_skill_submits_and_seals_each_terminal_report_before_finalize():
     assert steps[6].index("exact bytes") < steps[6].index("submit-report --reviewer X")
     assert steps[6].index("submit-report --reviewer X") < steps[6].index("sealed receipt")
     assert steps[7].index("validate-report") < steps[7].index('cli.py" finalize')
+    assert "immediately run `validate-report" not in steps[6]
+    assert "validate-report" in steps[7]
+    assert steps[6].count("validate-report") == 0
     assert "do not call `finalize`" in steps[7]
 
 
