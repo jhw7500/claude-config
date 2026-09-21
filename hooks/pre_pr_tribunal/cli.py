@@ -118,8 +118,10 @@ def _parser() -> argparse.ArgumentParser:
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
     submit.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
+    # Telemetry-only flags stay untyped: a malformed value must not fail the
+    # command at parse time, before stdin is read and the report is stored.
     submit.add_argument("--run-id")
-    submit.add_argument("--attempt", type=int)
+    submit.add_argument("--attempt")
     failure = commands.add_parser("record-failure", add_help=False)
     failure.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     failure.add_argument(
@@ -245,7 +247,7 @@ def _submit_with_telemetry(cwd, arguments, raw, *, wall_clock=utc_now, monotonic
             check_telemetry_ignored(cwd)
             span = telemetry.start_span(
                 cwd, run_id=run_id, stage=telemetry.TelemetryStage.REPORT_STORE,
-                reviewer=reviewer, attempt=attempt,
+                reviewer=reviewer, attempt=int(attempt),
                 started_at=wall_clock(), started_monotonic_ns=monotonic_ns(),
             )
         except Exception:

@@ -432,6 +432,23 @@ def test_pending_recovery_dispatches_only_pending_slots_and_never_replaces_seale
     assert "store-report --reviewer" not in body
 
 
+def test_pending_recovery_submits_exactly_as_step_six_does():
+    """Composing both normative blocks must still record one `report_store` span."""
+    body = pending_recovery_contract()
+    submit = 'submit-report --reviewer X --run-id "$RUN_ID" --attempt "$ATTEMPT"'
+    assert submit in body
+    assert submit in numbered_steps(text("SKILL.md"))[6]
+    assert re.search(r"submit-report --reviewer X(?! --run-id)", body) is None
+
+
+def test_hooks_readme_agrees_that_submit_report_owns_the_store_span():
+    """The runtime's own telemetry contract must not re-assign `report_store` to the controller."""
+    readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
+    surrounded = re.search(r"Other spans surround their operations:(.*?)\.", readme)
+    assert surrounded is not None and "report_store" not in surrounded.group(1)
+    assert "`submit-report` records that span itself" in readme
+
+
 def test_pending_recovery_uses_status_driven_command_sequence():
     body = pending_recovery_contract()
     status = "status"

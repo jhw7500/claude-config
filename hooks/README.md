@@ -182,8 +182,11 @@ cannot replace the primary result. The controller starts `reviewer_dispatch_wait
 before dispatch, finishes it at runtime acceptance, and starts `reviewer_total` at acceptance through the terminal
 response. If acceptance is unavailable, both spans start before dispatch and finish at the terminal response;
 dispatch is `incomplete` with `RUNTIME_SIGNAL_UNAVAILABLE`, and total retains the actual dispatch-to-terminal duration.
-Do not invent a 0ms acceptance interval. Other spans surround their operations: `view_create`, `report_store`,
-`report_validation`, `view_cleanup`, `recovery_retry`, and pre-final checks through `finalize`.
+Do not invent a 0ms acceptance interval. Other spans surround their operations: `view_create`,
+`report_validation`, `view_cleanup`, `recovery_retry`, and pre-final checks through `finalize`. `report_store` is
+not one of them: `submit-report` records that span itself from the `--run-id` and `--attempt` the controller passes
+it, so never open one around it. `scripts/probe-pre-pr-tribunal.py` still measures its own harness-local
+`report_store` span, so its durations are not comparable with controller runs.
 
 <!-- telemetry-command-examples -->
 ```bash

@@ -198,3 +198,24 @@ def test_primary_exception_propagates_unchanged_through_the_finished_span(
     assert (recorded[0]["attempt"], recorded[0]["status"], recorded[0]["reason_code"]) == (
         3, "failure", "BASE_INVALID",
     )
+
+
+@pytest.mark.parametrize("attempt", ("", "not-a-number"))
+def test_malformed_attempt_drops_the_span_without_failing_the_submission(
+    git_repo, tmp_path, monkeypatch, capsys, begun, attempt,
+):
+    """A telemetry-only value must never decide whether the report is stored."""
+    run_id = begun["telemetry"]["run_id"]
+    raw = report(begun, "A")
+    control = control_copy(git_repo, tmp_path)
+    plain = command(monkeypatch, capsys, control, ("submit-report", "--reviewer", "A"),
+                    raw=raw, second=5)
+    assert plain[0] == 0 and json.loads(plain[1])["state"] == "sealed"
+
+    observed = command(
+        monkeypatch, capsys, git_repo,
+        ("submit-report", "--reviewer", "A", "--run-id", run_id, "--attempt", attempt),
+        raw=raw, second=5,
+    )
+    assert observed == plain
+    assert spans(git_repo, run_id) == []
