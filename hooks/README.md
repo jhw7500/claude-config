@@ -142,7 +142,7 @@ The installed CLI and installed contract binding are authoritative; do not self-
 tribunal. The controller handles each terminal response privately and never sends one reviewer's output, slot state,
 or validation status to another reviewer. Preserve the full original response bytes in a controller-private file,
 explicitly enforce and verify current-user ownership, regular non-symlink type, and exact mode `0600` independently
-of ambient `umask`, then pipe those same bytes directly to `submit-report --reviewer A|B|C`. Do not trim,
+of ambient `umask`, then pipe those same bytes directly to `submit-report --reviewer A|B|C --run-id "$RUN_ID" --attempt "$ATTEMPT"`. Do not trim,
 parse-and-re-emit, reserialize, repair, or silently truncate them. The CLI's bounded read of maximum report size plus
 one byte is not the full oversized response evidence; preserve that complete rejected evidence privately.
 

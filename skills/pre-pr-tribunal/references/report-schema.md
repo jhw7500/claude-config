@@ -10,7 +10,7 @@ A finding path may be any normalized repository-relative path, including outside
 
 ## Controller receipt and recovery contract
 
-The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. Current verdict schema 5 uses report text contract 4, diff recipe 1 and evidence contract 2; reviewer report JSON still has `schema: 1`. Native schema-5 slots are `disabled`, `pending`, or `sealed`; only `submit-report` can turn an active pending slot into a sealed slot. Disabled slots reject context, report, failure, and validation operations. `store-report`, including its legacy replacement option, is v1-only.
+The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. `submit-report`'s `--run-id` and `--attempt` need an installed runtime from this change or later; an older installed package rejects them with an argparse usage exit instead of a stable `PRE_PR_TRIBUNAL` code, which `/usr/bin/python3 scripts/install-pre-pr-tribunal.py` resolves by reinstalling the package and the skill together. Current verdict schema 5 uses report text contract 4, diff recipe 1 and evidence contract 2; reviewer report JSON still has `schema: 1`. Native schema-5 slots are `disabled`, `pending`, or `sealed`; only `submit-report` can turn an active pending slot into a sealed slot. Disabled slots reject context, report, failure, and validation operations. `store-report`, including its legacy replacement option, is v1-only.
 
 `status.verdict_schema` selects the workflow. Schema 1 requires an explicit all-slot `migrate-legacy-pending`; compatible schema 2 requires an explicit `migrate-v2-pending`; schemas 3 and 4 have no automatic current-contract migration; schema 5 is current. Neither migration accepts a reviewer subset and both migrate conservatively to iterative A/B/C review. Legacy schema-1 migration preserves available exact raw evidence but leaves slots pending when receipt provenance is unavailable; `LEGACY_PROVENANCE_UNAVAILABLE` never means a fictional native receipt was adopted. Schema-2 migration requires its report/diff contract to match the installed runtime: historical report-contract-2 rounds fail with `CONTRACT_DRIFT`. Compatible migration validates sealed evidence and assigns a new lifecycle identity, so its first telemetry resume reports prior request accounting unknown. Preserve incompatible old rounds for explicit abandonment/restart judgment; readable historical state never upgrades pending authority.
 
@@ -88,7 +88,7 @@ The exact controller command shapes are below. `submit-report` reads exact repor
 | --- | --- |
 | inspect authoritative state | `status` |
 | project one pending role | `context --reviewer A` |
-| seal one valid response | `submit-report --reviewer A` |
+| seal one valid response | `submit-report --reviewer A --run-id "$RUN_ID" --attempt "$ATTEMPT"` |
 | record dispatch failure | `record-failure --reviewer A --reason DISPATCH_FAILED` |
 | record process failure | `record-failure --reviewer A --reason REVIEWER_FAILED` |
 | record true terminal timeout | `record-failure --reviewer A --reason REVIEWER_TIMEOUT` |

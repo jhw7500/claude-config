@@ -449,6 +449,20 @@ def test_hooks_readme_agrees_that_submit_report_owns_the_store_span():
     assert "`submit-report` records that span itself" in readme
 
 
+def test_every_controller_spec_agrees_on_the_submit_report_invocation():
+    """Four normative specs name this command; a flagless one silently records no span."""
+    flags = '--run-id "$RUN_ID" --attempt "$ATTEMPT"'
+    skill = text("SKILL.md")
+    schema = text("references/report-schema.md")
+    readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
+    assert f"submit-report --reviewer X {flags}" in numbered_steps(skill)[6]
+    assert f"submit-report --reviewer X {flags}" in pending_recovery_contract()
+    assert f"submit-report --reviewer A {flags}" in schema
+    assert f"submit-report --reviewer A|B|C {flags}" in readme
+    for spec in (skill, schema, readme):
+        assert re.search(r"submit-report --reviewer [A-Z|]+(?![A-Z|])(?! --run-id)", spec) is None
+
+
 def test_pending_recovery_uses_status_driven_command_sequence():
     body = pending_recovery_contract()
     status = "status"
