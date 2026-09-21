@@ -1019,6 +1019,7 @@ def submit_reviewer_report(
                 _validate_reviewer_closure(pending, parsed)
                 from .evidence_lifecycle import authenticate_report
                 authenticate_report(root, pending, parsed)
+                _validate_unexecutable_claims(root, pending, snapshot, parsed)
             else:
                 if len(raw) > MAX_ATTEMPT_RAW_BYTES:
                     raise SchemaError("REPORT_TOO_LARGE")
@@ -1030,6 +1031,7 @@ def submit_reviewer_report(
                     _validate_reviewer_closure(pending, parsed)
                     from .evidence_lifecycle import authenticate_report
                     authenticate_report(root, pending, parsed)
+                    _validate_unexecutable_claims(root, pending, snapshot, parsed)
                 except SchemaError as error:
                     if error.code in REPORT_RETRYABLE_CODES:
                         _record_failure_locked(review_fd, pending, reviewer, error.code, raw)
@@ -1452,6 +1454,39 @@ def begin_round(
             )
         _atomic_write(review_fd, pending)
         return pending
+
+
+def _validate_unexecutable_claims(
+    root: Path, verdict: Verdict, snapshot: Snapshot, report: m.ReviewerReport
+) -> None:
+    """A declared-unexecutable changed path must be covered and never `supported`.
+
+    The declaration lives in the committed repository config, so it is already
+    bound to the round through `PolicyBinding.config_sha256`.
+    """
+    if report.coverage is None:
+        return
+    from .policy import committed_unexecutable, unexecutable_reason
+
+    digest, declarations = committed_unexecutable(root, snapshot.head_sha)
+    if not declarations:
+        return
+    if verdict.policy is not None and digest != verdict.policy.config_sha256:
+        raise SchemaError("POLICY_CHANGED")
+    covered = {
+        entry.path: entry.claim_id for entry in report.coverage.primary_entry_paths
+    }
+    claims = {claim.id: claim for claim in report.claims}
+    for changed in snapshot.paths:
+        for path in (changed.path, changed.old_path):
+            if path is None or unexecutable_reason(declarations, path) is None:
+                continue
+            claim_id = covered.get(path)
+            if claim_id is None:
+                raise SchemaError("UNEXECUTABLE_PATH_UNCOVERED")
+            claim = claims.get(claim_id)
+            if claim is not None and claim.result == "supported":
+                raise SchemaError("UNEXECUTABLE_PATH_SUPPORTED")
 
 
 def _validate_reviewer_closure(

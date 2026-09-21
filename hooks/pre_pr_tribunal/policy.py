@@ -135,6 +135,7 @@ class _RepositoryConfig:
     digest: str
     policy: tuple[tuple[str, int], ...]
     reviewers: Mapping[str, Mapping[str, object]]
+    unexecutable: tuple[tuple[str, str], ...] = ()
 
 
 def _bounded_text(value: object, maximum: int, code: str) -> str:
@@ -349,6 +350,7 @@ def _parse_toml(raw: bytes) -> dict[str, object]:
             parts = tuple(_parse_key(part) for part in line[1:-1].split("."))
             if parts not in {
                 ("policy",),
+                ("unexecutable",),
                 ("reviewer", "A"),
                 ("reviewer", "B"),
                 ("reviewer", "C"),
@@ -387,6 +389,13 @@ def _validate_pattern(value: object) -> str:
     return pattern
 
 
+def _unexecutable_reason(value: object) -> str:
+    reason = _bounded_text(value, model.MAX_COMMAND_TEXT_BYTES, "CONFIG_INVALID")
+    if not reason.strip():
+        raise model.SchemaError("CONFIG_INVALID")
+    return reason
+
+
 def _configured_intensity(value: object) -> int:
     if isinstance(value, bool):
         raise model.SchemaError("CONFIG_INVALID")
@@ -418,7 +427,7 @@ def _default_reviewers() -> dict[str, dict[str, object]]:
 
 def _validate_config(raw: bytes) -> _RepositoryConfig:
     parsed = _parse_toml(raw) if raw else {}
-    if set(parsed) - {"policy", "reviewer"}:
+    if set(parsed) - {"policy", "unexecutable", "reviewer"}:
         raise model.SchemaError("CONFIG_INVALID")
     raw_policy = parsed.get("policy", {})
     if not isinstance(raw_policy, dict):
@@ -426,6 +435,13 @@ def _validate_config(raw: bytes) -> _RepositoryConfig:
     rules = tuple(
         (_validate_pattern(pattern), _configured_intensity(value))
         for pattern, value in raw_policy.items()
+    )
+    raw_unexecutable = parsed.get("unexecutable", {})
+    if not isinstance(raw_unexecutable, dict):
+        raise model.SchemaError("CONFIG_INVALID")
+    unexecutable = tuple(
+        (_validate_pattern(pattern), _unexecutable_reason(value))
+        for pattern, value in raw_unexecutable.items()
     )
     reviewers = _default_reviewers()
     raw_reviewers = parsed.get("reviewer", {})
@@ -446,7 +462,9 @@ def _validate_config(raw: bytes) -> _RepositoryConfig:
                 raise model.SchemaError("MODEL_UNKNOWN")
             models[runtime] = name
         reviewers[key] = {"enabled": enabled, "model": models}
-    return _RepositoryConfig(hashlib.sha256(raw).hexdigest(), rules, reviewers)
+    return _RepositoryConfig(
+        hashlib.sha256(raw).hexdigest(), rules, reviewers, unexecutable
+    )
 
 
 def _committed_config(root: Path, head_sha: str) -> _RepositoryConfig:
@@ -536,6 +554,28 @@ def _unsafe_git_kinds(root: Path, snapshot: model.Snapshot) -> tuple[bool, bool]
         if fields[:2] == [b"-", b"-"]:
             binary = True
     return special, binary
+
+
+def committed_unexecutable(
+    root: Path, head_sha: str
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Return the committed config digest and its declared-unexecutable patterns."""
+    config = _committed_config(root, head_sha)
+    return config.digest, config.unexecutable
+
+
+def unexecutable_reason(
+    declarations: Sequence[tuple[str, str]], path: str
+) -> str | None:
+    """Return the most specific declared reason matching path, or None."""
+    matches = [
+        (sum(character not in "*?[]" for character in pattern), -index, reason)
+        for index, (pattern, reason) in enumerate(declarations)
+        if _pattern_matches(pattern, path)
+    ]
+    if not matches:
+        return None
+    return max(matches)[2]
 
 
 def resolve_policy(
