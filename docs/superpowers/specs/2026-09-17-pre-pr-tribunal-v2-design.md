@@ -72,11 +72,18 @@ environment — a cross-compiled embedded target, for example — so no reviewer
 honestly produce execution evidence for it.
 
 At report seal, every changed path matching a declared pattern must appear in
-Reviewer B's `coverage.primary_entry_paths`, and the claim it maps to must not be
-`supported`. Omission raises `UNEXECUTABLE_PATH_UNCOVERED`; a `supported` claim
-raises `UNEXECUTABLE_PATH_SUPPORTED`. Both are retryable within the round, so the
-reviewer restates the claim as `refuted` or `unverified`, which already resolves
-the gate to `INCONCLUSIVE` rather than `PASS`.
+Reviewer B's `coverage.primary_entry_paths`, and the claim it maps to must be
+`unverified`. Omission raises `UNEXECUTABLE_PATH_UNCOVERED`; any other claim result
+raises `UNEXECUTABLE_PATH_NOT_UNVERIFIED`. Both are retryable within the round.
+
+`refuted` is rejected alongside `supported` because both require execution IDs,
+which the declaration asserts cannot honestly exist. Only `unverified` forbids
+them, and only `unverified` resolves the gate to `INCONCLUSIVE` rather than
+`PASS`; a `refuted` claim would otherwise seal and finalize to `PASS`, which is
+the outcome the declaration exists to prevent.
+
+A rename matches when either its pre- or post-rename path matches a declared
+pattern, and covering either side satisfies the rule.
 
 The anchor is the diff, not the report: a path the reviewer simply omits fails
 instead of passing silently. The declaration is read from the committed config at

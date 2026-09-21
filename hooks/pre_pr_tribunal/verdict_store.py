@@ -1459,7 +1459,7 @@ def begin_round(
 def _validate_unexecutable_claims(
     root: Path, verdict: Verdict, snapshot: Snapshot, report: m.ReviewerReport
 ) -> None:
-    """A declared-unexecutable changed path must be covered and never `supported`.
+    """A declared-unexecutable changed path must be covered and only `unverified`.
 
     The declaration lives in the committed repository config, so it is already
     bound to the round through `PolicyBinding.config_sha256`.
@@ -1478,15 +1478,18 @@ def _validate_unexecutable_claims(
     }
     claims = {claim.id: claim for claim in report.claims}
     for changed in snapshot.paths:
-        for path in (changed.path, changed.old_path):
-            if path is None or unexecutable_reason(declarations, path) is None:
-                continue
-            claim_id = covered.get(path)
-            if claim_id is None:
-                raise SchemaError("UNEXECUTABLE_PATH_UNCOVERED")
-            claim = claims.get(claim_id)
-            if claim is not None and claim.result == "supported":
-                raise SchemaError("UNEXECUTABLE_PATH_SUPPORTED")
+        sides = [side for side in (changed.path, changed.old_path) if side is not None]
+        if not any(unexecutable_reason(declarations, side) for side in sides):
+            continue
+        # A rename may match on either side; covering either one is enough.
+        claim_id = next((covered[side] for side in sides if side in covered), None)
+        if claim_id is None:
+            raise SchemaError("UNEXECUTABLE_PATH_UNCOVERED")
+        claim = claims.get(claim_id)
+        if claim is not None and claim.result != "unverified":
+            # `refuted` demands execution evidence exactly as `supported` does,
+            # and the declaration asserts no such evidence can exist.
+            raise SchemaError("UNEXECUTABLE_PATH_NOT_UNVERIFIED")
 
 
 def _validate_reviewer_closure(

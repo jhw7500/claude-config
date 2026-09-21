@@ -745,7 +745,7 @@ def test_pr_appendix_is_visibly_truncated_before_byte_limit(tmp_path):
 UNEXECUTABLE_CONFIG = '[unexecutable]\n"src/**" = "NO_CROSS_SDK"\n'
 
 
-def _unexecutable_report(verdict, *, result, cover=True):
+def _unexecutable_report(verdict, *, result, cover=True, path="src/app.py"):
     execution_id = f"B-R{verdict.round}-E001"
     claim_id = f"B-R{verdict.round}-C001"
     if result == "unverified":
@@ -766,7 +766,7 @@ def _unexecutable_report(verdict, *, result, cover=True):
             "execution_ids": [execution_id],
             "reason": "",
         },)
-    paths = [{"path": "src/app.py", "claim_id": claim_id}] if cover else []
+    paths = [{"path": path, "claim_id": claim_id}] if cover else []
     return _report(
         verdict,
         "B",
@@ -786,7 +786,7 @@ def test_declared_unexecutable_path_cannot_be_claimed_supported(tmp_path):
             raw=_unexecutable_report(verdict, result="supported"),
             now=NOW,
         )
-    assert error.value.code == "UNEXECUTABLE_PATH_SUPPORTED"
+    assert error.value.code == "UNEXECUTABLE_PATH_NOT_UNVERIFIED"
 
 
 def test_declared_unexecutable_path_must_appear_in_coverage(tmp_path):
@@ -839,5 +839,66 @@ def test_unexecutable_declaration_parses_and_requires_a_reason():
 def test_unexecutable_rejections_are_retryable():
     from pre_pr_tribunal.attempt_store import REPORT_RETRYABLE_CODES
 
-    assert "UNEXECUTABLE_PATH_SUPPORTED" in REPORT_RETRYABLE_CODES
+    assert "UNEXECUTABLE_PATH_NOT_UNVERIFIED" in REPORT_RETRYABLE_CODES
     assert "UNEXECUTABLE_PATH_UNCOVERED" in REPORT_RETRYABLE_CODES
+
+
+def _rename_repo(tmp_path, *, old="src/app.py", new="lib/app.py"):
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "feature")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "remote", "add", "origin", "https://github.com/jhw7500/claude-config.git")
+    _write(repo, ".gitignore", ".review/\n")
+    _write(repo, old, "base\n")
+    _write(repo, ".pre-pr-tribunal.toml", UNEXECUTABLE_CONFIG)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+    (repo / new).parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "mv", old, new)
+    _git(repo, "commit", "-qm", "rename")
+    return repo
+
+
+def test_declared_unexecutable_path_cannot_be_claimed_refuted(tmp_path):
+    """`refuted` demands execution evidence exactly as `supported` does.
+
+    Regression for the round-1 CRITICAL: permitting `refuted` sealed the report
+    and finalized to PASS, because gate aggregation only downgrades on
+    `unverified`.
+    """
+    repo = _repo(tmp_path, config=UNEXECUTABLE_CONFIG)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    with pytest.raises(SchemaError) as error:
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_unexecutable_report(verdict, result="refuted"),
+            now=NOW,
+        )
+    assert error.value.code == "UNEXECUTABLE_PATH_NOT_UNVERIFIED"
+
+
+def test_declared_unexecutable_rename_accepts_either_side(tmp_path):
+    """A rename matching on the old side may be covered by the new path."""
+    repo = _rename_repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_unexecutable_report(verdict, result="unverified", path="lib/app.py"),
+        now=NOW,
+    )
+
+
+def test_declared_unexecutable_rename_still_accepts_old_side(tmp_path):
+    repo = _rename_repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_unexecutable_report(verdict, result="unverified", path="src/app.py"),
+        now=NOW,
+    )
