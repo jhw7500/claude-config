@@ -118,6 +118,8 @@ def _parser() -> argparse.ArgumentParser:
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
     submit.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
+    submit.add_argument("--run-id")
+    submit.add_argument("--attempt", type=int)
     failure = commands.add_parser("record-failure", add_help=False)
     failure.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     failure.add_argument(
@@ -231,6 +233,50 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
     except Exception as error:
         projection = _telemetry_unavailable(error)
     return verdict, projection
+
+
+def _submit_with_telemetry(cwd, arguments, raw, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns):
+    """Own the report_store span when the caller supplies its run and request ordinal."""
+    reviewer = Reviewer(arguments.reviewer)
+    run_id, attempt = arguments.run_id, arguments.attempt
+    span = None
+    if run_id is not None and attempt is not None:
+        try:
+            check_telemetry_ignored(cwd)
+            span = telemetry.start_span(
+                cwd, run_id=run_id, stage=telemetry.TelemetryStage.REPORT_STORE,
+                reviewer=reviewer, attempt=attempt,
+                started_at=wall_clock(), started_monotonic_ns=monotonic_ns(),
+            )
+        except Exception:
+            span = None
+
+    # The review lock is exclusive and non-reentrant, so every telemetry call
+    # sits strictly before or after the primary transaction, never around it.
+    try:
+        receipt = submit_reviewer_report(cwd, reviewer=reviewer, raw=raw)
+    except Exception as primary_error:
+        try:
+            if span is not None:
+                telemetry.finish_span(
+                    cwd, run_id=run_id, span_id=span.span_id,
+                    outcome=telemetry.TelemetryOutcome.FAILURE,
+                    reason_code=primary_error.code if isinstance(primary_error, TribunalError) else None,
+                    ended_at=wall_clock(), ended_monotonic_ns=monotonic_ns(),
+                )
+        except Exception:
+            pass
+        raise
+    try:
+        if span is not None:
+            telemetry.finish_span(
+                cwd, run_id=run_id, span_id=span.span_id,
+                outcome=telemetry.TelemetryOutcome.SUCCESS, reason_code=None,
+                ended_at=wall_clock(), ended_monotonic_ns=monotonic_ns(),
+            )
+    except Exception:
+        pass
+    return receipt
 
 
 def _telemetry_command(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns):
@@ -467,10 +513,12 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 else reviewer_context_envelope(verdict, reviewer)
             )
         elif arguments.command == "submit-report":
-            receipt = submit_reviewer_report(
+            receipt = _submit_with_telemetry(
                 cwd,
-                reviewer=Reviewer(arguments.reviewer),
-                raw=_report_stdin(),
+                arguments,
+                _report_stdin(),
+                wall_clock=wall_clock,
+                monotonic_ns=monotonic_ns,
             )
             payload = {
                 "reviewer": receipt.reviewer.value,

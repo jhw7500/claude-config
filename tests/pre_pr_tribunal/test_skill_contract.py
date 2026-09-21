@@ -338,6 +338,21 @@ def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate()
     assert "telemetry" in skill and "does not change" in skill
 
 
+def test_skill_gives_the_report_store_span_to_the_submit_report_runtime():
+    skill = text("SKILL.md")
+    steps = numbered_steps(skill)
+    submit = "submit-report --reviewer X --run-id \"$RUN_ID\" --attempt \"$ATTEMPT\""
+    assert submit in steps[6]
+    assert "Record a `report_store` telemetry span" not in steps[6]
+    assert "records its own `report_store` span" in steps[6]
+    lifecycle = skill.split("## Telemetry lifecycle", 1)[1]
+    assert "`snapshot_preflight` is owned by `begin`." in lifecycle
+    assert "`report_store` is owned by `submit-report`" in lifecycle
+    # The request ordinal, not the persisted cumulative count, stays the source.
+    assert "and `report_store`; it is not the persisted cumulative `attempt_count`" in lifecycle
+    assert "--stage report_store" not in skill
+
+
 def test_skill_failure_order_preserves_peer_privacy_and_cleanup():
     steps = numbered_steps(text("SKILL.md"))
     failure = steps[6]
