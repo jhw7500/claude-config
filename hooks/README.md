@@ -142,7 +142,7 @@ The installed CLI and installed contract binding are authoritative; do not self-
 tribunal. The controller handles each terminal response privately and never sends one reviewer's output, slot state,
 or validation status to another reviewer. Preserve the full original response bytes in a controller-private file,
 explicitly enforce and verify current-user ownership, regular non-symlink type, and exact mode `0600` independently
-of ambient `umask`, then pipe those same bytes directly to `submit-report --reviewer A|B|C`. Do not trim,
+of ambient `umask`, then pipe those same bytes directly to `submit-report --reviewer A|B|C --run-id "$RUN_ID" --attempt "$ATTEMPT"`. Do not trim,
 parse-and-re-emit, reserialize, repair, or silently truncate them. The CLI's bounded read of maximum report size plus
 one byte is not the full oversized response evidence; preserve that complete rejected evidence privately.
 
@@ -182,8 +182,11 @@ cannot replace the primary result. The controller starts `reviewer_dispatch_wait
 before dispatch, finishes it at runtime acceptance, and starts `reviewer_total` at acceptance through the terminal
 response. If acceptance is unavailable, both spans start before dispatch and finish at the terminal response;
 dispatch is `incomplete` with `RUNTIME_SIGNAL_UNAVAILABLE`, and total retains the actual dispatch-to-terminal duration.
-Do not invent a 0ms acceptance interval. Other spans surround their operations: `view_create`, `report_store`,
-`report_validation`, `view_cleanup`, `recovery_retry`, and pre-final checks through `finalize`.
+Do not invent a 0ms acceptance interval. Other spans surround their operations: `view_create`,
+`report_validation`, `view_cleanup`, `recovery_retry`, and pre-final checks through `finalize`. `report_store` is
+not one of them: `submit-report` records that span itself from the `--run-id` and `--attempt` the controller passes
+it, so never open one around it. `scripts/probe-pre-pr-tribunal.py` still measures its own harness-local
+`report_store` span, so its durations are not comparable with controller runs.
 
 <!-- telemetry-command-examples -->
 ```bash

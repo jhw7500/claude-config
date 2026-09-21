@@ -338,6 +338,21 @@ def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate()
     assert "telemetry" in skill and "does not change" in skill
 
 
+def test_skill_gives_the_report_store_span_to_the_submit_report_runtime():
+    skill = text("SKILL.md")
+    steps = numbered_steps(skill)
+    submit = "submit-report --reviewer X --run-id \"$RUN_ID\" --attempt \"$ATTEMPT\""
+    assert submit in steps[6]
+    assert "Record a `report_store` telemetry span" not in steps[6]
+    assert "records its own `report_store` span" in steps[6]
+    lifecycle = skill.split("## Telemetry lifecycle", 1)[1]
+    assert "`snapshot_preflight` is owned by `begin`." in lifecycle
+    assert "`report_store` is owned by `submit-report`" in lifecycle
+    # The request ordinal, not the persisted cumulative count, stays the source.
+    assert "and `report_store`; it is not the persisted cumulative `attempt_count`" in lifecycle
+    assert "--stage report_store" not in skill
+
+
 def test_skill_failure_order_preserves_peer_privacy_and_cleanup():
     steps = numbered_steps(text("SKILL.md"))
     failure = steps[6]
@@ -415,6 +430,37 @@ def test_pending_recovery_dispatches_only_pending_slots_and_never_replaces_seale
         assert token.lower() in body.lower()
     assert re.search(r"fresh rerun.{0,120}A, B, and C", body, re.DOTALL) is None
     assert "store-report --reviewer" not in body
+
+
+def test_pending_recovery_submits_exactly_as_step_six_does():
+    """Composing both normative blocks must still record one `report_store` span."""
+    body = pending_recovery_contract()
+    submit = 'submit-report --reviewer X --run-id "$RUN_ID" --attempt "$ATTEMPT"'
+    assert submit in body
+    assert submit in numbered_steps(text("SKILL.md"))[6]
+    assert re.search(r"submit-report --reviewer X(?! --run-id)", body) is None
+
+
+def test_hooks_readme_agrees_that_submit_report_owns_the_store_span():
+    """The runtime's own telemetry contract must not re-assign `report_store` to the controller."""
+    readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
+    surrounded = re.search(r"Other spans surround their operations:(.*?)\.", readme)
+    assert surrounded is not None and "report_store" not in surrounded.group(1)
+    assert "`submit-report` records that span itself" in readme
+
+
+def test_every_controller_spec_agrees_on_the_submit_report_invocation():
+    """Four normative specs name this command; a flagless one silently records no span."""
+    flags = '--run-id "$RUN_ID" --attempt "$ATTEMPT"'
+    skill = text("SKILL.md")
+    schema = text("references/report-schema.md")
+    readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
+    assert f"submit-report --reviewer X {flags}" in numbered_steps(skill)[6]
+    assert f"submit-report --reviewer X {flags}" in pending_recovery_contract()
+    assert f"submit-report --reviewer A {flags}" in schema
+    assert f"submit-report --reviewer A|B|C {flags}" in readme
+    for spec in (skill, schema, readme):
+        assert re.search(r"submit-report --reviewer [A-Z|]+(?![A-Z|])(?! --run-id)", spec) is None
 
 
 def test_pending_recovery_uses_status_driven_command_sequence():
