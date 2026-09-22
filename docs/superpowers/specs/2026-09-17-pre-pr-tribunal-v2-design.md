@@ -64,6 +64,35 @@ Repository `[policy]` patterns may raise the floor by mapping to `off`,
 value. `.pre-pr-tribunal.toml` itself is always floor 100, preventing a policy
 weakening change from reviewing itself at the weakened level.
 
+## Declared-unexecutable paths
+
+`[unexecutable]` maps a path pattern to a short reason. It declares that the
+primary entry path for those files cannot be executed in any available
+environment — a cross-compiled embedded target, for example — so no reviewer can
+honestly produce execution evidence for it.
+
+At report seal, every changed path matching a declared pattern must appear in
+Reviewer B's `coverage.primary_entry_paths`, and the claim it maps to must be
+`unverified`. Omission raises `UNEXECUTABLE_PATH_UNCOVERED`; any other claim result
+raises `UNEXECUTABLE_PATH_NOT_UNVERIFIED`. Both are retryable within the round.
+
+`refuted` is rejected alongside `supported` because both require execution IDs,
+which the declaration asserts cannot honestly exist. Only `unverified` forbids
+them, and only `unverified` resolves the gate to `INCONCLUSIVE` rather than
+`PASS`; a `refuted` claim would otherwise seal and finalize to `PASS`, which is
+the outcome the declaration exists to prevent.
+
+A rename matches when either its pre- or post-rename path matches a declared
+pattern, and covering either side satisfies the rule.
+
+The anchor is the diff, not the report: a path the reviewer simply omits fails
+instead of passing silently. The declaration is read from the committed config at
+the bound HEAD, so an uncommitted edit cannot change it, and its digest is already
+part of `PolicyBinding.config_sha256`.
+
+Deploy order matters: merge the rule before writing any declaration. A declaration
+that predates the rule would leave verdicts sealed without it.
+
 ## Requested intensity
 
 The only request channel is the tribunal CLI `begin` command. Environment
@@ -91,6 +120,9 @@ unknown values are errors.
 "docs/**" = "off"
 "hooks/**" = "iterative"
 "**" = "single"
+
+[unexecutable]
+"drivers/**" = "NO_CROSS_SDK"
 
 [reviewer.A]
 enabled = true

@@ -1019,6 +1019,7 @@ def submit_reviewer_report(
                 _validate_reviewer_closure(pending, parsed)
                 from .evidence_lifecycle import authenticate_report
                 authenticate_report(root, pending, parsed)
+                _validate_unexecutable_claims(root, pending, snapshot, parsed)
             else:
                 if len(raw) > MAX_ATTEMPT_RAW_BYTES:
                     raise SchemaError("REPORT_TOO_LARGE")
@@ -1030,6 +1031,7 @@ def submit_reviewer_report(
                     _validate_reviewer_closure(pending, parsed)
                     from .evidence_lifecycle import authenticate_report
                     authenticate_report(root, pending, parsed)
+                    _validate_unexecutable_claims(root, pending, snapshot, parsed)
                 except SchemaError as error:
                     if error.code in REPORT_RETRYABLE_CODES:
                         _record_failure_locked(review_fd, pending, reviewer, error.code, raw)
@@ -1452,6 +1454,42 @@ def begin_round(
             )
         _atomic_write(review_fd, pending)
         return pending
+
+
+def _validate_unexecutable_claims(
+    root: Path, verdict: Verdict, snapshot: Snapshot, report: m.ReviewerReport
+) -> None:
+    """A declared-unexecutable changed path must be covered and only `unverified`.
+
+    The declaration lives in the committed repository config, so it is already
+    bound to the round through `PolicyBinding.config_sha256`.
+    """
+    if report.coverage is None:
+        return
+    from .policy import committed_unexecutable, unexecutable_reason
+
+    digest, declarations = committed_unexecutable(root, snapshot.head_sha)
+    if not declarations:
+        return
+    if verdict.policy is not None and digest != verdict.policy.config_sha256:
+        raise SchemaError("POLICY_CHANGED")
+    covered = {
+        entry.path: entry.claim_id for entry in report.coverage.primary_entry_paths
+    }
+    claims = {claim.id: claim for claim in report.claims}
+    for changed in snapshot.paths:
+        sides = [side for side in (changed.path, changed.old_path) if side is not None]
+        if not any(unexecutable_reason(declarations, side) for side in sides):
+            continue
+        # A rename may match on either side; covering either one is enough.
+        claim_id = next((covered[side] for side in sides if side in covered), None)
+        if claim_id is None:
+            raise SchemaError("UNEXECUTABLE_PATH_UNCOVERED")
+        claim = claims.get(claim_id)
+        if claim is not None and claim.result != "unverified":
+            # `refuted` demands execution evidence exactly as `supported` does,
+            # and the declaration asserts no such evidence can exist.
+            raise SchemaError("UNEXECUTABLE_PATH_NOT_UNVERIFIED")
 
 
 def _validate_reviewer_closure(
