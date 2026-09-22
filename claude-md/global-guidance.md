@@ -119,8 +119,9 @@
 이 패턴의 기록은 claude-config 이슈 #113·#121·#132·#135·#143에 있다. 스냅샷 밖인 것은 **이슈
 본문뿐**이고, 그 포인터가 무엇을 가리키는지는 저장소 안에서 확인된다 —
 `docs/superpowers/specs/2026-09-12-reviewer-evidence-bundle-design.md`(#113),
-`docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`(#143, 그리고 #132·#135가 준 중복
-계약과 #121·#136이 준 리뷰 품질 지적을 **묶어서** — 넷을 개별로 나누지는 않는다),
+`docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`(#143, 그리고 여는 문단이 #132·#135의
+중복 계약과 #121·#136의 리뷰 품질 지적을 **두 묶음으로** 귀속한다. 그 뒤 본문에서 개별로 다시
+언급되는 것은 #121 하나다 — `grep -nE '#121|#132|#135|#136'` 로 세 줄이 나온다),
 `docs/validation/2026-09-09-pre-pr-tribunal-validation-telemetry.md`(#113·#121).
 규칙의 근거는 위 메커니즘이고, 이력의 전문이 필요할 때만 트래커를 본다.
 
@@ -458,5 +459,5 @@ vs Read 646회 (2026-08-24 /insights, 75세션). 위임은 사망 빈도 자체�
 (claude-config #136). 이 저장소가 심사 수정에 쓴 커밋 수는 지금 셀 수 있다 —
 `git log --all --oneline --grep='review-fix round' | wc -l`. 고정 숫자는 곧 낡으므로 적지 않는다.
 구조적 원인과 개선안은 이슈 #147에 있다. #136이 무엇을 기여했는지는
-`docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`가 기록하고 있고, **#147은 커밋된
-파일 어디에도 없다** — 두 이슈의 본문은 어느 쪽이든 스냅샷 밖이다.
+`docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`가 기록하지만, **`git grep -n -I -E
+'#147' -- .` 로 걸리는 것은 이 문단 자신뿐이다** — 두 이슈의 본문은 어느 쪽이든 스냅샷 밖이다.
