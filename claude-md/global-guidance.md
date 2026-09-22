@@ -119,8 +119,9 @@
 이 패턴의 기록은 claude-config 이슈 #113·#121·#132·#135·#143에 있다. 스냅샷 밖인 것은 **이슈
 본문뿐**이고, 그 포인터가 무엇을 가리키는지는 저장소 안에서 확인된다 —
 `docs/superpowers/specs/2026-09-12-reviewer-evidence-bundle-design.md`(#113),
-`docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`(#143, 그리고 #121·#132·#135·#136이
-각각 무엇을 기여했는지), `docs/validation/2026-09-09-pre-pr-tribunal-validation-telemetry.md`(#113·#121).
+`docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`(#143, 그리고 #132·#135가 준 중복
+계약과 #121·#136이 준 리뷰 품질 지적을 **묶어서** — 넷을 개별로 나누지는 않는다),
+`docs/validation/2026-09-09-pre-pr-tribunal-validation-telemetry.md`(#113·#121).
 규칙의 근거는 위 메커니즘이고, 이력의 전문이 필요할 때만 트래커를 본다.
 
 ---
@@ -415,8 +416,12 @@ vs Read 646회 (2026-08-24 /insights, 75세션). 위임은 사망 빈도 자체�
    다시 심사한다. 따라서 브랜치가 클수록 매 라운드의 표면이 크고, 새 finding이 나올 확률이 높다.
 2. **고치는 행위가 심사 표면을 키운다.** 라운드 N의 blocker를 고치면 그 수정 코드가 라운드 N+1에서
    **처음 심사**된다. 수정이 클수록 다음 라운드가 불리해지고, 직전 라운드가 *추가한 문장 자체*가
-   다음 라운드 finding의 출처가 되는 일이 반복 관측됐다. **비율은 추정이다** — 저장소에 blocker
-   출처 기록이 없어 여기서 재계산할 수 없다.
+   다음 라운드 finding의 출처가 되는 일이 반복 관측됐다. 근거는 커밋 히스토리에 있다 —
+   `review-fix round` 커밋들의 메시지가 reviewer·라운드별 finding ID를 담고 있고
+   (`git log --all --format=%B | grep -oE '[ABC]-R[0-9]+-[0-9]{3}' | sort -u`), 그중 여럿은
+   결함을 **직전 라운드 수정에 명시적으로 귀속**한다(예: `b22788f` — "Reviewer B proved two
+   defects in the round-1 fix"). 다만 모든 커밋이 귀속을 적지는 않으므로 **전체 비율은
+   이 히스토리만으로 재계산되지 않는다** — 세려면 봉인된 리포트를 따로 모아야 한다.
 3. **그래서 큰 기능은 나눠서 올린다.** 통과 가능한 최소 단위로 끊어 각각 게이트를 통과시키는 편이,
    1000줄을 한 번에 넣고 3라운드를 태우는 것보다 싸다. 3라운드 상한을 소진하면 그 스냅샷으로는
    PR을 만들 수 없다.
