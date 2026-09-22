@@ -619,9 +619,19 @@ def resolve_policy(
     risk_floor = max(floors)
     effective = max(risk_floor, request.value)
     mode = intensity_mode(effective)
+    # A declaration is enforced only through Reviewer B's sealed coverage, so a
+    # config that declares one while disabling B would void it silently.
+    requires_reviewer_b = bool(config.unexecutable)
+    if requires_reviewer_b and not config.reviewers["B"]["enabled"]:
+        reasons.append("unexecutable-requires-reviewer-b")
     reviewers = {
         key: model.ReviewerPolicy(
-            enabled=(True if request.fail_closed_reason is not None else bool(value["enabled"])),
+            enabled=(
+                True
+                if request.fail_closed_reason is not None
+                or (key == "B" and requires_reviewer_b)
+                else bool(value["enabled"])
+            ),
             model=str(value["model"][runtime]),
         )
         for key, value in config.reviewers.items()

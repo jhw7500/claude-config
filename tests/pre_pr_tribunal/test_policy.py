@@ -902,3 +902,43 @@ def test_declared_unexecutable_rename_still_accepts_old_side(tmp_path):
         raw=_unexecutable_report(verdict, result="unverified", path="src/app.py"),
         now=NOW,
     )
+
+
+UNEXECUTABLE_B_DISABLED = (
+    '[unexecutable]\n"src/**" = "NO_CROSS_SDK"\n\n[reviewer.B]\nenabled = false\n'
+)
+
+
+def test_unexecutable_declaration_forces_reviewer_b(tmp_path):
+    """A declaration is enforced only through B, so disabling B must not void it.
+
+    Regression for tribunal round-2 finding A-R2-001: with B inactive,
+    `_validate_unexecutable_claims` never runs and the gate finalizes to PASS.
+    """
+    repo = _repo(tmp_path, config=UNEXECUTABLE_B_DISABLED)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert "B" in verdict.policy.active_reviewers
+    assert verdict.policy.reviewers["B"].enabled is True
+    assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
+
+
+def test_unexecutable_forcing_is_config_conditioned_not_diff_conditioned(tmp_path):
+    """Forcing depends on the committed config alone, never on the changed paths.
+
+    Round transitions reject a changed reviewer set (`POLICY_CHANGED`), and a
+    declared path may legitimately disappear between rounds because auto-fix
+    scope may shrink. Keying the decision to the config keeps it stable.
+    """
+    repo = _repo(tmp_path, path="docs/guide.md", config=UNEXECUTABLE_B_DISABLED)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert "src/app.py" not in verdict.initial_paths
+    assert verdict.policy.reviewers["B"].enabled is True
+
+
+def test_reviewer_b_stays_disabled_without_a_declaration(tmp_path):
+    """Control: the forcing is caused by the declaration, nothing else."""
+    repo = _repo(tmp_path, config='[reviewer.B]\nenabled = false\n')
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.reviewers["B"].enabled is False
+    assert "B" not in verdict.policy.active_reviewers
+    assert "unexecutable-requires-reviewer-b" not in verdict.policy.reasons

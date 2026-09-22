@@ -90,6 +90,21 @@ instead of passing silently. The declaration is read from the committed config a
 the bound HEAD, so an uncommitted edit cannot change it, and its digest is already
 part of `PolicyBinding.config_sha256`.
 
+A declaration is enforced only through Reviewer B's sealed coverage, so a
+configuration that declares a pattern while setting `[reviewer.B] enabled = false`
+would void every declaration silently. `resolve_policy` therefore forces Reviewer B
+enabled whenever the committed config declares any pattern, and records
+`unexecutable-requires-reviewer-b` among the policy reasons. The decision is keyed
+to the committed config, never to the changed paths: a round transition rejects a
+changed reviewer set, and a declared path may legitimately disappear between rounds
+because auto-fix scope is allowed to shrink.
+
+One gap remains open by design. At risk floor 0 the review mode is `off`, there are
+no active reviewers, and the gate passes without any report, so a documentation-only
+change does not apply the declaration even though the declaration is repository-wide.
+That follows from floor 0 having no review at all rather than from the declaration,
+but it means a declaration is not a guarantee about every change in the repository.
+
 Deploy order matters: merge the rule before writing any declaration. A declaration
 that predates the rule would leave verdicts sealed without it.
 
