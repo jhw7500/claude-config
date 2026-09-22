@@ -620,10 +620,12 @@ def resolve_policy(
     effective = max(risk_floor, request.value)
     mode = intensity_mode(effective)
     # A declaration is enforced only through Reviewer B's sealed coverage, so a
-    # config that declares one while disabling B would void it silently.
+    # config that declares one while disabling B would void it silently. The
+    # reason goes first: it records a security override, and the trailing
+    # entries are what MAX_POLICY_REASONS truncates.
     requires_reviewer_b = bool(config.unexecutable)
-    if requires_reviewer_b and not config.reviewers["B"]["enabled"]:
-        reasons.append("unexecutable-requires-reviewer-b")
+    if requires_reviewer_b:
+        reasons.insert(0, "unexecutable-requires-reviewer-b")
     reviewers = {
         key: model.ReviewerPolicy(
             enabled=(

@@ -93,8 +93,10 @@ part of `PolicyBinding.config_sha256`.
 A declaration is enforced only through Reviewer B's sealed coverage, so a
 configuration that declares a pattern while setting `[reviewer.B] enabled = false`
 would void every declaration silently. `resolve_policy` therefore forces Reviewer B
-enabled whenever the committed config declares any pattern, and records
-`unexecutable-requires-reviewer-b` among the policy reasons. The decision is keyed
+enabled whenever the committed config declares any pattern. It records
+`unexecutable-requires-reviewer-b` as the first policy reason whenever a pattern
+is declared — before the per-path reasons, because the reason cap truncates the
+tail and this entry is the durable record of a security override. The decision is keyed
 to the committed config, never to the changed paths: a round transition rejects a
 changed reviewer set, and a declared path may legitimately disappear between rounds
 because auto-fix scope is allowed to shrink.
