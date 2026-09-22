@@ -410,12 +410,19 @@ vs Read 646회 (2026-08-24 /insights, 75세션). 위임은 사망 빈도 자체�
 4. **리뷰어를 탓하지 않는다.** 라운드가 반복되는 이유는 판정이 까다로워서가 아니라 변경이 수렴보다
    빨리 자라기 때문이다. 실제로 blocker를 독립 재현해 보면 대부분 진짜다. 기준 완화를 요구하는
    방향으로 대응하지 않는다.
-5. **floor는 내릴 수 없다.** 빌트인 risk floor(문서 0 / 일반 소스·테스트 50 / tribunal·config·hooks·
-   workflows·deploy·auth·dependency 100)는 저장소 설정으로 **올릴 수만** 있다. `hooks/**`를 건드리는
-   변경은 항상 iterative 3라운드 전패널이므로, 그런 저장소일수록 1~3번이 중요하다.
+5. **floor는 내릴 수 없고, "문서"의 범위는 생각보다 훨씬 좁다.** 빌트인 risk floor는 저장소
+   설정으로 **올릴 수만** 있다. floor **0은 `docs/`·`doc/` 아래의 `.md`·`.mdx`·`.rst`·`.txt` 뿐**이다.
+   일반 소스·테스트 확장자가 50이고, **나머지는 전부 100**이다 — 민감 접두사(`hooks/`·`skills/`·
+   `commands/`·`claude-md/`·`config/`·`manifest/`·`migrations/`·`auth/`·`deploy/`·`.github/workflows/`
+   등)에 걸리면 `sensitive-path` 100, 어디에도 안 걸리면 fallback이 50이 아니라 **`unknown-path` 100**
+   이다. 그래서 저장소 루트의 `README.md`·`CHANGELOG.md`도 100이고, `docs/` 아래여도 확장자가 문서
+   계열이 아니면(`docs/x.png`) 100이다. `hooks/**`를 건드리는 변경은 항상 iterative 전패널이므로
+   그런 저장소일수록 1~3번이 중요하다. **예측하지 말고 설치본 `_path_floor`를 직접 실행해 확인한다.**
 
-**적용 안 함**: 문서만 바뀌는 변경(floor 0), 게이트가 없는 저장소, 나눌 수 없는 원자적 변경
-(스키마 마이그레이션 등) — 이 경우 큰 단위임을 인지하고 라운드 예산을 미리 계획한다.
+**적용 안 함**: `docs/`·`doc/` 아래 문서만 바뀌는 변경(floor 0), 게이트가 없는 저장소, 나눌 수 없는
+원자적 변경(스키마 마이그레이션 등) — 이 경우 큰 단위임을 인지하고 라운드 예산을 미리 계획한다.
+**마크다운이라는 이유만으로는 면제되지 않는다**: `claude-md/`·`skills/`·`commands/` 같은 민감 접두사
+아래의 `.md` 단독 변경도 floor 100 / iterative 전패널이다. 이 절을 담고 있는 파일 자체가 그 예다.
 
 근거: 2026-09-18 claude-config #136 — 1450 insertions / 9 files를 한 단위로 올려 두 lifecycle에서
 6라운드를 전부 소진하고 머지 없이 폐기. 저장소 전체 `review-fix round` 커밋 25건, 3라운드 소진 3건.
