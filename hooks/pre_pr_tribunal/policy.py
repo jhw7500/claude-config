@@ -619,11 +619,24 @@ def resolve_policy(
     risk_floor = max(floors)
     effective = max(risk_floor, request.value)
     mode = intensity_mode(effective)
+    # A configuration must enable a reviewer of its own: an override adds one,
+    # it never substitutes for one. `fail_closed` is the sole exemption because
+    # it overrides the whole request rather than a configuration decision, and
+    # it already enables every role. Reading the committed values here, before
+    # any override applies, is what keeps an override from masking a
+    # configuration that enables nobody.
+    if (
+        mode is not model.ReviewMode.OFF
+        and request.fail_closed_reason is None
+        and not any(bool(value["enabled"]) for value in config.reviewers.values())
+    ):
+        raise model.SchemaError("CONFIG_INVALID")
     # A declaration is enforced only through Reviewer B's sealed coverage, so a
-    # config that declares one while disabling B would void it silently. The
-    # reason goes first: it records a security override, and the trailing
-    # entries are what MAX_POLICY_REASONS truncates.
-    requires_reviewer_b = bool(config.unexecutable)
+    # config that declares one while disabling B would void it silently. `off`
+    # dispatches no reviewer at all, so forcing there would record an override
+    # that never happened. The reason goes first: it records a security
+    # override, and the trailing entries are what MAX_POLICY_REASONS truncates.
+    requires_reviewer_b = bool(config.unexecutable) and mode is not model.ReviewMode.OFF
     if requires_reviewer_b:
         reasons.insert(0, "unexecutable-requires-reviewer-b")
     reviewers = {
@@ -638,10 +651,6 @@ def resolve_policy(
         )
         for key, value in config.reviewers.items()
     }
-    if mode is not model.ReviewMode.OFF and not any(
-        reviewer.enabled for reviewer in reviewers.values()
-    ):
-        raise model.SchemaError("CONFIG_INVALID")
     unique_reasons = tuple(dict.fromkeys(reasons))
     if len(unique_reasons) > MAX_POLICY_REASONS:
         unique_reasons = (*unique_reasons[: MAX_POLICY_REASONS - 1], "reason-limit")

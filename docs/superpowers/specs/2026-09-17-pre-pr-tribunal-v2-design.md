@@ -93,13 +93,23 @@ part of `PolicyBinding.config_sha256`.
 A declaration is enforced only through Reviewer B's sealed coverage, so a
 configuration that declares a pattern while setting `[reviewer.B] enabled = false`
 would void every declaration silently. `resolve_policy` therefore forces Reviewer B
-enabled whenever the committed config declares any pattern. It records
-`unexecutable-requires-reviewer-b` as the first policy reason whenever a pattern
-is declared — before the per-path reasons, because the reason cap truncates the
-tail and this entry is the durable record of a security override. The decision is keyed
+enabled whenever the committed config declares any pattern and the review mode is
+not `off`. It records `unexecutable-requires-reviewer-b` as the first policy reason
+under that same condition — before the per-path reasons, because the reason cap
+truncates the tail and this entry is the durable record of a security override. An
+`off` run dispatches no reviewer at all, so forcing there would record an override
+that never happened; the gap described below is why that mode is excluded rather
+than made to enforce. The decision is keyed
 to the committed config, never to the changed paths: a round transition rejects a
 changed reviewer set, and a declared path may legitimately disappear between rounds
 because auto-fix scope is allowed to shrink.
+
+Forcing adds a reviewer; it never substitutes for one. The requirement that at least
+one reviewer be enabled for a non-`off` mode is therefore checked against the
+committed configuration values, before any override applies, so a declaration cannot
+stand in for a configuration that enables nobody. A request that failed closed is the
+sole exemption, because it overrides the whole request rather than a configuration
+decision and already enables every role.
 
 One gap remains open by design. At risk floor 0 the review mode is `off`, there are
 no active reviewers, and the gate passes without any report, so a documentation-only
@@ -108,7 +118,10 @@ That follows from floor 0 having no review at all rather than from the declarati
 but it means a declaration is not a guarantee about every change in the repository.
 
 Deploy order matters: merge the rule before writing any declaration. A declaration
-that predates the rule would leave verdicts sealed without it.
+that predates the rule would leave verdicts sealed without it. Narrowing the forcing
+condition likewise changes the recomputed policy, and the gate compares the whole
+binding rather than its reviewer set, so an `off`-mode verdict sealed by an older
+runtime becomes `VERDICT_STALE` until its round is begun again.
 
 ## Requested intensity
 
