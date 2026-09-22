@@ -14,7 +14,11 @@ from pre_pr_tribunal.git_state import (
     capture_snapshot,
 )
 from pre_pr_tribunal.model import GateStatus, ReviewMode, Reviewer, SchemaError
-from pre_pr_tribunal.policy import parse_intensity_request, parse_policy_binding
+from pre_pr_tribunal.policy import (
+    MAX_POLICY_REASONS,
+    parse_intensity_request,
+    parse_policy_binding,
+)
 from pre_pr_tribunal.verdict_store import (
     begin_round,
     finalize_round,
@@ -902,3 +906,87 @@ def test_declared_unexecutable_rename_still_accepts_old_side(tmp_path):
         raw=_unexecutable_report(verdict, result="unverified", path="src/app.py"),
         now=NOW,
     )
+
+
+UNEXECUTABLE_B_DISABLED = (
+    '[unexecutable]\n"src/**" = "NO_CROSS_SDK"\n\n[reviewer.B]\nenabled = false\n'
+)
+
+
+def test_unexecutable_declaration_forces_reviewer_b(tmp_path):
+    """A declaration is enforced only through B, so disabling B must not void it.
+
+    Regression for tribunal round-2 finding A-R2-001: with B inactive,
+    `_validate_unexecutable_claims` never runs and the gate finalizes to PASS.
+    """
+    repo = _repo(tmp_path, config=UNEXECUTABLE_B_DISABLED)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert "B" in verdict.policy.active_reviewers
+    assert verdict.policy.reviewers["B"].enabled is True
+    assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
+
+
+def test_unexecutable_forcing_is_config_conditioned_not_diff_conditioned(tmp_path):
+    """Forcing depends on the committed config alone, never on the changed paths.
+
+    Round transitions reject a changed reviewer set (`POLICY_CHANGED`), and a
+    declared path may legitimately disappear between rounds because auto-fix
+    scope may shrink. Keying the decision to the config keeps it stable.
+    """
+    repo = _repo(tmp_path, path="docs/guide.md", config=UNEXECUTABLE_B_DISABLED)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert "src/app.py" not in verdict.initial_paths
+    assert verdict.policy.reviewers["B"].enabled is True
+
+
+def test_reviewer_b_stays_disabled_without_a_declaration(tmp_path):
+    """Control: the forcing is caused by the declaration, nothing else."""
+    repo = _repo(tmp_path, config='[reviewer.B]\nenabled = false\n')
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.reviewers["B"].enabled is False
+    assert "B" not in verdict.policy.active_reviewers
+    assert "unexecutable-requires-reviewer-b" not in verdict.policy.reasons
+
+
+def test_unexecutable_reason_is_recorded_even_when_b_was_already_enabled(tmp_path):
+    """The override reason records the declaration, not a change to the config.
+
+    Regression for tribunal claim B-R1-C003: the reason used to be appended only
+    when the config had disabled B, so the common case recorded nothing while the
+    design note claimed it always did.
+    """
+    repo = _repo(tmp_path, config=UNEXECUTABLE_CONFIG)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.reviewers["B"].enabled is True
+    assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
+
+
+def test_unexecutable_reason_survives_the_policy_reason_cap(tmp_path):
+    """The override reason must outlive truncation on a wide change.
+
+    Regression for tribunal finding A-R1-001: the reason was appended last, so
+    `MAX_POLICY_REASONS` discarded it first — exactly on the large changes most
+    likely to touch a declared path.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "feature")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "remote", "add", "origin", "https://github.com/jhw7500/claude-config.git")
+    _write(repo, ".gitignore", ".review/\n")
+    _write(repo, ".pre-pr-tribunal.toml", UNEXECUTABLE_CONFIG)
+    for index in range(130):
+        _write(repo, f"src/mod{index}.py", "base\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+    for index in range(130):
+        _write(repo, f"src/mod{index}.py", "feature\n")
+    _git(repo, "commit", "-qam", "feature")
+
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert len(verdict.policy.reasons) == MAX_POLICY_REASONS
+    assert verdict.policy.reasons[-1] == "reason-limit"
+    assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
+    assert verdict.policy.reviewers["B"].enabled is True
