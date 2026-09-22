@@ -478,6 +478,45 @@ enabled = false
         begin_round(source, base="master", runtime="codex", round_number=1, now=NOW)
 
 
+DECLARED_ALL_DISABLED = """
+[unexecutable]
+"src/**" = "NO_CROSS_SDK"
+
+[reviewer.A]
+enabled = false
+[reviewer.B]
+enabled = false
+[reviewer.C]
+enabled = false
+""".lstrip()
+
+
+def test_all_reviewers_disabled_with_a_declaration_still_fails_closed(tmp_path):
+    """A declaration must not stand in for a reviewer the configuration disabled.
+
+    Regression for tribunal round-1 finding A-R1-002: forcing Reviewer B made
+    the all-disabled check unreachable, so "at least one reviewer must be
+    enabled for a non-off mode" silently stopped holding for exactly the
+    configurations that declare a pattern.
+    """
+    repo = _repo(tmp_path, config=DECLARED_ALL_DISABLED)
+    with pytest.raises(SchemaError, match="^CONFIG_INVALID$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+
+def test_all_reviewers_disabled_with_a_declaration_stays_off_for_docs(tmp_path):
+    """Preservation check: the invariant still binds only the non-off modes.
+
+    Passes both before and after the A-R1-002 fix; it pins the `off` half of
+    `test_all_reviewers_may_be_disabled_only_for_off_mode` against the added
+    pre-override check.
+    """
+    repo = _repo(tmp_path, path="docs/guide.md", config=DECLARED_ALL_DISABLED)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.OFF
+    assert verdict.policy.active_reviewers == ()
+
+
 def test_persisted_request_source_semantics_are_strict(tmp_path):
     repo = _repo(tmp_path)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
@@ -926,17 +965,31 @@ def test_unexecutable_declaration_forces_reviewer_b(tmp_path):
     assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
 
 
+UNEXECUTABLE_UNMATCHED_B_DISABLED = (
+    '[unexecutable]\n"drivers/**" = "NO_CROSS_SDK"\n\n[reviewer.B]\nenabled = false\n'
+)
+
+
 def test_unexecutable_forcing_is_config_conditioned_not_diff_conditioned(tmp_path):
     """Forcing depends on the committed config alone, never on the changed paths.
 
     Round transitions reject a changed reviewer set (`POLICY_CHANGED`), and a
     declared path may legitimately disappear between rounds because auto-fix
     scope may shrink. Keying the decision to the config keeps it stable.
+
+    The declared pattern and the changed path are deliberately disjoint while
+    the mode stays non-`off`. An earlier version of this test used a
+    documentation-only change, which is risk floor 0 and therefore `off`, so it
+    conflated "the diff does not match" with "no reviewer runs at all" and
+    pinned the A-R1-001 behaviour by accident. The mode assertion keeps the two
+    axes separate.
     """
-    repo = _repo(tmp_path, path="docs/guide.md", config=UNEXECUTABLE_B_DISABLED)
+    repo = _repo(tmp_path, config=UNEXECUTABLE_UNMATCHED_B_DISABLED)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
-    assert "src/app.py" not in verdict.initial_paths
+    assert verdict.policy.mode is not ReviewMode.OFF
+    assert not any(path.startswith("drivers/") for path in verdict.initial_paths)
     assert verdict.policy.reviewers["B"].enabled is True
+    assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
 
 
 def test_reviewer_b_stays_disabled_without_a_declaration(tmp_path):
@@ -990,3 +1043,18 @@ def test_unexecutable_reason_survives_the_policy_reason_cap(tmp_path):
     assert verdict.policy.reasons[-1] == "reason-limit"
     assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
     assert verdict.policy.reviewers["B"].enabled is True
+
+
+def test_off_mode_records_no_unexecutable_override(tmp_path):
+    """`off` dispatches no reviewer, so no override may be claimed.
+
+    Regression for tribunal round-1 finding A-R1-001: the forcing ran before the
+    mode was consulted, so an `off` run persisted `reviewers.B.enabled` and the
+    override reason while `active_reviewers` was empty and every slot disabled --
+    an audit record asserting a security override that never happened.
+    """
+    repo = _repo(tmp_path, path="docs/guide.md", config=UNEXECUTABLE_B_DISABLED)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.OFF
+    assert "unexecutable-requires-reviewer-b" not in verdict.policy.reasons
+    assert verdict.policy.reviewers["B"].enabled is False
