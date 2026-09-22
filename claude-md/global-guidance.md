@@ -419,10 +419,20 @@ vs Read 646회 (2026-08-24 /insights, 75세션). 위임은 사망 빈도 자체�
    계열이 아니면(`docs/x.png`) 100이다. `hooks/**`를 건드리는 변경은 항상 iterative 전패널이므로
    그런 저장소일수록 1~3번이 중요하다. **예측하지 말고 설치본 `_path_floor`를 직접 실행해 확인한다.**
 
-**적용 안 함**: `docs/`·`doc/` 아래 문서만 바뀌는 변경(floor 0), 게이트가 없는 저장소, 나눌 수 없는
-원자적 변경(스키마 마이그레이션 등) — 이 경우 큰 단위임을 인지하고 라운드 예산을 미리 계획한다.
-**마크다운이라는 이유만으로는 면제되지 않는다**: `claude-md/`·`skills/`·`commands/` 같은 민감 접두사
-아래의 `.md` 단독 변경도 floor 100 / iterative 전패널이다. 이 절을 담고 있는 파일 자체가 그 예다.
+**적용 안 함**: **실제로 resolve 해 본 floor가 0인** 변경, 게이트가 없는 저장소, 나눌 수 없는
+원자적 변경(스키마 마이그레이션 등) — 뒤 두 경우는 큰 단위임을 인지하고 라운드 예산을 미리 계획한다.
+
+**면제는 경로 모양으로 판정하지 않는다.** "문서만 바뀌었다"도, "`docs/` 아래다"도 충분조건이 아니다:
+
+- **basename 규칙이 문서 분기보다 먼저 평가된다.** `_HIGH_BASENAMES`와 `requirements*`·`dockerfile*`
+  접두사가 앞서므로 `docs/requirements-guide.md`는 `dependency-or-deploy` 100이다.
+- **status·kind가 경로와 무관하게 100을 덧씌운다.** rename·copy·type-change(`unsafe-status`),
+  symlink·submodule, 바이너리가 그렇다. `docs/a.md` → `docs/b.md` **단순 이동**도 100/iterative다
+  (실측: `unsafe-status:R100` + `mixed-risk-change`). 내용 수정만이면 같은 파일이 0/off다.
+- **민감 접두사 아래 `.md`도 100이다.** `claude-md/`·`skills/`·`commands/` — 이 절을 담고 있는
+  파일 자체가 그 예다.
+
+그래서 면제 판단은 **설치본으로 해당 변경을 실제 resolve 해 본 뒤에만** 한다.
 
 근거: 2026-09-18 claude-config #136 — 1450 insertions / 9 files를 한 단위로 올려 두 lifecycle에서
 6라운드를 전부 소진하고 머지 없이 폐기. 저장소 전체 `review-fix round` 커밋 25건, 3라운드 소진 3건.
