@@ -117,14 +117,22 @@
 축에 대한 **반례**를 이미 갖고 있을 때가 더 값지다.
 
 이 패턴의 기록은 claude-config 이슈 #113·#121·#132·#135·#143에 있다. 스냅샷 밖인 것은 **이슈
-본문뿐**이고, 그 포인터가 무엇을 가리키는지는 저장소 안에서 확인된다 —
-`docs/superpowers/specs/2026-09-12-reviewer-evidence-bundle-design.md`(#113),
-`docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`(#143, 그리고 여는 문단이 #132·#135의
-중복 계약과 #121·#136의 리뷰 품질 지적을 **두 묶음으로** 귀속한다. 그 뒤 본문에서 개별로 다시
-언급되는 것은 #121 하나다 — `grep -nE '#121|#132|#135|#136'` 로 세 줄이 나온다),
-`docs/superpowers/specs/2026-09-09-pre-pr-tribunal-validation-telemetry-design.md`(545행이 #113 을
-Reviewer B evidence bundle 로, 551행이 #121 을 prompt framing A/B 실험으로 적는다).
-`grep -rn '#121' --include=*.md docs` 로 전수 확인할 수 있다.
+본문뿐**이고, 그 포인터가 무엇을 가리키는지는 저장소 안에서 확인된다. 아래 명령은 **claude-config
+체크아웃 루트에서** 실행한다 — 다른 곳에서 돌리면 "No such file or directory"가 나오므로, 빈 출력이
+나왔다면 인용이 틀린 것이 아니라 위치가 틀린 것이다.
+
+- `docs/superpowers/specs/2026-09-12-reviewer-evidence-bundle-design.md` 가 머리에 #113 의 이슈 URL 을 적는다.
+- `docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md` 의 여는 문단이 #132·#135 의 중복
+  계약과 #121·#136 의 리뷰 품질 지적을 **두 묶음으로** 귀속하고, 그 뒤 본문에서 개별로 다시
+  언급되는 것은 #121 하나다 — 세 줄이 나온다:
+  `grep -nE '#121|#132|#135|#136' docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
+- `docs/superpowers/specs/2026-09-09-pre-pr-tribunal-validation-telemetry-design.md` 의
+  `## 17. 후속 이슈와 명시적 경계` 절이 #113 을 Reviewer B evidence bundle 로, #121 을 prompt
+  framing A/B 실험으로 적는다 — 두 줄이 나온다:
+  `grep -nE '#113|#121' docs/superpowers/specs/2026-09-09-pre-pr-tribunal-validation-telemetry-design.md`
+
+줄번호로 가리키지 않는다. 인용 대상은 살아 있는 문서이고, 위쪽에 한 줄만 끼어들면 고정 줄번호는
+조용히 거짓이 된다 — 그걸 잡아 줄 테스트는 없다.
 규칙의 근거는 위 메커니즘이고, 이력의 전문이 필요할 때만 트래커를 본다.
 
 ---
