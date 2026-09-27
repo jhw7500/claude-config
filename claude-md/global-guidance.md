@@ -122,7 +122,9 @@
 `docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`(#143, 그리고 여는 문단이 #132·#135의
 중복 계약과 #121·#136의 리뷰 품질 지적을 **두 묶음으로** 귀속한다. 그 뒤 본문에서 개별로 다시
 언급되는 것은 #121 하나다 — `grep -nE '#121|#132|#135|#136'` 로 세 줄이 나온다),
-`docs/validation/2026-09-09-pre-pr-tribunal-validation-telemetry.md`(#113·#121).
+`docs/superpowers/specs/2026-09-09-pre-pr-tribunal-validation-telemetry-design.md`(545행이 #113 을
+Reviewer B evidence bundle 로, 551행이 #121 을 prompt framing A/B 실험으로 적는다).
+`grep -rn '#121' --include=*.md docs` 로 전수 확인할 수 있다.
 규칙의 근거는 위 메커니즘이고, 이력의 전문이 필요할 때만 트래커를 본다.
 
 ---
