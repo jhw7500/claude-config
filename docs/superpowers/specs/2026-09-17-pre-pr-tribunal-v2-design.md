@@ -113,7 +113,10 @@ floor. Only when the user chooses a lower value does it run `intensity-grant
 user was shown. The grant records `channel: relayed`, and the verdict records
 requester `human-relayed` instead of `human-direct`. The parser accepts only
 these two requesters for `human_grant`. Grants written before #166 carry no
-channel and are read as terminal grants.
+channel and are read as terminal grants. After recording a relayed grant the
+agent runs `begin` with no intensity arguments. When the user keeps the floor it
+runs `intensity-grant --revoke`, which removes any earlier grant for the
+repository so that a keep-floor answer is never overridden by an older grant.
 
 Both paths are friction against policy-following agent mistakes, the threat
 model this design already states, not a security boundary: an agent running as

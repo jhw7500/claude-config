@@ -129,9 +129,10 @@ def _parser() -> argparse.ArgumentParser:
     grant = commands.add_parser("intensity-grant", add_help=False)
     grant.add_argument("--base", required=True)
     grant.add_argument("--runtime", required=True, choices=("claude", "codex"))
-    grant.add_argument("--intensity", required=True)
-    grant.add_argument("--reason", required=True)
+    grant.add_argument("--intensity")
+    grant.add_argument("--reason")
     grant.add_argument("--relayed", action="store_true")
+    grant.add_argument("--revoke", action="store_true")
     grant.add_argument("--head")
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
@@ -478,6 +479,13 @@ def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
     A relayed grant (#166) records the value the user chose when the agent asked;
     `--head` must repeat the head the user was shown. The agent never picks it.
     """
+    if arguments.revoke:
+        # A keep-floor answer removes any earlier grant for this repository.
+        if (arguments.intensity, arguments.reason, arguments.head) != (None, None, None) or arguments.relayed:
+            raise TribunalError("GRANT_INVALID")
+        return {"revoked": intensity_grant.revoke_grant(cwd)}
+    if arguments.intensity is None or arguments.reason is None:
+        raise TribunalError("GRANT_INVALID")
     relayed = arguments.relayed
     if relayed:
         head = arguments.head

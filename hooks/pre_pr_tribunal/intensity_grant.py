@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
+import os
 from pathlib import Path
 
 from . import model as m
@@ -90,6 +91,21 @@ def record_grant(
             too_large="GRANT_INVALID", unsafe="GRANT_FILE_UNSAFE",
         )
     return payload
+
+
+def revoke_grant(cwd: Path) -> bool:
+    """Remove this repository's grant, if any, so a keep-floor answer wins (#166)."""
+    root = repository_root(cwd)
+    if not (root / ".review").exists():
+        return False
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        try:
+            os.unlink(GRANT_NAME, dir_fd=review_fd)
+        except FileNotFoundError:
+            return False
+    return True
 
 
 def matching_grant_request(

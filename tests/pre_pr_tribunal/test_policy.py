@@ -1387,3 +1387,34 @@ def test_human_grant_accepts_only_direct_or_relayed_requesters(tmp_path, monkeyp
         else:
             with pytest.raises(SchemaError, match="^POLICY_INVALID$"):
                 parse_policy_binding(candidate, runtime="codex")
+
+
+def test_revoke_keeps_the_floor_over_an_earlier_grant(tmp_path, monkeypatch, capsys):
+    from pre_pr_tribunal.cli import main
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 0)
+    monkeypatch.chdir(repo)
+    assert main(["intensity-grant", "--base", "master", "--runtime", "codex", "--revoke"]) == 0
+    capsys.readouterr()
+    assert not (repo / ".review" / "intensity-grant.json").exists()
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert verdict.policy.request.source == "default"
+
+
+def test_revoke_without_a_grant_is_a_no_op_and_rejects_value_flags(
+    tmp_path, monkeypatch, capsys
+):
+    from pre_pr_tribunal.cli import main
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    monkeypatch.chdir(repo)
+    base = ["intensity-grant", "--base", "master", "--runtime", "codex", "--revoke"]
+    assert main(base) == 0
+    assert json.loads(capsys.readouterr().out) == {"revoked": False}
+    assert main([*base, "--intensity", "50"]) == 1
+    assert capsys.readouterr().err == "PRE_PR_TRIBUNAL:GRANT_INVALID\n"
+    assert main(["intensity-grant", "--base", "master", "--runtime", "codex",
+                 "--relayed", "--head", "0" * 12, "--reason", "no value"]) == 1
+    assert capsys.readouterr().err == "PRE_PR_TRIBUNAL:GRANT_INVALID\n"
