@@ -118,12 +118,15 @@
 
 이 패턴의 기록은 claude-config 이슈 #113·#121·#132·#135·#143에 있다. 스냅샷 밖인 것은 **이슈
 본문뿐**이고, 그 포인터가 무엇을 가리키는지는 저장소 안에서 확인된다. 아래 명령은 **claude-config
-체크아웃 루트에서** 실행한다. 빈 출력에는 원인이 둘이므로 **stderr를 먼저 본다** — 경고가 찍혔으면
-파일을 못 찾은 것(위치가 틀렸다, 종료코드 2)이고, stderr가 비었으면 파일은 찾았는데 패턴이 없는
-것(인용이 낡았다, 종료코드 1)이다. 빈 출력을 위치 탓으로만 돌리면 낡은 인용이 조용히 통과한다.
+체크아웃 루트에서** 실행하고, 출력이 아니라 **종료코드를 본다** — 2면 파일을 못 찾은 것(위치가
+틀렸거나 인용된 경로가 옮겨졌다; stderr에 경고가 찍힌다)이고, 1이면 파일은 찾았는데 패턴이 없는
+것(인용이 낡았다)이다. 출력이 비지 않았다는 사실은 통과의 근거가 아니다.
 
-- #113 과 #143 의 포인터는 각 설계문서 **머리의 이슈 URL** 이다. 번호 형태가 아니라 URL 로 찾는다:
-  `grep -nE 'issues/(113|143)' docs/superpowers/specs/2026-09-12-reviewer-evidence-bundle-design.md docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
+- #113 과 #143 의 포인터는 각 설계문서 **머리의 이슈 URL** 이다. 번호 형태가 아니라 URL 로 찾되
+  **한 명령에 한 파일만** 준다 — 여러 파일을 한 번에 주면 한쪽이 사라져도 다른 쪽 매치가 출력되어
+  종료코드 하나가 두 인용을 뭉뚱그린다:
+  `grep -n 'issues/113' docs/superpowers/specs/2026-09-12-reviewer-evidence-bundle-design.md`
+  `grep -n 'issues/143' docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
 - `docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md` 의 여는 문단이 #132·#135 의 중복
   계약과 #121·#136 의 리뷰 품질 지적을 **두 묶음으로** 귀속하고, 그 뒤 본문에서 개별로 다시
   언급되는 것은 #121 하나다:
