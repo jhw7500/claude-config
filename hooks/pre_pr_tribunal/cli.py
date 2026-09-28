@@ -35,6 +35,7 @@ if __package__ in {None, ""}:
         finalize_round,
         migrate_legacy_pending_round,
         migrate_v2_pending_round,
+        preview_policy,
         read_verdict,
         record_reviewer_failure,
         store_reviewer_report,
@@ -62,6 +63,7 @@ else:
         finalize_round,
         migrate_legacy_pending_round,
         migrate_v2_pending_round,
+        preview_policy,
         read_verdict,
         record_reviewer_failure,
         store_reviewer_report,
@@ -114,6 +116,12 @@ def _parser() -> argparse.ArgumentParser:
     begin.add_argument("--intensity", action="append")
     begin.add_argument("--intensity-requester", action="append")
     begin.add_argument("--intensity-reason", action="append")
+    preview = commands.add_parser("policy-preview", add_help=False)
+    preview.add_argument("--base", required=True)
+    preview.add_argument("--runtime", required=True, choices=("claude", "codex"))
+    preview.add_argument("--intensity", action="append")
+    preview.add_argument("--intensity-requester", action="append")
+    preview.add_argument("--intensity-reason", action="append")
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -504,6 +512,30 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
             if verdict.policy is not None:
                 payload["policy"] = verdict.policy.to_json()
                 payload["active_reviewers"] = list(verdict.policy.active_reviewers)
+        elif arguments.command == "policy-preview":
+            # Predicts the policy only: stored verdict state is not read, so this
+            # never says whether `begin` will accept the snapshot.
+            snapshot, policy = preview_policy(
+                cwd, base=arguments.base, runtime=arguments.runtime,
+                intensity_values=arguments.intensity,
+                intensity_requester=arguments.intensity_requester,
+                intensity_reason=arguments.intensity_reason,
+            )
+            payload = {
+                "schema": 1,
+                "round_authority": False,
+                "begin_admissible": "not-evaluated",
+                "snapshot": {
+                    "repository": snapshot.repository,
+                    "base": {"ref": snapshot.base_ref, "sha": snapshot.base_sha},
+                    "head_ref": snapshot.head_ref,
+                    "head_sha": snapshot.head_sha,
+                    "merge_base_sha": snapshot.merge_base_sha,
+                    "diff_sha256": snapshot.diff_sha256,
+                },
+                "policy": policy.to_json(),
+                "active_reviewers": list(policy.active_reviewers),
+            }
         elif arguments.command.startswith("telemetry-"):
             payload = _telemetry_command(cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns)
         elif arguments.command == "context":

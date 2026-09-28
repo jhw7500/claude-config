@@ -1279,6 +1279,37 @@ def _lifecycle_id(token_hex: Callable[[int], str]) -> str:
     return value
 
 
+def preview_policy(
+    cwd: Path,
+    *,
+    base: str,
+    runtime: str,
+    intensity_values: Sequence[str] | None = None,
+    intensity_requester: str | Sequence[str] | None = None,
+    intensity_reason: str | Sequence[str] | None = None,
+    now: Callable[[], str] = utc_now,
+) -> tuple[Snapshot, m.PolicyBinding]:
+    """Resolve the policy `begin` would bind, without taking the review lock.
+
+    Stored verdict state is never read, so this predicts the policy only, not
+    whether `begin` will accept the snapshot.
+    """
+    if runtime not in {"claude", "codex"}:
+        raise SchemaError("RUNTIME_INVALID")
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    snapshot = capture_snapshot(root, base, now=now)
+    from .policy import parse_intensity_request, resolve_policy
+
+    request = parse_intensity_request(
+        intensity_values,
+        requester=intensity_requester,
+        reason=intensity_reason,
+    )
+    return snapshot, resolve_policy(root, snapshot, runtime=runtime, request=request)
+
+
 def begin_round(
     cwd: Path,
     *,
