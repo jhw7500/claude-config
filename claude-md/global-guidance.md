@@ -117,28 +117,25 @@
 축에 대한 **반례**를 이미 갖고 있을 때가 더 값지다.
 
 이 패턴의 기록은 claude-config 이슈 #113·#121·#132·#135·#143에 있다. 스냅샷 밖인 것은 **이슈
-본문뿐**이고, 그 포인터가 무엇을 가리키는지는 저장소 안에서 확인된다. 아래 명령은 **claude-config
+본문뿐**이고, 다섯 이슈가 저장소 안에서 무엇에 닿는지는 아래로 확인된다. 명령은 **claude-config
 체크아웃 루트에서** 실행하고, 출력이 아니라 **종료코드를 본다** — 2면 파일을 못 찾은 것(위치가
-틀렸거나 인용된 경로가 옮겨졌다; stderr에 경고가 찍힌다)이고, 1이면 파일은 찾았는데 패턴이 없는
-것(인용이 낡았다)이다. 출력이 비지 않았다는 사실은 통과의 근거가 아니다.
+틀렸거나 인용된 경로가 옮겨졌다; stderr에 경고가 찍힌다)이고, 1이면 파일은 찾았는데 그 이슈가
+사라진 것이다. 출력이 비지 않았다는 사실은 통과의 근거가 아니다.
 
-- #113 과 #143 의 포인터는 각 설계문서 **머리의 이슈 URL** 이다. 번호 형태가 아니라 URL 로 찾되
-  **한 명령에 한 파일만** 준다 — 여러 파일을 한 번에 주면 한쪽이 사라져도 다른 쪽 매치가 출력되어
-  종료코드 하나가 두 인용을 뭉뚱그린다:
-  `grep -n 'issues/113' docs/superpowers/specs/2026-09-12-reviewer-evidence-bundle-design.md`
-  `grep -n 'issues/143' docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
-- `docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md` 의 여는 문단이 #132·#135 의 중복
-  계약과 #121·#136 의 리뷰 품질 지적을 **두 묶음으로** 귀속하고, 그 뒤 본문에서 개별로 다시
-  언급되는 것은 #121 하나다:
-  `grep -nE '#121|#132|#135|#136' docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
-- `docs/superpowers/specs/2026-09-09-pre-pr-tribunal-validation-telemetry-design.md` 의
-  `## 17. 후속 이슈와 명시적 경계` 절이 #113 을 Reviewer B evidence bundle 로, #121 을 prompt
-  framing A/B 실험으로 적는다:
-  `grep -nE '#113|#121' docs/superpowers/specs/2026-09-09-pre-pr-tribunal-validation-telemetry-design.md`
+**명령 하나가 주장 하나만 확인한다.** 파일이든 패턴이든 둘 이상을 한 명령에 묶으면 종료코드가
+OR이 되어, 하나만 살아 있어도 0이 나오고 나머지가 사라진 것을 가려 준다. 그래서 이슈마다 명령이
+따로 있고, #113·#143은 번호 형태가 아니라 머리의 이슈 URL 로 찾는다:
+
+`grep -n 'issues/113' docs/superpowers/specs/2026-09-12-reviewer-evidence-bundle-design.md`
+`grep -n 'issues/143' docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
+`grep -n '#121' docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
+`grep -n '#132' docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
+`grep -n '#135' docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
 
 줄번호도 개수도 적지 않는다. 인용 대상은 살아 있는 문서여서 위에 한 줄만 끼어들면 고정 줄번호가,
-문장 하나만 늘면 고정 개수가 조용히 거짓이 된다 — 어느 쪽도 잡아 줄 테스트는 없다. 인용은 명령과
-그 명령이 **무엇을 보여 줄 것인지**로 적고, 수치로는 적지 않는다.
+문장 하나만 늘면 고정 개수가 조용히 거짓이 된다 — 어느 쪽도 잡아 줄 테스트는 없다. **어느 절·어느
+문단에 있다는 범위 주장도 적지 않는다** — grep은 절 경계를 모르므로 그런 주장은 위 명령으로
+반증되지 않는다. 인용은 명령 하나와 그 명령이 확인하는 주장 하나로 적는다.
 규칙의 근거는 위 메커니즘이고, 이력의 전문이 필요할 때만 트래커를 본다.
 
 ---
