@@ -25,6 +25,10 @@ from .review_store import (
 
 GRANT_NAME = "intensity-grant.json"
 MAX_GRANT_BYTES = 16 * 1024
+_CHANNEL_REQUESTERS = {
+    "tty": m.HUMAN_GRANT_REQUESTER,
+    "relayed": m.HUMAN_RELAYED_REQUESTER,
+}
 
 
 def _binding(snapshot: m.Snapshot, policy: m.PolicyBinding) -> dict[str, object]:
@@ -55,11 +59,16 @@ def record_grant(
     value: int,
     reason: str,
     now: Callable[[], str],
+    channel: str = "tty",
 ) -> dict[str, object]:
-    """Write the grant for the snapshot and baseline policy the human was shown."""
+    """Write the grant for the snapshot and baseline policy the human was shown.
+
+    `channel` is "tty" when the person typed the confirmation at a terminal and
+    "relayed" when the agent recorded the answer the person gave in its prompt.
+    """
     from .policy import MAX_REASON_BYTES, _bounded_text, validate_grant_lowering
 
-    if policy.request.source != "default":
+    if policy.request.source != "default" or channel not in _CHANNEL_REQUESTERS:
         raise m.SchemaError("GRANT_INVALID")
     validate_grant_lowering(policy.risk_floor, value)
     reason = _bounded_text(reason, MAX_REASON_BYTES, "GRANT_INVALID")
@@ -68,6 +77,7 @@ def record_grant(
         "binding": _binding(snapshot, policy),
         "value": value,
         "reason": reason,
+        "channel": channel,
         "created_at": now(),
     }
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
@@ -106,7 +116,9 @@ def matching_grant_request(
         value = payload["value"]
         reason = payload["reason"]
         binding = payload["binding"]
-    except (ValueError, TypeError, KeyError, RecursionError):
+        # Grants written before #166 carry no channel; they came from a terminal.
+        requester = _CHANNEL_REQUESTERS.get(payload.get("channel", "tty"))
+    except (ValueError, TypeError, KeyError, RecursionError, AttributeError):
         return None
     if (
         not isinstance(payload, dict)
@@ -114,6 +126,7 @@ def matching_grant_request(
         or not isinstance(value, int)
         or isinstance(value, bool)
         or not isinstance(reason, str)
+        or requester is None
     ):
         return None
     policy = baseline()
@@ -126,6 +139,4 @@ def matching_grant_request(
         validate_grant_lowering(policy.risk_floor, value)
     except m.SchemaError:
         return None
-    return m.IntensityRequest(
-        value, m.HUMAN_GRANT_SOURCE, m.HUMAN_GRANT_REQUESTER, reason
-    )
+    return m.IntensityRequest(value, m.HUMAN_GRANT_SOURCE, requester, reason)

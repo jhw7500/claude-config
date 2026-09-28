@@ -175,7 +175,7 @@ def validate_grant_lowering(risk_floor: int, value: int) -> None:
 def _effective_intensity(risk_floor: int, request: model.IntensityRequest) -> int:
     if request.source != model.HUMAN_GRANT_SOURCE:
         return max(risk_floor, request.value)
-    if request.requester != model.HUMAN_GRANT_REQUESTER:
+    if request.requester not in model.HUMAN_GRANT_REQUESTERS:
         raise model.SchemaError("POLICY_INVALID")
     validate_grant_lowering(risk_floor, request.value)
     return request.value

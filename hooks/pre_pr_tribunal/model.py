@@ -479,6 +479,9 @@ class IntensityRequest:
 
 HUMAN_GRANT_SOURCE = "human_grant"
 HUMAN_GRANT_REQUESTER = "human-direct"
+# A grant the agent recorded from the user's answer in its own prompt (#166).
+HUMAN_RELAYED_REQUESTER = "human-relayed"
+HUMAN_GRANT_REQUESTERS = frozenset({HUMAN_GRANT_REQUESTER, HUMAN_RELAYED_REQUESTER})
 
 
 @dataclass(frozen=True)

@@ -1333,3 +1333,57 @@ def test_malformed_grant_is_ignored_and_state_stays_readable(tmp_path, tamper):
     assert verdict.policy.mode is ReviewMode.ITERATIVE
     assert verdict.policy.request.source == "default"
     assert read_verdict(repo).policy == verdict.policy
+
+
+def _head(repo):
+    return subprocess.run(
+        ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _relayed(repo, monkeypatch, capsys, *extra):
+    from pre_pr_tribunal.cli import main
+
+    monkeypatch.chdir(repo)
+    status = main(["intensity-grant", "--base", "master", "--runtime", "codex",
+                   "--intensity", "50", "--reason", "user chose single in the prompt",
+                   "--relayed", *extra])
+    return status, capsys.readouterr()
+
+
+def test_relayed_grant_needs_no_terminal_and_records_its_channel(
+    tmp_path, monkeypatch, capsys
+):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    status, captured = _relayed(repo, monkeypatch, capsys, "--head", _head(repo)[:12])
+    assert status == 0, captured.err
+    assert json.loads(captured.out)["channel"] == "relayed"
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    policy = verdict.policy
+    assert (policy.request.source, policy.request.requester) == ("human_grant", "human-relayed")
+    assert (policy.risk_floor, policy.effective_intensity) == (100, 50)
+    assert parse_policy_binding(policy.to_json(), runtime="codex") == policy
+
+
+def test_relayed_grant_is_bound_to_the_head_the_user_saw(tmp_path, monkeypatch, capsys):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    status, captured = _relayed(repo, monkeypatch, capsys, "--head", "0" * 12)
+    assert (status, captured.err) == (1, "PRE_PR_TRIBUNAL:GRANT_CONFIRMATION_MISMATCH\n")
+    status, captured = _relayed(repo, monkeypatch, capsys)
+    assert (status, captured.err) == (1, "PRE_PR_TRIBUNAL:GRANT_INVALID\n")
+    assert not (repo / ".review" / "intensity-grant.json").exists()
+
+
+def test_human_grant_accepts_only_direct_or_relayed_requesters(tmp_path, monkeypatch, capsys):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    assert _relayed(repo, monkeypatch, capsys, "--head", _head(repo)[:12])[0] == 0
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    for requester, valid in (("human-direct", True), ("human-relayed", True), ("agent", False)):
+        candidate = verdict.policy.to_json()
+        candidate["request"] = {**candidate["request"], "requester": requester}
+        if valid:
+            assert parse_policy_binding(candidate, runtime="codex").request.requester == requester
+        else:
+            with pytest.raises(SchemaError, match="^POLICY_INVALID$"):
+                parse_policy_binding(candidate, runtime="codex")

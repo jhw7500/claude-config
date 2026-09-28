@@ -131,6 +131,8 @@ def _parser() -> argparse.ArgumentParser:
     grant.add_argument("--runtime", required=True, choices=("claude", "codex"))
     grant.add_argument("--intensity", required=True)
     grant.add_argument("--reason", required=True)
+    grant.add_argument("--relayed", action="store_true")
+    grant.add_argument("--head")
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -471,8 +473,21 @@ def _snapshot_equal(verdict, snapshot) -> bool:
 
 
 def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
-    """Record a human-direct grant; only a person at a terminal may run this."""
-    if not sys.stdin.isatty():
+    """Record a human grant, typed at a terminal or relayed from the user's prompt answer.
+
+    A relayed grant (#166) records the value the user chose when the agent asked;
+    `--head` must repeat the head the user was shown. The agent never picks it.
+    """
+    relayed = arguments.relayed
+    if relayed:
+        head = arguments.head
+        if not isinstance(head, str) or len(head) != 12 or any(
+            character not in "0123456789abcdef" for character in head
+        ):
+            raise TribunalError("GRANT_INVALID")
+    elif arguments.head is not None:
+        raise TribunalError("GRANT_INVALID")
+    elif not sys.stdin.isatty():
         raise TribunalError("GRANT_TTY_REQUIRED")
     raw = arguments.intensity
     if not isinstance(raw, str) or not raw.isascii() or not raw.isdigit() or (
@@ -484,6 +499,13 @@ def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
         cwd, base=arguments.base, runtime=arguments.runtime, now=wall_clock
     )
     validate_grant_lowering(policy.risk_floor, value)
+    if relayed:
+        if arguments.head != snapshot.head_sha[:12]:
+            raise TribunalError("GRANT_CONFIRMATION_MISMATCH")
+        return intensity_grant.record_grant(
+            cwd, snapshot=snapshot, policy=policy, value=value,
+            reason=arguments.reason, now=wall_clock, channel="relayed",
+        )
     sys.stderr.write(
         "pre-pr-tribunal intensity grant\n"
         f"  head {snapshot.head_sha}  base {snapshot.base_ref} {snapshot.base_sha[:12]}\n"

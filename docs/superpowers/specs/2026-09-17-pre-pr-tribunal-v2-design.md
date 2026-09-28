@@ -106,10 +106,21 @@ pre-grant `risk_floor`, and its request has source `human_grant`, requester
 every parser, the PR gate's recomputation, and the INCONCLUSIVE restart rule
 check it. At N=0 the gate is the existing `skipped`, told apart by that source.
 
-This is friction against policy-following agent mistakes, the threat model this
-design already states, not a security boundary: an agent running as the same
-user can obtain a pseudo-terminal (for example with `script`). The skill
-contract forbids agents from running the command.
+A grant can also be relayed (#166). Before round 1 the controlling agent shows
+the `policy-preview` result in its own prompt and asks whether to keep the
+floor. Only when the user chooses a lower value does it run `intensity-grant
+--relayed --head <12 hex>`, which needs no terminal but must repeat the head the
+user was shown. The grant records `channel: relayed`, and the verdict records
+requester `human-relayed` instead of `human-direct`. The parser accepts only
+these two requesters for `human_grant`. Grants written before #166 carry no
+channel and are read as terminal grants.
+
+Both paths are friction against policy-following agent mistakes, the threat
+model this design already states, not a security boundary: an agent running as
+the same user can obtain a pseudo-terminal (for example with `script`), and a
+relayed grant is the agent's record of the user's answer. The skill contract
+forbids agents from choosing the value, asking again after the user keeps the
+floor, or running the terminal path.
 
 ## Declared-unexecutable paths
 
