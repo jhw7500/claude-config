@@ -80,6 +80,37 @@ Repository `[policy]` patterns may raise the floor by mapping to `off`,
 value. `.pre-pr-tribunal.toml` itself is always floor 100, preventing a policy
 weakening change from reviewing itself at the weakened level.
 
+## Human-direct intensity grants
+
+Neither repository configuration nor the controller's `--intensity` request can
+lower the built-in floor. A person can, for one snapshot, through
+`intensity-grant --base B --runtime R --intensity N --reason TEXT` (#162). This
+reverses #135's non-goal "lower the floor by user request"; #132's "no
+unrecorded bypass" and the raise-only `[policy]` rule still hold.
+
+The command requires a terminal on stdin, shows the snapshot, floor, mode and
+reasons it resolved, and records nothing until the person types the head's first
+12 SHA characters and `lower`. N must be below the floor and must change the
+mode, so a grant from floor 100 yields `single` (1..66) or `off` (0) and never
+reaches round 2. The grant is `.review/intensity-grant.json` (mode 0600). It
+binds the repository, base, head, merge base, diff SHA-256, committed config
+digest, resolved floor and reasons, and installed contract versions. Round-1
+`begin` applies it only while all of these still match and no `--intensity` was
+passed; passing one alongside a matching grant is `INTENSITY_GRANT_CONFLICT`. A
+mismatched or malformed grant is ignored, so the snapshot is reviewed at its
+floor.
+
+The verdict records the lowering without a new field: the policy keeps the
+pre-grant `risk_floor`, and its request has source `human_grant`, requester
+`human-direct`, and the typed reason. Only that source may sit below the floor;
+every parser, the PR gate's recomputation, and the INCONCLUSIVE restart rule
+check it. At N=0 the gate is the existing `skipped`, told apart by that source.
+
+This is friction against policy-following agent mistakes, the threat model this
+design already states, not a security boundary: an agent running as the same
+user can obtain a pseudo-terminal (for example with `script`). The skill
+contract forbids agents from running the command.
+
 ## Declared-unexecutable paths
 
 `[unexecutable]` maps a path pattern to a short reason. It declares that the

@@ -43,6 +43,8 @@ if __package__ in {None, ""}:
         validate_stored_reviewer_report,
     )
     from pre_pr_tribunal import telemetry, evidence_runtime, evidence_store, evidence_lifecycle  # type: ignore
+    from pre_pr_tribunal import intensity_grant  # type: ignore
+    from pre_pr_tribunal.policy import validate_grant_lowering  # type: ignore
 else:
     from .model import (
         MAX_REPORT_BYTES,
@@ -71,6 +73,8 @@ else:
         validate_stored_reviewer_report,
     )
     from . import telemetry, evidence_runtime, evidence_store, evidence_lifecycle
+    from . import intensity_grant
+    from .policy import validate_grant_lowering
 
 
 class _Parser(argparse.ArgumentParser):
@@ -122,6 +126,11 @@ def _parser() -> argparse.ArgumentParser:
     preview.add_argument("--intensity", action="append")
     preview.add_argument("--intensity-requester", action="append")
     preview.add_argument("--intensity-reason", action="append")
+    grant = commands.add_parser("intensity-grant", add_help=False)
+    grant.add_argument("--base", required=True)
+    grant.add_argument("--runtime", required=True, choices=("claude", "codex"))
+    grant.add_argument("--intensity", required=True)
+    grant.add_argument("--reason", required=True)
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -461,6 +470,41 @@ def _snapshot_equal(verdict, snapshot) -> bool:
     )
 
 
+def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
+    """Record a human-direct grant; only a person at a terminal may run this."""
+    if not sys.stdin.isatty():
+        raise TribunalError("GRANT_TTY_REQUIRED")
+    raw = arguments.intensity
+    if not isinstance(raw, str) or not raw.isascii() or not raw.isdigit() or (
+        len(raw) > 1 and raw.startswith("0")
+    ) or int(raw) > 100:
+        raise TribunalError("GRANT_INVALID")
+    value = int(raw)
+    snapshot, policy = preview_policy(
+        cwd, base=arguments.base, runtime=arguments.runtime, now=wall_clock
+    )
+    validate_grant_lowering(policy.risk_floor, value)
+    sys.stderr.write(
+        "pre-pr-tribunal intensity grant\n"
+        f"  head {snapshot.head_sha}  base {snapshot.base_ref} {snapshot.base_sha[:12]}\n"
+        f"  floor {policy.risk_floor} ({policy.mode.value})  ->  {value}\n"
+        f"  reasons: {', '.join(policy.reasons)}\n"
+        f"  changed paths: {len(snapshot.initial_paths)}\n"
+        "Type the first 12 characters of the head SHA: "
+    )
+    sys.stderr.flush()
+    if sys.stdin.readline().strip() != snapshot.head_sha[:12]:
+        raise TribunalError("GRANT_CONFIRMATION_MISMATCH")
+    sys.stderr.write("Type 'lower' to review this snapshot below its floor: ")
+    sys.stderr.flush()
+    if sys.stdin.readline().strip() != "lower":
+        raise TribunalError("GRANT_CONFIRMATION_MISMATCH")
+    return intensity_grant.record_grant(
+        cwd, snapshot=snapshot, policy=policy, value=value,
+        reason=arguments.reason, now=wall_clock,
+    )
+
+
 def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns) -> int:
     parser = _parser()
     arguments = parser.parse_args(argv)
@@ -536,6 +580,8 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 "policy": policy.to_json(),
                 "active_reviewers": list(policy.active_reviewers),
             }
+        elif arguments.command == "intensity-grant":
+            payload = _intensity_grant(cwd, arguments, wall_clock=wall_clock)
         elif arguments.command.startswith("telemetry-"):
             payload = _telemetry_command(cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns)
         elif arguments.command == "context":

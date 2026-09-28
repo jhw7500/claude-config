@@ -477,6 +477,10 @@ class IntensityRequest:
         }
 
 
+HUMAN_GRANT_SOURCE = "human_grant"
+HUMAN_GRANT_REQUESTER = "human-direct"
+
+
 @dataclass(frozen=True)
 class ReviewerPolicy:
     enabled: bool
@@ -512,7 +516,11 @@ class PolicyBinding:
             or not isinstance(self.effective_intensity, int)
             or isinstance(self.effective_intensity, bool)
             or not 0 <= self.effective_intensity <= 100
-            or self.effective_intensity < self.risk_floor
+            # Only a human-direct grant may sit below the floor (#162).
+            or (
+                self.effective_intensity < self.risk_floor
+                and getattr(self.request, "source", None) != HUMAN_GRANT_SOURCE
+            )
             or not isinstance(self.mode, ReviewMode)
             or set(self.reviewers) != set("ABC")
         ):

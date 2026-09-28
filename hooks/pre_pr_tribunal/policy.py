@@ -164,6 +164,23 @@ def intensity_mode(value: int) -> model.ReviewMode:
     raise model.SchemaError("INTENSITY_INVALID")
 
 
+def validate_grant_lowering(risk_floor: int, value: int) -> None:
+    """A human grant must lower the floor far enough to change the mode (#162)."""
+    if value >= risk_floor:
+        raise model.SchemaError("GRANT_NOT_LOWER")
+    if intensity_mode(value) is intensity_mode(risk_floor):
+        raise model.SchemaError("GRANT_MODE_UNCHANGED")
+
+
+def _effective_intensity(risk_floor: int, request: model.IntensityRequest) -> int:
+    if request.source != model.HUMAN_GRANT_SOURCE:
+        return max(risk_floor, request.value)
+    if request.requester != model.HUMAN_GRANT_REQUESTER:
+        raise model.SchemaError("POLICY_INVALID")
+    validate_grant_lowering(risk_floor, request.value)
+    return request.value
+
+
 def _request_fail_closed(reason: str) -> model.IntensityRequest:
     return model.IntensityRequest(
         100,
@@ -617,7 +634,7 @@ def resolve_policy(
         floors.append(100)
         reasons.append("binary-change")
     risk_floor = max(floors)
-    effective = max(risk_floor, request.value)
+    effective = _effective_intensity(risk_floor, request)
     mode = intensity_mode(effective)
     # A configuration must enable a reviewer of its own: an override adds one,
     # it never substitutes for one. `fail_closed` is the sole exemption because
@@ -721,7 +738,7 @@ def parse_policy_binding(value: object, *, runtime: str) -> model.PolicyBinding:
         request_obj["value"], "POLICY_INVALID", minimum=0, maximum=100
     )
     source = request_obj["source"]
-    if source not in {"default", "cli", "fail_closed"}:
+    if source not in {"default", "cli", "fail_closed", model.HUMAN_GRANT_SOURCE}:
         raise model.SchemaError("POLICY_INVALID")
     requester = _bounded_text(request_obj["requester"], MAX_REQUESTER_BYTES, "POLICY_INVALID")
     request_reason = _bounded_text(request_obj["reason"], MAX_REASON_BYTES, "POLICY_INVALID")
@@ -767,8 +784,12 @@ def parse_policy_binding(value: object, *, runtime: str) -> model.PolicyBinding:
         digest, floor, effective, mode, reasons, request, reviewers
     )
     binding.to_json()
+    try:
+        expected = _effective_intensity(floor, request)
+    except model.SchemaError:
+        raise model.SchemaError("POLICY_INVALID") from None
     if (
-        effective != max(floor, request_value)
+        effective != expected
         or mode is not intensity_mode(effective)
         or (mode is not model.ReviewMode.OFF and not binding.active_reviewers)
         or (fail_closed is not None and set(binding.active_reviewers) != set("ABC"))
