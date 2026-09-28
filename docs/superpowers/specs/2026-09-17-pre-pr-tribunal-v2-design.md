@@ -51,13 +51,29 @@ Built-in classification cannot be lowered by repository configuration.
 
 | Floor | Mode | Examples |
 | ---: | --- | --- |
-| 0 | off | documentation-only Markdown/text under documentation paths |
+| 0 | off | content edits to `.md`, `.mdx`, `.rst`, or `.txt` files under `docs/` or `doc/` only |
 | 50 | single | ordinary recognized source or test changes |
-| 100 | iterative | tribunal/config/hooks/workflows/deploy/auth/data/dependency changes; rename/copy/type/unknown status; binary, symlink, submodule, mixed or unknown paths |
+| 100 | iterative | tribunal/config/hooks/workflows/deploy/auth/data/dependency changes; installed instruction prose under `claude-md/`, `skills/`, or `commands/`; rename/copy/type/unknown status; binary, symlink, submodule, mixed or unknown paths |
 
 Every changed path is classified, including both sides of a rename. The final
 floor is the maximum. Ambiguous Git metadata or classification errors resolve
 to 100.
+
+"Documentation-only" means the floor-0 row above and nothing wider. Changing only
+Markdown files is not enough. Sensitive file names and path prefixes are checked
+before the documentation rule, so `docs/requirements-guide.md` is 100, and a
+`.md` file outside `docs/` or `doc/` is 100 as well: a repository-root
+`README.md` is an unknown path. Prose under `claude-md/`, `skills/`, and
+`commands/` is deliberately classified as configuration, not documentation.
+`install.sh` installs those files into `~/.claude/`, where they become the
+instructions every agent session runs under, so a wording change there is a
+behavior change (#160, option 2). A rename or copy is 100 even between two
+documentation paths.
+
+A change whose built-in floor looks too high for its content is not lowered by
+reclassification or by repository configuration. A human-requested lowering
+path bound to one snapshot is proposed separately in #162; until it exists,
+these changes run the iterative mode.
 
 Repository `[policy]` patterns may raise the floor by mapping to `off`,
 `single`, `iterative`, or integer 0..100. They cannot reduce the built-in
