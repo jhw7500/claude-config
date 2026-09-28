@@ -34,6 +34,7 @@ PACKAGE_NAMES = (
     "gate.py",
     "git_state.py",
     "hook_common.py",
+    "intensity_grant.py",
     "model.py",
     "policy.py",
     "review_context.py",

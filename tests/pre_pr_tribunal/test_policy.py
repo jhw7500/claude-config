@@ -1154,3 +1154,182 @@ def test_policy_preview_refuses_what_begin_refuses_before_policy(
     assert not (repo / ".review").exists()
     with pytest.raises(GitStateError, match="^EMPTY_DIFF$"):
         begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+
+def _grant(repo, value, reason="lower a reviewed-by-hand change"):
+    from pre_pr_tribunal.intensity_grant import record_grant
+    from pre_pr_tribunal.verdict_store import preview_policy
+
+    snapshot, policy = preview_policy(repo, base="master", runtime="codex", now=NOW)
+    return record_grant(
+        repo, snapshot=snapshot, policy=policy, value=value, reason=reason, now=NOW
+    )
+
+
+def test_matching_human_grant_lowers_below_the_floor(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 50)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    policy = verdict.policy
+    assert (policy.risk_floor, policy.effective_intensity) == (100, 50)
+    assert policy.mode is ReviewMode.SINGLE
+    assert (policy.request.source, policy.request.requester) == ("human_grant", "human-direct")
+    assert parse_policy_binding(policy.to_json(), runtime="codex") == policy
+
+
+def test_human_grant_to_zero_is_skipped_with_its_provenance(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 0)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.OFF
+    assert verdict.gate.status is GateStatus.SKIPPED
+    assert verdict.policy.risk_floor == 100
+    assert verdict.policy.request.source == "human_grant"
+    assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.PASS
+
+
+def test_human_grant_for_another_snapshot_is_ignored(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 0)
+    _write(repo, "hooks/guard.py", "changed after the grant\n")
+    _git(repo, "commit", "-qam", "change")
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert verdict.policy.request.source == "default"
+
+
+def test_controller_intensity_conflicts_with_a_matching_grant(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 50)
+    with pytest.raises(SchemaError, match="^INTENSITY_GRANT_CONFLICT$"):
+        begin_round(
+            repo, base="master", runtime="codex", round_number=1, now=NOW,
+            intensity_values=("100",), intensity_requester="maintainer",
+            intensity_reason="wider review",
+        )
+
+
+def test_grant_must_lower_the_floor_and_change_the_mode(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    with pytest.raises(SchemaError, match="^GRANT_MODE_UNCHANGED$"):
+        _grant(repo, 80)
+    docs = _repo(tmp_path / "docs", path="docs/guide.md")
+    with pytest.raises(SchemaError, match="^GRANT_NOT_LOWER$"):
+        _grant(docs, 50)
+    assert not (repo / ".review").exists()
+
+
+def test_lowered_policy_is_valid_only_for_a_human_grant(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 50)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    forged = verdict.policy.to_json()
+    forged["request"] = {**forged["request"], "source": "cli", "requester": "maintainer"}
+    with pytest.raises(SchemaError, match="^POLICY_INVALID$"):
+        parse_policy_binding(forged, runtime="codex")
+    wrong_requester = verdict.policy.to_json()
+    wrong_requester["request"] = {**wrong_requester["request"], "requester": "agent"}
+    with pytest.raises(SchemaError, match="^POLICY_INVALID$"):
+        parse_policy_binding(wrong_requester, runtime="codex")
+
+
+def test_human_grant_may_restart_an_inconclusive_snapshot_lower(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    submit_reviewer_report(repo, reviewer=Reviewer.A, raw=_report(verdict, "A"), now=NOW)
+    claim = {
+        "id": "B-R1-C001",
+        "statement": "The hook entry path runs.",
+        "result": "unverified",
+        "execution_ids": [],
+        "reason": "The required runtime is unavailable.",
+    }
+    submit_reviewer_report(
+        repo, reviewer=Reviewer.B, raw=_report(verdict, "B", claims=(claim,)), now=NOW
+    )
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.INCONCLUSIVE
+    _grant(repo, 50)
+    restarted = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert restarted.policy.effective_intensity == 50
+    assert restarted.policy.request.source == "human_grant"
+
+
+class _FakeTty:
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def isatty(self):
+        return True
+
+    def readline(self):
+        return self._lines.pop(0) if self._lines else ""
+
+
+def test_intensity_grant_cli_requires_a_terminal(tmp_path, monkeypatch, capsys):
+    from pre_pr_tribunal.cli import main
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    monkeypatch.chdir(repo)
+    status = main(["intensity-grant", "--base", "master", "--runtime", "codex",
+                   "--intensity", "50", "--reason", "small change"])
+    assert status == 1
+    assert capsys.readouterr().err == "PRE_PR_TRIBUNAL:GRANT_TTY_REQUIRED\n"
+    assert not (repo / ".review").exists()
+
+
+def test_intensity_grant_cli_records_only_after_typed_confirmation(
+    tmp_path, monkeypatch, capsys
+):
+    import sys as _sys
+    from pre_pr_tribunal.cli import main
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    head = subprocess.run(
+        ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    arguments = ["intensity-grant", "--base", "master", "--runtime", "codex",
+                 "--intensity", "50", "--reason", "small change"]
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(_sys, "stdin", _FakeTty(["0" * 12 + "\n", "lower\n"]))
+    assert main(arguments) == 1
+    assert capsys.readouterr().err.endswith("PRE_PR_TRIBUNAL:GRANT_CONFIRMATION_MISMATCH\n")
+    assert not (repo / ".review" / "intensity-grant.json").exists()
+
+    monkeypatch.setattr(_sys, "stdin", _FakeTty([head[:12] + "\n", "lower\n"]))
+    assert main(arguments) == 0
+    capsys.readouterr()
+    assert ((repo / ".review" / "intensity-grant.json").stat().st_mode & 0o777) == 0o600
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.request.source == "human_grant"
+    assert verdict.policy.effective_intensity == 50
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        lambda grant: {**grant, "reason": ""},
+        lambda grant: {**grant, "reason": "x" * 2048},
+        lambda grant: {**grant, "reason": "bell\u0007"},
+        lambda grant: {**grant, "value": 80},
+        lambda grant: {**grant, "value": True},
+        None,
+    ),
+    ids=("empty-reason", "long-reason", "control-reason", "mode-unchanged", "bool-value", "deep-nesting"),
+)
+def test_malformed_grant_is_ignored_and_state_stays_readable(tmp_path, tamper):
+    from pre_pr_tribunal.verdict_store import read_verdict
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 0)
+    path = repo / ".review" / "intensity-grant.json"
+    raw = (
+        b"[" * 5000
+        if tamper is None
+        else json.dumps(tamper(json.loads(path.read_bytes()))).encode()
+    )
+    path.write_bytes(raw)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert verdict.policy.request.source == "default"
+    assert read_verdict(repo).policy == verdict.policy

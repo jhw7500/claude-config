@@ -1388,11 +1388,29 @@ def begin_round(
             else:
                 request = previous.policy.request
         else:
+            from .intensity_grant import matching_grant_request
+
             request = parse_intensity_request(
                 intensity_values,
                 requester=intensity_requester,
                 reason=intensity_reason,
             )
+            grant_request = matching_grant_request(
+                review_fd,
+                snapshot,
+                lambda: resolve_policy(
+                    root, snapshot, runtime=runtime,
+                    request=parse_intensity_request(None, requester=None, reason=None),
+                ),
+            )
+            if grant_request is not None:
+                if (
+                    intensity_values
+                    or intensity_requester is not None
+                    or intensity_reason is not None
+                ):
+                    raise SchemaError("INTENSITY_GRANT_CONFLICT")
+                request = grant_request
         policy = resolve_policy(root, snapshot, runtime=runtime, request=request)
         if (
             round_number == 1
@@ -1408,9 +1426,11 @@ def begin_round(
                 if stored.round == 3:
                     raise SchemaError("ROUND_LIMIT_EXHAUSTED")
                 raise SchemaError("ROUND_TRANSITION_INVALID")
+            # A human grant is the one sanctioned way to lower a snapshot (#162).
             if (
                 stored.gate.status is GateStatus.INCONCLUSIVE
                 and policy.effective_intensity < prior_intensity
+                and policy.request.source != m.HUMAN_GRANT_SOURCE
             ):
                 raise SchemaError("ROUND_TRANSITION_INVALID")
         if round_number > 1:
