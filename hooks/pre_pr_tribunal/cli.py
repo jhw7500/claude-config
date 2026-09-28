@@ -133,7 +133,6 @@ def _parser() -> argparse.ArgumentParser:
     grant.add_argument("--reason")
     grant.add_argument("--relayed", action="store_true")
     grant.add_argument("--revoke", action="store_true")
-    grant.add_argument("--head")
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -476,26 +475,19 @@ def _snapshot_equal(verdict, snapshot) -> bool:
 def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
     """Record a human grant, typed at a terminal or relayed from the user's prompt answer.
 
-    A relayed grant (#166) records the value the user chose when the agent asked;
-    `--head` must repeat the head the user was shown. The agent never picks it.
+    A relayed grant (#166) records the value the user chose when the agent asked,
+    right after showing the preview; the agent never picks it. Either way the grant
+    binds the snapshot it was recorded for, and `begin` ignores it once that changes.
     """
     if arguments.revoke:
         # A keep-floor answer removes any earlier grant for this repository.
-        if (arguments.intensity, arguments.reason, arguments.head) != (None, None, None) or arguments.relayed:
+        if (arguments.intensity, arguments.reason) != (None, None) or arguments.relayed:
             raise TribunalError("GRANT_INVALID")
         return {"revoked": intensity_grant.revoke_grant(cwd)}
     if arguments.intensity is None or arguments.reason is None:
         raise TribunalError("GRANT_INVALID")
     relayed = arguments.relayed
-    if relayed:
-        head = arguments.head
-        if not isinstance(head, str) or len(head) != 12 or any(
-            character not in "0123456789abcdef" for character in head
-        ):
-            raise TribunalError("GRANT_INVALID")
-    elif arguments.head is not None:
-        raise TribunalError("GRANT_INVALID")
-    elif not sys.stdin.isatty():
+    if not relayed and not sys.stdin.isatty():
         raise TribunalError("GRANT_TTY_REQUIRED")
     raw = arguments.intensity
     if not isinstance(raw, str) or not raw.isascii() or not raw.isdigit() or (
@@ -508,8 +500,6 @@ def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
     )
     validate_grant_lowering(policy.risk_floor, value)
     if relayed:
-        if arguments.head != snapshot.head_sha[:12]:
-            raise TribunalError("GRANT_CONFIRMATION_MISMATCH")
         return intensity_grant.record_grant(
             cwd, snapshot=snapshot, policy=policy, value=value,
             reason=arguments.reason, now=wall_clock, channel="relayed",
@@ -520,12 +510,8 @@ def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
         f"  floor {policy.risk_floor} ({policy.mode.value})  ->  {value}\n"
         f"  reasons: {', '.join(policy.reasons)}\n"
         f"  changed paths: {len(snapshot.initial_paths)}\n"
-        "Type the first 12 characters of the head SHA: "
+        "Type 'lower' to review this snapshot below its floor: "
     )
-    sys.stderr.flush()
-    if sys.stdin.readline().strip() != snapshot.head_sha[:12]:
-        raise TribunalError("GRANT_CONFIRMATION_MISMATCH")
-    sys.stderr.write("Type 'lower' to review this snapshot below its floor: ")
     sys.stderr.flush()
     if sys.stdin.readline().strip() != "lower":
         raise TribunalError("GRANT_CONFIRMATION_MISMATCH")

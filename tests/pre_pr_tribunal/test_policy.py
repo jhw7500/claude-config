@@ -1284,19 +1284,15 @@ def test_intensity_grant_cli_records_only_after_typed_confirmation(
     from pre_pr_tribunal.cli import main
 
     repo = _repo(tmp_path, path="hooks/guard.py")
-    head = subprocess.run(
-        ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
     arguments = ["intensity-grant", "--base", "master", "--runtime", "codex",
                  "--intensity", "50", "--reason", "small change"]
     monkeypatch.chdir(repo)
-    monkeypatch.setattr(_sys, "stdin", _FakeTty(["0" * 12 + "\n", "lower\n"]))
+    monkeypatch.setattr(_sys, "stdin", _FakeTty(["nope\n"]))
     assert main(arguments) == 1
     assert capsys.readouterr().err.endswith("PRE_PR_TRIBUNAL:GRANT_CONFIRMATION_MISMATCH\n")
     assert not (repo / ".review" / "intensity-grant.json").exists()
 
-    monkeypatch.setattr(_sys, "stdin", _FakeTty([head[:12] + "\n", "lower\n"]))
+    monkeypatch.setattr(_sys, "stdin", _FakeTty(["lower\n"]))
     assert main(arguments) == 0
     capsys.readouterr()
     assert ((repo / ".review" / "intensity-grant.json").stat().st_mode & 0o777) == 0o600
@@ -1335,13 +1331,6 @@ def test_malformed_grant_is_ignored_and_state_stays_readable(tmp_path, tamper):
     assert read_verdict(repo).policy == verdict.policy
 
 
-def _head(repo):
-    return subprocess.run(
-        ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-
-
 def _relayed(repo, monkeypatch, capsys, *extra):
     from pre_pr_tribunal.cli import main
 
@@ -1356,7 +1345,7 @@ def test_relayed_grant_needs_no_terminal_and_records_its_channel(
     tmp_path, monkeypatch, capsys
 ):
     repo = _repo(tmp_path, path="hooks/guard.py")
-    status, captured = _relayed(repo, monkeypatch, capsys, "--head", _head(repo)[:12])
+    status, captured = _relayed(repo, monkeypatch, capsys)
     assert status == 0, captured.err
     assert json.loads(captured.out)["channel"] == "relayed"
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
@@ -1366,18 +1355,19 @@ def test_relayed_grant_needs_no_terminal_and_records_its_channel(
     assert parse_policy_binding(policy.to_json(), runtime="codex") == policy
 
 
-def test_relayed_grant_is_bound_to_the_head_the_user_saw(tmp_path, monkeypatch, capsys):
+def test_relayed_grant_binds_the_snapshot_it_was_recorded_for(tmp_path, monkeypatch, capsys):
     repo = _repo(tmp_path, path="hooks/guard.py")
-    status, captured = _relayed(repo, monkeypatch, capsys, "--head", "0" * 12)
-    assert (status, captured.err) == (1, "PRE_PR_TRIBUNAL:GRANT_CONFIRMATION_MISMATCH\n")
-    status, captured = _relayed(repo, monkeypatch, capsys)
-    assert (status, captured.err) == (1, "PRE_PR_TRIBUNAL:GRANT_INVALID\n")
-    assert not (repo / ".review" / "intensity-grant.json").exists()
+    assert _relayed(repo, monkeypatch, capsys)[0] == 0
+    _write(repo, "hooks/guard.py", "changed after the user answered\n")
+    _git(repo, "commit", "-qam", "change")
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert verdict.policy.request.source == "default"
 
 
 def test_human_grant_accepts_only_direct_or_relayed_requesters(tmp_path, monkeypatch, capsys):
     repo = _repo(tmp_path, path="hooks/guard.py")
-    assert _relayed(repo, monkeypatch, capsys, "--head", _head(repo)[:12])[0] == 0
+    assert _relayed(repo, monkeypatch, capsys)[0] == 0
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     for requester, valid in (("human-direct", True), ("human-relayed", True), ("agent", False)):
         candidate = verdict.policy.to_json()
@@ -1416,5 +1406,5 @@ def test_revoke_without_a_grant_is_a_no_op_and_rejects_value_flags(
     assert main([*base, "--intensity", "50"]) == 1
     assert capsys.readouterr().err == "PRE_PR_TRIBUNAL:GRANT_INVALID\n"
     assert main(["intensity-grant", "--base", "master", "--runtime", "codex",
-                 "--relayed", "--head", "0" * 12, "--reason", "no value"]) == 1
+                 "--relayed", "--reason", "no value"]) == 1
     assert capsys.readouterr().err == "PRE_PR_TRIBUNAL:GRANT_INVALID\n"
