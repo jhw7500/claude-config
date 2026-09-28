@@ -1058,3 +1058,99 @@ def test_off_mode_records_no_unexecutable_override(tmp_path):
     assert verdict.policy.mode is ReviewMode.OFF
     assert "unexecutable-requires-reviewer-b" not in verdict.policy.reasons
     assert verdict.policy.reviewers["B"].enabled is False
+
+
+def _review_tree_digest(repo):
+    review = repo / ".review"
+    if not review.exists():
+        return None
+    digest = hashlib.sha256()
+    for path in sorted(review.rglob("*")):
+        digest.update(str(path.relative_to(review)).encode())
+        if path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _preview(repo, monkeypatch, capsys, *extra):
+    from pre_pr_tribunal.cli import main
+
+    monkeypatch.chdir(repo)
+    status = main(["policy-preview", "--base", "master", "--runtime", "codex", *extra])
+    captured = capsys.readouterr()
+    return status, captured
+
+
+@pytest.mark.parametrize(
+    ("path", "mode"),
+    (
+        ("docs/guide.md", ReviewMode.OFF),
+        ("src/app.py", ReviewMode.SINGLE),
+        ("hooks/guard.py", ReviewMode.ITERATIVE),
+    ),
+)
+def test_policy_preview_matches_begin_without_creating_review_state(
+    tmp_path, monkeypatch, capsys, path, mode
+):
+    repo = _repo(tmp_path, path=path)
+    status, captured = _preview(repo, monkeypatch, capsys)
+    assert status == 0, captured.err
+    assert not (repo / ".review").exists()
+    payload = json.loads(captured.out)
+    assert payload["round_authority"] is False
+    assert payload["begin_admissible"] == "not-evaluated"
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is mode
+    assert payload["policy"] == verdict.policy.to_json()
+    assert payload["active_reviewers"] == list(verdict.policy.active_reviewers)
+    assert payload["snapshot"]["head_sha"] == verdict.head_sha
+    assert payload["snapshot"]["diff_sha256"] == verdict.diff_sha256
+
+
+def test_policy_preview_passes_the_same_intensity_request_as_begin(
+    tmp_path, monkeypatch, capsys
+):
+    repo = _repo(tmp_path)
+    request = ("--intensity", "100", "--intensity-requester", "maintainer",
+               "--intensity-reason", "wider review")
+    status, captured = _preview(repo, monkeypatch, capsys, *request)
+    assert status == 0, captured.err
+    payload = json.loads(captured.out)
+    verdict = begin_round(
+        repo, base="master", runtime="codex", round_number=1, now=NOW,
+        intensity_values=["100"], intensity_requester=["maintainer"],
+        intensity_reason=["wider review"],
+    )
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert payload["policy"] == verdict.policy.to_json()
+
+
+def test_policy_preview_leaves_existing_review_state_byte_identical(
+    tmp_path, monkeypatch, capsys
+):
+    from pre_pr_tribunal.cli import main
+
+    repo = _repo(tmp_path)
+    monkeypatch.chdir(repo)
+    assert main(["begin", "--base", "master", "--runtime", "codex", "--round", "1"]) == 0
+    capsys.readouterr()
+    before = _review_tree_digest(repo)
+    assert before is not None
+    assert (repo / ".review" / "telemetry.json").is_file()
+    assert (repo / ".review" / "verdict.json").is_file()
+    status, captured = _preview(repo, monkeypatch, capsys)
+    assert status == 0, captured.err
+    assert _review_tree_digest(repo) == before
+
+
+def test_policy_preview_refuses_what_begin_refuses_before_policy(
+    tmp_path, monkeypatch, capsys
+):
+    repo = _repo(tmp_path)
+    _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+    status, captured = _preview(repo, monkeypatch, capsys)
+    assert status == 1
+    assert captured.err == "PRE_PR_TRIBUNAL:EMPTY_DIFF\n"
+    assert not (repo / ".review").exists()
+    with pytest.raises(GitStateError, match="^EMPTY_DIFF$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
