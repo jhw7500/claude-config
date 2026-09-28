@@ -118,21 +118,24 @@
 
 이 패턴의 기록은 claude-config 이슈 #113·#121·#132·#135·#143에 있다. 스냅샷 밖인 것은 **이슈
 본문뿐**이고, 그 포인터가 무엇을 가리키는지는 저장소 안에서 확인된다. 아래 명령은 **claude-config
-체크아웃 루트에서** 실행한다 — 다른 곳에서 돌리면 "No such file or directory"가 나오므로, 빈 출력이
-나왔다면 인용이 틀린 것이 아니라 위치가 틀린 것이다.
+체크아웃 루트에서** 실행한다. 빈 출력에는 원인이 둘이므로 **stderr를 먼저 본다** — 경고가 찍혔으면
+파일을 못 찾은 것(위치가 틀렸다, 종료코드 2)이고, stderr가 비었으면 파일은 찾았는데 패턴이 없는
+것(인용이 낡았다, 종료코드 1)이다. 빈 출력을 위치 탓으로만 돌리면 낡은 인용이 조용히 통과한다.
 
-- `docs/superpowers/specs/2026-09-12-reviewer-evidence-bundle-design.md` 가 머리에 #113 의 이슈 URL 을 적는다.
+- #113 과 #143 의 포인터는 각 설계문서 **머리의 이슈 URL** 이다. 번호 형태가 아니라 URL 로 찾는다:
+  `grep -nE 'issues/(113|143)' docs/superpowers/specs/2026-09-12-reviewer-evidence-bundle-design.md docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
 - `docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md` 의 여는 문단이 #132·#135 의 중복
   계약과 #121·#136 의 리뷰 품질 지적을 **두 묶음으로** 귀속하고, 그 뒤 본문에서 개별로 다시
-  언급되는 것은 #121 하나다 — 세 줄이 나온다:
+  언급되는 것은 #121 하나다:
   `grep -nE '#121|#132|#135|#136' docs/superpowers/specs/2026-09-17-pre-pr-tribunal-v2-design.md`
 - `docs/superpowers/specs/2026-09-09-pre-pr-tribunal-validation-telemetry-design.md` 의
   `## 17. 후속 이슈와 명시적 경계` 절이 #113 을 Reviewer B evidence bundle 로, #121 을 prompt
-  framing A/B 실험으로 적는다 — 두 줄이 나온다:
+  framing A/B 실험으로 적는다:
   `grep -nE '#113|#121' docs/superpowers/specs/2026-09-09-pre-pr-tribunal-validation-telemetry-design.md`
 
-줄번호로 가리키지 않는다. 인용 대상은 살아 있는 문서이고, 위쪽에 한 줄만 끼어들면 고정 줄번호는
-조용히 거짓이 된다 — 그걸 잡아 줄 테스트는 없다.
+줄번호도 개수도 적지 않는다. 인용 대상은 살아 있는 문서여서 위에 한 줄만 끼어들면 고정 줄번호가,
+문장 하나만 늘면 고정 개수가 조용히 거짓이 된다 — 어느 쪽도 잡아 줄 테스트는 없다. 인용은 명령과
+그 명령이 **무엇을 보여 줄 것인지**로 적고, 수치로는 적지 않는다.
 규칙의 근거는 위 메커니즘이고, 이력의 전문이 필요할 때만 트래커를 본다.
 
 ---
