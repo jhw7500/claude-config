@@ -89,8 +89,8 @@ reverses #135's non-goal "lower the floor by user request"; #132's "no
 unrecorded bypass" and the raise-only `[policy]` rule still hold.
 
 The command requires a terminal on stdin, shows the snapshot, floor, mode and
-reasons it resolved, and records nothing until the person types the head's first
-12 SHA characters and `lower`. N must be below the floor and must change the
+reasons it resolved, and records nothing until the person types `lower`. N must
+be below the floor and must change the
 mode, so a grant from floor 100 yields `single` (1..66) or `off` (0) and never
 reaches round 2. The grant is `.review/intensity-grant.json` (mode 0600). It
 binds the repository, base, head, merge base, diff SHA-256, committed config
@@ -106,10 +106,26 @@ pre-grant `risk_floor`, and its request has source `human_grant`, requester
 every parser, the PR gate's recomputation, and the INCONCLUSIVE restart rule
 check it. At N=0 the gate is the existing `skipped`, told apart by that source.
 
-This is friction against policy-following agent mistakes, the threat model this
-design already states, not a security boundary: an agent running as the same
-user can obtain a pseudo-terminal (for example with `script`). The skill
-contract forbids agents from running the command.
+A grant can also be relayed (#166). Before round 1 the controlling agent shows
+the `policy-preview` result in its own prompt and asks whether to keep the
+floor. Only when the user chooses a lower value does it run `intensity-grant
+--relayed`, right after showing the preview; it needs no terminal. Neither path
+asks the user to retype a SHA: the grant binds the snapshot it was recorded for,
+so a head, base, diff or config that changes before `begin` voids it. The grant
+records `channel: relayed`, and the verdict records
+requester `human-relayed` instead of `human-direct`. The parser accepts only
+these two requesters for `human_grant`. Grants written before #166 carry no
+channel and are read as terminal grants. After recording a relayed grant the
+agent runs `begin` with no intensity arguments. When the user keeps the floor it
+runs `intensity-grant --revoke`, which removes any earlier grant for the
+repository so that a keep-floor answer is never overridden by an older grant.
+
+Both paths are friction against policy-following agent mistakes, the threat
+model this design already states, not a security boundary: an agent running as
+the same user can obtain a pseudo-terminal (for example with `script`), and a
+relayed grant is the agent's record of the user's answer. The skill contract
+forbids agents from choosing the value, asking again after the user keeps the
+floor, or running the terminal path.
 
 ## Declared-unexecutable paths
 
