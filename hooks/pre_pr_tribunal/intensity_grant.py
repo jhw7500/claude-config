@@ -99,12 +99,14 @@ def matching_grant_request(
         if error.code == "GRANT_MISSING":
             return None
         raise
+    from .policy import MAX_REASON_BYTES, _bounded_text, validate_grant_lowering
+
     try:
         payload = json.loads(raw)
         value = payload["value"]
         reason = payload["reason"]
         binding = payload["binding"]
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError, RecursionError):
         return None
     if (
         not isinstance(payload, dict)
@@ -112,8 +114,17 @@ def matching_grant_request(
         or not isinstance(value, int)
         or isinstance(value, bool)
         or not isinstance(reason, str)
-        or binding != _binding(snapshot, baseline())
     ):
+        return None
+    policy = baseline()
+    if binding != _binding(snapshot, policy):
+        return None
+    # Apply the same checks the verdict parser will, so an applied grant can
+    # never persist a verdict that no reader accepts.
+    try:
+        reason = _bounded_text(reason, MAX_REASON_BYTES, "GRANT_INVALID")
+        validate_grant_lowering(policy.risk_floor, value)
+    except m.SchemaError:
         return None
     return m.IntensityRequest(
         value, m.HUMAN_GRANT_SOURCE, m.HUMAN_GRANT_REQUESTER, reason

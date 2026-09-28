@@ -1303,3 +1303,33 @@ def test_intensity_grant_cli_records_only_after_typed_confirmation(
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     assert verdict.policy.request.source == "human_grant"
     assert verdict.policy.effective_intensity == 50
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        lambda grant: {**grant, "reason": ""},
+        lambda grant: {**grant, "reason": "x" * 2048},
+        lambda grant: {**grant, "reason": "bell\u0007"},
+        lambda grant: {**grant, "value": 80},
+        lambda grant: {**grant, "value": True},
+        None,
+    ),
+    ids=("empty-reason", "long-reason", "control-reason", "mode-unchanged", "bool-value", "deep-nesting"),
+)
+def test_malformed_grant_is_ignored_and_state_stays_readable(tmp_path, tamper):
+    from pre_pr_tribunal.verdict_store import read_verdict
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 0)
+    path = repo / ".review" / "intensity-grant.json"
+    raw = (
+        b"[" * 5000
+        if tamper is None
+        else json.dumps(tamper(json.loads(path.read_bytes()))).encode()
+    )
+    path.write_bytes(raw)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert verdict.policy.request.source == "default"
+    assert read_verdict(repo).policy == verdict.policy
