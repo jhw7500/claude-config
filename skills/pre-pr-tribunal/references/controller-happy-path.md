@@ -1,6 +1,6 @@
 # Controller happy path (worked example)
 
-This is a non-normative example of one uneventful round on Claude: a new round 1, no evidence reuse, enough capacity for every active reviewer at once, and no runtime acceptance signal. SKILL.md is authoritative. Run each block so that a non-zero exit ends the sequence (for example with `set -e`, or by checking `$?` before the next block): a non-zero exit is a stop, not a warning. When any command below exits non-zero, a check fails, or a reviewer does not return one terminal report, stop following this page and apply the SKILL.md failure policy and telemetry lifecycle.
+This is a non-normative example of one uneventful round on Claude: a new round 1, no evidence reuse, enough capacity for every active reviewer at once, and no runtime acceptance signal. SKILL.md is authoritative. Do not add `set -e`: some blocks handle a non-zero exit themselves, and a view-cleanup refusal is only a warning. Check that each block ended with exit 0 before running the next one; a block that exits non-zero is a stop, not a warning. When any command below exits non-zero, a check fails, or a reviewer does not return one terminal report, stop following this page and apply the SKILL.md failure policy and telemetry lifecycle.
 
 Only the controller reads this page. Reviewers receive their own role reference, the report schema, and their projected context, never this file.
 
@@ -56,7 +56,7 @@ Then start one native `Agent` call per reviewer, without a `name`, with the poli
 
 ## Seal each terminal report
 
-Claude Code completion notifications HTML-escape the agent's text (for example `&&` arrives as `&amp;&amp;`), so the notification body is not the exact terminal response. Take the final assistant message bytes from the agent's own output transcript, write them to `$PRIVATE/response-$REVIEWER.raw` with mode `0600`, and confirm the file is a current-user-owned regular file.
+The controller must preserve the exact terminal response bytes, and a completion notification is a rendering of the result rather than those bytes. Take the final assistant message bytes from the agent's own output transcript, not from the notification text, write them to `$PRIVATE/response-$REVIEWER.raw` with mode `0600`, and confirm the file is a current-user-owned regular file.
 
 ```bash
 "$PY" "$CLI" telemetry-finish --run-id "$RUN_ID" --span-id "$DISPATCH_SPAN_ID" --outcome incomplete --reason-code RUNTIME_SIGNAL_UNAVAILABLE

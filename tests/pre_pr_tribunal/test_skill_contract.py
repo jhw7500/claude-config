@@ -906,7 +906,8 @@ def test_every_reviewer_role_says_command_is_one_line():
 
 def test_controller_happy_path_closes_finalize_span_before_an_integrity_stop():
     example = text("references/controller-happy-path.md")
-    assert "a non-zero exit is a stop" in example
+    assert "a block that exits non-zero is a stop" in example
+    assert "Do not add `set -e`" in example
     rejection = example.index("--reason-code REPORT_BYTES_MISMATCH")
     closes_finalize = example.index('--span-id "$FINALIZE_SPAN_ID" --outcome failure --reason-code REPORT_BYTES_MISMATCH')
     stop = example.index("exit 1   # integrity stop")
