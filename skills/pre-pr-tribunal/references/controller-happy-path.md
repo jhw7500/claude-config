@@ -1,6 +1,6 @@
 # Controller happy path (worked example)
 
-This is a non-normative example of one uneventful round on Claude: a new round 1, no evidence reuse, enough capacity for every active reviewer at once, and no runtime acceptance signal. SKILL.md is authoritative. When any command below exits non-zero, a check fails, or a reviewer does not return one terminal report, stop following this page and apply the SKILL.md failure policy and telemetry lifecycle.
+This is a non-normative example of one uneventful round on Claude: a new round 1, no evidence reuse, enough capacity for every active reviewer at once, and no runtime acceptance signal. SKILL.md is authoritative. Run each block so that a non-zero exit ends the sequence (for example with `set -e`, or by checking `$?` before the next block): a non-zero exit is a stop, not a warning. When any command below exits non-zero, a check fails, or a reviewer does not return one terminal report, stop following this page and apply the SKILL.md failure policy and telemetry lifecycle.
 
 Only the controller reads this page. Reviewers receive their own role reference, the report schema, and their projected context, never this file.
 
@@ -26,7 +26,7 @@ for REVIEWER in A B; do
   VIEW="$VIEW_ROOT/view-$REVIEWER"
   SPAN_ID="$("$PY" "$CLI" telemetry-start --run-id "$RUN_ID" --stage view_create --reviewer "$REVIEWER" --attempt 1 | span_id)"
   git worktree add --detach "$VIEW" "$BOUND_HEAD"; rc=$?
-  if [ "$rc" -ne 0 ]; then exit "$rc"; fi   # finish this span with the primary stable code per SKILL.md, then step 6 failure handling
+  if [ "$rc" -ne 0 ]; then exit "$rc"; fi   # step 6 failure handling; the drain's telemetry-recover closes this span
   "$PY" "$CLI" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome success
   test "$(git -C "$VIEW" rev-parse HEAD)" = "$BOUND_HEAD" || exit 1
   test -z "$(git -C "$VIEW" status --porcelain -uall)" || exit 1
@@ -97,6 +97,7 @@ for REVIEWER in A B; do
     "$PY" "$CLI" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome success
   else
     "$PY" "$CLI" telemetry-finish --run-id "$RUN_ID" --span-id "$SPAN_ID" --outcome failure --reason-code REPORT_BYTES_MISMATCH
+    "$PY" "$CLI" telemetry-finish --run-id "$RUN_ID" --span-id "$FINALIZE_SPAN_ID" --outcome failure --reason-code REPORT_BYTES_MISMATCH
     exit 1   # integrity stop: do not finalize
   fi
 done

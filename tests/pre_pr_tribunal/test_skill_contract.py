@@ -891,3 +891,23 @@ def test_controller_happy_path_example_is_linked_and_agrees_with_the_contract():
         }, stage
     assert "--stage report_store" not in example
     assert "--stage snapshot_preflight" not in example
+
+
+def test_every_reviewer_role_says_command_is_one_line():
+    for name in (
+        "references/reviewer-a.md",
+        "references/reviewer-b.md",
+        "references/reviewer-c.md",
+    ):
+        body = text(name)
+        assert "`TEXT_INVALID`" in body, name
+        assert "newline" in body, name
+
+
+def test_controller_happy_path_closes_finalize_span_before_an_integrity_stop():
+    example = text("references/controller-happy-path.md")
+    assert "a non-zero exit is a stop" in example
+    rejection = example.index("--reason-code REPORT_BYTES_MISMATCH")
+    closes_finalize = example.index('--span-id "$FINALIZE_SPAN_ID" --outcome failure --reason-code REPORT_BYTES_MISMATCH')
+    stop = example.index("exit 1   # integrity stop")
+    assert rejection < closes_finalize < stop
