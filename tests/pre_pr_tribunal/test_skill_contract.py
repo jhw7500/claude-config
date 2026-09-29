@@ -879,3 +879,5 @@ def test_every_reviewer_role_says_command_is_one_line():
         body = text(name)
         assert "`TEXT_INVALID`" in body, name
         assert "newline" in body, name
+        assert "ANSI-C quoting" in body, name
+        assert "scratch file" not in body, name
