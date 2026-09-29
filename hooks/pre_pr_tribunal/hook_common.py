@@ -62,7 +62,10 @@ def decode_request(raw: bytes, *, runtime: str) -> HookRequest | None:
 
 
 def deny_output(
-    code: GateCode, ambiguity_reason: str | None = None
+    code: GateCode,
+    ambiguity_reason: str | None = None,
+    *,
+    runtime: str | None = None,
 ) -> dict[str, object]:
     bounded_reason = (
         ambiguity_reason
@@ -80,6 +83,14 @@ def deny_output(
             "PR 생성 명령 형태가 허용된 canonical 형식과 다릅니다. "
             "shell context와 target 옵션을 수정하세요."
         )
+    elif code in {
+        GateCode.ROUND_LIMIT_EXHAUSTED,
+        GateCode.VERIFICATION_INCOMPLETE,
+    } and runtime in {"claude", "codex"}:
+        guidance = (
+            "현재 snapshot의 최종 non-pass 결과를 사용자에게 보여 주고 명시적 승인을 받은 뒤 "
+            "pre-pr-tribunal Skill의 one-shot PR override 절차를 실행하세요."
+        )
     else:
         guidance = "현재 diff에서 pre-pr-tribunal Skill을 다시 실행하세요."
     reason = f"{marker} PR 생성이 차단되었습니다. {guidance}"
@@ -92,10 +103,15 @@ def deny_output(
     }
 
 
-def _write_deny(code: GateCode, ambiguity_reason: str | None = None) -> None:
+def _write_deny(
+    code: GateCode,
+    ambiguity_reason: str | None = None,
+    *,
+    runtime: str | None = None,
+) -> None:
     try:
         output = json.dumps(
-            deny_output(code, ambiguity_reason),
+            deny_output(code, ambiguity_reason, runtime=runtime),
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -110,13 +126,13 @@ def adapter_main(runtime: str) -> int:
     except Exception:
         return 0
     if len(raw) > MAX_STDIN_BYTES:
-        _write_deny(GateCode.COMMAND_AMBIGUOUS)
+        _write_deny(GateCode.COMMAND_AMBIGUOUS, runtime=runtime)
         return 0
     request = decode_request(raw, runtime=runtime)
     if request is None:
         return 0
     try:
-        decision = evaluate_gate(request.cwd, request.command)
+        decision = evaluate_gate(request.cwd, request.command, runtime=runtime)
         code = decision.code
         block = decision.block
         ambiguity_reason = decision.reason
@@ -126,5 +142,5 @@ def adapter_main(runtime: str) -> int:
         ambiguity_reason = None
     if not block:
         return 0
-    _write_deny(code, ambiguity_reason)
+    _write_deny(code, ambiguity_reason, runtime=runtime)
     return 0

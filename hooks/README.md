@@ -122,10 +122,35 @@ deny reason code와 기본 복구는 다음과 같다.
 | `COMMAND_AMBIGUOUS` | direct command, target 또는 실행 전 snapshot 보존을 확정할 수 없다. 다른 shell 동작을 제거하고 literal `--base <verdict-base>`를 쓰며, oversized payload면 command를 줄인 뒤 다시 실행한다. |
 | `TRIBUNAL_REQUIRED`, `REVIEW_INCOMPLETE` | verdict가 없거나 round가 끝나지 않았다. `/pre-pr-tribunal` 또는 `$pre-pr-tribunal`로 현재 round를 완료한다. |
 | `BLOCKERS_OPEN` | Critical/High finding이 열려 있다. Skill의 decision/fix/re-review 흐름을 계속한다. |
-| `ROUND_LIMIT_EXHAUSTED` | 3 round 뒤에도 blocker가 남았다. 자동 진행을 멈추고 사용자 결정을 받는다. |
+| `ROUND_LIMIT_EXHAUSTED` | 3 round 뒤에도 blocker가 남았다. 자동 진행을 멈추고 아래 terminal one-shot 승인 절차로 사용자 결정을 받는다. |
+| `VERIFICATION_INCOMPLETE` | finalize된 INCONCLUSIVE verdict다. 안전한 증거로 새 round 1을 시작하거나 아래 terminal one-shot 승인 절차로 사용자 결정을 받는다. |
 | `WORKTREE_DIRTY`, `VERDICT_STALE` | HEAD/base/merge-base/diff 또는 clean 상태가 verdict와 다르다. 변경을 정리하고 새 snapshot으로 Skill을 다시 시작한다. |
 | `REPOSITORY_UNSUPPORTED` | exact repository root, GitHub origin 또는 supported Git 상태가 아니다. root와 remote를 확인한다. |
 | `VERDICT_UNSAFE`, `VERDICT_INVALID` | `.review` 권한·파일 형식·schema/state invariant가 안전하지 않다. 우회하지 말고 원인을 고친 뒤 Skill로 재생성한다. |
+
+Terminal one-shot 승인은 정상 finalize와 telemetry close가 끝난 round-3 FAIL 또는 INCONCLUSIVE에만
+적용된다. Skill controller는 bound head, diff SHA-256, round, terminal status와 blocker count를
+사용자에게 보여 주고 runtime의 question surface에서 명시적 답을 받은 뒤에만 다음 relayed grant를
+기록한다.
+
+```bash
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" \
+  pr-override-grant --runtime "$RUNTIME" --reason "<user answer>" --relayed
+```
+
+직접 terminal을 조작하는 사람은 `--relayed`를 빼고 exact `override`를 입력할 수 있다. 거절 시에는
+`pr-override-grant --runtime "$RUNTIME" --revoke`로 이전 grant를 제거한다. Agent는 직접 terminal
+경로를 pseudo-TTY로 흉내 내거나 스스로 승인하지 않는다. Codex adapter는 hook의 `ask` 결과를 승인
+prompt로 취급하지 않으며, Skill이 먼저 받은 명시적 답만 relayed grant로 기록한다.
+
+`pr-override-grant.json`은 ambient umask와 무관하게 owner-only `0600` regular non-symlink file로
+기록된다. Exact verdict bytes, repository, base/head/merge-base, diff, round, gate, installed contract,
+runtime과 channel이 모두 일치해야 한다. Hook은 canonical command 검사와 현재 snapshot 검증 뒤 review
+lock 안에서 grant를 원자적으로 삭제하므로 한 번의 tool call만 통과한다. GitHub CLI 실행 실패도 이미
+소비된 시도이므로 새 명시적 승인이 필요하다. Runtime 불일치, snapshot/verdict drift,
+malformed/unsafe grant, early-round blocker, incomplete review, ambiguous command는 계속 fail closed한다.
+Relayed grant는 기존 intensity grant와 마찬가지로 policy-following agent가 사용자 답을 기록한 운영
+증거이며 human presence의 암호학적 증명은 아니다.
 
 `status`가 `in_progress`를 반환하면 `verdict_schema`를 먼저 확인한다. Native v2에서는
 `reviewers.A|B|C.state`의 `pending` role만 복구하고 `sealed` role은 다시 실행하거나 교체하지 않는다.

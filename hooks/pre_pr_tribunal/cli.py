@@ -43,7 +43,7 @@ if __package__ in {None, ""}:
         validate_stored_reviewer_report,
     )
     from pre_pr_tribunal import telemetry, evidence_runtime, evidence_store, evidence_lifecycle  # type: ignore
-    from pre_pr_tribunal import intensity_grant  # type: ignore
+    from pre_pr_tribunal import intensity_grant, pr_override_grant  # type: ignore
     from pre_pr_tribunal.policy import validate_grant_lowering  # type: ignore
 else:
     from .model import (
@@ -73,7 +73,7 @@ else:
         validate_stored_reviewer_report,
     )
     from . import telemetry, evidence_runtime, evidence_store, evidence_lifecycle
-    from . import intensity_grant
+    from . import intensity_grant, pr_override_grant
     from .policy import validate_grant_lowering
 
 
@@ -133,6 +133,13 @@ def _parser() -> argparse.ArgumentParser:
     grant.add_argument("--reason")
     grant.add_argument("--relayed", action="store_true")
     grant.add_argument("--revoke", action="store_true")
+    override = commands.add_parser("pr-override-grant", add_help=False)
+    override.add_argument(
+        "--runtime", required=True, choices=("claude", "codex")
+    )
+    override.add_argument("--reason")
+    override.add_argument("--relayed", action="store_true")
+    override.add_argument("--revoke", action="store_true")
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -521,6 +528,39 @@ def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
     )
 
 
+def _pr_override_grant(cwd, arguments, *, wall_clock=utc_now):
+    """Record one user-approved exception for a terminal non-pass verdict."""
+    if arguments.revoke:
+        if arguments.reason is not None or arguments.relayed:
+            raise TribunalError("PR_OVERRIDE_GRANT_INVALID")
+        return {"revoked": pr_override_grant.revoke_grant(cwd)}
+    if arguments.reason is None:
+        raise TribunalError("PR_OVERRIDE_GRANT_INVALID")
+    if not arguments.relayed and not sys.stdin.isatty():
+        raise TribunalError("PR_OVERRIDE_GRANT_TTY_REQUIRED")
+    verdict = pr_override_grant.preview_grant(
+        cwd, runtime=arguments.runtime
+    )
+    if not arguments.relayed:
+        sys.stderr.write(
+            "pre-pr-tribunal one-shot PR override\n"
+            f"  head {verdict.head_sha}  diff {verdict.diff_sha256}\n"
+            f"  round {verdict.round}  status {verdict.gate.status.value}  "
+            f"blockers {verdict.gate.blocking_count}\n"
+            "Type 'override' to allow one canonical PR create attempt: "
+        )
+        sys.stderr.flush()
+        if sys.stdin.readline().strip() != "override":
+            raise TribunalError("PR_OVERRIDE_CONFIRMATION_MISMATCH")
+    return pr_override_grant.record_grant(
+        cwd,
+        runtime=arguments.runtime,
+        reason=arguments.reason,
+        channel="relayed" if arguments.relayed else "tty",
+        now=wall_clock,
+    )
+
+
 def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns) -> int:
     parser = _parser()
     arguments = parser.parse_args(argv)
@@ -598,6 +638,8 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
             }
         elif arguments.command == "intensity-grant":
             payload = _intensity_grant(cwd, arguments, wall_clock=wall_clock)
+        elif arguments.command == "pr-override-grant":
+            payload = _pr_override_grant(cwd, arguments, wall_clock=wall_clock)
         elif arguments.command.startswith("telemetry-"):
             payload = _telemetry_command(cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns)
         elif arguments.command == "context":
