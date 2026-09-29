@@ -281,6 +281,26 @@ def _evaluate_direct_pr_create(
         return _decision(True, GateCode.VERDICT_INVALID)
     if verdict.gate.status is GateStatus.IN_PROGRESS:
         return _decision(True, GateCode.REVIEW_INCOMPLETE)
+    if any(
+        execution.evidence_ref is not None
+        for key in active
+        for execution in verdict.reviewers[key].report.executions
+    ):
+        from .verdict_store import validate_stored_reviewer_report
+        from .model import Reviewer
+        try:
+            report, digest = validate_stored_reviewer_report(
+                root, reviewer=Reviewer.B
+            )
+            slot = verdict.reviewers['B']
+            if (
+                slot.receipt is None
+                or report != slot.report
+                or digest != slot.receipt.raw_sha256
+            ):
+                return _decision(True, GateCode.VERDICT_INVALID)
+        except Exception:
+            return _decision(True, GateCode.VERDICT_INVALID)
     if verdict.gate.status is GateStatus.FAIL:
         if verdict.gate.blocking_count <= 0:
             return _decision(True, GateCode.VERDICT_INVALID)
@@ -305,20 +325,6 @@ def _evaluate_direct_pr_create(
         return _decision(True, GateCode.VERIFICATION_INCOMPLETE)
     if verdict.gate.status is not GateStatus.PASS or verdict.gate.blocking_count != 0:
         return _decision(True, GateCode.VERDICT_INVALID)
-    if any(
-        execution.evidence_ref is not None
-        for key in active
-        for execution in verdict.reviewers[key].report.executions
-    ):
-        from .verdict_store import validate_stored_reviewer_report
-        from .model import Reviewer
-        try:
-            report, digest = validate_stored_reviewer_report(root, reviewer=Reviewer.B)
-            slot = verdict.reviewers['B']
-            if slot.receipt is None or report != slot.report or digest != slot.receipt.raw_sha256:
-                return _decision(True, GateCode.VERDICT_INVALID)
-        except Exception:
-            return _decision(True, GateCode.VERDICT_INVALID)
     return _decision(False, GateCode.PASS)
 
 

@@ -11,7 +11,12 @@ import sys
 
 import pytest
 
-from pre_pr_tribunal import gate, hook_common, pr_override_grant
+from pre_pr_tribunal import (
+    evidence_runtime,
+    gate,
+    hook_common,
+    pr_override_grant,
+)
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
 from pre_pr_tribunal.model import VERDICT_SCHEMA_VERSION, Reviewer, SchemaError
 from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict, submit_reviewer_report
@@ -344,6 +349,202 @@ def _inconclusive_round(repo: Path):
     terminal = finalize_round(repo)
     assert terminal.gate.status.value == "inconclusive"
     return terminal
+
+
+def _evidence_bundle(repo: Path):
+    from pre_pr_tribunal.evidence_environment import PYTHON_TRACKED_READ_PROGRAM
+
+    captured = evidence_runtime.capture_evidence(
+        repo,
+        base="master",
+        profile="python-v1",
+        command_cwd=".",
+        argv=[
+            "python3",
+            "-I",
+            "-S",
+            "-c",
+            PYTHON_TRACKED_READ_PROGRAM,
+            "tracked.txt",
+        ],
+        timeout_seconds=3,
+    )
+    return evidence_runtime.freeze_evidence(
+        repo,
+        base="master",
+        receipt_sha256s=[captured["receipt_sha256"]],
+    )
+
+
+def _reused_execution(repo: Path, frozen, *, round_number: int):
+    from pre_pr_tribunal.evidence_lifecycle import reusable_execution
+
+    entry = evidence_runtime.verify_evidence(
+        repo,
+        bundle_sha256=frozen["bundle_sha256"],
+        expected_binding=frozen["binding"],
+    )["eligible"][0]
+    return {
+        "id": f"B-R{round_number}-E001",
+        **reusable_execution(repo, frozen["bundle_sha256"], entry),
+    }
+
+
+def _evidence_reports(
+    repo: Path,
+    verdict,
+    frozen,
+    *,
+    finding_id: str | None = None,
+    prior_response: dict[str, object] | None = None,
+    unverified: bool = False,
+) -> None:
+    execution = _reused_execution(
+        repo, frozen, round_number=verdict.round
+    )
+    for reviewer in "ABC":
+        value = {
+            "schema": 1,
+            "reviewer": reviewer,
+            "round": verdict.round,
+            "snapshot": {
+                "head_sha": verdict.head_sha,
+                "diff_sha256": verdict.diff_sha256,
+            },
+            "status": "complete",
+            "findings": (
+                [_finding(finding_id)]
+                if finding_id is not None and finding_id.startswith(reviewer)
+                else []
+            ),
+            "executions": [],
+            "claims": [],
+            "prior_decisions": (
+                [prior_response]
+                if prior_response is not None and reviewer == "A"
+                else []
+            ),
+        }
+        if reviewer == "B":
+            claims = [{
+                "id": f"B-R{verdict.round}-C001",
+                "statement": "The reviewed behavior is executable.",
+                "result": "supported",
+                "execution_ids": [execution["id"]],
+                "reason": "",
+            }]
+            if unverified:
+                claims.append({
+                    "id": f"B-R{verdict.round}-C002",
+                    "statement": "A required runtime path remains unverified.",
+                    "result": "unverified",
+                    "execution_ids": [],
+                    "reason": "The required runtime is unavailable.",
+                })
+            value.update({
+                "executions": [execution],
+                "claims": claims,
+                "coverage": {
+                    "complete": True,
+                    "primary_entry_paths": [],
+                },
+            })
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer(reviewer),
+            raw=json.dumps(value).encode(),
+        )
+
+
+def _round_three_reused_evidence_failure(repo: Path):
+    frozen = _evidence_bundle(repo)
+    verdict = begin_round(
+        repo,
+        base="master",
+        runtime="codex",
+        round_number=1,
+        evidence_bundle_sha256=frozen["bundle_sha256"],
+    )
+    _evidence_reports(repo, verdict, frozen, finding_id="A-R1-001")
+    assert finalize_round(repo).gate.status.value == "fail"
+
+    for round_number in (2, 3):
+        _commit(repo, f"round {round_number} evidence fix\n")
+        decisions = _write_json(
+            repo
+            / f".review/inbox/round-{round_number - 1}/decisions.json",
+            [_decision(round_number - 1, f"A-R{round_number - 1}-001")],
+        )
+        frozen = _evidence_bundle(repo)
+        verdict = begin_round(
+            repo,
+            base="master",
+            runtime="codex",
+            round_number=round_number,
+            decisions_path=decisions,
+            evidence_bundle_sha256=frozen["bundle_sha256"],
+        )
+        _evidence_reports(
+            repo,
+            verdict,
+            frozen,
+            finding_id=f"A-R{round_number}-001",
+            prior_response={
+                "decision_id": f"D-R{round_number - 1}-A-001",
+                "outcome": "reissued",
+                "replacement_finding_id": f"A-R{round_number}-001",
+            },
+        )
+        terminal = finalize_round(repo)
+        assert terminal.gate.status.value == "fail"
+    return terminal, frozen
+
+
+def _inconclusive_reused_evidence(repo: Path):
+    frozen = _evidence_bundle(repo)
+    verdict = begin_round(
+        repo,
+        base="master",
+        runtime="codex",
+        round_number=1,
+        evidence_bundle_sha256=frozen["bundle_sha256"],
+    )
+    _evidence_reports(repo, verdict, frozen, unverified=True)
+    terminal = finalize_round(repo)
+    assert terminal.gate.status.value == "inconclusive"
+    return terminal, frozen
+
+
+@pytest.mark.parametrize("terminal_kind", ("fail", "inconclusive"))
+def test_terminal_override_revalidates_reused_evidence_before_consuming(
+    git_repo, terminal_kind
+):
+    if terminal_kind == "fail":
+        terminal, frozen = _round_three_reused_evidence_failure(git_repo)
+    else:
+        terminal, frozen = _inconclusive_reused_evidence(git_repo)
+    pr_override_grant.record_grant(
+        git_repo,
+        runtime="codex",
+        reason="user approved the terminal result",
+        channel="relayed",
+        now=lambda: "2026-09-29T00:00:00Z",
+    )
+    bundle_path = (
+        git_repo
+        / ".review/evidence/bundles"
+        / f"{frozen['bundle_sha256']}.json"
+    )
+    bundle_path.unlink()
+
+    decision = evaluate_gate(
+        git_repo,
+        BOUND_COMMAND,
+        runtime="codex",
+    )
+    assert terminal.gate.status.value == terminal_kind
+    assert decision.code is GateCode.VERDICT_INVALID
+    assert (git_repo / ".review/pr-override-grant.json").exists()
 
 
 @pytest.mark.parametrize(
