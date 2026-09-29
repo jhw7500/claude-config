@@ -35,6 +35,7 @@ if __package__ in {None, ""}:
         finalize_round,
         migrate_legacy_pending_round,
         migrate_v2_pending_round,
+        preview_policy,
         read_verdict,
         record_reviewer_failure,
         store_reviewer_report,
@@ -42,6 +43,8 @@ if __package__ in {None, ""}:
         validate_stored_reviewer_report,
     )
     from pre_pr_tribunal import telemetry, evidence_runtime, evidence_store, evidence_lifecycle  # type: ignore
+    from pre_pr_tribunal import intensity_grant  # type: ignore
+    from pre_pr_tribunal.policy import validate_grant_lowering  # type: ignore
 else:
     from .model import (
         MAX_REPORT_BYTES,
@@ -62,6 +65,7 @@ else:
         finalize_round,
         migrate_legacy_pending_round,
         migrate_v2_pending_round,
+        preview_policy,
         read_verdict,
         record_reviewer_failure,
         store_reviewer_report,
@@ -69,6 +73,8 @@ else:
         validate_stored_reviewer_report,
     )
     from . import telemetry, evidence_runtime, evidence_store, evidence_lifecycle
+    from . import intensity_grant
+    from .policy import validate_grant_lowering
 
 
 class _Parser(argparse.ArgumentParser):
@@ -114,6 +120,19 @@ def _parser() -> argparse.ArgumentParser:
     begin.add_argument("--intensity", action="append")
     begin.add_argument("--intensity-requester", action="append")
     begin.add_argument("--intensity-reason", action="append")
+    preview = commands.add_parser("policy-preview", add_help=False)
+    preview.add_argument("--base", required=True)
+    preview.add_argument("--runtime", required=True, choices=("claude", "codex"))
+    preview.add_argument("--intensity", action="append")
+    preview.add_argument("--intensity-requester", action="append")
+    preview.add_argument("--intensity-reason", action="append")
+    grant = commands.add_parser("intensity-grant", add_help=False)
+    grant.add_argument("--base", required=True)
+    grant.add_argument("--runtime", required=True, choices=("claude", "codex"))
+    grant.add_argument("--intensity")
+    grant.add_argument("--reason")
+    grant.add_argument("--relayed", action="store_true")
+    grant.add_argument("--revoke", action="store_true")
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -453,6 +472,55 @@ def _snapshot_equal(verdict, snapshot) -> bool:
     )
 
 
+def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
+    """Record a human grant, typed at a terminal or relayed from the user's prompt answer.
+
+    A relayed grant (#166) records the value the user chose when the agent asked,
+    right after showing the preview; the agent never picks it. Either way the grant
+    binds the snapshot it was recorded for, and `begin` ignores it once that changes.
+    """
+    if arguments.revoke:
+        # A keep-floor answer removes any earlier grant for this repository.
+        if (arguments.intensity, arguments.reason) != (None, None) or arguments.relayed:
+            raise TribunalError("GRANT_INVALID")
+        return {"revoked": intensity_grant.revoke_grant(cwd)}
+    if arguments.intensity is None or arguments.reason is None:
+        raise TribunalError("GRANT_INVALID")
+    relayed = arguments.relayed
+    if not relayed and not sys.stdin.isatty():
+        raise TribunalError("GRANT_TTY_REQUIRED")
+    raw = arguments.intensity
+    if not isinstance(raw, str) or not raw.isascii() or not raw.isdigit() or (
+        len(raw) > 1 and raw.startswith("0")
+    ) or int(raw) > 100:
+        raise TribunalError("GRANT_INVALID")
+    value = int(raw)
+    snapshot, policy = preview_policy(
+        cwd, base=arguments.base, runtime=arguments.runtime, now=wall_clock
+    )
+    validate_grant_lowering(policy.risk_floor, value)
+    if relayed:
+        return intensity_grant.record_grant(
+            cwd, snapshot=snapshot, policy=policy, value=value,
+            reason=arguments.reason, now=wall_clock, channel="relayed",
+        )
+    sys.stderr.write(
+        "pre-pr-tribunal intensity grant\n"
+        f"  head {snapshot.head_sha}  base {snapshot.base_ref} {snapshot.base_sha[:12]}\n"
+        f"  floor {policy.risk_floor} ({policy.mode.value})  ->  {value}\n"
+        f"  reasons: {', '.join(policy.reasons)}\n"
+        f"  changed paths: {len(snapshot.initial_paths)}\n"
+        "Type 'lower' to review this snapshot below its floor: "
+    )
+    sys.stderr.flush()
+    if sys.stdin.readline().strip() != "lower":
+        raise TribunalError("GRANT_CONFIRMATION_MISMATCH")
+    return intensity_grant.record_grant(
+        cwd, snapshot=snapshot, policy=policy, value=value,
+        reason=arguments.reason, now=wall_clock,
+    )
+
+
 def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns) -> int:
     parser = _parser()
     arguments = parser.parse_args(argv)
@@ -504,6 +572,32 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
             if verdict.policy is not None:
                 payload["policy"] = verdict.policy.to_json()
                 payload["active_reviewers"] = list(verdict.policy.active_reviewers)
+        elif arguments.command == "policy-preview":
+            # Predicts the policy only: stored verdict state is not read, so this
+            # never says whether `begin` will accept the snapshot.
+            snapshot, policy = preview_policy(
+                cwd, base=arguments.base, runtime=arguments.runtime,
+                intensity_values=arguments.intensity,
+                intensity_requester=arguments.intensity_requester,
+                intensity_reason=arguments.intensity_reason,
+            )
+            payload = {
+                "schema": 1,
+                "round_authority": False,
+                "begin_admissible": "not-evaluated",
+                "snapshot": {
+                    "repository": snapshot.repository,
+                    "base": {"ref": snapshot.base_ref, "sha": snapshot.base_sha},
+                    "head_ref": snapshot.head_ref,
+                    "head_sha": snapshot.head_sha,
+                    "merge_base_sha": snapshot.merge_base_sha,
+                    "diff_sha256": snapshot.diff_sha256,
+                },
+                "policy": policy.to_json(),
+                "active_reviewers": list(policy.active_reviewers),
+            }
+        elif arguments.command == "intensity-grant":
+            payload = _intensity_grant(cwd, arguments, wall_clock=wall_clock)
         elif arguments.command.startswith("telemetry-"):
             payload = _telemetry_command(cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns)
         elif arguments.command == "context":

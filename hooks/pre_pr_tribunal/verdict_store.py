@@ -1019,6 +1019,7 @@ def submit_reviewer_report(
                 _validate_reviewer_closure(pending, parsed)
                 from .evidence_lifecycle import authenticate_report
                 authenticate_report(root, pending, parsed)
+                _validate_unexecutable_claims(root, pending, snapshot, parsed)
             else:
                 if len(raw) > MAX_ATTEMPT_RAW_BYTES:
                     raise SchemaError("REPORT_TOO_LARGE")
@@ -1030,6 +1031,7 @@ def submit_reviewer_report(
                     _validate_reviewer_closure(pending, parsed)
                     from .evidence_lifecycle import authenticate_report
                     authenticate_report(root, pending, parsed)
+                    _validate_unexecutable_claims(root, pending, snapshot, parsed)
                 except SchemaError as error:
                     if error.code in REPORT_RETRYABLE_CODES:
                         _record_failure_locked(review_fd, pending, reviewer, error.code, raw)
@@ -1277,6 +1279,37 @@ def _lifecycle_id(token_hex: Callable[[int], str]) -> str:
     return value
 
 
+def preview_policy(
+    cwd: Path,
+    *,
+    base: str,
+    runtime: str,
+    intensity_values: Sequence[str] | None = None,
+    intensity_requester: str | Sequence[str] | None = None,
+    intensity_reason: str | Sequence[str] | None = None,
+    now: Callable[[], str] = utc_now,
+) -> tuple[Snapshot, m.PolicyBinding]:
+    """Resolve the policy `begin` would bind, without taking the review lock.
+
+    Stored verdict state is never read, so this predicts the policy only, not
+    whether `begin` will accept the snapshot.
+    """
+    if runtime not in {"claude", "codex"}:
+        raise SchemaError("RUNTIME_INVALID")
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    snapshot = capture_snapshot(root, base, now=now)
+    from .policy import parse_intensity_request, resolve_policy
+
+    request = parse_intensity_request(
+        intensity_values,
+        requester=intensity_requester,
+        reason=intensity_reason,
+    )
+    return snapshot, resolve_policy(root, snapshot, runtime=runtime, request=request)
+
+
 def begin_round(
     cwd: Path,
     *,
@@ -1355,11 +1388,29 @@ def begin_round(
             else:
                 request = previous.policy.request
         else:
+            from .intensity_grant import matching_grant_request
+
             request = parse_intensity_request(
                 intensity_values,
                 requester=intensity_requester,
                 reason=intensity_reason,
             )
+            grant_request = matching_grant_request(
+                review_fd,
+                snapshot,
+                lambda: resolve_policy(
+                    root, snapshot, runtime=runtime,
+                    request=parse_intensity_request(None, requester=None, reason=None),
+                ),
+            )
+            if grant_request is not None:
+                if (
+                    intensity_values
+                    or intensity_requester is not None
+                    or intensity_reason is not None
+                ):
+                    raise SchemaError("INTENSITY_GRANT_CONFLICT")
+                request = grant_request
         policy = resolve_policy(root, snapshot, runtime=runtime, request=request)
         if (
             round_number == 1
@@ -1375,9 +1426,11 @@ def begin_round(
                 if stored.round == 3:
                     raise SchemaError("ROUND_LIMIT_EXHAUSTED")
                 raise SchemaError("ROUND_TRANSITION_INVALID")
+            # A human grant is the one sanctioned way to lower a snapshot (#162).
             if (
                 stored.gate.status is GateStatus.INCONCLUSIVE
                 and policy.effective_intensity < prior_intensity
+                and policy.request.source != m.HUMAN_GRANT_SOURCE
             ):
                 raise SchemaError("ROUND_TRANSITION_INVALID")
         if round_number > 1:
@@ -1452,6 +1505,42 @@ def begin_round(
             )
         _atomic_write(review_fd, pending)
         return pending
+
+
+def _validate_unexecutable_claims(
+    root: Path, verdict: Verdict, snapshot: Snapshot, report: m.ReviewerReport
+) -> None:
+    """A declared-unexecutable changed path must be covered and only `unverified`.
+
+    The declaration lives in the committed repository config, so it is already
+    bound to the round through `PolicyBinding.config_sha256`.
+    """
+    if report.coverage is None:
+        return
+    from .policy import committed_unexecutable, unexecutable_reason
+
+    digest, declarations = committed_unexecutable(root, snapshot.head_sha)
+    if not declarations:
+        return
+    if verdict.policy is not None and digest != verdict.policy.config_sha256:
+        raise SchemaError("POLICY_CHANGED")
+    covered = {
+        entry.path: entry.claim_id for entry in report.coverage.primary_entry_paths
+    }
+    claims = {claim.id: claim for claim in report.claims}
+    for changed in snapshot.paths:
+        sides = [side for side in (changed.path, changed.old_path) if side is not None]
+        if not any(unexecutable_reason(declarations, side) for side in sides):
+            continue
+        # A rename may match on either side; covering either one is enough.
+        claim_id = next((covered[side] for side in sides if side in covered), None)
+        if claim_id is None:
+            raise SchemaError("UNEXECUTABLE_PATH_UNCOVERED")
+        claim = claims.get(claim_id)
+        if claim is not None and claim.result != "unverified":
+            # `refuted` demands execution evidence exactly as `supported` does,
+            # and the declaration asserts no such evidence can exist.
+            raise SchemaError("UNEXECUTABLE_PATH_NOT_UNVERIFIED")
 
 
 def _validate_reviewer_closure(

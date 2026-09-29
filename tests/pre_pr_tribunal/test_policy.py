@@ -14,7 +14,11 @@ from pre_pr_tribunal.git_state import (
     capture_snapshot,
 )
 from pre_pr_tribunal.model import GateStatus, ReviewMode, Reviewer, SchemaError
-from pre_pr_tribunal.policy import parse_intensity_request, parse_policy_binding
+from pre_pr_tribunal.policy import (
+    MAX_POLICY_REASONS,
+    parse_intensity_request,
+    parse_policy_binding,
+)
 from pre_pr_tribunal.verdict_store import (
     begin_round,
     finalize_round,
@@ -474,6 +478,45 @@ enabled = false
         begin_round(source, base="master", runtime="codex", round_number=1, now=NOW)
 
 
+DECLARED_ALL_DISABLED = """
+[unexecutable]
+"src/**" = "NO_CROSS_SDK"
+
+[reviewer.A]
+enabled = false
+[reviewer.B]
+enabled = false
+[reviewer.C]
+enabled = false
+""".lstrip()
+
+
+def test_all_reviewers_disabled_with_a_declaration_still_fails_closed(tmp_path):
+    """A declaration must not stand in for a reviewer the configuration disabled.
+
+    Regression for tribunal round-1 finding A-R1-002: forcing Reviewer B made
+    the all-disabled check unreachable, so "at least one reviewer must be
+    enabled for a non-off mode" silently stopped holding for exactly the
+    configurations that declare a pattern.
+    """
+    repo = _repo(tmp_path, config=DECLARED_ALL_DISABLED)
+    with pytest.raises(SchemaError, match="^CONFIG_INVALID$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+
+def test_all_reviewers_disabled_with_a_declaration_stays_off_for_docs(tmp_path):
+    """Preservation check: the invariant still binds only the non-off modes.
+
+    Passes both before and after the A-R1-002 fix; it pins the `off` half of
+    `test_all_reviewers_may_be_disabled_only_for_off_mode` against the added
+    pre-override check.
+    """
+    repo = _repo(tmp_path, path="docs/guide.md", config=DECLARED_ALL_DISABLED)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.OFF
+    assert verdict.policy.active_reviewers == ()
+
+
 def test_persisted_request_source_semantics_are_strict(tmp_path):
     repo = _repo(tmp_path)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
@@ -740,3 +783,628 @@ def test_pr_appendix_is_visibly_truncated_before_byte_limit(tmp_path):
     assert final.gate.status is GateStatus.PASS
     assert len(appendix.encode("utf-8")) <= 32 * 1024
     assert "Additional advisory findings were omitted" in appendix
+
+
+UNEXECUTABLE_CONFIG = '[unexecutable]\n"src/**" = "NO_CROSS_SDK"\n'
+
+
+def _unexecutable_report(verdict, *, result, cover=True, path="src/app.py"):
+    execution_id = f"B-R{verdict.round}-E001"
+    claim_id = f"B-R{verdict.round}-C001"
+    if result == "unverified":
+        executions = ()
+        claims = ({
+            "id": claim_id,
+            "statement": "The documented primary entry path runs.",
+            "result": "unverified",
+            "execution_ids": [],
+            "reason": "This view has no cross SDK.",
+        },)
+    else:
+        executions = (_execution(execution_id),)
+        claims = ({
+            "id": claim_id,
+            "statement": "The documented primary entry path runs.",
+            "result": result,
+            "execution_ids": [execution_id],
+            "reason": "",
+        },)
+    paths = [{"path": path, "claim_id": claim_id}] if cover else []
+    return _report(
+        verdict,
+        "B",
+        claims=claims,
+        executions=executions,
+        coverage={"complete": True, "primary_entry_paths": paths},
+    )
+
+
+def test_declared_unexecutable_path_cannot_be_claimed_supported(tmp_path):
+    repo = _repo(tmp_path, config=UNEXECUTABLE_CONFIG)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    with pytest.raises(SchemaError) as error:
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_unexecutable_report(verdict, result="supported"),
+            now=NOW,
+        )
+    assert error.value.code == "UNEXECUTABLE_PATH_NOT_UNVERIFIED"
+
+
+def test_declared_unexecutable_path_must_appear_in_coverage(tmp_path):
+    repo = _repo(tmp_path, config=UNEXECUTABLE_CONFIG)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    with pytest.raises(SchemaError) as error:
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_unexecutable_report(verdict, result="unverified", cover=False),
+            now=NOW,
+        )
+    assert error.value.code == "UNEXECUTABLE_PATH_UNCOVERED"
+
+
+def test_declared_unexecutable_path_seals_when_unverified(tmp_path):
+    repo = _repo(tmp_path, config=UNEXECUTABLE_CONFIG)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_unexecutable_report(verdict, result="unverified"),
+        now=NOW,
+    )
+
+
+def test_supported_claim_seals_without_a_declaration(tmp_path):
+    """Control: the same report seals when nothing is declared unexecutable."""
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_unexecutable_report(verdict, result="supported"),
+        now=NOW,
+    )
+
+
+def test_unexecutable_declaration_parses_and_requires_a_reason():
+    from pre_pr_tribunal.policy import _validate_config
+
+    config = _validate_config(b'[unexecutable]\n"src/**" = "NO_CROSS_SDK"\n')
+    assert config.unexecutable == (("src/**", "NO_CROSS_SDK"),)
+    for invalid in (b'[unexecutable]\n"src/**" = ""\n', b'[unexecutable]\n"src/**" = 1\n'):
+        with pytest.raises(SchemaError) as error:
+            _validate_config(invalid)
+        assert error.value.code == "CONFIG_INVALID"
+
+
+def test_unexecutable_rejections_are_retryable():
+    from pre_pr_tribunal.attempt_store import REPORT_RETRYABLE_CODES
+
+    assert "UNEXECUTABLE_PATH_NOT_UNVERIFIED" in REPORT_RETRYABLE_CODES
+    assert "UNEXECUTABLE_PATH_UNCOVERED" in REPORT_RETRYABLE_CODES
+
+
+def _rename_repo(tmp_path, *, old="src/app.py", new="lib/app.py"):
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "feature")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "remote", "add", "origin", "https://github.com/jhw7500/claude-config.git")
+    _write(repo, ".gitignore", ".review/\n")
+    _write(repo, old, "base\n")
+    _write(repo, ".pre-pr-tribunal.toml", UNEXECUTABLE_CONFIG)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+    (repo / new).parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "mv", old, new)
+    _git(repo, "commit", "-qm", "rename")
+    return repo
+
+
+def test_declared_unexecutable_path_cannot_be_claimed_refuted(tmp_path):
+    """`refuted` demands execution evidence exactly as `supported` does.
+
+    Regression for the round-1 CRITICAL: permitting `refuted` sealed the report
+    and finalized to PASS, because gate aggregation only downgrades on
+    `unverified`.
+    """
+    repo = _repo(tmp_path, config=UNEXECUTABLE_CONFIG)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    with pytest.raises(SchemaError) as error:
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_unexecutable_report(verdict, result="refuted"),
+            now=NOW,
+        )
+    assert error.value.code == "UNEXECUTABLE_PATH_NOT_UNVERIFIED"
+
+
+def test_declared_unexecutable_rename_accepts_either_side(tmp_path):
+    """A rename matching on the old side may be covered by the new path."""
+    repo = _rename_repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_unexecutable_report(verdict, result="unverified", path="lib/app.py"),
+        now=NOW,
+    )
+
+
+def test_declared_unexecutable_rename_still_accepts_old_side(tmp_path):
+    repo = _rename_repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_unexecutable_report(verdict, result="unverified", path="src/app.py"),
+        now=NOW,
+    )
+
+
+UNEXECUTABLE_B_DISABLED = (
+    '[unexecutable]\n"src/**" = "NO_CROSS_SDK"\n\n[reviewer.B]\nenabled = false\n'
+)
+
+
+def test_unexecutable_declaration_forces_reviewer_b(tmp_path):
+    """A declaration is enforced only through B, so disabling B must not void it.
+
+    Regression for tribunal round-2 finding A-R2-001: with B inactive,
+    `_validate_unexecutable_claims` never runs and the gate finalizes to PASS.
+    """
+    repo = _repo(tmp_path, config=UNEXECUTABLE_B_DISABLED)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert "B" in verdict.policy.active_reviewers
+    assert verdict.policy.reviewers["B"].enabled is True
+    assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
+
+
+UNEXECUTABLE_UNMATCHED_B_DISABLED = (
+    '[unexecutable]\n"drivers/**" = "NO_CROSS_SDK"\n\n[reviewer.B]\nenabled = false\n'
+)
+
+
+def test_unexecutable_forcing_is_config_conditioned_not_diff_conditioned(tmp_path):
+    """Forcing depends on the committed config alone, never on the changed paths.
+
+    Round transitions reject a changed reviewer set (`POLICY_CHANGED`), and a
+    declared path may legitimately disappear between rounds because auto-fix
+    scope may shrink. Keying the decision to the config keeps it stable.
+
+    The declared pattern and the changed path are deliberately disjoint while
+    the mode stays non-`off`. An earlier version of this test used a
+    documentation-only change, which is risk floor 0 and therefore `off`, so it
+    conflated "the diff does not match" with "no reviewer runs at all" and
+    pinned the A-R1-001 behaviour by accident. The mode assertion keeps the two
+    axes separate.
+    """
+    repo = _repo(tmp_path, config=UNEXECUTABLE_UNMATCHED_B_DISABLED)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is not ReviewMode.OFF
+    assert not any(path.startswith("drivers/") for path in verdict.initial_paths)
+    assert verdict.policy.reviewers["B"].enabled is True
+    assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
+
+
+def test_reviewer_b_stays_disabled_without_a_declaration(tmp_path):
+    """Control: the forcing is caused by the declaration, nothing else."""
+    repo = _repo(tmp_path, config='[reviewer.B]\nenabled = false\n')
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.reviewers["B"].enabled is False
+    assert "B" not in verdict.policy.active_reviewers
+    assert "unexecutable-requires-reviewer-b" not in verdict.policy.reasons
+
+
+def test_unexecutable_reason_is_recorded_even_when_b_was_already_enabled(tmp_path):
+    """The override reason records the declaration, not a change to the config.
+
+    Regression for tribunal claim B-R1-C003: the reason used to be appended only
+    when the config had disabled B, so the common case recorded nothing while the
+    design note claimed it always did.
+    """
+    repo = _repo(tmp_path, config=UNEXECUTABLE_CONFIG)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.reviewers["B"].enabled is True
+    assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
+
+
+def test_unexecutable_reason_survives_the_policy_reason_cap(tmp_path):
+    """The override reason must outlive truncation on a wide change.
+
+    Regression for tribunal finding A-R1-001: the reason was appended last, so
+    `MAX_POLICY_REASONS` discarded it first — exactly on the large changes most
+    likely to touch a declared path.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "feature")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "remote", "add", "origin", "https://github.com/jhw7500/claude-config.git")
+    _write(repo, ".gitignore", ".review/\n")
+    _write(repo, ".pre-pr-tribunal.toml", UNEXECUTABLE_CONFIG)
+    for index in range(130):
+        _write(repo, f"src/mod{index}.py", "base\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+    for index in range(130):
+        _write(repo, f"src/mod{index}.py", "feature\n")
+    _git(repo, "commit", "-qam", "feature")
+
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert len(verdict.policy.reasons) == MAX_POLICY_REASONS
+    assert verdict.policy.reasons[-1] == "reason-limit"
+    assert "unexecutable-requires-reviewer-b" in verdict.policy.reasons
+    assert verdict.policy.reviewers["B"].enabled is True
+
+
+def test_off_mode_records_no_unexecutable_override(tmp_path):
+    """`off` dispatches no reviewer, so no override may be claimed.
+
+    Regression for tribunal round-1 finding A-R1-001: the forcing ran before the
+    mode was consulted, so an `off` run persisted `reviewers.B.enabled` and the
+    override reason while `active_reviewers` was empty and every slot disabled --
+    an audit record asserting a security override that never happened.
+    """
+    repo = _repo(tmp_path, path="docs/guide.md", config=UNEXECUTABLE_B_DISABLED)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.OFF
+    assert "unexecutable-requires-reviewer-b" not in verdict.policy.reasons
+    assert verdict.policy.reviewers["B"].enabled is False
+
+
+def _review_tree_digest(repo):
+    review = repo / ".review"
+    if not review.exists():
+        return None
+    digest = hashlib.sha256()
+    for path in sorted(review.rglob("*")):
+        digest.update(str(path.relative_to(review)).encode())
+        if path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _preview(repo, monkeypatch, capsys, *extra):
+    from pre_pr_tribunal.cli import main
+
+    monkeypatch.chdir(repo)
+    status = main(["policy-preview", "--base", "master", "--runtime", "codex", *extra])
+    captured = capsys.readouterr()
+    return status, captured
+
+
+@pytest.mark.parametrize(
+    ("path", "mode"),
+    (
+        ("docs/guide.md", ReviewMode.OFF),
+        ("src/app.py", ReviewMode.SINGLE),
+        ("hooks/guard.py", ReviewMode.ITERATIVE),
+    ),
+)
+def test_policy_preview_matches_begin_without_creating_review_state(
+    tmp_path, monkeypatch, capsys, path, mode
+):
+    repo = _repo(tmp_path, path=path)
+    status, captured = _preview(repo, monkeypatch, capsys)
+    assert status == 0, captured.err
+    assert not (repo / ".review").exists()
+    payload = json.loads(captured.out)
+    assert payload["round_authority"] is False
+    assert payload["begin_admissible"] == "not-evaluated"
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is mode
+    assert payload["policy"] == verdict.policy.to_json()
+    assert payload["active_reviewers"] == list(verdict.policy.active_reviewers)
+    assert payload["snapshot"]["head_sha"] == verdict.head_sha
+    assert payload["snapshot"]["diff_sha256"] == verdict.diff_sha256
+
+
+def test_policy_preview_passes_the_same_intensity_request_as_begin(
+    tmp_path, monkeypatch, capsys
+):
+    repo = _repo(tmp_path)
+    request = ("--intensity", "100", "--intensity-requester", "maintainer",
+               "--intensity-reason", "wider review")
+    status, captured = _preview(repo, monkeypatch, capsys, *request)
+    assert status == 0, captured.err
+    payload = json.loads(captured.out)
+    verdict = begin_round(
+        repo, base="master", runtime="codex", round_number=1, now=NOW,
+        intensity_values=["100"], intensity_requester=["maintainer"],
+        intensity_reason=["wider review"],
+    )
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert payload["policy"] == verdict.policy.to_json()
+
+
+def test_policy_preview_leaves_existing_review_state_byte_identical(
+    tmp_path, monkeypatch, capsys
+):
+    from pre_pr_tribunal.cli import main
+
+    repo = _repo(tmp_path)
+    monkeypatch.chdir(repo)
+    assert main(["begin", "--base", "master", "--runtime", "codex", "--round", "1"]) == 0
+    capsys.readouterr()
+    before = _review_tree_digest(repo)
+    assert before is not None
+    assert (repo / ".review" / "telemetry.json").is_file()
+    assert (repo / ".review" / "verdict.json").is_file()
+    status, captured = _preview(repo, monkeypatch, capsys)
+    assert status == 0, captured.err
+    assert _review_tree_digest(repo) == before
+
+
+def test_policy_preview_refuses_what_begin_refuses_before_policy(
+    tmp_path, monkeypatch, capsys
+):
+    repo = _repo(tmp_path)
+    _git(repo, "update-ref", "refs/remotes/origin/master", "HEAD")
+    status, captured = _preview(repo, monkeypatch, capsys)
+    assert status == 1
+    assert captured.err == "PRE_PR_TRIBUNAL:EMPTY_DIFF\n"
+    assert not (repo / ".review").exists()
+    with pytest.raises(GitStateError, match="^EMPTY_DIFF$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+
+def _grant(repo, value, reason="lower a reviewed-by-hand change"):
+    from pre_pr_tribunal.intensity_grant import record_grant
+    from pre_pr_tribunal.verdict_store import preview_policy
+
+    snapshot, policy = preview_policy(repo, base="master", runtime="codex", now=NOW)
+    return record_grant(
+        repo, snapshot=snapshot, policy=policy, value=value, reason=reason, now=NOW
+    )
+
+
+def test_matching_human_grant_lowers_below_the_floor(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 50)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    policy = verdict.policy
+    assert (policy.risk_floor, policy.effective_intensity) == (100, 50)
+    assert policy.mode is ReviewMode.SINGLE
+    assert (policy.request.source, policy.request.requester) == ("human_grant", "human-direct")
+    assert parse_policy_binding(policy.to_json(), runtime="codex") == policy
+
+
+def test_human_grant_to_zero_is_skipped_with_its_provenance(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 0)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.OFF
+    assert verdict.gate.status is GateStatus.SKIPPED
+    assert verdict.policy.risk_floor == 100
+    assert verdict.policy.request.source == "human_grant"
+    assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.PASS
+
+
+def test_human_grant_for_another_snapshot_is_ignored(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 0)
+    _write(repo, "hooks/guard.py", "changed after the grant\n")
+    _git(repo, "commit", "-qam", "change")
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert verdict.policy.request.source == "default"
+
+
+def test_controller_intensity_conflicts_with_a_matching_grant(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 50)
+    with pytest.raises(SchemaError, match="^INTENSITY_GRANT_CONFLICT$"):
+        begin_round(
+            repo, base="master", runtime="codex", round_number=1, now=NOW,
+            intensity_values=("100",), intensity_requester="maintainer",
+            intensity_reason="wider review",
+        )
+
+
+def test_grant_must_lower_the_floor_and_change_the_mode(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    with pytest.raises(SchemaError, match="^GRANT_MODE_UNCHANGED$"):
+        _grant(repo, 80)
+    docs = _repo(tmp_path / "docs", path="docs/guide.md")
+    with pytest.raises(SchemaError, match="^GRANT_NOT_LOWER$"):
+        _grant(docs, 50)
+    assert not (repo / ".review").exists()
+
+
+def test_lowered_policy_is_valid_only_for_a_human_grant(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 50)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    forged = verdict.policy.to_json()
+    forged["request"] = {**forged["request"], "source": "cli", "requester": "maintainer"}
+    with pytest.raises(SchemaError, match="^POLICY_INVALID$"):
+        parse_policy_binding(forged, runtime="codex")
+    wrong_requester = verdict.policy.to_json()
+    wrong_requester["request"] = {**wrong_requester["request"], "requester": "agent"}
+    with pytest.raises(SchemaError, match="^POLICY_INVALID$"):
+        parse_policy_binding(wrong_requester, runtime="codex")
+
+
+def test_human_grant_may_restart_an_inconclusive_snapshot_lower(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    submit_reviewer_report(repo, reviewer=Reviewer.A, raw=_report(verdict, "A"), now=NOW)
+    claim = {
+        "id": "B-R1-C001",
+        "statement": "The hook entry path runs.",
+        "result": "unverified",
+        "execution_ids": [],
+        "reason": "The required runtime is unavailable.",
+    }
+    submit_reviewer_report(
+        repo, reviewer=Reviewer.B, raw=_report(verdict, "B", claims=(claim,)), now=NOW
+    )
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.INCONCLUSIVE
+    _grant(repo, 50)
+    restarted = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert restarted.policy.effective_intensity == 50
+    assert restarted.policy.request.source == "human_grant"
+
+
+class _FakeTty:
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def isatty(self):
+        return True
+
+    def readline(self):
+        return self._lines.pop(0) if self._lines else ""
+
+
+def test_intensity_grant_cli_requires_a_terminal(tmp_path, monkeypatch, capsys):
+    from pre_pr_tribunal.cli import main
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    monkeypatch.chdir(repo)
+    status = main(["intensity-grant", "--base", "master", "--runtime", "codex",
+                   "--intensity", "50", "--reason", "small change"])
+    assert status == 1
+    assert capsys.readouterr().err == "PRE_PR_TRIBUNAL:GRANT_TTY_REQUIRED\n"
+    assert not (repo / ".review").exists()
+
+
+def test_intensity_grant_cli_records_only_after_typed_confirmation(
+    tmp_path, monkeypatch, capsys
+):
+    import sys as _sys
+    from pre_pr_tribunal.cli import main
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    arguments = ["intensity-grant", "--base", "master", "--runtime", "codex",
+                 "--intensity", "50", "--reason", "small change"]
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(_sys, "stdin", _FakeTty(["nope\n"]))
+    assert main(arguments) == 1
+    assert capsys.readouterr().err.endswith("PRE_PR_TRIBUNAL:GRANT_CONFIRMATION_MISMATCH\n")
+    assert not (repo / ".review" / "intensity-grant.json").exists()
+
+    monkeypatch.setattr(_sys, "stdin", _FakeTty(["lower\n"]))
+    assert main(arguments) == 0
+    capsys.readouterr()
+    assert ((repo / ".review" / "intensity-grant.json").stat().st_mode & 0o777) == 0o600
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.request.source == "human_grant"
+    assert verdict.policy.effective_intensity == 50
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        lambda grant: {**grant, "reason": ""},
+        lambda grant: {**grant, "reason": "x" * 2048},
+        lambda grant: {**grant, "reason": "bell\u0007"},
+        lambda grant: {**grant, "value": 80},
+        lambda grant: {**grant, "value": True},
+        None,
+    ),
+    ids=("empty-reason", "long-reason", "control-reason", "mode-unchanged", "bool-value", "deep-nesting"),
+)
+def test_malformed_grant_is_ignored_and_state_stays_readable(tmp_path, tamper):
+    from pre_pr_tribunal.verdict_store import read_verdict
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 0)
+    path = repo / ".review" / "intensity-grant.json"
+    raw = (
+        b"[" * 5000
+        if tamper is None
+        else json.dumps(tamper(json.loads(path.read_bytes()))).encode()
+    )
+    path.write_bytes(raw)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert verdict.policy.request.source == "default"
+    assert read_verdict(repo).policy == verdict.policy
+
+
+def _relayed(repo, monkeypatch, capsys, *extra):
+    from pre_pr_tribunal.cli import main
+
+    monkeypatch.chdir(repo)
+    status = main(["intensity-grant", "--base", "master", "--runtime", "codex",
+                   "--intensity", "50", "--reason", "user chose single in the prompt",
+                   "--relayed", *extra])
+    return status, capsys.readouterr()
+
+
+def test_relayed_grant_needs_no_terminal_and_records_its_channel(
+    tmp_path, monkeypatch, capsys
+):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    status, captured = _relayed(repo, monkeypatch, capsys)
+    assert status == 0, captured.err
+    assert json.loads(captured.out)["channel"] == "relayed"
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    policy = verdict.policy
+    assert (policy.request.source, policy.request.requester) == ("human_grant", "human-relayed")
+    assert (policy.risk_floor, policy.effective_intensity) == (100, 50)
+    assert parse_policy_binding(policy.to_json(), runtime="codex") == policy
+
+
+def test_relayed_grant_binds_the_snapshot_it_was_recorded_for(tmp_path, monkeypatch, capsys):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    assert _relayed(repo, monkeypatch, capsys)[0] == 0
+    _write(repo, "hooks/guard.py", "changed after the user answered\n")
+    _git(repo, "commit", "-qam", "change")
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert verdict.policy.request.source == "default"
+
+
+def test_human_grant_accepts_only_direct_or_relayed_requesters(tmp_path, monkeypatch, capsys):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    assert _relayed(repo, monkeypatch, capsys)[0] == 0
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    for requester, valid in (("human-direct", True), ("human-relayed", True), ("agent", False)):
+        candidate = verdict.policy.to_json()
+        candidate["request"] = {**candidate["request"], "requester": requester}
+        if valid:
+            assert parse_policy_binding(candidate, runtime="codex").request.requester == requester
+        else:
+            with pytest.raises(SchemaError, match="^POLICY_INVALID$"):
+                parse_policy_binding(candidate, runtime="codex")
+
+
+def test_revoke_keeps_the_floor_over_an_earlier_grant(tmp_path, monkeypatch, capsys):
+    from pre_pr_tribunal.cli import main
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    _grant(repo, 0)
+    monkeypatch.chdir(repo)
+    assert main(["intensity-grant", "--base", "master", "--runtime", "codex", "--revoke"]) == 0
+    capsys.readouterr()
+    assert not (repo / ".review" / "intensity-grant.json").exists()
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert verdict.policy.request.source == "default"
+
+
+def test_revoke_without_a_grant_is_a_no_op_and_rejects_value_flags(
+    tmp_path, monkeypatch, capsys
+):
+    from pre_pr_tribunal.cli import main
+
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    monkeypatch.chdir(repo)
+    base = ["intensity-grant", "--base", "master", "--runtime", "codex", "--revoke"]
+    assert main(base) == 0
+    assert json.loads(capsys.readouterr().out) == {"revoked": False}
+    assert main([*base, "--intensity", "50"]) == 1
+    assert capsys.readouterr().err == "PRE_PR_TRIBUNAL:GRANT_INVALID\n"
+    assert main(["intensity-grant", "--base", "master", "--runtime", "codex",
+                 "--relayed", "--reason", "no value"]) == 1
+    assert capsys.readouterr().err == "PRE_PR_TRIBUNAL:GRANT_INVALID\n"

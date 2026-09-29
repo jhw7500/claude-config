@@ -51,18 +51,140 @@ Built-in classification cannot be lowered by repository configuration.
 
 | Floor | Mode | Examples |
 | ---: | --- | --- |
-| 0 | off | documentation-only Markdown/text under documentation paths |
+| 0 | off | content edits to `.md`, `.mdx`, `.rst`, or `.txt` files under `docs/` or `doc/` only |
 | 50 | single | ordinary recognized source or test changes |
-| 100 | iterative | tribunal/config/hooks/workflows/deploy/auth/data/dependency changes; rename/copy/type/unknown status; binary, symlink, submodule, mixed or unknown paths |
+| 100 | iterative | tribunal/config/hooks/workflows/deploy/auth/data/dependency changes; installed instruction prose under `claude-md/`, `skills/`, or `commands/`; rename/copy/type/unknown status; binary, symlink, submodule, mixed or unknown paths |
 
 Every changed path is classified, including both sides of a rename. The final
 floor is the maximum. Ambiguous Git metadata or classification errors resolve
 to 100.
 
+"Documentation-only" means the floor-0 row above and nothing wider. Changing only
+Markdown files is not enough. Sensitive file names and path prefixes are checked
+before the documentation rule, so `docs/requirements-guide.md` is 100, and a
+`.md` file outside `docs/` or `doc/` is 100 as well: a repository-root
+`README.md` is an unknown path. Prose under `claude-md/`, `skills/`, and
+`commands/` is deliberately classified as configuration, not documentation.
+`install.sh` installs those files into `~/.claude/`, where they become the
+instructions every agent session runs under, so a wording change there is a
+behavior change (#160, option 2). A rename or copy is 100 even between two
+documentation paths.
+
+A change whose built-in floor looks too high for its content is not lowered by
+reclassification or by repository configuration. A human-requested lowering
+path bound to one snapshot is proposed separately in #162; until it exists,
+these changes run the iterative mode.
+
 Repository `[policy]` patterns may raise the floor by mapping to `off`,
 `single`, `iterative`, or integer 0..100. They cannot reduce the built-in
 value. `.pre-pr-tribunal.toml` itself is always floor 100, preventing a policy
 weakening change from reviewing itself at the weakened level.
+
+## Human-direct intensity grants
+
+Neither repository configuration nor the controller's `--intensity` request can
+lower the built-in floor. A person can, for one snapshot, through
+`intensity-grant --base B --runtime R --intensity N --reason TEXT` (#162). This
+reverses #135's non-goal "lower the floor by user request"; #132's "no
+unrecorded bypass" and the raise-only `[policy]` rule still hold.
+
+The command requires a terminal on stdin, shows the snapshot, floor, mode and
+reasons it resolved, and records nothing until the person types `lower`. N must
+be below the floor and must change the
+mode, so a grant from floor 100 yields `single` (1..66) or `off` (0) and never
+reaches round 2. The grant is `.review/intensity-grant.json` (mode 0600). It
+binds the repository, base, head, merge base, diff SHA-256, committed config
+digest, resolved floor and reasons, and installed contract versions. Round-1
+`begin` applies it only while all of these still match and no `--intensity` was
+passed; passing one alongside a matching grant is `INTENSITY_GRANT_CONFLICT`. A
+mismatched or malformed grant is ignored, so the snapshot is reviewed at its
+floor.
+
+The verdict records the lowering without a new field: the policy keeps the
+pre-grant `risk_floor`, and its request has source `human_grant`, requester
+`human-direct`, and the typed reason. Only that source may sit below the floor;
+every parser, the PR gate's recomputation, and the INCONCLUSIVE restart rule
+check it. At N=0 the gate is the existing `skipped`, told apart by that source.
+
+A grant can also be relayed (#166). Before round 1 the controlling agent shows
+the `policy-preview` result in its own prompt and asks whether to keep the
+floor. Only when the user chooses a lower value does it run `intensity-grant
+--relayed`, right after showing the preview; it needs no terminal. Neither path
+asks the user to retype a SHA: the grant binds the snapshot it was recorded for,
+so a head, base, diff or config that changes before `begin` voids it. The grant
+records `channel: relayed`, and the verdict records
+requester `human-relayed` instead of `human-direct`. The parser accepts only
+these two requesters for `human_grant`. Grants written before #166 carry no
+channel and are read as terminal grants. After recording a relayed grant the
+agent runs `begin` with no intensity arguments. When the user keeps the floor it
+runs `intensity-grant --revoke`, which removes any earlier grant for the
+repository so that a keep-floor answer is never overridden by an older grant.
+
+Both paths are friction against policy-following agent mistakes, the threat
+model this design already states, not a security boundary: an agent running as
+the same user can obtain a pseudo-terminal (for example with `script`), and a
+relayed grant is the agent's record of the user's answer. The skill contract
+forbids agents from choosing the value, asking again after the user keeps the
+floor, or running the terminal path.
+
+## Declared-unexecutable paths
+
+`[unexecutable]` maps a path pattern to a short reason. It declares that the
+primary entry path for those files cannot be executed in any available
+environment — a cross-compiled embedded target, for example — so no reviewer can
+honestly produce execution evidence for it.
+
+At report seal, every changed path matching a declared pattern must appear in
+Reviewer B's `coverage.primary_entry_paths`, and the claim it maps to must be
+`unverified`. Omission raises `UNEXECUTABLE_PATH_UNCOVERED`; any other claim result
+raises `UNEXECUTABLE_PATH_NOT_UNVERIFIED`. Both are retryable within the round.
+
+`refuted` is rejected alongside `supported` because both require execution IDs,
+which the declaration asserts cannot honestly exist. Only `unverified` forbids
+them, and only `unverified` resolves the gate to `INCONCLUSIVE` rather than
+`PASS`; a `refuted` claim would otherwise seal and finalize to `PASS`, which is
+the outcome the declaration exists to prevent.
+
+A rename matches when either its pre- or post-rename path matches a declared
+pattern, and covering either side satisfies the rule.
+
+The anchor is the diff, not the report: a path the reviewer simply omits fails
+instead of passing silently. The declaration is read from the committed config at
+the bound HEAD, so an uncommitted edit cannot change it, and its digest is already
+part of `PolicyBinding.config_sha256`.
+
+A declaration is enforced only through Reviewer B's sealed coverage, so a
+configuration that declares a pattern while setting `[reviewer.B] enabled = false`
+would void every declaration silently. `resolve_policy` therefore forces Reviewer B
+enabled whenever the committed config declares any pattern and the review mode is
+not `off`. It records `unexecutable-requires-reviewer-b` as the first policy reason
+under that same condition — before the per-path reasons, because the reason cap
+truncates the tail and this entry is the durable record of a security override. An
+`off` run dispatches no reviewer at all, so forcing there would record an override
+that never happened; the gap described below is why that mode is excluded rather
+than made to enforce. The decision is keyed
+to the committed config, never to the changed paths: a round transition rejects a
+changed reviewer set, and a declared path may legitimately disappear between rounds
+because auto-fix scope is allowed to shrink.
+
+Forcing adds a reviewer; it never substitutes for one. The requirement that at least
+one reviewer be enabled for a non-`off` mode is therefore checked against the
+committed configuration values, before any override applies, so a declaration cannot
+stand in for a configuration that enables nobody. A request that failed closed is the
+sole exemption, because it overrides the whole request rather than a configuration
+decision and already enables every role.
+
+One gap remains open by design. At risk floor 0 the review mode is `off`, there are
+no active reviewers, and the gate passes without any report, so a documentation-only
+change does not apply the declaration even though the declaration is repository-wide.
+That follows from floor 0 having no review at all rather than from the declaration,
+but it means a declaration is not a guarantee about every change in the repository.
+
+Deploy order matters: merge the rule before writing any declaration. A declaration
+that predates the rule would leave verdicts sealed without it. Narrowing the forcing
+condition likewise changes the recomputed policy, and the gate compares the whole
+binding rather than its reviewer set, so an `off`-mode verdict sealed by an older
+runtime becomes `VERDICT_STALE` until its round is begun again.
 
 ## Requested intensity
 
@@ -91,6 +213,9 @@ unknown values are errors.
 "docs/**" = "off"
 "hooks/**" = "iterative"
 "**" = "single"
+
+[unexecutable]
+"drivers/**" = "NO_CROSS_SDK"
 
 [reviewer.A]
 enabled = true

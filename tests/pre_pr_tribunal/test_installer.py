@@ -34,6 +34,7 @@ PACKAGE_NAMES = (
     "gate.py",
     "git_state.py",
     "hook_common.py",
+    "intensity_grant.py",
     "model.py",
     "policy.py",
     "review_context.py",
@@ -928,3 +929,10 @@ def test_cli_error_is_bounded_and_does_not_leak_config_or_paths(installer, home)
     assert str(home) not in result.stderr
     assert str(REPO) not in result.stderr
     assert _artifacts(home) == {}
+
+
+def test_installer_package_names_cover_every_package_module(installer):
+    source = REPO / "hooks/pre_pr_tribunal"
+    modules = {path.name for path in source.glob("*.py")}
+    assert set(installer.PACKAGE_NAMES) == modules
+    assert set(PACKAGE_NAMES) == modules

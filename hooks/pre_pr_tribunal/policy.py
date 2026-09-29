@@ -135,6 +135,7 @@ class _RepositoryConfig:
     digest: str
     policy: tuple[tuple[str, int], ...]
     reviewers: Mapping[str, Mapping[str, object]]
+    unexecutable: tuple[tuple[str, str], ...] = ()
 
 
 def _bounded_text(value: object, maximum: int, code: str) -> str:
@@ -161,6 +162,23 @@ def intensity_mode(value: int) -> model.ReviewMode:
     if 67 <= value <= 100:
         return model.ReviewMode.ITERATIVE
     raise model.SchemaError("INTENSITY_INVALID")
+
+
+def validate_grant_lowering(risk_floor: int, value: int) -> None:
+    """A human grant must lower the floor far enough to change the mode (#162)."""
+    if value >= risk_floor:
+        raise model.SchemaError("GRANT_NOT_LOWER")
+    if intensity_mode(value) is intensity_mode(risk_floor):
+        raise model.SchemaError("GRANT_MODE_UNCHANGED")
+
+
+def _effective_intensity(risk_floor: int, request: model.IntensityRequest) -> int:
+    if request.source != model.HUMAN_GRANT_SOURCE:
+        return max(risk_floor, request.value)
+    if request.requester not in model.HUMAN_GRANT_REQUESTERS:
+        raise model.SchemaError("POLICY_INVALID")
+    validate_grant_lowering(risk_floor, request.value)
+    return request.value
 
 
 def _request_fail_closed(reason: str) -> model.IntensityRequest:
@@ -349,6 +367,7 @@ def _parse_toml(raw: bytes) -> dict[str, object]:
             parts = tuple(_parse_key(part) for part in line[1:-1].split("."))
             if parts not in {
                 ("policy",),
+                ("unexecutable",),
                 ("reviewer", "A"),
                 ("reviewer", "B"),
                 ("reviewer", "C"),
@@ -387,6 +406,13 @@ def _validate_pattern(value: object) -> str:
     return pattern
 
 
+def _unexecutable_reason(value: object) -> str:
+    reason = _bounded_text(value, model.MAX_COMMAND_TEXT_BYTES, "CONFIG_INVALID")
+    if not reason.strip():
+        raise model.SchemaError("CONFIG_INVALID")
+    return reason
+
+
 def _configured_intensity(value: object) -> int:
     if isinstance(value, bool):
         raise model.SchemaError("CONFIG_INVALID")
@@ -418,7 +444,7 @@ def _default_reviewers() -> dict[str, dict[str, object]]:
 
 def _validate_config(raw: bytes) -> _RepositoryConfig:
     parsed = _parse_toml(raw) if raw else {}
-    if set(parsed) - {"policy", "reviewer"}:
+    if set(parsed) - {"policy", "unexecutable", "reviewer"}:
         raise model.SchemaError("CONFIG_INVALID")
     raw_policy = parsed.get("policy", {})
     if not isinstance(raw_policy, dict):
@@ -426,6 +452,13 @@ def _validate_config(raw: bytes) -> _RepositoryConfig:
     rules = tuple(
         (_validate_pattern(pattern), _configured_intensity(value))
         for pattern, value in raw_policy.items()
+    )
+    raw_unexecutable = parsed.get("unexecutable", {})
+    if not isinstance(raw_unexecutable, dict):
+        raise model.SchemaError("CONFIG_INVALID")
+    unexecutable = tuple(
+        (_validate_pattern(pattern), _unexecutable_reason(value))
+        for pattern, value in raw_unexecutable.items()
     )
     reviewers = _default_reviewers()
     raw_reviewers = parsed.get("reviewer", {})
@@ -446,7 +479,9 @@ def _validate_config(raw: bytes) -> _RepositoryConfig:
                 raise model.SchemaError("MODEL_UNKNOWN")
             models[runtime] = name
         reviewers[key] = {"enabled": enabled, "model": models}
-    return _RepositoryConfig(hashlib.sha256(raw).hexdigest(), rules, reviewers)
+    return _RepositoryConfig(
+        hashlib.sha256(raw).hexdigest(), rules, reviewers, unexecutable
+    )
 
 
 def _committed_config(root: Path, head_sha: str) -> _RepositoryConfig:
@@ -538,6 +573,28 @@ def _unsafe_git_kinds(root: Path, snapshot: model.Snapshot) -> tuple[bool, bool]
     return special, binary
 
 
+def committed_unexecutable(
+    root: Path, head_sha: str
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Return the committed config digest and its declared-unexecutable patterns."""
+    config = _committed_config(root, head_sha)
+    return config.digest, config.unexecutable
+
+
+def unexecutable_reason(
+    declarations: Sequence[tuple[str, str]], path: str
+) -> str | None:
+    """Return the most specific declared reason matching path, or None."""
+    matches = [
+        (sum(character not in "*?[]" for character in pattern), -index, reason)
+        for index, (pattern, reason) in enumerate(declarations)
+        if _pattern_matches(pattern, path)
+    ]
+    if not matches:
+        return None
+    return max(matches)[2]
+
+
 def resolve_policy(
     root: Path,
     snapshot: model.Snapshot,
@@ -577,19 +634,40 @@ def resolve_policy(
         floors.append(100)
         reasons.append("binary-change")
     risk_floor = max(floors)
-    effective = max(risk_floor, request.value)
+    effective = _effective_intensity(risk_floor, request)
     mode = intensity_mode(effective)
+    # A configuration must enable a reviewer of its own: an override adds one,
+    # it never substitutes for one. `fail_closed` is the sole exemption because
+    # it overrides the whole request rather than a configuration decision, and
+    # it already enables every role. Reading the committed values here, before
+    # any override applies, is what keeps an override from masking a
+    # configuration that enables nobody.
+    if (
+        mode is not model.ReviewMode.OFF
+        and request.fail_closed_reason is None
+        and not any(bool(value["enabled"]) for value in config.reviewers.values())
+    ):
+        raise model.SchemaError("CONFIG_INVALID")
+    # A declaration is enforced only through Reviewer B's sealed coverage, so a
+    # config that declares one while disabling B would void it silently. `off`
+    # dispatches no reviewer at all, so forcing there would record an override
+    # that never happened. The reason goes first: it records a security
+    # override, and the trailing entries are what MAX_POLICY_REASONS truncates.
+    requires_reviewer_b = bool(config.unexecutable) and mode is not model.ReviewMode.OFF
+    if requires_reviewer_b:
+        reasons.insert(0, "unexecutable-requires-reviewer-b")
     reviewers = {
         key: model.ReviewerPolicy(
-            enabled=(True if request.fail_closed_reason is not None else bool(value["enabled"])),
+            enabled=(
+                True
+                if request.fail_closed_reason is not None
+                or (key == "B" and requires_reviewer_b)
+                else bool(value["enabled"])
+            ),
             model=str(value["model"][runtime]),
         )
         for key, value in config.reviewers.items()
     }
-    if mode is not model.ReviewMode.OFF and not any(
-        reviewer.enabled for reviewer in reviewers.values()
-    ):
-        raise model.SchemaError("CONFIG_INVALID")
     unique_reasons = tuple(dict.fromkeys(reasons))
     if len(unique_reasons) > MAX_POLICY_REASONS:
         unique_reasons = (*unique_reasons[: MAX_POLICY_REASONS - 1], "reason-limit")
@@ -660,7 +738,7 @@ def parse_policy_binding(value: object, *, runtime: str) -> model.PolicyBinding:
         request_obj["value"], "POLICY_INVALID", minimum=0, maximum=100
     )
     source = request_obj["source"]
-    if source not in {"default", "cli", "fail_closed"}:
+    if source not in {"default", "cli", "fail_closed", model.HUMAN_GRANT_SOURCE}:
         raise model.SchemaError("POLICY_INVALID")
     requester = _bounded_text(request_obj["requester"], MAX_REQUESTER_BYTES, "POLICY_INVALID")
     request_reason = _bounded_text(request_obj["reason"], MAX_REASON_BYTES, "POLICY_INVALID")
@@ -706,8 +784,12 @@ def parse_policy_binding(value: object, *, runtime: str) -> model.PolicyBinding:
         digest, floor, effective, mode, reasons, request, reviewers
     )
     binding.to_json()
+    try:
+        expected = _effective_intensity(floor, request)
+    except model.SchemaError:
+        raise model.SchemaError("POLICY_INVALID") from None
     if (
-        effective != max(floor, request_value)
+        effective != expected
         or mode is not intensity_mode(effective)
         or (mode is not model.ReviewMode.OFF and not binding.active_reviewers)
         or (fail_closed is not None and set(binding.active_reviewers) != set("ABC"))
