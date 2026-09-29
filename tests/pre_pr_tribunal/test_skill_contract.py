@@ -868,3 +868,26 @@ def test_every_reviewer_role_says_how_to_write_home_paths():
         assert "`command`" in body, name
         assert "`$HOME`" in body, name
         assert "EVIDENCE_SECRET_DETECTED" in body, name
+
+
+def test_controller_happy_path_example_is_linked_and_agrees_with_the_contract():
+    skill = text("SKILL.md")
+    example = text("references/controller-happy-path.md")
+    assert "references/controller-happy-path.md" in skill
+    assert "SKILL.md is authoritative" in example
+    flags = '--run-id "$RUN_ID" --attempt "$ATTEMPT"'
+    assert f"submit-report --reviewer \"$REVIEWER\" {flags}" in example
+    assert example.count("submit-report --reviewer") == example.count(
+        f"submit-report --reviewer \"$REVIEWER\" {flags}"
+    )
+    submit = example.index("submit-report --reviewer")
+    receipt_check = example.index("REPORT_BYTES_MISMATCH")
+    cleanup = example.index("git worktree remove")
+    assert submit < receipt_check < cleanup
+    for stage in re.findall(r"--stage (\w+)", example):
+        assert stage in {
+            "view_create", "reviewer_dispatch_wait", "reviewer_total",
+            "view_cleanup", "report_validation", "finalize",
+        }, stage
+    assert "--stage report_store" not in example
+    assert "--stage snapshot_preflight" not in example
