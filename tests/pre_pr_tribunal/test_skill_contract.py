@@ -855,3 +855,16 @@ def test_findings_may_report_normalized_repository_paths_outside_the_diff():
     )
     assert parsed.findings[0].path == "docs/outside-diff.md"
     assert parsed.findings[0].path not in SNAPSHOT.initial_paths
+
+
+def test_every_reviewer_role_says_how_to_write_home_paths():
+    for name in (
+        "references/reviewer-a.md",
+        "references/reviewer-b.md",
+        "references/reviewer-c.md",
+    ):
+        body = text(name)
+        assert "absolute home paths" in body, name
+        assert "`command`" in body, name
+        assert "`$HOME`" in body, name
+        assert "EVIDENCE_SECRET_DETECTED" in body, name
