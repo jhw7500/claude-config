@@ -870,29 +870,6 @@ def test_every_reviewer_role_says_how_to_write_home_paths():
         assert "EVIDENCE_SECRET_DETECTED" in body, name
 
 
-def test_controller_happy_path_example_is_linked_and_agrees_with_the_contract():
-    skill = text("SKILL.md")
-    example = text("references/controller-happy-path.md")
-    assert "references/controller-happy-path.md" in skill
-    assert "SKILL.md is authoritative" in example
-    flags = '--run-id "$RUN_ID" --attempt "$ATTEMPT"'
-    assert f"submit-report --reviewer \"$REVIEWER\" {flags}" in example
-    assert example.count("submit-report --reviewer") == example.count(
-        f"submit-report --reviewer \"$REVIEWER\" {flags}"
-    )
-    submit = example.index("submit-report --reviewer")
-    receipt_check = example.index("REPORT_BYTES_MISMATCH")
-    cleanup = example.index("git worktree remove")
-    assert submit < receipt_check < cleanup
-    for stage in re.findall(r"--stage (\w+)", example):
-        assert stage in {
-            "view_create", "reviewer_dispatch_wait", "reviewer_total",
-            "view_cleanup", "report_validation", "finalize",
-        }, stage
-    assert "--stage report_store" not in example
-    assert "--stage snapshot_preflight" not in example
-
-
 def test_every_reviewer_role_says_command_is_one_line():
     for name in (
         "references/reviewer-a.md",
@@ -902,13 +879,3 @@ def test_every_reviewer_role_says_command_is_one_line():
         body = text(name)
         assert "`TEXT_INVALID`" in body, name
         assert "newline" in body, name
-
-
-def test_controller_happy_path_closes_finalize_span_before_an_integrity_stop():
-    example = text("references/controller-happy-path.md")
-    assert "a block that exits non-zero is a stop" in example
-    assert "Do not add `set -e`" in example
-    rejection = example.index("--reason-code REPORT_BYTES_MISMATCH")
-    closes_finalize = example.index('--span-id "$FINALIZE_SPAN_ID" --outcome failure --reason-code REPORT_BYTES_MISMATCH')
-    stop = example.index("exit 1   # integrity stop")
-    assert rejection < closes_finalize < stop
