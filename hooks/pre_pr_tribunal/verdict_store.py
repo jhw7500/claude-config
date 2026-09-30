@@ -1012,26 +1012,30 @@ def submit_reviewer_report(
             if existing is not None:
                 # A canonical publication can precede a failed verdict write.
                 # Its validation is an integrity boundary, outside retry handling.
-                parsed, digest = m.validate_report_bytes(
+                parsed = m.parse_reviewer_report(
                     existing, expected_reviewer=reviewer, expected_round=pending.round,
                     snapshot=snapshot,
                 )
+                digest = hashlib.sha256(existing).hexdigest()
                 _validate_reviewer_closure(pending, parsed)
                 from .evidence_lifecycle import authenticate_report
                 authenticate_report(root, pending, parsed)
                 _validate_unexecutable_claims(root, pending, snapshot, parsed)
+                m.validate_reviewer_report_semantics(parsed)
             else:
                 if len(raw) > MAX_ATTEMPT_RAW_BYTES:
                     raise SchemaError("REPORT_TOO_LARGE")
                 try:
-                    parsed, digest = m.validate_report_bytes(
+                    parsed = m.parse_reviewer_report(
                         raw, expected_reviewer=reviewer, expected_round=pending.round,
                         snapshot=snapshot,
                     )
+                    digest = hashlib.sha256(raw).hexdigest()
                     _validate_reviewer_closure(pending, parsed)
                     from .evidence_lifecycle import authenticate_report
                     authenticate_report(root, pending, parsed)
                     _validate_unexecutable_claims(root, pending, snapshot, parsed)
+                    m.validate_reviewer_report_semantics(parsed)
                 except SchemaError as error:
                     if error.code in REPORT_RETRYABLE_CODES:
                         _record_failure_locked(review_fd, pending, reviewer, error.code, raw)
@@ -1578,9 +1582,16 @@ def _validate_reviewer_closure(
 
 def _validate_closure(verdict: Verdict, reports: Mapping[str, ReviewerReport]) -> None:
     seen_replacements: set[str] = set()
+    report_contract_version = (
+        verdict.contract.report_text if verdict.contract is not None else 1
+    )
     for reviewer in reports:
         _validate_reviewer_closure(
             verdict, reports[reviewer], seen_replacements=seen_replacements,
+        )
+        m.validate_reviewer_report_semantics(
+            reports[reviewer],
+            report_contract_version=report_contract_version,
         )
     if verdict.round == 1 and any(
         report.prior_decisions for report in reports.values()

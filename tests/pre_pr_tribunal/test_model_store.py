@@ -244,6 +244,103 @@ def test_v2_terminal_aggregates_every_sealed_report(git_repo, severity, status, 
     assert read_verdict(git_repo) == final
 
 
+def test_persisted_pass_rejects_refuted_claim_without_blocker(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    report_paths(git_repo, pending.snapshot)
+    finalize_round(git_repo, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    payload = json.loads(verdict_path.read_text(encoding="utf-8"))
+    payload["reviewers"]["B"]["report"]["claims"][0]["result"] = "refuted"
+    write_json(verdict_path, payload)
+
+    with pytest.raises(SchemaError, match="^REFUTED_CLAIM_REQUIRES_BLOCKER$"):
+        read_verdict(git_repo)
+
+
+def test_persisted_contract_four_pass_keeps_historical_refutation_readable(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    report_paths(git_repo, pending.snapshot)
+    finalized = finalize_round(git_repo, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    payload = finalized.to_json()
+    payload["contract"]["report_text"] = 4
+    for slot in payload["reviewers"].values():
+        if slot["state"] == "sealed":
+            slot["receipt"]["report_contract_version"] = 4
+    payload["reviewers"]["B"]["report"]["claims"][0]["result"] = "refuted"
+    write_json(verdict_path, payload)
+    before = verdict_path.read_bytes()
+
+    historical = read_verdict(git_repo)
+
+    assert historical.contract.report_text == 4
+    assert historical.gate.status.value == "pass"
+    assert historical.reviewers["B"].report.claims[0].result == "refuted"
+    assert verdict_path.read_bytes() == before
+
+
+def test_prior_contract_in_progress_refutation_fails_closed_as_drift(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    old_contract_version = REPORT_TEXT_CONTRACT_VERSION - 1
+    value = report(pending.snapshot, "B")
+    value["claims"][0]["result"] = "refuted"
+    raw = json.dumps(value, separators=(",", ":")).encode()
+    parsed = parse_reviewer_report(
+        raw,
+        expected_reviewer=Reviewer.B,
+        expected_round=1,
+        snapshot=pending.snapshot,
+        report_contract_version=old_contract_version,
+    )
+    receipt = ReportReceipt(
+        Reviewer.B,
+        1,
+        ".review/inbox/round-1/B.json",
+        hashlib.sha256(raw).hexdigest(),
+        "2" * 64,
+        old_contract_version,
+        1,
+        "native_submit",
+    )
+    old_pending = replace(
+        pending,
+        contract=replace(pending.contract, report_text=old_contract_version),
+        reviewers={
+            **pending.reviewers,
+            "B": ReviewerSlot("sealed", parsed, receipt, 1),
+        },
+    )
+    report_path = git_repo / ".review/inbox/round-1/B.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    report_path.write_bytes(raw)
+    report_path.chmod(0o600)
+    write_json(git_repo / ".review/verdict.json", old_pending.to_json())
+
+    loaded = read_verdict(git_repo)
+    assert loaded.reviewers["B"].report.claims[0].result == "refuted"
+    verdict_before = (git_repo / ".review/verdict.json").read_bytes()
+    report_before = report_path.read_bytes()
+    replacement = json.dumps(report(pending.snapshot, "B")).encode()
+
+    with pytest.raises(SchemaError, match="^CONTRACT_DRIFT$"):
+        submit_reviewer_report(
+            git_repo, reviewer=Reviewer.B, raw=replacement, now=NOW
+        )
+    with pytest.raises(SchemaError, match="^CONTRACT_DRIFT$"):
+        validate_stored_reviewer_report(git_repo, reviewer=Reviewer.B)
+    with pytest.raises(SchemaError, match="^CONTRACT_DRIFT$"):
+        finalize_round(git_repo, now=NOW)
+
+    assert (git_repo / ".review/verdict.json").read_bytes() == verdict_before
+    assert report_path.read_bytes() == report_before
+
+
 @pytest.mark.parametrize("version", (1, 2))
 def test_begin_refuses_pending_reset_without_losing_reports(git_repo, version):
     pending = legacy_pending(git_repo) if version == 1 else write_current_pending(git_repo)
@@ -940,6 +1037,19 @@ def test_validate_report_bytes_returns_parser_result_and_raw_digest(snapshot):
         raw, expected_reviewer=Reviewer.A, expected_round=1, snapshot=snapshot
     )
     assert digest == hashlib.sha256(raw).hexdigest()
+
+
+def test_validate_report_bytes_rejects_refuted_b_claim_without_blocker(snapshot):
+    value = report(snapshot, "B")
+    value["claims"][0]["result"] = "refuted"
+
+    with pytest.raises(SchemaError, match="^REFUTED_CLAIM_REQUIRES_BLOCKER$"):
+        validate_report_bytes(
+            json.dumps(value).encode(),
+            expected_reviewer=Reviewer.B,
+            expected_round=1,
+            snapshot=snapshot,
+        )
 
 
 @pytest.mark.parametrize(
@@ -3279,6 +3389,40 @@ def test_cli_validates_stdin_bytes_and_rejects_invalid_without_mutation(git_repo
     assert verdict_path.read_bytes() == before
     assert target.read_bytes() == report_before
     assert stat.S_IMODE(target.stat().st_mode) == report_mode_before == 0o600
+
+
+def test_cli_rejects_refuted_b_report_for_stdin_and_stored_validation(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    value = report(pending.snapshot, "B")
+    value["claims"][0]["result"] = "refuted"
+    raw = json.dumps(value, separators=(",", ":")).encode()
+    verdict_path = git_repo / ".review/verdict.json"
+    verdict_before = verdict_path.read_bytes()
+
+    stdin_result = run_cli_bytes(
+        git_repo,
+        "validate-report",
+        "--reviewer",
+        "B",
+        "--source",
+        "stdin",
+        input=raw,
+    )
+    assert stdin_result.returncode == 1 and stdin_result.stdout == b""
+    assert stdin_result.stderr == b"PRE_PR_TRIBUNAL:REFUTED_CLAIM_REQUIRES_BLOCKER\n"
+
+    target = git_repo / ".review/inbox/round-1/B.json"
+    write_json(target, value)
+    report_before = target.read_bytes()
+    stored_result = run_cli_bytes(
+        git_repo, "validate-report", "--reviewer", "B", "--source", "stored"
+    )
+    assert stored_result.returncode == 1 and stored_result.stdout == b""
+    assert stored_result.stderr == b"PRE_PR_TRIBUNAL:REFUTED_CLAIM_REQUIRES_BLOCKER\n"
+    assert verdict_path.read_bytes() == verdict_before
+    assert target.read_bytes() == report_before
 
 
 def test_cli_stored_validation_completes_without_reading_open_stdin(git_repo):
