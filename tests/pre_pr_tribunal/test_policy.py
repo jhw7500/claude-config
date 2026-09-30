@@ -1397,11 +1397,26 @@ def test_intensity_grant_cli_records_only_after_typed_confirmation(
     assert "proposed effective_intensity: 50  resulting mode: single" in grant_prompt
     assert "mode transition from floor: iterative -> single" in grant_prompt
     assert "0=off, 1-66=single, 67-100=iterative" in grant_prompt
-    assert "scores within a mode do not change behavior" in grant_prompt
+    assert "off skips review" in grant_prompt
+    assert "single runs one decision round" in grant_prompt
+    assert "iterative allows up to three decision rounds" in grant_prompt
+    assert "scores within a mode do not change review depth or reviewer selection" in grant_prompt
+    assert "numeric scores can still affect policy floors" in grant_prompt
     assert ((repo / ".review" / "intensity-grant.json").stat().st_mode & 0o777) == 0o600
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     assert verdict.policy.request.source == "human_grant"
     assert verdict.policy.effective_intensity == 50
+
+
+def test_relayed_grant_instruction_explains_each_mode_before_choice():
+    skill = (
+        Path(__file__).resolve().parents[2] / "skills/pre-pr-tribunal/SKILL.md"
+    ).read_text(encoding="utf-8")
+    question_instruction = skill.split("4. Generate one projection", 1)[0]
+    assert "Before presenting any lower-mode choice" in question_instruction
+    assert "`off` skips review" in question_instruction
+    assert "`single` runs one decision round" in question_instruction
+    assert "`iterative` allows up to three decision rounds" in question_instruction
 
 
 @pytest.mark.parametrize(

@@ -156,10 +156,12 @@ lock 안에서 grant를 원자적으로 삭제하므로 한 번의 tool call만 
 소비된 시도이므로 새 명시적 승인이 필요하다. Runtime 불일치, snapshot/verdict drift,
 malformed/unsafe grant, early-round blocker, incomplete review, ambiguous command는 계속 fail closed한다.
 The legacy numeric selector is a compatibility interface, not a continuous review-depth control:
-`0=off`, `1..66=single`, and `67..100=iterative`. Scores within a band do not change behavior, and the
+`0=off`, `1..66=single`, and `67..100=iterative`. Scores within a band do not change review rounds or
+reviewer selection, but can still affect numeric policy floors and same-snapshot transition checks. The
 configured reviewer set is independent. In `policy-preview` and verdict JSON, interpret `risk_floor`,
 `effective_intensity`, and `mode` as three distinct fields. Human approval should name the mode transition
-(such as `iterative -> single`); the numeric value is only the backward-compatible encoding for that mode.
+(such as `iterative -> single`) and explain that `off` skips review, `single` runs one decision round,
+and `iterative` allows up to three. The numeric value is only the backward-compatible encoding for that mode.
 
 Relayed grant는 기존 intensity grant와 마찬가지로 policy-following agent가 사용자 답을 기록한 운영
 증거이며 human presence의 암호학적 증명은 아니다.
