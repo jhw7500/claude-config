@@ -30,6 +30,7 @@ MAX_CONFIG_BYTES = 16 * 1024
 MAX_PROVIDER_OUTPUT_BYTES = 64 * 1024
 MAX_CONTROL_OUTPUT_BYTES = 12 * 1024
 MAX_SECRET_BYTES = 16 * 1024
+MAX_SAFE_INTEGER = (1 << 53) - 1
 PROVIDER_TIMEOUT_SECONDS = 15.0
 UNLOCK_TIMEOUT_SECONDS = 120.0
 CONTROL_TIMEOUT_SECONDS = 600.0
@@ -1925,12 +1926,23 @@ def _validate_board_acquire_result(value: object, *, request: Sequence[str]) -> 
 
 def _validate_command_failure_detail(value: object) -> dict[str, object]:
     detail = _exact_object(value, {"command", "exit_code"}, {"stderr_head"})
-    command = _bounded_text(detail["command"], maximum=255)
-    exit_code = detail["exit_code"]
-    if exit_code is not None and (
-        not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code <= 0
-    ):
+    command = _bounded_zod_utf8_text(detail["command"], maximum=255)
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in command):
         raise LauncherError("CONTROL_OUTPUT_INVALID")
+    exit_code = detail["exit_code"]
+    if exit_code is not None:
+        if isinstance(exit_code, bool):
+            raise LauncherError("CONTROL_OUTPUT_INVALID")
+        if isinstance(exit_code, float):
+            if not math.isfinite(exit_code) or not exit_code.is_integer():
+                raise LauncherError("CONTROL_OUTPUT_INVALID")
+            exit_code = int(exit_code)
+        if (
+            not isinstance(exit_code, int)
+            or exit_code <= 0
+            or exit_code > MAX_SAFE_INTEGER
+        ):
+            raise LauncherError("CONTROL_OUTPUT_INVALID")
     projected: dict[str, object] = {"command": command, "exit_code": exit_code}
     if "stderr_head" in detail:
         projected["stderr_head"] = _bounded_zod_utf8_text(detail["stderr_head"], maximum=512)
@@ -1980,6 +1992,8 @@ def _validate_error_result(
             raise LauncherError("CONTROL_OUTPUT_INVALID")
         projected["reason"] = reason
     if "detail" in error:
+        if code != "COMMAND_FAILED":
+            raise LauncherError("CONTROL_OUTPUT_INVALID")
         projected["detail"] = _validate_command_failure_detail(error["detail"])
     if "conflicting_board" in error:
         projected["conflicting_board"] = _validate_conflicting_board(error["conflicting_board"])
@@ -2115,7 +2129,13 @@ def _program_result(
 
     def collect_strings(value: object) -> None:
         if isinstance(value, str):
-            decoded_strings.append(value.encode("utf-8"))
+            try:
+                decoded_strings.append(value.encode("utf-8"))
+            except UnicodeEncodeError:
+                # The raw JSON bytes are still scanned; strict UTF-8 encoding
+                # here rejects escaped unpaired surrogates without escaping
+                # the fixed CONTROL_OUTPUT_INVALID boundary below.
+                return
         elif isinstance(value, list):
             for item in value:
                 collect_strings(item)
