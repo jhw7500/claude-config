@@ -2129,13 +2129,10 @@ def _program_result(
 
     def collect_strings(value: object) -> None:
         if isinstance(value, str):
-            try:
-                decoded_strings.append(value.encode("utf-8"))
-            except UnicodeEncodeError:
-                # The raw JSON bytes are still scanned; strict UTF-8 encoding
-                # here rejects escaped unpaired surrogates without escaping
-                # the fixed CONTROL_OUTPUT_INVALID boundary below.
-                return
+            # Preserve valid neighboring text around escaped lone surrogates;
+            # otherwise a JSON-escaped secret in the same string is invisible
+            # to the raw-byte scan.
+            decoded_strings.append(value.encode("utf-8", errors="surrogatepass"))
         elif isinstance(value, list):
             for item in value:
                 collect_strings(item)

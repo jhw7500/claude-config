@@ -2654,6 +2654,32 @@ def test_safe_reason_survives_and_unrecognized_details_are_dropped(
     }
 
 
+def test_escaped_secret_next_to_lone_surrogate_in_discarded_field_is_rejected(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "status", "--task", TASK_ID)
+    payload = {
+        "error": {
+            "code": "FUTURE_STABLE_ERROR",
+            "reason": "safe_reason",
+            "diagnostic": f"{chr(0xD800)}{PROJECT_TOKEN}",
+        },
+    }
+    output = json.dumps(payload, separators=(",", ":")).encode()
+    escaped_secret = "".join(f"\\u{ord(character):04x}" for character in PROJECT_TOKEN).encode()
+    output = output.replace(PROJECT_TOKEN.encode(), escaped_secret) + b"\n"
+    assert PROJECT_TOKEN.encode() not in output
+    runner.control_results[command] = launcher.CommandResult(1, b"", output)
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "SENSITIVE_OUTPUT_REJECTED"}}
+    assert PROJECT_TOKEN.encode() not in result.stdout + result.stderr
+
+
 def test_bounded_command_failure_detail_survives_secure_projection(
     launcher: ModuleType,
     tmp_path: Path,
