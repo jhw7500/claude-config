@@ -71,6 +71,13 @@ command-local `GIT_EDITOR` 할당은 계속 차단한다. Bounded scanner reason
 이 gate는 Claude/Codex shell hook에 보이는 direct `gh pr create`만 다룬다. GitHub UI에서의 PR
 생성, `gh api`, shell alias/function, 또는 다른 간접 API 호출은 gate 대상이 아니므로 별도 운영 통제가
 필요하다. 1 MiB를 넘는 hook payload는 command를 신뢰할 수 없으므로 bounded deny한다.
+
+자동 통과는 현재 snapshot에 결합된 PASS 또는 policy-off SKIPPED verdict에만 적용된다. Finalized
+round-3 FAIL이나 INCONCLUSIVE에서는 Skill이 bound head, diff, round, status와 blocker count를 보여
+준 뒤 사용자의 명시적 승인을 받아 표시한 verdict digest와 exact snapshot/verdict/runtime에 결합된 one-shot grant를 기록할 수
+있다. Hook은 이 grant를 canonical PR command 실행 전에 원자적으로 소비하므로 GitHub CLI 실패 후
+재시도에도 새 승인이 필요하다. Early-round, incomplete, stale, unsafe, invalid 또는 ambiguous 상태는
+이 승인으로 우회할 수 없다.
 설치·복구와 검증 절차는 [hook 운영 문서](hooks/README.md#pre-pr-tribunal-운영)를 따른다.
 
 실제 runtime canary는 `/usr/bin/bwrap` 안에서 GitHub hostname을 sinkhole하고 발견된

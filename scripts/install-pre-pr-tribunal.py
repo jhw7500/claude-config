@@ -63,6 +63,7 @@ PACKAGE_NAMES = (
     "intensity_grant.py",
     "model.py",
     "policy.py",
+    "pr_override_grant.py",
     "review_context.py",
     "review_store.py",
     "shell_scan.py",

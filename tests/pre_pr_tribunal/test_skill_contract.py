@@ -108,6 +108,24 @@ def test_skill_encodes_the_exact_ordered_ten_step_state_machine():
     assert "gh pr create" in steps[10]
 
 
+def test_skill_limits_terminal_user_override_to_exact_one_shot_contract():
+    skill = text("SKILL.md")
+    assert "ROUND_LIMIT_EXHAUSTED" in skill
+    assert "VERIFICATION_INCOMPLETE" in skill
+    assert 'pr-override-preview --runtime "$RUNTIME"' in skill
+    assert 'pr-override-grant --runtime "$RUNTIME"' in skill
+    assert '--verdict-sha256 "<shown verdict_sha256>"' in skill
+    assert '--reason "<the user\'s answer>" --relayed' in skill
+    assert 'pr-override-grant --runtime "$RUNTIME" --revoke' in skill
+    assert "`PATH=/usr/bin:/bin`" in skill
+    assert "executable `/usr/bin/gh`" in skill
+    assert "`pr create --base <verdict-base>`" in skill
+    assert "one exact canonical command" in skill
+    assert "failed command requires a new explicit user approval" in skill
+    assert "earlier-round FAIL" in skill
+    assert "stale or dirty snapshot" in skill
+
+
 def test_runtime_dispatch_is_native_parallel_and_does_not_invent_omx_authority():
     skill = text("SKILL.md")
     assert "Claude" in skill and "Agent" in skill

@@ -44,6 +44,7 @@ class GateCode(str, Enum):
     BLOCKERS_OPEN = "BLOCKERS_OPEN"
     ROUND_LIMIT_EXHAUSTED = "ROUND_LIMIT_EXHAUSTED"
     VERIFICATION_INCOMPLETE = "VERIFICATION_INCOMPLETE"
+    USER_APPROVED = "USER_APPROVED"
 
 
 @dataclass(frozen=True)
@@ -183,7 +184,17 @@ def _snapshot_is_bound(verdict, snapshot) -> bool:
     )
 
 
-def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
+def _consume_terminal_override(cwd: Path, verdict, runtime: str | None) -> bool:
+    if runtime is None:
+        return False
+    from .pr_override_grant import consume_matching_grant
+
+    return consume_matching_grant(cwd, verdict=verdict, runtime=runtime)
+
+
+def _evaluate_direct_pr_create(
+    cwd: Path, command: str, *, runtime: str | None = None
+) -> GateDecision:
     # The bound scan requires PATH=/usr/bin:/bin on the command itself, so the
     # inherited PATH cannot influence the gh child process.
     safe_inherited_names = {"GH_CONFIG_DIR", "GH_HOST", "PATH"}
@@ -270,16 +281,6 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
         return _decision(True, GateCode.VERDICT_INVALID)
     if verdict.gate.status is GateStatus.IN_PROGRESS:
         return _decision(True, GateCode.REVIEW_INCOMPLETE)
-    if verdict.gate.status is GateStatus.FAIL:
-        if verdict.gate.blocking_count <= 0:
-            return _decision(True, GateCode.VERDICT_INVALID)
-        if verdict.round == 3:
-            return _decision(True, GateCode.ROUND_LIMIT_EXHAUSTED)
-        return _decision(True, GateCode.BLOCKERS_OPEN)
-    if verdict.gate.status is GateStatus.INCONCLUSIVE:
-        return _decision(True, GateCode.VERIFICATION_INCOMPLETE)
-    if verdict.gate.status is not GateStatus.PASS or verdict.gate.blocking_count != 0:
-        return _decision(True, GateCode.VERDICT_INVALID)
     if any(
         execution.evidence_ref is not None
         for key in active
@@ -288,16 +289,48 @@ def _evaluate_direct_pr_create(cwd: Path, command: str) -> GateDecision:
         from .verdict_store import validate_stored_reviewer_report
         from .model import Reviewer
         try:
-            report, digest = validate_stored_reviewer_report(root, reviewer=Reviewer.B)
+            report, digest = validate_stored_reviewer_report(
+                root, reviewer=Reviewer.B
+            )
             slot = verdict.reviewers['B']
-            if slot.receipt is None or report != slot.report or digest != slot.receipt.raw_sha256:
+            if (
+                slot.receipt is None
+                or report != slot.report
+                or digest != slot.receipt.raw_sha256
+            ):
                 return _decision(True, GateCode.VERDICT_INVALID)
         except Exception:
             return _decision(True, GateCode.VERDICT_INVALID)
+    if verdict.gate.status is GateStatus.FAIL:
+        if verdict.gate.blocking_count <= 0:
+            return _decision(True, GateCode.VERDICT_INVALID)
+        if verdict.round == 3:
+            try:
+                if _consume_terminal_override(root, verdict, runtime):
+                    return _decision(False, GateCode.USER_APPROVED)
+            except SchemaError as error:
+                if error.code.endswith("_UNSAFE"):
+                    return _decision(True, GateCode.VERDICT_UNSAFE)
+                return _decision(True, GateCode.VERDICT_INVALID)
+            return _decision(True, GateCode.ROUND_LIMIT_EXHAUSTED)
+        return _decision(True, GateCode.BLOCKERS_OPEN)
+    if verdict.gate.status is GateStatus.INCONCLUSIVE:
+        try:
+            if _consume_terminal_override(root, verdict, runtime):
+                return _decision(False, GateCode.USER_APPROVED)
+        except SchemaError as error:
+            if error.code.endswith("_UNSAFE"):
+                return _decision(True, GateCode.VERDICT_UNSAFE)
+            return _decision(True, GateCode.VERDICT_INVALID)
+        return _decision(True, GateCode.VERIFICATION_INCOMPLETE)
+    if verdict.gate.status is not GateStatus.PASS or verdict.gate.blocking_count != 0:
+        return _decision(True, GateCode.VERDICT_INVALID)
     return _decision(False, GateCode.PASS)
 
 
-def evaluate_gate(cwd: Path, command: str) -> GateDecision:
+def evaluate_gate(
+    cwd: Path, command: str, *, runtime: str | None = None
+) -> GateDecision:
     """Return a bounded decision without executing the candidate command."""
 
     try:
@@ -309,6 +342,6 @@ def evaluate_gate(cwd: Path, command: str) -> GateDecision:
     if scan.kind is ScanKind.AMBIGUOUS_CANDIDATE:
         return _decision(True, GateCode.COMMAND_AMBIGUOUS, scan.reason)
     try:
-        return _evaluate_direct_pr_create(cwd, command)
+        return _evaluate_direct_pr_create(cwd, command, runtime=runtime)
     except Exception:
         return _decision(True, GateCode.VERDICT_INVALID)

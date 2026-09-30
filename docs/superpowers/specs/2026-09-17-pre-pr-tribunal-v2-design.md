@@ -284,6 +284,31 @@ support by inference. Report contract 4 requires at least one empirical claim
 and an explicit complete primary-entry-path-to-claim mapping before Reviewer B
 can seal, so an empty report cannot authorize PASS.
 
+### terminal non-pass user override
+
+A normal PASS or policy-off SKIPPED verdict remains the automatic authorization
+path. After finalization and telemetry closure, a human may explicitly authorize
+one canonical PR-create attempt for either a round-3 FAIL with open blockers or
+a finalized INCONCLUSIVE verdict. No other gate result is eligible: earlier
+round failures, pending or incomplete reviews, dirty or stale snapshots, unsafe
+or invalid state, repository mismatch, and ambiguous commands remain closed.
+
+The controller shows the bound head, diff digest, round, terminal status, and
+blocker count before asking. A direct operator types an exact terminal
+confirmation; a policy-following agent records the explicit answer as a
+`human-relayed`-style channel. The latter is operational friction and an audit
+record, not cryptographic proof that a human was present.
+
+The private `pr-override-grant.json` is a current-user-owned, regular,
+non-symlink mode-`0600` file bound to the exact verdict bytes, repository,
+base/head/merge-base, diff, round, gate, installed contract, runtime, and
+channel. The hook first validates the unchanged snapshot and exact canonical
+command, then consumes the matching grant atomically under the review lock.
+Consumption precedes command execution, so failure does not make the grant
+reusable. Mismatch is a denial; unsafe grant storage fails closed. This creates
+one deliberate exception at the terminal policy boundary without weakening any
+integrity or command-recognition boundary.
+
 ## Reviewer independence and scope
 
 Reviewer contexts contain the immutable snapshot/diff contract, the role's own

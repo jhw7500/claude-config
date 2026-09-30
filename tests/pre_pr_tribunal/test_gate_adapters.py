@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import io
@@ -10,7 +11,12 @@ import sys
 
 import pytest
 
-from pre_pr_tribunal import gate, hook_common
+from pre_pr_tribunal import (
+    evidence_runtime,
+    gate,
+    hook_common,
+    pr_override_grant,
+)
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
 from pre_pr_tribunal.model import VERDICT_SCHEMA_VERSION, Reviewer, SchemaError
 from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict, submit_reviewer_report
@@ -74,6 +80,14 @@ def _write_json(path: Path, value: object) -> Path:
     path.write_text(json.dumps(value), encoding="utf-8")
     path.chmod(0o600)
     return path
+
+
+def _override_digest(repo: Path, runtime: str = "codex") -> str:
+    value = pr_override_grant.preview_grant_binding(repo, runtime=runtime)[
+        "verdict_sha256"
+    ]
+    assert isinstance(value, str)
+    return value
 
 
 def _reports(
@@ -296,6 +310,557 @@ def _round_three_failure(repo: Path):
     )
     assert first.gate.blocking_count == terminal.gate.blocking_count == 1
     return terminal
+
+
+def _inconclusive_round(repo: Path):
+    pending = begin_round(
+        repo, base="master", runtime="codex", round_number=1
+    )
+    for reviewer in "ABC":
+        value = {
+            "schema": 1,
+            "reviewer": reviewer,
+            "round": 1,
+            "snapshot": {
+                "head_sha": pending.head_sha,
+                "diff_sha256": pending.diff_sha256,
+            },
+            "status": "complete",
+            "findings": [],
+            "executions": [],
+            "claims": [],
+            "prior_decisions": [],
+        }
+        if reviewer == "B":
+            value.update(
+                {
+                    "claims": [
+                        {
+                            "id": "B-R1-C001",
+                            "statement": "The primary PR path is executable.",
+                            "result": "unverified",
+                            "execution_ids": [],
+                            "reason": "The required runtime was unavailable.",
+                        }
+                    ],
+                    "coverage": {
+                        "complete": True,
+                        "primary_entry_paths": [],
+                    },
+                }
+            )
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer(reviewer),
+            raw=json.dumps(value).encode(),
+        )
+    terminal = finalize_round(repo)
+    assert terminal.gate.status.value == "inconclusive"
+    return terminal
+
+
+def _evidence_bundle(repo: Path):
+    from pre_pr_tribunal.evidence_environment import PYTHON_TRACKED_READ_PROGRAM
+
+    captured = evidence_runtime.capture_evidence(
+        repo,
+        base="master",
+        profile="python-v1",
+        command_cwd=".",
+        argv=[
+            "python3",
+            "-I",
+            "-S",
+            "-c",
+            PYTHON_TRACKED_READ_PROGRAM,
+            "tracked.txt",
+        ],
+        timeout_seconds=3,
+    )
+    return evidence_runtime.freeze_evidence(
+        repo,
+        base="master",
+        receipt_sha256s=[captured["receipt_sha256"]],
+    )
+
+
+def _reused_execution(repo: Path, frozen, *, round_number: int):
+    from pre_pr_tribunal.evidence_lifecycle import reusable_execution
+
+    entry = evidence_runtime.verify_evidence(
+        repo,
+        bundle_sha256=frozen["bundle_sha256"],
+        expected_binding=frozen["binding"],
+    )["eligible"][0]
+    return {
+        "id": f"B-R{round_number}-E001",
+        **reusable_execution(repo, frozen["bundle_sha256"], entry),
+    }
+
+
+def _evidence_reports(
+    repo: Path,
+    verdict,
+    frozen,
+    *,
+    finding_id: str | None = None,
+    prior_response: dict[str, object] | None = None,
+    unverified: bool = False,
+) -> None:
+    execution = _reused_execution(
+        repo, frozen, round_number=verdict.round
+    )
+    for reviewer in "ABC":
+        value = {
+            "schema": 1,
+            "reviewer": reviewer,
+            "round": verdict.round,
+            "snapshot": {
+                "head_sha": verdict.head_sha,
+                "diff_sha256": verdict.diff_sha256,
+            },
+            "status": "complete",
+            "findings": (
+                [_finding(finding_id)]
+                if finding_id is not None and finding_id.startswith(reviewer)
+                else []
+            ),
+            "executions": [],
+            "claims": [],
+            "prior_decisions": (
+                [prior_response]
+                if prior_response is not None and reviewer == "A"
+                else []
+            ),
+        }
+        if reviewer == "B":
+            claims = [{
+                "id": f"B-R{verdict.round}-C001",
+                "statement": "The reviewed behavior is executable.",
+                "result": "supported",
+                "execution_ids": [execution["id"]],
+                "reason": "",
+            }]
+            if unverified:
+                claims.append({
+                    "id": f"B-R{verdict.round}-C002",
+                    "statement": "A required runtime path remains unverified.",
+                    "result": "unverified",
+                    "execution_ids": [],
+                    "reason": "The required runtime is unavailable.",
+                })
+            value.update({
+                "executions": [execution],
+                "claims": claims,
+                "coverage": {
+                    "complete": True,
+                    "primary_entry_paths": [],
+                },
+            })
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer(reviewer),
+            raw=json.dumps(value).encode(),
+        )
+
+
+def _round_three_reused_evidence_failure(repo: Path):
+    frozen = _evidence_bundle(repo)
+    verdict = begin_round(
+        repo,
+        base="master",
+        runtime="codex",
+        round_number=1,
+        evidence_bundle_sha256=frozen["bundle_sha256"],
+    )
+    _evidence_reports(repo, verdict, frozen, finding_id="A-R1-001")
+    assert finalize_round(repo).gate.status.value == "fail"
+
+    for round_number in (2, 3):
+        _commit(repo, f"round {round_number} evidence fix\n")
+        decisions = _write_json(
+            repo
+            / f".review/inbox/round-{round_number - 1}/decisions.json",
+            [_decision(round_number - 1, f"A-R{round_number - 1}-001")],
+        )
+        frozen = _evidence_bundle(repo)
+        verdict = begin_round(
+            repo,
+            base="master",
+            runtime="codex",
+            round_number=round_number,
+            decisions_path=decisions,
+            evidence_bundle_sha256=frozen["bundle_sha256"],
+        )
+        _evidence_reports(
+            repo,
+            verdict,
+            frozen,
+            finding_id=f"A-R{round_number}-001",
+            prior_response={
+                "decision_id": f"D-R{round_number - 1}-A-001",
+                "outcome": "reissued",
+                "replacement_finding_id": f"A-R{round_number}-001",
+            },
+        )
+        terminal = finalize_round(repo)
+        assert terminal.gate.status.value == "fail"
+    return terminal, frozen
+
+
+def _inconclusive_reused_evidence(repo: Path):
+    frozen = _evidence_bundle(repo)
+    verdict = begin_round(
+        repo,
+        base="master",
+        runtime="codex",
+        round_number=1,
+        evidence_bundle_sha256=frozen["bundle_sha256"],
+    )
+    _evidence_reports(repo, verdict, frozen, unverified=True)
+    terminal = finalize_round(repo)
+    assert terminal.gate.status.value == "inconclusive"
+    return terminal, frozen
+
+
+@pytest.mark.parametrize("terminal_kind", ("fail", "inconclusive"))
+def test_terminal_override_revalidates_reused_evidence_before_consuming(
+    git_repo, terminal_kind
+):
+    if terminal_kind == "fail":
+        terminal, frozen = _round_three_reused_evidence_failure(git_repo)
+    else:
+        terminal, frozen = _inconclusive_reused_evidence(git_repo)
+    pr_override_grant.record_grant(
+        git_repo,
+        runtime="codex",
+        expected_verdict_sha256=_override_digest(git_repo),
+        reason="user approved the terminal result",
+        channel="relayed",
+        now=lambda: "2026-09-29T00:00:00Z",
+    )
+    bundle_path = (
+        git_repo
+        / ".review/evidence/bundles"
+        / f"{frozen['bundle_sha256']}.json"
+    )
+    bundle_path.unlink()
+
+    decision = evaluate_gate(
+        git_repo,
+        BOUND_COMMAND,
+        runtime="codex",
+    )
+    assert terminal.gate.status.value == terminal_kind
+    assert decision.code is GateCode.VERDICT_INVALID
+    assert (git_repo / ".review/pr-override-grant.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "runtime"),
+    (("codex_hook.py", "codex"), ("claude_hook.py", "claude")),
+)
+def test_terminal_override_grant_allows_exactly_one_hook_call(
+    installed_package, git_repo, name, runtime
+):
+    terminal = _round_three_failure(git_repo)
+    assert evaluate_gate(git_repo, BOUND_COMMAND).code is GateCode.ROUND_LIMIT_EXHAUSTED
+
+    recorded = pr_override_grant.record_grant(
+        git_repo,
+        runtime=runtime,
+        expected_verdict_sha256=_override_digest(git_repo, runtime),
+        reason="user approved this terminal verdict in the prompt",
+        channel="relayed",
+        now=lambda: "2026-09-29T00:00:00Z",
+    )
+    grant_path = git_repo / ".review/pr-override-grant.json"
+    assert recorded["binding"]["verdict_sha256"]
+    assert recorded["channel"] == "relayed"
+    assert (grant_path.stat().st_mode & 0o777) == 0o600
+
+    allowed = run_adapter(
+        installed_package, name, payload(git_repo, BOUND_COMMAND), git_repo
+    )
+    assert allowed.returncode == 0 and allowed.stdout == "" and allowed.stderr == ""
+    assert not grant_path.exists()
+
+    denied = run_adapter(
+        installed_package, name, payload(git_repo, BOUND_COMMAND), git_repo
+    )
+    assert denied.returncode == 0 and denied.stderr == ""
+    specific = json.loads(denied.stdout)["hookSpecificOutput"]
+    assert specific["permissionDecision"] == "deny"
+    assert "ROUND_LIMIT_EXHAUSTED" in specific["permissionDecisionReason"]
+    assert terminal.gate.blocking_count == 1
+
+
+def test_override_grant_is_runtime_bound_and_unsafe_file_fails_closed(
+    installed_package, git_repo
+):
+    _round_three_failure(git_repo)
+    pr_override_grant.record_grant(
+        git_repo,
+        runtime="codex",
+        expected_verdict_sha256=_override_digest(git_repo),
+        reason="user approved in Codex",
+        channel="relayed",
+        now=lambda: "2026-09-29T00:00:00Z",
+    )
+    grant_path = git_repo / ".review/pr-override-grant.json"
+
+    wrong_runtime = run_adapter(
+        installed_package,
+        "claude_hook.py",
+        payload(git_repo, BOUND_COMMAND),
+        git_repo,
+    )
+    assert "ROUND_LIMIT_EXHAUSTED" in wrong_runtime.stdout
+    assert grant_path.exists()
+
+    grant_path.chmod(0o644)
+    unsafe = run_adapter(
+        installed_package,
+        "codex_hook.py",
+        payload(git_repo, BOUND_COMMAND),
+        git_repo,
+    )
+    assert "VERDICT_UNSAFE" in unsafe.stdout
+    assert grant_path.exists()
+
+
+def test_override_grant_cannot_be_recorded_for_an_early_round_failure(git_repo):
+    _finish_round(git_repo, finding_id="A-R1-001")
+
+    with pytest.raises(SchemaError, match="^PR_OVERRIDE_NOT_ELIGIBLE$"):
+        pr_override_grant.record_grant(
+            git_repo,
+            runtime="codex",
+            expected_verdict_sha256="0" * 64,
+            reason="do not bypass an early blocker",
+            channel="relayed",
+            now=lambda: "2026-09-29T00:00:00Z",
+        )
+
+
+def test_override_grant_concurrent_consumers_cannot_both_win(git_repo):
+    verdict = _round_three_failure(git_repo)
+    pr_override_grant.record_grant(
+        git_repo,
+        runtime="codex",
+        expected_verdict_sha256=_override_digest(git_repo),
+        reason="one approved PR attempt",
+        channel="relayed",
+        now=lambda: "2026-09-29T00:00:00Z",
+    )
+
+    def consume():
+        try:
+            return pr_override_grant.consume_matching_grant(
+                git_repo, verdict=verdict, runtime="codex"
+            )
+        except SchemaError as error:
+            assert error.code == "STORE_LOCKED"
+            return False
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _index: consume(), range(4)))
+
+    assert results.count(True) == 1
+    assert pr_override_grant.consume_matching_grant(
+        git_repo, verdict=verdict, runtime="codex"
+    ) is False
+
+
+def test_inconclusive_verdict_accepts_one_prompt_relayed_override(
+    installed_package, git_repo
+):
+    _inconclusive_round(git_repo)
+    assert evaluate_gate(git_repo, BOUND_COMMAND).code is GateCode.VERIFICATION_INCOMPLETE
+    pr_override_grant.record_grant(
+        git_repo,
+        runtime="codex",
+        expected_verdict_sha256=_override_digest(git_repo),
+        reason="user accepts the missing runtime evidence",
+        channel="relayed",
+        now=lambda: "2026-09-29T00:00:00Z",
+    )
+
+    result = run_adapter(
+        installed_package,
+        "codex_hook.py",
+        payload(git_repo, BOUND_COMMAND),
+        git_repo,
+    )
+    assert result.returncode == 0 and result.stdout == "" and result.stderr == ""
+    assert not (git_repo / ".review/pr-override-grant.json").exists()
+
+
+def test_override_grant_does_not_bypass_snapshot_drift(git_repo):
+    _round_three_failure(git_repo)
+    pr_override_grant.record_grant(
+        git_repo,
+        runtime="codex",
+        expected_verdict_sha256=_override_digest(git_repo),
+        reason="approved before the snapshot moved",
+        channel="relayed",
+        now=lambda: "2026-09-29T00:00:00Z",
+    )
+    _commit(git_repo, "changed after approval\n")
+
+    decision = evaluate_gate(git_repo, BOUND_COMMAND, runtime="codex")
+    assert decision.code is GateCode.VERDICT_STALE
+    assert (git_repo / ".review/pr-override-grant.json").exists()
+
+
+def test_malformed_override_grant_remains_denied(git_repo):
+    _round_three_failure(git_repo)
+    grant = git_repo / ".review/pr-override-grant.json"
+    _write_json(grant, {})
+
+    decision = evaluate_gate(git_repo, BOUND_COMMAND, runtime="codex")
+    assert decision.code is GateCode.ROUND_LIMIT_EXHAUSTED
+    assert grant.exists()
+
+
+class _OverrideTty:
+    def __init__(self, answer):
+        self.answer = answer
+
+    def isatty(self):
+        return True
+
+    def readline(self):
+        return self.answer
+
+
+class _ChangingOverrideTty(_OverrideTty):
+    def __init__(self, answer, verdict_path: Path):
+        super().__init__(answer)
+        self.verdict_path = verdict_path
+
+    def readline(self):
+        self.verdict_path.write_bytes(self.verdict_path.read_bytes() + b"\n")
+        return super().readline()
+
+
+def test_override_grant_cli_direct_relayed_and_revoke(
+    git_repo, monkeypatch, capsys
+):
+    from pre_pr_tribunal.cli import main
+
+    _round_three_failure(git_repo)
+    monkeypatch.chdir(git_repo)
+    grant = git_repo / ".review/pr-override-grant.json"
+
+    relayed = [
+        "pr-override-grant",
+        "--runtime",
+        "codex",
+        "--verdict-sha256",
+        _override_digest(git_repo),
+        "--reason",
+        "approved in the prompt",
+        "--relayed",
+    ]
+    assert main(relayed) == 0
+    assert json.loads(capsys.readouterr().out)["channel"] == "relayed"
+    assert (grant.stat().st_mode & 0o777) == 0o600
+
+    assert main(["pr-override-grant", "--runtime", "codex", "--revoke"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"revoked": True}
+    assert not grant.exists()
+
+    monkeypatch.setattr(sys, "stdin", _OverrideTty("override\n"))
+    direct = [
+        "pr-override-grant",
+        "--runtime",
+        "codex",
+        "--reason",
+        "approved in the terminal",
+    ]
+    assert main(direct) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["channel"] == "tty"
+    assert "one-shot PR override" in captured.err
+
+
+def test_override_grant_rejects_verdict_bytes_changed_after_preview(
+    git_repo, monkeypatch, capsys
+):
+    from pre_pr_tribunal.cli import main
+
+    _round_three_failure(git_repo)
+    monkeypatch.chdir(git_repo)
+    assert main(["pr-override-preview", "--runtime", "codex"]) == 0
+    binding = json.loads(capsys.readouterr().out)
+
+    verdict_path = git_repo / ".review/verdict.json"
+    verdict_path.write_bytes(verdict_path.read_bytes() + b"\n")
+    assert main(
+        [
+            "pr-override-grant",
+            "--runtime",
+            "codex",
+            "--verdict-sha256",
+            binding["verdict_sha256"],
+            "--reason",
+            "approved before verdict bytes changed",
+            "--relayed",
+        ]
+    ) == 1
+    assert capsys.readouterr().err == (
+        "PRE_PR_TRIBUNAL:PR_OVERRIDE_VERDICT_CHANGED\n"
+    )
+    assert not (git_repo / ".review/pr-override-grant.json").exists()
+
+
+def test_direct_override_rejects_verdict_bytes_changed_while_prompt_waits(
+    git_repo, monkeypatch, capsys
+):
+    from pre_pr_tribunal.cli import main
+
+    _round_three_failure(git_repo)
+    monkeypatch.chdir(git_repo)
+    verdict_path = git_repo / ".review/verdict.json"
+    monkeypatch.setattr(
+        sys, "stdin", _ChangingOverrideTty("override\n", verdict_path)
+    )
+    assert main(
+        [
+            "pr-override-grant",
+            "--runtime",
+            "codex",
+            "--reason",
+            "approved before verdict bytes changed",
+        ]
+    ) == 1
+    captured = capsys.readouterr()
+    assert "verdict " in captured.err
+    assert captured.err.endswith("PRE_PR_TRIBUNAL:PR_OVERRIDE_VERDICT_CHANGED\n")
+    assert not (git_repo / ".review/pr-override-grant.json").exists()
+
+
+def test_override_grant_cli_requires_terminal_or_relayed_channel(
+    git_repo, monkeypatch, capsys
+):
+    from pre_pr_tribunal.cli import main
+
+    _round_three_failure(git_repo)
+    monkeypatch.chdir(git_repo)
+    assert main(
+        [
+            "pr-override-grant",
+            "--runtime",
+            "codex",
+            "--reason",
+            "no terminal",
+        ]
+    ) == 1
+    assert capsys.readouterr().err == (
+        "PRE_PR_TRIBUNAL:PR_OVERRIDE_GRANT_TTY_REQUIRED\n"
+    )
+    assert not (git_repo / ".review/pr-override-grant.json").exists()
 
 
 def _verdict_payload(repo: Path) -> dict[str, object]:
