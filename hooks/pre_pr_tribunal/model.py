@@ -35,6 +35,7 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
 REPORT_TEXT_CONTRACT_VERSION = 5
+REFUTED_CLAIM_BLOCKER_CONTRACT_VERSION = 5
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -1339,12 +1340,21 @@ def validate_report_bytes(
     return report, hashlib.sha256(raw).hexdigest()
 
 
-def validate_reviewer_report_semantics(report: ReviewerReport) -> None:
+def validate_reviewer_report_semantics(
+    report: ReviewerReport,
+    *,
+    report_contract_version: int = REPORT_TEXT_CONTRACT_VERSION,
+) -> None:
     """Validate cross-field report meaning after strict structural parsing."""
-    if not isinstance(report, ReviewerReport):
+    if (
+        not isinstance(report, ReviewerReport)
+        or type(report_contract_version) is not int
+        or report_contract_version < 1
+    ):
         raise SchemaError("REPORT_SCHEMA_INVALID")
     if (
-        report.reviewer is Reviewer.B
+        report_contract_version >= REFUTED_CLAIM_BLOCKER_CONTRACT_VERSION
+        and report.reviewer is Reviewer.B
         and any(claim.result == "refuted" for claim in report.claims)
         and not any(
             finding.severity in {Severity.CRITICAL, Severity.HIGH}

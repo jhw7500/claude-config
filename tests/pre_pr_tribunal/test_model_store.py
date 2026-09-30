@@ -259,6 +259,30 @@ def test_persisted_pass_rejects_refuted_claim_without_blocker(git_repo):
         read_verdict(git_repo)
 
 
+def test_persisted_contract_four_pass_keeps_historical_refutation_readable(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    report_paths(git_repo, pending.snapshot)
+    finalized = finalize_round(git_repo, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    payload = finalized.to_json()
+    payload["contract"]["report_text"] = 4
+    for slot in payload["reviewers"].values():
+        if slot["state"] == "sealed":
+            slot["receipt"]["report_contract_version"] = 4
+    payload["reviewers"]["B"]["report"]["claims"][0]["result"] = "refuted"
+    write_json(verdict_path, payload)
+    before = verdict_path.read_bytes()
+
+    historical = read_verdict(git_repo)
+
+    assert historical.contract.report_text == 4
+    assert historical.gate.status.value == "pass"
+    assert historical.reviewers["B"].report.claims[0].result == "refuted"
+    assert verdict_path.read_bytes() == before
+
+
 def test_prior_contract_in_progress_refutation_fails_closed_as_drift(git_repo):
     pending = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW

@@ -1582,11 +1582,17 @@ def _validate_reviewer_closure(
 
 def _validate_closure(verdict: Verdict, reports: Mapping[str, ReviewerReport]) -> None:
     seen_replacements: set[str] = set()
+    report_contract_version = (
+        verdict.contract.report_text if verdict.contract is not None else 1
+    )
     for reviewer in reports:
         _validate_reviewer_closure(
             verdict, reports[reviewer], seen_replacements=seen_replacements,
         )
-        m.validate_reviewer_report_semantics(reports[reviewer])
+        m.validate_reviewer_report_semantics(
+            reports[reviewer],
+            report_contract_version=report_contract_version,
+        )
     if verdict.round == 1 and any(
         report.prior_decisions for report in reports.values()
     ):
