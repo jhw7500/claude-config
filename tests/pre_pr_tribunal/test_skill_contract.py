@@ -793,6 +793,7 @@ def test_empirical_reviewer_forbids_unsupported_claims_and_requires_capture_fiel
         "capture_sha256",
         "truncated",
         "unverified",
+        "REFUTED_CLAIM_REQUIRES_BLOCKER",
     ):
         assert token in reviewer
 

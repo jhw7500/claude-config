@@ -1020,6 +1020,7 @@ def submit_reviewer_report(
                 from .evidence_lifecycle import authenticate_report
                 authenticate_report(root, pending, parsed)
                 _validate_unexecutable_claims(root, pending, snapshot, parsed)
+                _validate_refuted_claim_blocker(parsed)
             else:
                 if len(raw) > MAX_ATTEMPT_RAW_BYTES:
                     raise SchemaError("REPORT_TOO_LARGE")
@@ -1032,6 +1033,7 @@ def submit_reviewer_report(
                     from .evidence_lifecycle import authenticate_report
                     authenticate_report(root, pending, parsed)
                     _validate_unexecutable_claims(root, pending, snapshot, parsed)
+                    _validate_refuted_claim_blocker(parsed)
                 except SchemaError as error:
                     if error.code in REPORT_RETRYABLE_CODES:
                         _record_failure_locked(review_fd, pending, reviewer, error.code, raw)
@@ -1543,6 +1545,18 @@ def _validate_unexecutable_claims(
             raise SchemaError("UNEXECUTABLE_PATH_NOT_UNVERIFIED")
 
 
+def _validate_refuted_claim_blocker(report: m.ReviewerReport) -> None:
+    if (
+        report.reviewer is Reviewer.B
+        and any(claim.result == "refuted" for claim in report.claims)
+        and not any(
+            finding.severity in {Severity.CRITICAL, Severity.HIGH}
+            for finding in report.findings
+        )
+    ):
+        raise SchemaError("REFUTED_CLAIM_REQUIRES_BLOCKER")
+
+
 def _validate_reviewer_closure(
     verdict: Verdict, report: ReviewerReport, *, seen_replacements: set[str] | None = None,
 ) -> None:
@@ -1582,6 +1596,7 @@ def _validate_closure(verdict: Verdict, reports: Mapping[str, ReviewerReport]) -
         _validate_reviewer_closure(
             verdict, reports[reviewer], seen_replacements=seen_replacements,
         )
+        _validate_refuted_claim_blocker(reports[reviewer])
     if verdict.round == 1 and any(
         report.prior_decisions for report in reports.values()
     ):

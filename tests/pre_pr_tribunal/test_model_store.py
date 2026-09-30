@@ -244,6 +244,21 @@ def test_v2_terminal_aggregates_every_sealed_report(git_repo, severity, status, 
     assert read_verdict(git_repo) == final
 
 
+def test_persisted_pass_rejects_refuted_claim_without_blocker(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    report_paths(git_repo, pending.snapshot)
+    finalize_round(git_repo, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    payload = json.loads(verdict_path.read_text(encoding="utf-8"))
+    payload["reviewers"]["B"]["report"]["claims"][0]["result"] = "refuted"
+    write_json(verdict_path, payload)
+
+    with pytest.raises(SchemaError, match="^REFUTED_CLAIM_REQUIRES_BLOCKER$"):
+        read_verdict(git_repo)
+
+
 @pytest.mark.parametrize("version", (1, 2))
 def test_begin_refuses_pending_reset_without_losing_reports(git_repo, version):
     pending = legacy_pending(git_repo) if version == 1 else write_current_pending(git_repo)

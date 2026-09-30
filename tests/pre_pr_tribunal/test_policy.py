@@ -583,6 +583,79 @@ def test_active_only_finalize_and_unverified_is_inconclusive(tmp_path):
     assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.VERIFICATION_INCOMPLETE
 
 
+def _refuted_report(verdict, *, findings=()):
+    execution_id = f"B-R{verdict.round}-E001"
+    claim_id = f"B-R{verdict.round}-C001"
+    evidence_findings = tuple(
+        {**finding, "execution_ids": [execution_id]}
+        for finding in findings
+    )
+    claim = {
+        "id": claim_id,
+        "statement": "The documented primary entry path runs.",
+        "result": "refuted",
+        "execution_ids": [execution_id],
+        "reason": "",
+    }
+    return _report(
+        verdict,
+        "B",
+        findings=evidence_findings,
+        executions=(_execution(execution_id),),
+        claims=(claim,),
+        coverage={
+            "complete": True,
+            "primary_entry_paths": [
+                {"path": "src/app.py", "claim_id": claim_id},
+            ],
+        },
+    )
+
+
+def test_refuted_claim_without_blocker_is_retryable_and_cannot_seal(tmp_path):
+    from pre_pr_tribunal.attempt_store import REPORT_RETRYABLE_CODES
+
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+    with pytest.raises(SchemaError) as error:
+        submit_reviewer_report(
+            repo,
+            reviewer=Reviewer.B,
+            raw=_refuted_report(verdict),
+            now=NOW,
+        )
+
+    assert error.value.code == "REFUTED_CLAIM_REQUIRES_BLOCKER"
+    assert error.value.code in REPORT_RETRYABLE_CODES
+
+
+def test_refuted_claim_with_blocker_produces_terminal_failure(tmp_path):
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.A,
+        raw=_report(verdict, "A"),
+        now=NOW,
+    )
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.B,
+        raw=_refuted_report(
+            verdict,
+            findings=(_finding("B-R1-001", "B", severity="HIGH"),),
+        ),
+        now=NOW,
+    )
+
+    final = finalize_round(repo, now=NOW)
+
+    assert final.gate.status is GateStatus.FAIL
+    assert final.gate.blocking_count == 1
+    assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.BLOCKERS_OPEN
+
+
 def test_inconclusive_restart_cannot_lower_same_snapshot_intensity(tmp_path):
     repo = _repo(tmp_path, path="docs/guide.md")
     verdict = begin_round(
