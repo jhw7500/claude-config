@@ -102,18 +102,41 @@ def preview_grant(cwd: Path, *, runtime: str) -> m.Verdict:
     return verdict
 
 
+def preview_grant_binding(cwd: Path, *, runtime: str) -> dict[str, object]:
+    """Return the exact verdict binding that may be shown for approval."""
+    expected = preview_grant(cwd, runtime=runtime)
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        verdict, verdict_raw = _read_bound_verdict(review_fd)
+        if verdict != expected or not _eligible(verdict):
+            raise m.SchemaError("PR_OVERRIDE_VERDICT_CHANGED")
+        return _binding(verdict, verdict_raw)
+
+
 def record_grant(
     cwd: Path,
     *,
     runtime: str,
+    expected_verdict_sha256: str,
     reason: str,
     channel: str,
     now: Callable[[], str],
 ) -> dict[str, object]:
-    """Record one direct or prompt-relayed approval for the current verdict."""
+    """Record approval only for the exact verdict bytes shown to the user."""
     from .policy import MAX_REASON_BYTES, _bounded_text
 
     if channel not in _CHANNELS:
+        raise m.SchemaError("PR_OVERRIDE_GRANT_INVALID")
+    if (
+        not isinstance(expected_verdict_sha256, str)
+        or len(expected_verdict_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in expected_verdict_sha256
+        )
+    ):
         raise m.SchemaError("PR_OVERRIDE_GRANT_INVALID")
     reason = _bounded_text(
         reason, MAX_REASON_BYTES, "PR_OVERRIDE_GRANT_INVALID"
@@ -126,9 +149,12 @@ def record_grant(
         verdict, verdict_raw = _read_bound_verdict(review_fd)
         if verdict != expected or not _eligible(verdict):
             raise m.SchemaError("PR_OVERRIDE_NOT_ELIGIBLE")
+        binding = _binding(verdict, verdict_raw)
+        if binding["verdict_sha256"] != expected_verdict_sha256:
+            raise m.SchemaError("PR_OVERRIDE_VERDICT_CHANGED")
         payload: dict[str, object] = {
             "schema": 1,
-            "binding": _binding(verdict, verdict_raw),
+            "binding": binding,
             "runtime": runtime,
             "reason": reason,
             "channel": channel,

@@ -82,6 +82,14 @@ def _write_json(path: Path, value: object) -> Path:
     return path
 
 
+def _override_digest(repo: Path, runtime: str = "codex") -> str:
+    value = pr_override_grant.preview_grant_binding(repo, runtime=runtime)[
+        "verdict_sha256"
+    ]
+    assert isinstance(value, str)
+    return value
+
+
 def _reports(
     repo: Path,
     snapshot,
@@ -526,6 +534,7 @@ def test_terminal_override_revalidates_reused_evidence_before_consuming(
     pr_override_grant.record_grant(
         git_repo,
         runtime="codex",
+        expected_verdict_sha256=_override_digest(git_repo),
         reason="user approved the terminal result",
         channel="relayed",
         now=lambda: "2026-09-29T00:00:00Z",
@@ -560,6 +569,7 @@ def test_terminal_override_grant_allows_exactly_one_hook_call(
     recorded = pr_override_grant.record_grant(
         git_repo,
         runtime=runtime,
+        expected_verdict_sha256=_override_digest(git_repo, runtime),
         reason="user approved this terminal verdict in the prompt",
         channel="relayed",
         now=lambda: "2026-09-29T00:00:00Z",
@@ -592,6 +602,7 @@ def test_override_grant_is_runtime_bound_and_unsafe_file_fails_closed(
     pr_override_grant.record_grant(
         git_repo,
         runtime="codex",
+        expected_verdict_sha256=_override_digest(git_repo),
         reason="user approved in Codex",
         channel="relayed",
         now=lambda: "2026-09-29T00:00:00Z",
@@ -625,6 +636,7 @@ def test_override_grant_cannot_be_recorded_for_an_early_round_failure(git_repo):
         pr_override_grant.record_grant(
             git_repo,
             runtime="codex",
+            expected_verdict_sha256="0" * 64,
             reason="do not bypass an early blocker",
             channel="relayed",
             now=lambda: "2026-09-29T00:00:00Z",
@@ -636,6 +648,7 @@ def test_override_grant_concurrent_consumers_cannot_both_win(git_repo):
     pr_override_grant.record_grant(
         git_repo,
         runtime="codex",
+        expected_verdict_sha256=_override_digest(git_repo),
         reason="one approved PR attempt",
         channel="relayed",
         now=lambda: "2026-09-29T00:00:00Z",
@@ -667,6 +680,7 @@ def test_inconclusive_verdict_accepts_one_prompt_relayed_override(
     pr_override_grant.record_grant(
         git_repo,
         runtime="codex",
+        expected_verdict_sha256=_override_digest(git_repo),
         reason="user accepts the missing runtime evidence",
         channel="relayed",
         now=lambda: "2026-09-29T00:00:00Z",
@@ -687,6 +701,7 @@ def test_override_grant_does_not_bypass_snapshot_drift(git_repo):
     pr_override_grant.record_grant(
         git_repo,
         runtime="codex",
+        expected_verdict_sha256=_override_digest(git_repo),
         reason="approved before the snapshot moved",
         channel="relayed",
         now=lambda: "2026-09-29T00:00:00Z",
@@ -719,6 +734,16 @@ class _OverrideTty:
         return self.answer
 
 
+class _ChangingOverrideTty(_OverrideTty):
+    def __init__(self, answer, verdict_path: Path):
+        super().__init__(answer)
+        self.verdict_path = verdict_path
+
+    def readline(self):
+        self.verdict_path.write_bytes(self.verdict_path.read_bytes() + b"\n")
+        return super().readline()
+
+
 def test_override_grant_cli_direct_relayed_and_revoke(
     git_repo, monkeypatch, capsys
 ):
@@ -732,6 +757,8 @@ def test_override_grant_cli_direct_relayed_and_revoke(
         "pr-override-grant",
         "--runtime",
         "codex",
+        "--verdict-sha256",
+        _override_digest(git_repo),
         "--reason",
         "approved in the prompt",
         "--relayed",
@@ -756,6 +783,62 @@ def test_override_grant_cli_direct_relayed_and_revoke(
     captured = capsys.readouterr()
     assert json.loads(captured.out)["channel"] == "tty"
     assert "one-shot PR override" in captured.err
+
+
+def test_override_grant_rejects_verdict_bytes_changed_after_preview(
+    git_repo, monkeypatch, capsys
+):
+    from pre_pr_tribunal.cli import main
+
+    _round_three_failure(git_repo)
+    monkeypatch.chdir(git_repo)
+    assert main(["pr-override-preview", "--runtime", "codex"]) == 0
+    binding = json.loads(capsys.readouterr().out)
+
+    verdict_path = git_repo / ".review/verdict.json"
+    verdict_path.write_bytes(verdict_path.read_bytes() + b"\n")
+    assert main(
+        [
+            "pr-override-grant",
+            "--runtime",
+            "codex",
+            "--verdict-sha256",
+            binding["verdict_sha256"],
+            "--reason",
+            "approved before verdict bytes changed",
+            "--relayed",
+        ]
+    ) == 1
+    assert capsys.readouterr().err == (
+        "PRE_PR_TRIBUNAL:PR_OVERRIDE_VERDICT_CHANGED\n"
+    )
+    assert not (git_repo / ".review/pr-override-grant.json").exists()
+
+
+def test_direct_override_rejects_verdict_bytes_changed_while_prompt_waits(
+    git_repo, monkeypatch, capsys
+):
+    from pre_pr_tribunal.cli import main
+
+    _round_three_failure(git_repo)
+    monkeypatch.chdir(git_repo)
+    verdict_path = git_repo / ".review/verdict.json"
+    monkeypatch.setattr(
+        sys, "stdin", _ChangingOverrideTty("override\n", verdict_path)
+    )
+    assert main(
+        [
+            "pr-override-grant",
+            "--runtime",
+            "codex",
+            "--reason",
+            "approved before verdict bytes changed",
+        ]
+    ) == 1
+    captured = capsys.readouterr()
+    assert "verdict " in captured.err
+    assert captured.err.endswith("PRE_PR_TRIBUNAL:PR_OVERRIDE_VERDICT_CHANGED\n")
+    assert not (git_repo / ".review/pr-override-grant.json").exists()
 
 
 def test_override_grant_cli_requires_terminal_or_relayed_channel(

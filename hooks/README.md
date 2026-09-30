@@ -135,8 +135,14 @@ Terminal one-shot 승인은 정상 finalize와 telemetry close가 끝난 round-3
 
 ```bash
 /usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" \
-  pr-override-grant --runtime "$RUNTIME" --reason "<user answer>" --relayed
+  pr-override-preview --runtime "$RUNTIME"
+/usr/bin/python3 "$HOME/.local/share/claude-config/pre_pr_tribunal/cli.py" \
+  pr-override-grant --runtime "$RUNTIME" --verdict-sha256 "<shown verdict_sha256>" \
+  --reason "<user answer>" --relayed
 ```
+
+두 번째 명령은 질문 전에 표시한 exact verdict digest를 요구한다. 질문 대기 중 verdict가 바뀌면
+`PR_OVERRIDE_VERDICT_CHANGED`로 grant 기록을 거부하고 새 preview부터 다시 시작한다.
 
 직접 terminal을 조작하는 사람은 `--relayed`를 빼고 exact `override`를 입력할 수 있다. 거절 시에는
 `pr-override-grant --runtime "$RUNTIME" --revoke`로 이전 grant를 제거한다. Agent는 직접 terminal

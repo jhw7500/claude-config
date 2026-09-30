@@ -138,8 +138,13 @@ def _parser() -> argparse.ArgumentParser:
         "--runtime", required=True, choices=("claude", "codex")
     )
     override.add_argument("--reason")
+    override.add_argument("--verdict-sha256")
     override.add_argument("--relayed", action="store_true")
     override.add_argument("--revoke", action="store_true")
+    override_preview = commands.add_parser("pr-override-preview", add_help=False)
+    override_preview.add_argument(
+        "--runtime", required=True, choices=("claude", "codex")
+    )
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -531,30 +536,43 @@ def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
 def _pr_override_grant(cwd, arguments, *, wall_clock=utc_now):
     """Record one user-approved exception for a terminal non-pass verdict."""
     if arguments.revoke:
-        if arguments.reason is not None or arguments.relayed:
+        if (
+            arguments.reason is not None
+            or arguments.verdict_sha256 is not None
+            or arguments.relayed
+        ):
             raise TribunalError("PR_OVERRIDE_GRANT_INVALID")
         return {"revoked": pr_override_grant.revoke_grant(cwd)}
     if arguments.reason is None:
         raise TribunalError("PR_OVERRIDE_GRANT_INVALID")
     if not arguments.relayed and not sys.stdin.isatty():
         raise TribunalError("PR_OVERRIDE_GRANT_TTY_REQUIRED")
-    verdict = pr_override_grant.preview_grant(
-        cwd, runtime=arguments.runtime
-    )
-    if not arguments.relayed:
+    if arguments.relayed:
+        if arguments.verdict_sha256 is None:
+            raise TribunalError("PR_OVERRIDE_GRANT_INVALID")
+        expected_verdict_sha256 = arguments.verdict_sha256
+    else:
+        if arguments.verdict_sha256 is not None:
+            raise TribunalError("PR_OVERRIDE_GRANT_INVALID")
+        binding = pr_override_grant.preview_grant_binding(
+            cwd, runtime=arguments.runtime
+        )
         sys.stderr.write(
             "pre-pr-tribunal one-shot PR override\n"
-            f"  head {verdict.head_sha}  diff {verdict.diff_sha256}\n"
-            f"  round {verdict.round}  status {verdict.gate.status.value}  "
-            f"blockers {verdict.gate.blocking_count}\n"
+            f"  head {binding['head_sha']}  diff {binding['diff_sha256']}\n"
+            f"  verdict {binding['verdict_sha256']}\n"
+            f"  round {binding['round']}  status {binding['gate']['status']}  "
+            f"blockers {binding['gate']['blocking_count']}\n"
             "Type 'override' to allow one canonical PR create attempt: "
         )
         sys.stderr.flush()
         if sys.stdin.readline().strip() != "override":
             raise TribunalError("PR_OVERRIDE_CONFIRMATION_MISMATCH")
+        expected_verdict_sha256 = binding["verdict_sha256"]
     return pr_override_grant.record_grant(
         cwd,
         runtime=arguments.runtime,
+        expected_verdict_sha256=expected_verdict_sha256,
         reason=arguments.reason,
         channel="relayed" if arguments.relayed else "tty",
         now=wall_clock,
@@ -640,6 +658,10 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
             payload = _intensity_grant(cwd, arguments, wall_clock=wall_clock)
         elif arguments.command == "pr-override-grant":
             payload = _pr_override_grant(cwd, arguments, wall_clock=wall_clock)
+        elif arguments.command == "pr-override-preview":
+            payload = pr_override_grant.preview_grant_binding(
+                cwd, runtime=arguments.runtime
+            )
         elif arguments.command.startswith("telemetry-"):
             payload = _telemetry_command(cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns)
         elif arguments.command == "context":

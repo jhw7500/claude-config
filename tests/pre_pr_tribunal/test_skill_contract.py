@@ -112,7 +112,9 @@ def test_skill_limits_terminal_user_override_to_exact_one_shot_contract():
     skill = text("SKILL.md")
     assert "ROUND_LIMIT_EXHAUSTED" in skill
     assert "VERIFICATION_INCOMPLETE" in skill
+    assert 'pr-override-preview --runtime "$RUNTIME"' in skill
     assert 'pr-override-grant --runtime "$RUNTIME"' in skill
+    assert '--verdict-sha256 "<shown verdict_sha256>"' in skill
     assert '--reason "<the user\'s answer>" --relayed' in skill
     assert 'pr-override-grant --runtime "$RUNTIME" --revoke' in skill
     assert "`PATH=/usr/bin:/bin`" in skill
