@@ -453,6 +453,12 @@ vs Read 646회 (2026-08-24 /insights, 75세션). 위임은 사망 빈도 자체�
    리뷰어는 설정이 정하고, 설정 파일이 없으면 기본값 A·B만 돈다(C는 기본 비활성). 몇 명이 도는지는
    `begin` 출력의 `active_reviewers`를 본다. **예측하지 말고 설치본으로 직접 실행해 확인한다.**
 
+   **숫자 intensity는 연속적인 리뷰 강도 조절기가 아니라 호환용 모드 선택자다**: `0=off`,
+   `1..66=single`, `67..100=iterative`이며 같은 구간 안에서 숫자를 바꿔도 동작은 달라지지 않는다.
+   `policy-preview`와 verdict에서는 `risk_floor`(위험 정책의 최소값), `effective_intensity`(요청·승인
+   반영 후 값), `mode`(실제 실행 모드)를 별개로 읽는다. 사용자에게 물을 때도 임의의 점수 하향이 아니라
+   `iterative -> single` 같은 모드 전환을 보여 주고, 필요한 숫자는 기존 CLI 호환 값으로만 제시한다.
+
 6. **PASS 뒤의 비차단 지적은 모아서 한 번에 고친다.** PASS에는 decision 경로가 없으므로, PASS 뒤에
    고치는 커밋마다 새 lifecycle이 `base..HEAD` 전체를 다시 심사한다. advisory finding, PR 리뷰어
    지적, 직접 찾은 결함을 하나씩 고쳐 올리면 그 수만큼 전패널 리뷰가 반복된다. 그러니 고칠지 판단할
