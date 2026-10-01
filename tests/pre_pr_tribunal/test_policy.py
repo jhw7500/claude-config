@@ -804,6 +804,54 @@ def test_terminal_failure_requires_one_shot_re_review_grant(tmp_path):
     assert not grant_path.exists()
 
 
+def test_re_review_grant_accepts_large_valid_binding(tmp_path):
+    pattern_prefix = "src/" + "*" * 700
+    config = "[policy]\n" + "".join(
+        f'"{pattern_prefix}mod{index}.py" = 50\n' for index in range(48)
+    )
+    repo = _repo(tmp_path, config=config)
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    _seal_empty(repo, first)
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.PASS
+    for index in range(48):
+        _write(repo, f"src/mod{index}.py", "new\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "add matching sources")
+
+    binding = round_grant.preview_grant_binding(
+        repo, base="master", runtime="codex", round_number=1, now=NOW,
+    )
+    assert len(json.dumps(binding, ensure_ascii=False).encode()) > round_grant.MAX_GRANT_BYTES
+    _authorize_next_round(repo)
+    grant_path = repo / ".review/re-review-grant.json"
+    payload = json.loads(grant_path.read_text(encoding="utf-8"))
+    assert payload["schema"] == 2
+    assert "binding" not in payload
+    assert payload["verdict_sha256"] == binding["verdict_sha256"]
+    assert payload["binding_sha256"] == binding["binding_sha256"]
+    assert len(grant_path.read_bytes()) <= round_grant.MAX_GRANT_BYTES
+    assert begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert not grant_path.exists()
+
+
+def test_re_review_grant_rejects_tampered_binding_digest(tmp_path):
+    repo = _repo(tmp_path)
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    _seal_empty(repo, first)
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.PASS
+    _write(repo, "src/app.py", "next target\n")
+    _git(repo, "commit", "-qam", "next target")
+    _authorize_next_round(repo)
+    grant_path = repo / ".review/re-review-grant.json"
+    payload = json.loads(grant_path.read_text(encoding="utf-8"))
+    payload["binding_sha256"] = "0" * 64
+    grant_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(SchemaError, match="^RE_REVIEW_GRANT_REQUIRED$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert grant_path.exists()
+
+
 def test_re_review_grant_rejects_target_snapshot_drift(tmp_path):
     repo = _repo(tmp_path)
     first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)

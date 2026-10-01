@@ -377,8 +377,9 @@ def record_grant(
         if binding["binding_sha256"] != expected_binding_sha256:
             raise m.SchemaError("RE_REVIEW_BINDING_CHANGED")
         payload: dict[str, object] = {
-            "schema": 1,
-            "binding": binding,
+            "schema": 2,
+            "verdict_sha256": binding["verdict_sha256"],
+            "binding_sha256": binding["binding_sha256"],
             "reason": reason,
             "channel": channel,
             "created_at": now(),
@@ -474,9 +475,12 @@ def consume_matching_grant_locked(
         return False
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"schema", "binding", "reason", "channel", "created_at"}
-        or payload.get("schema") != 1
-        or payload.get("binding") != expected
+        or set(payload) != {
+            "schema", "verdict_sha256", "binding_sha256", "reason", "channel", "created_at"
+        }
+        or payload.get("schema") != 2
+        or payload.get("verdict_sha256") != expected["verdict_sha256"]
+        or payload.get("binding_sha256") != expected["binding_sha256"]
         or channel not in _CHANNELS
         or not isinstance(reason, str)
         or not isinstance(created_at, str)
