@@ -26,6 +26,7 @@ from runtime_hook_installer import (  # noqa: E402
     capture_source_file,
     inspect_target,
     merge_pre_tool_hook,
+    merge_user_prompt_hook,
     read_python_source_group,
     render_json_config,
     strict_json_object,
@@ -63,6 +64,7 @@ PACKAGE_NAMES = (
     "intensity_grant.py",
     "model.py",
     "policy.py",
+    "prompt_hook.py",
     "pr_override_grant.py",
     "review_context.py",
     "review_store.py",
@@ -78,6 +80,14 @@ CLAUDE_COMMAND = (
 CODEX_COMMAND = (
     "/usr/bin/python3 $HOME/.local/share/claude-config/"
     "pre_pr_tribunal/codex_hook.py"
+)
+CLAUDE_PROMPT_COMMAND = (
+    "/usr/bin/python3 $HOME/.local/share/claude-config/"
+    "pre_pr_tribunal/prompt_hook.py claude"
+)
+CODEX_PROMPT_COMMAND = (
+    "/usr/bin/python3 $HOME/.local/share/claude-config/"
+    "pre_pr_tribunal/prompt_hook.py codex"
 )
 
 
@@ -187,6 +197,18 @@ def merge_runtime_configs(
         matcher=None,
         command=codex_command,
         legacy_commands=(codex_command,),
+        home=home,
+    )
+    claude = merge_user_prompt_hook(
+        claude,
+        command=CLAUDE_PROMPT_COMMAND,
+        legacy_commands=(CLAUDE_PROMPT_COMMAND,),
+        home=home,
+    )
+    codex = merge_user_prompt_hook(
+        codex,
+        command=CODEX_PROMPT_COMMAND,
+        legacy_commands=(CODEX_PROMPT_COMMAND,),
         home=home,
     )
     return render_json_config(claude), render_json_config(codex)

@@ -62,6 +62,7 @@ fi
 | `task-nudge.sh` | Claude PreToolUse compatibility shim | 설치된 neutral Claude adapter를 호출 |
 | `pre_pr_tribunal/claude_hook.py` | Claude PreToolUse: `Bash` | direct `gh pr create`를 현재 repository snapshot의 tribunal pass verdict에 결합 |
 | `pre_pr_tribunal/codex_hook.py` | Codex PreToolUse: matcher 없음 | 미래 shell tool 이름도 포함해 같은 tribunal gate를 적용 |
+| `pre_pr_tribunal/prompt_hook.py` | Claude/Codex UserPromptSubmit | 자연어 심사와 명시적 Skill 호출을 구분해 1라운드·중단 경계 안내 (advisory) |
 | `delegate-nudge-hook.py` | UserPromptSubmit | 직전 턴 메인 스레드 탐색성 호출·tool_result 바이트가 임계(기본 10회/100KB) 초과 시 위임 넛지 주입 — 세션당 최대 3회, 발화마다 임계 2배, 발화/억제를 `state/delegate-nudge/log.jsonl`에 기록 |
 | `precompact-handoff.sh` | PreCompact | HANDOFF 파일이 없거나 낡았으면 auto compaction 을 막고 /handoff 를 요구 (manual 은 경고만) |
 
@@ -84,8 +85,20 @@ fi
 
 ## pre-PR tribunal 운영
 
-설치기는 Claude의 `Bash` matcher와 Codex의 matcherless `PreToolUse` group을 한 transaction으로
-추가한다. 관련 없는 command와 current pass verdict에 결합된 direct PR command에는 adapter가 아무
+설치기는 두 runtime에 advisory `UserPromptSubmit` hook도 추가한다. 자연어 심사 동작 요청과
+명시적 `$pre-pr-tribunal`/`/pre-pr-tribunal` 호출을 구분해 안내하지만, 훅 메시지는 사용자
+요청의 암호학적 증명이나 CLI 재실행 권한이 아니다. 자연어 요청은 일반 코드 리뷰와 Tribunal의
+범위를 먼저 구분한다. 어느 경로든 Tribunal을 택하면 한 사용자 요청에 결정 라운드 최대 1회,
+실행 전 reviewer·intensity/mode·예상 소요·중단 조건 안내, FAIL/INCONCLUSIVE 뒤 즉시 중단이
+기본이다. 수정과 재심사는 결과를 본 뒤의 새 명시적 사용자 요청이 필요하다. `iterative`는
+라이프사이클 전체에서 최대 3라운드를 허용하는 정책 모드이지 한 요청에서 자동으로 3회 실행하는
+허가가 아니다. 중간 수정에는 타깃 테스트를 쓰고 전체 테스트는 최종 검증에서 최대 1회 실행한다.
+긴 단계에서는 상태·누적 시간을 60초 이내 간격으로 보고하고, 취소 후에는 신규 작업을 시작하지
+않으며 이미 시작한 reviewer와 증거는 안전하게 보존한다.
+
+설치기는 Claude의 `Bash` matcher와 Codex의 matcherless `PreToolUse` group, 양쪽의
+`UserPromptSubmit` 안내 group을 한 transaction으로 추가한다. 관련 없는 command와 current
+pass verdict에 결합된 direct PR command에는 adapter가 아무
 decision도 출력하지 않는다. direct 후보가 모호하거나 현재 verdict가 없거나 안전하지 않으면
 `[PRE-PR-TRIBUNAL:<CODE>]` reason이 포함된 deny를 출력한다. Scanner가 계산한 모호성
 사유가 bounded identifier이면 `COMMAND_AMBIGUOUS` marker는
@@ -121,9 +134,9 @@ deny reason code와 기본 복구는 다음과 같다.
 |---|---|
 | `COMMAND_AMBIGUOUS` | direct command, target 또는 실행 전 snapshot 보존을 확정할 수 없다. 다른 shell 동작을 제거하고 literal `--base <verdict-base>`를 쓰며, oversized payload면 command를 줄인 뒤 다시 실행한다. |
 | `TRIBUNAL_REQUIRED`, `REVIEW_INCOMPLETE` | verdict가 없거나 round가 끝나지 않았다. `/pre-pr-tribunal` 또는 `$pre-pr-tribunal`로 현재 round를 완료한다. |
-| `BLOCKERS_OPEN` | Critical/High finding이 열려 있다. Skill의 decision/fix/re-review 흐름을 계속한다. |
+| `BLOCKERS_OPEN` | Critical/High finding이 열려 있다. 이번 요청에서는 결과를 보고 멈춘다. 수정이나 재심사는 결과를 본 뒤의 새 명시적 사용자 요청이 필요하다. |
 | `ROUND_LIMIT_EXHAUSTED` | 3 round 뒤에도 blocker가 남았다. 자동 진행을 멈추고 아래 terminal one-shot 승인 절차로 사용자 결정을 받는다. |
-| `VERIFICATION_INCOMPLETE` | finalize된 INCONCLUSIVE verdict다. 안전한 증거로 새 round 1을 시작하거나 아래 terminal one-shot 승인 절차로 사용자 결정을 받는다. |
+| `VERIFICATION_INCOMPLETE` | finalize된 INCONCLUSIVE verdict다. 이번 요청에서는 멈춘다. 새 round 1이나 아래 terminal one-shot 승인 절차는 별도 명시적 사용자 결정이 필요하다. |
 | `WORKTREE_DIRTY`, `VERDICT_STALE` | HEAD/base/merge-base/diff 또는 clean 상태가 verdict와 다르다. 변경을 정리하고 새 snapshot으로 Skill을 다시 시작한다. |
 | `REPOSITORY_UNSUPPORTED` | exact repository root, GitHub origin 또는 supported Git 상태가 아니다. root와 remote를 확인한다. |
 | `VERDICT_UNSAFE`, `VERDICT_INVALID` | `.review` 권한·파일 형식·schema/state invariant가 안전하지 않다. 우회하지 말고 원인을 고친 뒤 Skill로 재생성한다. |
@@ -355,9 +368,11 @@ rtk python3 scripts/probe-pre-pr-tribunal.py --runtime codex --repo-source "$PWD
 rtk python3 scripts/probe-pre-pr-tribunal.py --runtime claude --auth-source environment --repo-source "$PWD"
 ```
 
-uninstall 또는 수동 복구 시 전체 `settings.json`, `hooks.json`, `hooks.PreToolUse`를 삭제하지 않는다.
-Claude에서는 matcher가 `Bash`이고 command가 installed `pre_pr_tribunal/claude_hook.py`인 group만,
-Codex에서는 command가 installed `pre_pr_tribunal/codex_hook.py`인 matcherless group만 제거한다. 이어서
+uninstall 또는 수동 복구 시 전체 `settings.json`, `hooks.json`, `hooks.PreToolUse`,
+`hooks.UserPromptSubmit`을 삭제하지 않는다. Claude에서는 matcher가 `Bash`이고 command가
+installed `pre_pr_tribunal/claude_hook.py`인 group만, Codex에서는 command가 installed
+`pre_pr_tribunal/codex_hook.py`인 matcherless group만 제거한다. 양쪽 runtime에서 command가
+installed `pre_pr_tribunal/prompt_hook.py`인 UserPromptSubmit group도 각각 제거한다. 이어서
 두 runtime의 `skills/pre-pr-tribunal` link와
 `$HOME/.local/share/claude-config/pre_pr_tribunal/` package만 대상으로 한다. 다른 hook group과 Skill은
 보존하며, repository의 `.review/`는 해당 review를 명시적으로 폐기할 때만 별도로 제거한다.
