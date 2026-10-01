@@ -185,9 +185,10 @@ def _validated_hook_groups(
         if not isinstance(records, list) or not records:
             raise InstallError("hook records must be a non-empty list")
         for record in records:
-            if (
-                not isinstance(record, dict)
-                or set(record) != {"type", "command"}
+            if not isinstance(record, dict):
+                raise InstallError("unknown hook record shape")
+            if event != "UserPromptSubmit" and (
+                set(record) != {"type", "command"}
                 or record.get("type") != "command"
                 or not isinstance(record.get("command"), str)
             ):
@@ -221,11 +222,17 @@ def _merge_hook(
         matching = [
             record
             for record in records
-            if _normalize_command(record["command"], home) in managed_commands
+            if _normalize_command(record.get("command"), home) in managed_commands
         ]
         if matching and len(records) != 1:
             raise InstallError("managed command appears in a multi-hook group")
         if matching:
+            if any(
+                set(record) != {"type", "command"}
+                or record.get("type") != "command"
+                for record in matching
+            ):
+                raise InstallError("managed hook record has unknown fields")
             if set(group) not in ({"matcher", "hooks"}, {"hooks"}):
                 raise InstallError("managed hook group has unknown fields")
             found.append(index)
