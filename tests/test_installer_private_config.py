@@ -101,9 +101,14 @@ def test_fresh_install_creates_private_settings_with_all_non_notion_hooks(home: 
                 "/usr/bin/python3 $HOME/.local/share/claude-config/"
                 "pre_pr_tribunal/claude_hook.py",
             ),
+            (
+                "UserPromptSubmit",
+                "/usr/bin/python3 $HOME/.local/share/claude-config/"
+                "pre_pr_tribunal/prompt_hook.py claude",
+            ),
             ("PreCompact", "$HOME/.claude/hooks/precompact-handoff.sh"),
         }
-    assert len(wired) == 16
+    assert len(wired) == 17
     assert set(wired) == expected
 
     hygiene_groups = [

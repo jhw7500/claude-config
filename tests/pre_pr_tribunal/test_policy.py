@@ -6,7 +6,7 @@ import subprocess
 
 import pytest
 
-from pre_pr_tribunal.cli import _parser, _status
+from pre_pr_tribunal.cli import _parser, _status, main
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
 from pre_pr_tribunal.git_state import (
     GitStateError,
@@ -16,9 +16,11 @@ from pre_pr_tribunal.git_state import (
 from pre_pr_tribunal.model import GateStatus, ReviewMode, Reviewer, SchemaError
 from pre_pr_tribunal.policy import (
     MAX_POLICY_REASONS,
+    intensity_mode,
     parse_intensity_request,
     parse_policy_binding,
 )
+from pre_pr_tribunal import round_grant
 from pre_pr_tribunal.verdict_store import (
     begin_round,
     finalize_round,
@@ -26,7 +28,10 @@ from pre_pr_tribunal.verdict_store import (
 )
 
 
-NOW = lambda: "2026-09-17T00:00:00Z"
+def NOW():
+    return "2026-09-17T00:00:00Z"
+
+
 BOUND_COMMAND = "PATH=/usr/bin:/bin /usr/bin/gh pr create --base master"
 
 
@@ -150,6 +155,31 @@ def _seal_empty(repo, verdict):
         submit_reviewer_report(
             repo, reviewer=Reviewer(key), raw=_report(verdict, key), now=NOW
         )
+
+
+def _authorize_next_round(
+    repo, *, runtime="codex", round_number=1, decisions_path=None,
+    intensity_values=None, intensity_requester=None, intensity_reason=None,
+    evidence_bundle_sha256=None,
+):
+    preview = round_grant.preview_grant_binding(
+        repo, base="master", runtime=runtime, round_number=round_number,
+        decisions_path=decisions_path,
+        intensity_values=intensity_values, intensity_requester=intensity_requester,
+        intensity_reason=intensity_reason,
+        evidence_bundle_sha256=evidence_bundle_sha256,
+    )
+    round_grant.record_grant(
+        repo, base="master", runtime=runtime, round_number=round_number,
+        decisions_path=decisions_path,
+        expected_verdict_sha256=preview["verdict_sha256"],
+        expected_binding_sha256=preview["binding_sha256"],
+        reason="Fresh user request after the prior result", channel="relayed", now=NOW,
+        intensity_values=intensity_values, intensity_requester=intensity_requester,
+        intensity_reason=intensity_reason,
+        evidence_bundle_sha256=evidence_bundle_sha256,
+    )
+    return preview
 
 
 def test_docs_only_is_snapshot_bound_skipped_verdict(tmp_path):
@@ -692,6 +722,10 @@ def test_inconclusive_restart_cannot_lower_same_snapshot_intensity(tmp_path):
     with pytest.raises(SchemaError, match="^ROUND_TRANSITION_INVALID$"):
         begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
 
+    _authorize_next_round(
+        repo, intensity_values=("50",), intensity_requester="maintainer",
+        intensity_reason="retry with newly available evidence",
+    )
     restarted = begin_round(
         repo,
         base="master",
@@ -734,11 +768,261 @@ def test_single_failure_requires_changed_snapshot_for_round_one_retry(tmp_path):
         begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     _write(repo, "src/app.py", "fixed\n")
     _git(repo, "commit", "-qam", "fix")
+    _authorize_next_round(repo)
     restarted = begin_round(
         repo, base="master", runtime="codex", round_number=1, now=NOW
     )
     assert restarted.round == 1
     assert restarted.head_sha != verdict.head_sha
+
+
+def test_terminal_failure_requires_one_shot_re_review_grant(tmp_path):
+    repo = _repo(tmp_path)
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    submit_reviewer_report(
+        repo, reviewer=Reviewer.A,
+        raw=_report(first, "A", findings=(_finding("A-R1-001", "A"),)), now=NOW,
+    )
+    submit_reviewer_report(repo, reviewer=Reviewer.B, raw=_report(first, "B"), now=NOW)
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.FAIL
+    _write(repo, "src/app.py", "fixed\n")
+    _git(repo, "commit", "-qam", "fix")
+    verdict_path = repo / ".review/verdict.json"
+    before = verdict_path.read_bytes()
+
+    with pytest.raises(SchemaError, match="^RE_REVIEW_GRANT_REQUIRED$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict_path.read_bytes() == before
+
+    approval = _authorize_next_round(repo)
+    grant_path = repo / ".review/re-review-grant.json"
+    assert approval["verdict_sha256"] == hashlib.sha256(before).hexdigest()
+    assert grant_path.stat().st_mode & 0o777 == 0o600
+    restarted = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert restarted.head_sha != first.head_sha
+    assert restarted.gate.status is GateStatus.IN_PROGRESS
+    assert not grant_path.exists()
+
+
+def test_re_review_grant_accepts_large_valid_binding(tmp_path):
+    pattern_prefix = "src/" + "*" * 700
+    config = "[policy]\n" + "".join(
+        f'"{pattern_prefix}mod{index}.py" = 50\n' for index in range(48)
+    )
+    repo = _repo(tmp_path, config=config)
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    _seal_empty(repo, first)
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.PASS
+    for index in range(48):
+        _write(repo, f"src/mod{index}.py", "new\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "add matching sources")
+
+    binding = round_grant.preview_grant_binding(
+        repo, base="master", runtime="codex", round_number=1, now=NOW,
+    )
+    assert len(json.dumps(binding, ensure_ascii=False).encode()) > round_grant.MAX_GRANT_BYTES
+    _authorize_next_round(repo)
+    grant_path = repo / ".review/re-review-grant.json"
+    payload = json.loads(grant_path.read_text(encoding="utf-8"))
+    assert payload["schema"] == 2
+    assert "binding" not in payload
+    assert payload["verdict_sha256"] == binding["verdict_sha256"]
+    assert payload["binding_sha256"] == binding["binding_sha256"]
+    assert len(grant_path.read_bytes()) <= round_grant.MAX_GRANT_BYTES
+    assert begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert not grant_path.exists()
+
+
+def test_re_review_grant_rejects_tampered_binding_digest(tmp_path):
+    repo = _repo(tmp_path)
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    _seal_empty(repo, first)
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.PASS
+    _write(repo, "src/app.py", "next target\n")
+    _git(repo, "commit", "-qam", "next target")
+    _authorize_next_round(repo)
+    grant_path = repo / ".review/re-review-grant.json"
+    payload = json.loads(grant_path.read_text(encoding="utf-8"))
+    payload["binding_sha256"] = "0" * 64
+    grant_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(SchemaError, match="^RE_REVIEW_GRANT_REQUIRED$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert grant_path.exists()
+
+
+def test_re_review_grant_rejects_target_snapshot_drift(tmp_path):
+    repo = _repo(tmp_path)
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    _seal_empty(repo, first)
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.PASS
+    _authorize_next_round(repo)
+    _write(repo, "src/app.py", "changed after approval\n")
+    _git(repo, "commit", "-qam", "post-approval change")
+
+    with pytest.raises(SchemaError, match="^RE_REVIEW_GRANT_REQUIRED$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert (repo / ".review/re-review-grant.json").exists()
+    assert (repo / ".review/verdict.json").exists()
+
+
+def test_re_review_grant_rejects_drift_between_preview_and_record(tmp_path):
+    repo = _repo(tmp_path, path="docs/guide.md")
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert first.gate.status is GateStatus.SKIPPED
+    preview = round_grant.preview_grant_binding(
+        repo, base="master", runtime="codex", round_number=1, now=NOW,
+    )
+    _write(repo, "docs/guide.md", "changed after preview\n")
+    _git(repo, "commit", "-qam", "post-preview change")
+
+    with pytest.raises(SchemaError, match="^RE_REVIEW_BINDING_CHANGED$"):
+        round_grant.record_grant(
+            repo, base="master", runtime="codex", round_number=1,
+            expected_verdict_sha256=preview["verdict_sha256"],
+            expected_binding_sha256=preview["binding_sha256"],
+            reason="Fresh user request for the previewed target", channel="relayed",
+            now=NOW,
+        )
+    assert not (repo / ".review/re-review-grant.json").exists()
+
+
+def test_re_review_grant_binds_evidence_selection(tmp_path):
+    repo = _repo(tmp_path)
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    _seal_empty(repo, first)
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.PASS
+    _write(repo, "src/app.py", "next target\n")
+    _git(repo, "commit", "-qam", "next target")
+    _authorize_next_round(repo)
+    verdict_before = (repo / ".review/verdict.json").read_bytes()
+
+    with pytest.raises(SchemaError, match="^RE_REVIEW_GRANT_REQUIRED$"):
+        begin_round(
+            repo, base="master", runtime="codex", round_number=1,
+            evidence_bundle_sha256="0" * 64, now=NOW,
+        )
+    assert (repo / ".review/verdict.json").read_bytes() == verdict_before
+    assert (repo / ".review/re-review-grant.json").exists()
+    second = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert second.head_sha != first.head_sha
+
+
+def test_cli_requires_grant_for_new_begin_after_terminal_verdict(
+    tmp_path, monkeypatch, capsys,
+):
+    repo = _repo(tmp_path, path="docs/guide.md")
+    monkeypatch.chdir(repo)
+    args = ["--base", "master", "--runtime", "codex", "--round", "1"]
+    assert main(["policy-preview", "--base", "master", "--runtime", "codex"], wall_clock=NOW) == 0
+    capsys.readouterr()
+    assert main(["begin", *args], wall_clock=NOW) == 0
+    capsys.readouterr()
+    _write(repo, "docs/guide.md", "changed after first verdict\n")
+    _git(repo, "commit", "-qam", "change")
+
+    assert main(["begin", *args], wall_clock=NOW) == 1
+    assert "PRE_PR_TRIBUNAL:RE_REVIEW_GRANT_REQUIRED" in capsys.readouterr().err
+    assert main(["re-review-preview", *args], wall_clock=NOW) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert main([
+        "re-review-grant", *args,
+        "--verdict-sha256", preview["verdict_sha256"],
+        "--binding-sha256", preview["binding_sha256"],
+        "--reason", "Fresh user approval for this exact target", "--relayed",
+    ], wall_clock=NOW) == 0
+    capsys.readouterr()
+    assert main(["begin", *args], wall_clock=NOW) == 0
+    capsys.readouterr()
+    assert not (repo / ".review/re-review-grant.json").exists()
+
+
+def test_cli_re_review_preview_binds_evidence_argument(tmp_path, monkeypatch, capsys):
+    repo = _repo(tmp_path, path="docs/guide.md")
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert first.gate.status is GateStatus.SKIPPED
+    _write(repo, "docs/guide.md", "next target\n")
+    _git(repo, "commit", "-qam", "next target")
+    monkeypatch.chdir(repo)
+    args = ["--base", "master", "--runtime", "codex", "--round", "1"]
+    digest = "0" * 64
+    assert main(["re-review-preview", *args, "--evidence-bundle", digest], wall_clock=NOW) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["target"]["evidence"]["requested_bundle_sha256"] == digest
+    assert main([
+        "re-review-grant", *args, "--evidence-bundle", digest,
+        "--verdict-sha256", preview["verdict_sha256"],
+        "--binding-sha256", preview["binding_sha256"],
+        "--reason", "Fresh user approval for this exact target", "--relayed",
+    ], wall_clock=NOW) == 0
+
+
+def test_re_review_grant_file_must_be_private_regular_file(tmp_path):
+    repo = _repo(tmp_path)
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    _seal_empty(repo, first)
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.PASS
+    grant_path = repo / ".review/re-review-grant.json"
+    grant_path.symlink_to("verdict.json")
+    verdict_before = (repo / ".review/verdict.json").read_bytes()
+
+    with pytest.raises(SchemaError, match="^RE_REVIEW_GRANT_FILE_UNSAFE$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert (repo / ".review/verdict.json").read_bytes() == verdict_before
+
+
+def test_re_review_grant_rejects_world_readable_file(tmp_path):
+    repo = _repo(tmp_path, path="docs/guide.md")
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert first.gate.status is GateStatus.SKIPPED
+    _write(repo, "docs/guide.md", "next target\n")
+    _git(repo, "commit", "-qam", "next target")
+    _authorize_next_round(repo)
+    grant_path = repo / ".review/re-review-grant.json"
+    grant_path.chmod(0o644)
+    verdict_before = (repo / ".review/verdict.json").read_bytes()
+
+    with pytest.raises(SchemaError, match="^RE_REVIEW_GRANT_FILE_UNSAFE$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert (repo / ".review/verdict.json").read_bytes() == verdict_before
+
+
+def test_iterative_second_round_requires_decisions_bound_approval(tmp_path):
+    repo = _repo(tmp_path, path="hooks/guard.py")
+    first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert first.policy.mode is ReviewMode.ITERATIVE
+    for key in first.policy.active_reviewers:
+        findings = (_finding("A-R1-001", "A"),) if key == "A" else ()
+        submit_reviewer_report(
+            repo, reviewer=Reviewer(key), raw=_report(first, key, findings=findings),
+            now=NOW,
+        )
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.FAIL
+    _write(repo, "hooks/guard.py", "fixed\n")
+    _git(repo, "commit", "-qam", "fix")
+    decisions_path = repo / ".review/inbox/round-1/decisions.json"
+    decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    decisions_path.write_text(json.dumps([{
+        "id": "D-R1-A-001",
+        "finding_ref": {"round": 1, "id": "A-R1-001", "reviewer": "A"},
+        "disposition": "fixed", "rationale": "Covered by a regression test.",
+        "executions": [_execution("D-R1-E001")],
+    }]), encoding="utf-8")
+    decisions_path.chmod(0o600)
+
+    with pytest.raises(SchemaError, match="^RE_REVIEW_GRANT_REQUIRED$"):
+        begin_round(
+            repo, base="master", runtime="codex", round_number=2,
+            decisions_path=decisions_path, now=NOW,
+        )
+    _authorize_next_round(repo, round_number=2, decisions_path=decisions_path)
+    second = begin_round(
+        repo, base="master", runtime="codex", round_number=2,
+        decisions_path=decisions_path, now=NOW,
+    )
+    assert second.round == 2
+    assert second.head_sha != first.head_sha
 
 
 def test_failed_single_mode_cannot_restart_same_snapshot_at_iterative_intensity(
@@ -1155,6 +1439,20 @@ def _preview(repo, monkeypatch, capsys, *extra):
 
 
 @pytest.mark.parametrize(
+    ("score", "mode"),
+    (
+        (0, ReviewMode.OFF),
+        (1, ReviewMode.SINGLE),
+        (66, ReviewMode.SINGLE),
+        (67, ReviewMode.ITERATIVE),
+        (100, ReviewMode.ITERATIVE),
+    ),
+)
+def test_compatibility_intensity_scores_map_to_explicit_modes(score, mode):
+    assert intensity_mode(score) is mode
+
+
+@pytest.mark.parametrize(
     ("path", "mode"),
     (
         ("docs/guide.md", ReviewMode.OFF),
@@ -1174,6 +1472,9 @@ def test_policy_preview_matches_begin_without_creating_review_state(
     assert payload["begin_admissible"] == "not-evaluated"
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     assert verdict.policy.mode is mode
+    assert payload["policy"]["risk_floor"] == verdict.policy.risk_floor
+    assert payload["policy"]["effective_intensity"] == verdict.policy.effective_intensity
+    assert payload["policy"]["mode"] == verdict.policy.mode.value
     assert payload["policy"] == verdict.policy.to_json()
     assert payload["active_reviewers"] == list(verdict.policy.active_reviewers)
     assert payload["snapshot"]["head_sha"] == verdict.head_sha
@@ -1195,6 +1496,9 @@ def test_policy_preview_passes_the_same_intensity_request_as_begin(
         intensity_reason=["wider review"],
     )
     assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert payload["policy"]["risk_floor"] == 50
+    assert payload["policy"]["effective_intensity"] == 100
+    assert payload["policy"]["mode"] == "iterative"
     assert payload["policy"] == verdict.policy.to_json()
 
 
@@ -1206,7 +1510,10 @@ def test_policy_preview_leaves_existing_review_state_byte_identical(
     repo = _repo(tmp_path)
     monkeypatch.chdir(repo)
     assert main(["begin", "--base", "master", "--runtime", "codex", "--round", "1"]) == 0
-    capsys.readouterr()
+    begin_payload = json.loads(capsys.readouterr().out)
+    assert begin_payload["policy"]["risk_floor"] == 50
+    assert begin_payload["policy"]["effective_intensity"] == 50
+    assert begin_payload["policy"]["mode"] == "single"
     before = _review_tree_digest(repo)
     assert before is not None
     assert (repo / ".review" / "telemetry.json").is_file()
@@ -1322,6 +1629,7 @@ def test_human_grant_may_restart_an_inconclusive_snapshot_lower(tmp_path):
     )
     assert finalize_round(repo, now=NOW).gate.status is GateStatus.INCONCLUSIVE
     _grant(repo, 50)
+    _authorize_next_round(repo)
     restarted = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     assert restarted.policy.effective_intensity == 50
     assert restarted.policy.request.source == "human_grant"
@@ -1367,11 +1675,32 @@ def test_intensity_grant_cli_records_only_after_typed_confirmation(
 
     monkeypatch.setattr(_sys, "stdin", _FakeTty(["lower\n"]))
     assert main(arguments) == 0
-    capsys.readouterr()
+    grant_prompt = capsys.readouterr().err
+    assert "risk_floor: 100  floor mode: iterative" in grant_prompt
+    assert "current effective_intensity: 100  current mode: iterative" in grant_prompt
+    assert "proposed effective_intensity: 50  resulting mode: single" in grant_prompt
+    assert "mode transition from floor: iterative -> single" in grant_prompt
+    assert "0=off, 1-66=single, 67-100=iterative" in grant_prompt
+    assert "off skips review" in grant_prompt
+    assert "single runs one decision round" in grant_prompt
+    assert "iterative allows up to three decision rounds" in grant_prompt
+    assert "scores within a mode do not change review depth or reviewer selection" in grant_prompt
+    assert "numeric scores can still affect policy floors" in grant_prompt
     assert ((repo / ".review" / "intensity-grant.json").stat().st_mode & 0o777) == 0o600
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     assert verdict.policy.request.source == "human_grant"
     assert verdict.policy.effective_intensity == 50
+
+
+def test_relayed_grant_instruction_explains_each_mode_before_choice():
+    skill = (
+        Path(__file__).resolve().parents[2] / "skills/pre-pr-tribunal/SKILL.md"
+    ).read_text(encoding="utf-8")
+    question_instruction = skill.split("4. Generate one projection", 1)[0]
+    assert "Before presenting any lower-mode choice" in question_instruction
+    assert "`off` skips review" in question_instruction
+    assert "`single` runs one decision round" in question_instruction
+    assert "`iterative` allows up to three decision rounds" in question_instruction
 
 
 @pytest.mark.parametrize(

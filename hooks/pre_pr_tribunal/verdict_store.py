@@ -1343,7 +1343,16 @@ def begin_round(
     preflight_review_directory(root)
     check_ignored(root)
     with locked_review(root, create=True) as review_fd:
-        stored = _read_optional_verdict_locked(review_fd)
+        try:
+            stored_raw = read_named_file(
+                review_fd, "verdict.json", maximum=m.MAX_VERDICT_BYTES,
+                missing="VERDICT_MISSING", unsafe="VERDICT_FILE_UNSAFE",
+            )
+        except SchemaError as error:
+            if error.code != "VERDICT_MISSING":
+                raise
+            stored_raw = None
+        stored = _parse_verdict(stored_raw) if stored_raw is not None else None
         if stored is not None and stored.gate.status is GateStatus.IN_PROGRESS:
             raise SchemaError("ROUND_TRANSITION_INVALID")
         snapshot = capture_snapshot(root, base, now=now)
@@ -1449,6 +1458,7 @@ def begin_round(
         if previous is None:
             initial_paths = tuple(snapshot.initial_paths)
             decisions: tuple[Decision, ...] = ()
+            decisions_sha256 = None
             history: tuple[RoundSummary, ...] = ()
         else:
             if (
@@ -1476,6 +1486,7 @@ def begin_round(
                 path_code="DECISIONS_PATH_INVALID",
             )
             decisions = m.parse_decisions(raw, prior_blockers=_blockers(previous))
+            decisions_sha256 = hashlib.sha256(raw).hexdigest()
             if (
                 any(item.disposition == "fixed" for item in decisions)
                 and snapshot.head_sha == previous.head_sha
@@ -1483,13 +1494,14 @@ def begin_round(
                 raise SchemaError("FIXED_HEAD_UNCHANGED")
             initial_paths = tuple(previous.initial_paths)
             history = tuple((*previous.history, _summary(previous))[-2:])
-        # Without a terminal predecessor, no old fixed namespace has proven
-        # completion. Check all three before a future transition could reuse one.
-        for target_round in ((round_number,) if stored is not None else (1, 2, 3)):
-            reset_round_attempt_evidence(
-                review_fd, round_number=target_round, allow_reset=stored is not None,
+        evidence_binding = None
+        evidence_fallback_reason = None
+        if policy.mode is not m.ReviewMode.OFF:
+            from .evidence_lifecycle import select_evidence
+
+            evidence_binding, evidence_fallback_reason = select_evidence(
+                root, snapshot, evidence_bundle_sha256
             )
-        _invalidate_round_inputs(review_fd, round_number)
         pending = _new_current_pending(
             snapshot, runtime=runtime, initial_paths=initial_paths,
             round_number=round_number, decisions=decisions, history=history,
@@ -1497,16 +1509,37 @@ def begin_round(
             policy=policy,
         )
         if policy.mode is not m.ReviewMode.OFF:
-            from .evidence_lifecycle import select_evidence
-
-            selection, fallback = select_evidence(
-                root, snapshot, evidence_bundle_sha256
-            )
             pending = replace(
                 pending,
-                evidence_binding=selection,
-                evidence_fallback_reason=fallback,
+                evidence_binding=evidence_binding,
+                evidence_fallback_reason=evidence_fallback_reason,
             )
+        if stored is not None:
+            if stored_raw is None:
+                raise SchemaError("VERDICT_INVALID")
+            from .round_grant import consume_matching_grant_locked
+
+            if not consume_matching_grant_locked(
+                review_fd,
+                prior=stored,
+                prior_raw=stored_raw,
+                snapshot=snapshot,
+                runtime=runtime,
+                round_number=round_number,
+                policy=policy,
+                decisions_sha256=decisions_sha256,
+                evidence_bundle_sha256=evidence_bundle_sha256,
+                evidence_binding=evidence_binding,
+                evidence_fallback_reason=evidence_fallback_reason,
+            ):
+                raise SchemaError("RE_REVIEW_GRANT_REQUIRED")
+        # Without a terminal predecessor, no old fixed namespace has proven
+        # completion. Check all three before a future transition could reuse one.
+        for target_round in ((round_number,) if stored is not None else (1, 2, 3)):
+            reset_round_attempt_evidence(
+                review_fd, round_number=target_round, allow_reset=stored is not None,
+            )
+        _invalidate_round_inputs(review_fd, round_number)
         _atomic_write(review_fd, pending)
         return pending
 
