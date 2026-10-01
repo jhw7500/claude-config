@@ -2654,6 +2654,32 @@ def test_safe_reason_survives_and_unrecognized_details_are_dropped(
     }
 
 
+def test_escaped_secret_next_to_lone_surrogate_in_discarded_field_is_rejected(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "status", "--task", TASK_ID)
+    payload = {
+        "error": {
+            "code": "FUTURE_STABLE_ERROR",
+            "reason": "safe_reason",
+            "diagnostic": f"{chr(0xD800)}{PROJECT_TOKEN}",
+        },
+    }
+    output = json.dumps(payload, separators=(",", ":")).encode()
+    escaped_secret = "".join(f"\\u{ord(character):04x}" for character in PROJECT_TOKEN).encode()
+    output = output.replace(PROJECT_TOKEN.encode(), escaped_secret) + b"\n"
+    assert PROJECT_TOKEN.encode() not in output
+    runner.control_results[command] = launcher.CommandResult(1, b"", output)
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "SENSITIVE_OUTPUT_REJECTED"}}
+    assert PROJECT_TOKEN.encode() not in result.stdout + result.stderr
+
+
 def test_bounded_command_failure_detail_survives_secure_projection(
     launcher: ModuleType,
     tmp_path: Path,
@@ -2663,7 +2689,7 @@ def test_bounded_command_failure_detail_survives_secure_projection(
     detail = {
         "command": "git",
         "exit_code": 128,
-        "stderr_head": "fatal: cannot change directory\n",
+        "stderr_head": "fatal: cannot change directory\n\u0000",
     }
     runner.control_results[command] = launcher.CommandResult(
         1,
@@ -2676,6 +2702,30 @@ def test_bounded_command_failure_detail_survives_secure_projection(
     assert json.loads(result.stderr) == {
         "error": {"code": "COMMAND_FAILED", "detail": detail},
     }
+    assert b"\\n" in runner.control_results[command].stderr
+    assert b"\\u0000" in runner.control_results[command].stderr
+
+
+@pytest.mark.parametrize("exit_code", [None, 1, 9_007_199_254_740_991, 1.0])
+def test_command_failure_detail_accepts_positive_safe_integer_or_null(
+    launcher: ModuleType,
+    tmp_path: Path,
+    exit_code: int | float | None,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "status", "--task", TASK_ID)
+    detail = {"command": "git", "exit_code": exit_code}
+    runner.control_results[command] = launcher.CommandResult(
+        1,
+        b"",
+        json.dumps({"error": {"code": "COMMAND_FAILED", "detail": detail}}).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert json.loads(result.stderr) == {
+        "error": {"code": "COMMAND_FAILED", "detail": {"command": "git", "exit_code": exit_code}},
+    }
 
 
 @pytest.mark.parametrize(
@@ -2684,6 +2734,15 @@ def test_bounded_command_failure_detail_survives_secure_projection(
         {"command": "", "exit_code": 128},
         {"command": "git", "exit_code": True},
         {"command": "git", "exit_code": -1},
+        {"command": "git", "exit_code": 9_007_199_254_740_992},
+        {"command": "git", "exit_code": 1.5},
+        {"command": "git\nstatus", "exit_code": 128},
+        {"command": "한" * 86, "exit_code": 128},
+        {"command": chr(0xD800), "exit_code": 128},
+        {"exit_code": 128},
+        {"command": "git", "exit_code": 128, "args": ["status"]},
+        {"command": "git", "exit_code": 128, "stderr_head": ""},
+        {"command": "git", "exit_code": 128, "stderr_head": "한" * 171},
         {"command": "git", "exit_code": 128, "stderr_head": "x" * 513},
     ],
 )
@@ -2704,6 +2763,68 @@ def test_malformed_command_failure_detail_fails_closed(
 
     assert result.returncode == 78
     assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+
+
+def test_command_failure_detail_round_trips_exact_512_utf8_bytes(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "status", "--task", TASK_ID)
+    stderr_head = "한" * 170 + "ab"
+    detail = {"command": "git", "exit_code": 128, "stderr_head": stderr_head}
+    runner.control_results[command] = launcher.CommandResult(
+        1,
+        b"",
+        json.dumps({"error": {"code": "COMMAND_FAILED", "detail": detail}}).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert json.loads(result.stderr)["error"]["detail"] == detail
+    assert len(stderr_head.encode("utf-8")) == 512
+
+
+def test_only_command_failed_may_project_detail(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "status", "--task", TASK_ID)
+    runner.control_results[command] = launcher.CommandResult(
+        1,
+        b"",
+        b'{"error":{"code":"FUTURE_STABLE_ERROR","detail":{"command":"git","exit_code":128}}}\n',
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "CONTROL_OUTPUT_INVALID"}}
+
+
+def test_command_failure_detail_remains_subject_to_sensitive_output_scan(
+    launcher: ModuleType,
+    tmp_path: Path,
+) -> None:
+    runner = FakeCommandRunner(launcher)
+    command = ("task", "status", "--task", TASK_ID)
+    runner.control_results[command] = launcher.CommandResult(
+        1,
+        b"",
+        json.dumps({
+            "error": {
+                "code": "COMMAND_FAILED",
+                "detail": {"command": "git", "exit_code": 128, "stderr_head": PROJECT_TOKEN},
+            },
+        }).encode() + b"\n",
+    )
+
+    result = run_secure(launcher, tmp_path, list(command), runner)
+
+    assert result.returncode == 78
+    assert json.loads(result.stderr) == {"error": {"code": "SENSITIVE_OUTPUT_REJECTED"}}
+    assert PROJECT_TOKEN.encode() not in result.stderr
 
 
 @pytest.mark.parametrize(
