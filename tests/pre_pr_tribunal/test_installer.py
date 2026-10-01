@@ -18,6 +18,14 @@ CODEX_COMMAND = (
     "/usr/bin/python3 $HOME/.local/share/claude-config/"
     "pre_pr_tribunal/codex_hook.py"
 )
+CLAUDE_PROMPT_COMMAND = (
+    "/usr/bin/python3 $HOME/.local/share/claude-config/"
+    "pre_pr_tribunal/prompt_hook.py claude"
+)
+CODEX_PROMPT_COMMAND = (
+    "/usr/bin/python3 $HOME/.local/share/claude-config/"
+    "pre_pr_tribunal/prompt_hook.py codex"
+)
 PACKAGE_NAMES = (
     "__init__.py",
     "attempt_store.py",
@@ -37,6 +45,7 @@ PACKAGE_NAMES = (
     "intensity_grant.py",
     "model.py",
     "policy.py",
+    "prompt_hook.py",
     "pr_override_grant.py",
     "review_context.py",
     "review_store.py",
@@ -166,6 +175,12 @@ def test_build_plan_installs_one_shared_package_two_hooks_and_two_skill_links(in
     ]
     assert _managed(codex["hooks"]["PreToolUse"], CODEX_COMMAND) == [
         {"hooks": [{"type": "command", "command": CODEX_COMMAND}]}
+    ]
+    assert _managed(claude["hooks"]["UserPromptSubmit"], CLAUDE_PROMPT_COMMAND) == [
+        {"hooks": [{"type": "command", "command": CLAUDE_PROMPT_COMMAND}]}
+    ]
+    assert _managed(codex["hooks"]["UserPromptSubmit"], CODEX_PROMPT_COMMAND) == [
+        {"hooks": [{"type": "command", "command": CODEX_PROMPT_COMMAND}]}
     ]
     for relative in SKILL_TARGETS:
         entry = by_path[home / relative]

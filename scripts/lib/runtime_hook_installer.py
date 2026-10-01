@@ -160,19 +160,21 @@ def _normalize_command(command: object, home: Path) -> str | None:
     return pattern.sub("$HOME", command)
 
 
-def _validated_pre_tool_groups(config: dict[str, object]) -> list[dict[str, object]]:
+def _validated_hook_groups(
+    config: dict[str, object], event: str
+) -> list[dict[str, object]]:
     hooks = config.get("hooks")
     if hooks is None:
         hooks = {}
         config["hooks"] = hooks
     if not isinstance(hooks, dict):
         raise InstallError("hooks must be an object")
-    groups = hooks.get("PreToolUse")
+    groups = hooks.get(event)
     if groups is None:
         groups = []
-        hooks["PreToolUse"] = groups
+        hooks[event] = groups
     if not isinstance(groups, list):
-        raise InstallError("PreToolUse hooks must be a list")
+        raise InstallError(f"{event} hooks must be a list")
     for group in groups:
         if not isinstance(group, dict):
             raise InstallError("hook group must be an object")
@@ -193,19 +195,20 @@ def _validated_pre_tool_groups(config: dict[str, object]) -> list[dict[str, obje
     return groups
 
 
-def merge_pre_tool_hook(
+def _merge_hook(
     original: dict[str, object],
     *,
+    event: str,
     matcher: str | None,
     command: str,
     legacy_commands: Sequence[str],
     home: Path,
 ) -> dict[str, object]:
-    """Add or replace exactly one managed PreToolUse command group."""
+    """Add or replace exactly one managed command group for an event."""
     if not isinstance(original, dict):
         raise InstallError("JSON configuration must be an object")
     merged = deepcopy(original)
-    groups = _validated_pre_tool_groups(merged)
+    groups = _validated_hook_groups(merged, event)
     managed_commands = {
         normalized
         for candidate in (command, *legacy_commands)
@@ -234,6 +237,33 @@ def merge_pre_tool_hook(
     else:
         groups.append(replacement)
     return merged
+
+
+def merge_pre_tool_hook(
+    original: dict[str, object],
+    *,
+    matcher: str | None,
+    command: str,
+    legacy_commands: Sequence[str],
+    home: Path,
+) -> dict[str, object]:
+    return _merge_hook(
+        original, event="PreToolUse", matcher=matcher,
+        command=command, legacy_commands=legacy_commands, home=home,
+    )
+
+
+def merge_user_prompt_hook(
+    original: dict[str, object],
+    *,
+    command: str,
+    legacy_commands: Sequence[str],
+    home: Path,
+) -> dict[str, object]:
+    return _merge_hook(
+        original, event="UserPromptSubmit", matcher=None,
+        command=command, legacy_commands=legacy_commands, home=home,
+    )
 
 
 def _identity(metadata: os.stat_result) -> tuple[int, int, int]:
