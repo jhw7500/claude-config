@@ -108,6 +108,35 @@ def test_skill_encodes_the_exact_ordered_ten_step_state_machine():
     assert "gh pr create" in steps[10]
 
 
+def test_one_request_stops_after_one_round_and_requires_a_new_request_for_followup():
+    skill = text("SKILL.md")
+    steps = numbered_steps(skill)
+    assert "One user request authorizes at most one decision round" in skill
+    assert 'A natural-language request such as "심사해줘"' in skill
+    assert "An explicit `$pre-pr-tribunal` invocation" in skill
+    assert "active reviewer count and names" in steps[3]
+    assert "estimated elapsed-time/cost range" in steps[3]
+    assert "one-round invocation maximum" in steps[3]
+    assert "stop condition" in steps[3]
+    assert "report the blocker IDs" in steps[8]
+    assert "stop immediately: do not fix, commit, run tests for a fix, or call another `begin`" in steps[8]
+    assert "do not obtain evidence or restart automatically" in steps[8]
+    assert "Only after a new explicit user request" in steps[9]
+    assert "A request to fix does not itself authorize re-review" in steps[9]
+    assert "Run targeted regression tests" in steps[9]
+    assert "full test suite at most once" in steps[9]
+    assert "Only after a new explicit user request to re-review" in steps[10]
+    assert "at most one complete A/B/C round" in steps[10]
+    assert "A general \"keep going\" instruction from before the FAIL" in steps[10]
+    assert "at least every 60 seconds" in skill
+    assert "A user stop/cancel request halts new dispatch" in skill
+    assert 're-review-preview --base "$BASE" --runtime "$RUNTIME" --round "$ROUND"' in skill
+    assert "--verdict-sha256 \"<shown verdict_sha256>\"" in skill
+    assert "--binding-sha256 \"<shown binding_sha256>\"" in skill
+    assert "consumed once under the review lock" in skill
+    assert "an intensity grant or earlier general instruction" in skill.lower()
+
+
 def test_skill_limits_terminal_user_override_to_exact_one_shot_contract():
     skill = text("SKILL.md")
     assert "ROUND_LIMIT_EXHAUSTED" in skill

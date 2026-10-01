@@ -131,6 +131,72 @@ def test_matcherless_group_replaces_one_known_legacy_matcher(common_installer):
     }
 
 
+def test_user_prompt_merge_preserves_unrelated_extended_handlers(common_installer):
+    unrelated = [
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "keep-command",
+                    "statusMessage": "Keeping context",
+                    "timeout": 30,
+                    "additionalContextLimit": 1024,
+                    "async": True,
+                }
+            ]
+        },
+        {
+            "hooks": [
+                {
+                    "type": "mcp_tool",
+                    "server": "scanner",
+                    "tool": "inspect",
+                    "input": {"prompt": "${prompt}"},
+                }
+            ]
+        },
+    ]
+    original = {"hooks": {"UserPromptSubmit": unrelated}, "theme": "dark"}
+
+    merged = common_installer.merge_user_prompt_hook(
+        original,
+        command="managed-command",
+        legacy_commands=(),
+        home=Path("/home/test"),
+    )
+
+    assert merged["hooks"]["UserPromptSubmit"] == [
+        *unrelated,
+        {"hooks": [{"type": "command", "command": "managed-command"}]},
+    ]
+    assert merged["theme"] == "dark"
+    assert original == {"hooks": {"UserPromptSubmit": unrelated}, "theme": "dark"}
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        [{"type": "command", "command": "managed-command", "statusMessage": "keep"}],
+        [
+            {"type": "command", "command": "managed-command"},
+            {"type": "mcp_tool", "server": "scanner", "tool": "inspect"},
+        ],
+    ],
+)
+def test_user_prompt_merge_still_rejects_ambiguous_managed_handlers(
+    common_installer, records
+):
+    original = {"hooks": {"UserPromptSubmit": [{"hooks": records}]}}
+
+    with pytest.raises(common_installer.InstallError):
+        common_installer.merge_user_prompt_hook(
+            original,
+            command="managed-command",
+            legacy_commands=(),
+            home=Path("/home/test"),
+        )
+
+
 def test_managed_group_with_unknown_fields_is_rejected(common_installer):
     command = "$HOME/.local/share/claude-config/pre_pr_tribunal/codex_hook.py"
     original = {

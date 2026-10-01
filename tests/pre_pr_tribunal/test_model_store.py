@@ -10,6 +10,7 @@ import sys
 
 import pytest
 
+from pre_pr_tribunal import round_grant
 from pre_pr_tribunal.git_state import DIFF_RECIPE_VERSION, capture_snapshot
 from pre_pr_tribunal.model import (
     SCHEMA_VERSION,
@@ -125,6 +126,21 @@ def write_json(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
     path.chmod(0o600)
     return path
+
+
+def authorize_next_begin(repo, *, runtime="codex", round_number=1, decisions_path=None):
+    """Model a fresh user approval in legacy transition-focused tests."""
+    preview = round_grant.preview_grant_binding(
+        repo, base="master", runtime=runtime, round_number=round_number,
+        decisions_path=decisions_path, now=NOW,
+    )
+    round_grant.record_grant(
+        repo, base="master", runtime=runtime, round_number=round_number,
+        decisions_path=decisions_path,
+        expected_verdict_sha256=preview["verdict_sha256"],
+        expected_binding_sha256=preview["binding_sha256"],
+        reason="Fresh test approval for this transition", channel="relayed", now=NOW,
+    )
 
 
 def report_paths(repo, snapshot, *, round_number=1, overrides=None):
@@ -957,6 +973,7 @@ def finalized_round_two_pass(repo):
     decisions_path = write_json(
         repo / ".review/inbox/round-1/decisions.json", [decision()]
     )
+    authorize_next_begin(repo, round_number=2, decisions_path=decisions_path)
     second = begin_round(
         repo,
         base="master",
@@ -2225,6 +2242,7 @@ def test_complete_reports_pass_and_round_one_restart_resets_pending(git_repo):
     assert final.gate.status.value == "pass"
     assert (git_repo / ".review/verdict.json").stat().st_ino != pending_inode
     assert not tuple((git_repo / ".review").glob(".verdict.tmp.*"))
+    authorize_next_begin(git_repo)
     restarted = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
@@ -2243,6 +2261,7 @@ def test_pass_restart_can_record_another_failure(git_repo, reviewer, failure):
         submit_reviewer_report(git_repo, reviewer=Reviewer(reviewer), raw=b"{", now=NOW)
     report_paths(git_repo, first.snapshot)
     assert finalize_round(git_repo, now=NOW).gate.status.value == "pass"
+    authorize_next_begin(git_repo)
     begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
     if failure == "malformed":
         with pytest.raises(SchemaError, match="^JSON_INVALID$"):
@@ -2260,6 +2279,10 @@ def test_later_pass_can_reuse_every_round_attempt_namespace(git_repo, last_round
     for cycle in range(2):
         decisions_path = None
         for round_number in range(1, last_round + 1):
+            if cycle or round_number > 1:
+                authorize_next_begin(
+                    git_repo, round_number=round_number, decisions_path=decisions_path,
+                )
             pending = begin_round(
                 git_repo, base="master", runtime="codex", round_number=round_number,
                 decisions_path=decisions_path, now=NOW,
@@ -2294,6 +2317,7 @@ def test_restart_rejects_unknown_attempt_target_before_changing_verdict_or_repor
     unknown = git_repo / ".review/attempts/round-1/unknown"
     unknown.write_bytes(b"must remain")
     unknown.chmod(0o600)
+    authorize_next_begin(git_repo)
     protected = [*paths.values(), git_repo / ".review/verdict.json", unknown,
                  git_repo / ".review/attempts/round-1/A/attempt-1.meta.json"]
     before = {path: path.read_bytes() for path in protected}
@@ -2324,6 +2348,7 @@ def test_round_one_replaces_owner_private_readonly_verdict(git_repo):
     verdict_path = git_repo / ".review/verdict.json"
     verdict_path.chmod(0o400)
 
+    authorize_next_begin(git_repo)
     restarted = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
@@ -2339,6 +2364,7 @@ def test_verdict_persistence_failure_keeps_write_failure_code(git_repo, monkeypa
     finalize_round(git_repo, now=NOW)
     verdict_path = git_repo / ".review/verdict.json"
     before = verdict_path.read_bytes()
+    authorize_next_begin(git_repo)
 
     def fail_replace(*args, **kwargs):
         raise OSError("injected replacement failure")
@@ -2367,6 +2393,7 @@ def test_round_restart_invalidates_stale_reports_before_fresh_reports_pass(git_r
         == "pass"
     )
     stale_decisions = write_json(git_repo / ".review/inbox/round-1/decisions.json", [])
+    authorize_next_begin(git_repo)
     restarted = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
@@ -2466,6 +2493,7 @@ def test_failed_legacy_verdict_without_head_ref_migrates_on_next_round(git_repo)
         git_repo / ".review/inbox/round-1/decisions.json", [decision()]
     )
 
+    authorize_next_begin(git_repo, round_number=2, decisions_path=decisions_path)
     second = begin_round(
         git_repo,
         base="master",
@@ -2569,6 +2597,7 @@ def test_independent_decision_numbers_survive_rounds_and_persisted_history(git_r
         git_repo / ".review/inbox/round-1/decisions.json",
         [decision(identifier="D-R1-A-002")],
     )
+    authorize_next_begin(git_repo, round_number=2, decisions_path=first_decision)
     second = begin_round(
         git_repo,
         base="master",
@@ -2609,6 +2638,7 @@ def test_independent_decision_numbers_survive_rounds_and_persisted_history(git_r
     second_decisions_path = write_json(
         git_repo / ".review/inbox/round-2/decisions.json", [second_decision]
     )
+    authorize_next_begin(git_repo, round_number=3, decisions_path=second_decisions_path)
     third = begin_round(
         git_repo,
         base="master",
@@ -2681,6 +2711,7 @@ def test_two_round_originating_reviewer_closure_and_round_limit(git_repo):
     decisions_path = write_json(
         git_repo / ".review/inbox/round-1/decisions.json", [decision()]
     )
+    authorize_next_begin(git_repo, round_number=2, decisions_path=decisions_path)
     second = begin_round(
         git_repo,
         base="master",
@@ -2702,6 +2733,7 @@ def test_two_round_originating_reviewer_closure_and_round_limit(git_repo):
     )
     passed = finalize_round(git_repo, reviewer_paths=second_paths, now=NOW)
     assert passed.gate.status.value == "pass" and len(passed.history) == 1
+    authorize_next_begin(git_repo)
     third = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
@@ -2711,6 +2743,7 @@ def test_two_round_originating_reviewer_closure_and_round_limit(git_repo):
     finalize_round(git_repo, reviewer_paths=paths, now=NOW)
     commit_fix(git_repo)
     d1 = write_json(git_repo / ".review/inbox/round-1/decisions.json", [decision()])
+    authorize_next_begin(git_repo, round_number=2, decisions_path=d1)
     r2 = begin_round(
         git_repo,
         base="master",
@@ -2741,6 +2774,7 @@ def test_two_round_originating_reviewer_closure_and_round_limit(git_repo):
         "executions": [execution("D-R2-E001")],
     }
     d2 = write_json(git_repo / ".review/inbox/round-2/decisions.json", [d2value])
+    authorize_next_begin(git_repo, round_number=3, decisions_path=d2)
     r3 = begin_round(
         git_repo,
         base="master",
@@ -2811,6 +2845,7 @@ def test_only_originating_reviewer_can_close_decision(git_repo, owner_payload, c
     )
     commit_fix(git_repo)
     dpath = write_json(git_repo / ".review/inbox/round-1/decisions.json", [decision()])
+    authorize_next_begin(git_repo, round_number=2, decisions_path=dpath)
     second = begin_round(
         git_repo,
         base="master",
@@ -2971,6 +3006,7 @@ def test_round_three_failure_rejects_round_one_with_exhaustion(git_repo):
     r1_decisions = write_json(
         git_repo / ".review/inbox/round-1/decisions.json", [decision()]
     )
+    authorize_next_begin(git_repo, round_number=2, decisions_path=r1_decisions)
     second = begin_round(
         git_repo,
         base="master",
@@ -3012,6 +3048,7 @@ def test_round_three_failure_rejects_round_one_with_exhaustion(git_repo):
     r2_decisions = write_json(
         git_repo / ".review/inbox/round-2/decisions.json", [r2_decision]
     )
+    authorize_next_begin(git_repo, round_number=3, decisions_path=r2_decisions)
     third = begin_round(
         git_repo,
         base="master",
@@ -3075,6 +3112,7 @@ def test_cli_later_round_context_omits_own_decision_executions(git_repo):
     decisions_path = write_json(
         git_repo / ".review/inbox/round-1/decisions.json", [decision()]
     )
+    authorize_next_begin(git_repo, round_number=2, decisions_path=decisions_path)
     begin_round(
         git_repo,
         base="master",
