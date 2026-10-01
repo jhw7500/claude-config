@@ -155,6 +155,11 @@ def _bounded_text(value: object, maximum: int, code: str) -> str:
 
 
 def intensity_mode(value: int) -> model.ReviewMode:
+    """Map the legacy 0..100 selector to its three actual review modes.
+
+    Values within a band are compatibility scores, not a continuous review-
+    depth control; reviewer selection is configured independently.
+    """
     if value == 0:
         return model.ReviewMode.OFF
     if 1 <= value <= 66:

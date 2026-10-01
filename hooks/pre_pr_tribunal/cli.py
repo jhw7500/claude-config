@@ -44,7 +44,10 @@ if __package__ in {None, ""}:
     )
     from pre_pr_tribunal import telemetry, evidence_runtime, evidence_store, evidence_lifecycle  # type: ignore
     from pre_pr_tribunal import intensity_grant, pr_override_grant  # type: ignore
-    from pre_pr_tribunal.policy import validate_grant_lowering  # type: ignore
+    from pre_pr_tribunal.policy import (  # type: ignore
+        intensity_mode,
+        validate_grant_lowering,
+    )
 else:
     from .model import (
         MAX_REPORT_BYTES,
@@ -74,7 +77,7 @@ else:
     )
     from . import telemetry, evidence_runtime, evidence_store, evidence_lifecycle
     from . import intensity_grant, pr_override_grant
-    from .policy import validate_grant_lowering
+    from .policy import intensity_mode, validate_grant_lowering
 
 
 class _Parser(argparse.ArgumentParser):
@@ -516,13 +519,22 @@ def _intensity_grant(cwd, arguments, *, wall_clock=utc_now):
             cwd, snapshot=snapshot, policy=policy, value=value,
             reason=arguments.reason, now=wall_clock, channel="relayed",
         )
+    requested_mode = intensity_mode(value)
+    floor_mode = intensity_mode(policy.risk_floor)
     sys.stderr.write(
-        "pre-pr-tribunal intensity grant\n"
+        "pre-pr-tribunal review-mode grant\n"
         f"  head {snapshot.head_sha}  base {snapshot.base_ref} {snapshot.base_sha[:12]}\n"
-        f"  floor {policy.risk_floor} ({policy.mode.value})  ->  {value}\n"
+        f"  risk_floor: {policy.risk_floor}  floor mode: {floor_mode.value}\n"
+        f"  current effective_intensity: {policy.effective_intensity}  current mode: {policy.mode.value}\n"
+        f"  proposed effective_intensity: {value}  resulting mode: {requested_mode.value}\n"
+        f"  mode transition from floor: {floor_mode.value} -> {requested_mode.value}\n"
+        "  mapping: 0=off, 1-66=single, 67-100=iterative\n"
+        "  off skips review; single runs one decision round; iterative allows up to three decision rounds\n"
+        "  scores within a mode do not change review depth or reviewer selection\n"
+        "  numeric scores can still affect policy floors and same-snapshot transition checks\n"
         f"  reasons: {', '.join(policy.reasons)}\n"
         f"  changed paths: {len(snapshot.initial_paths)}\n"
-        "Type 'lower' to review this snapshot below its floor: "
+        "Type 'lower' to switch this snapshot below its floor: "
     )
     sys.stderr.flush()
     if sys.stdin.readline().strip() != "lower":

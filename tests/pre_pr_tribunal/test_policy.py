@@ -16,6 +16,7 @@ from pre_pr_tribunal.git_state import (
 from pre_pr_tribunal.model import GateStatus, ReviewMode, Reviewer, SchemaError
 from pre_pr_tribunal.policy import (
     MAX_POLICY_REASONS,
+    intensity_mode,
     parse_intensity_request,
     parse_policy_binding,
 )
@@ -1155,6 +1156,20 @@ def _preview(repo, monkeypatch, capsys, *extra):
 
 
 @pytest.mark.parametrize(
+    ("score", "mode"),
+    (
+        (0, ReviewMode.OFF),
+        (1, ReviewMode.SINGLE),
+        (66, ReviewMode.SINGLE),
+        (67, ReviewMode.ITERATIVE),
+        (100, ReviewMode.ITERATIVE),
+    ),
+)
+def test_compatibility_intensity_scores_map_to_explicit_modes(score, mode):
+    assert intensity_mode(score) is mode
+
+
+@pytest.mark.parametrize(
     ("path", "mode"),
     (
         ("docs/guide.md", ReviewMode.OFF),
@@ -1174,6 +1189,9 @@ def test_policy_preview_matches_begin_without_creating_review_state(
     assert payload["begin_admissible"] == "not-evaluated"
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     assert verdict.policy.mode is mode
+    assert payload["policy"]["risk_floor"] == verdict.policy.risk_floor
+    assert payload["policy"]["effective_intensity"] == verdict.policy.effective_intensity
+    assert payload["policy"]["mode"] == verdict.policy.mode.value
     assert payload["policy"] == verdict.policy.to_json()
     assert payload["active_reviewers"] == list(verdict.policy.active_reviewers)
     assert payload["snapshot"]["head_sha"] == verdict.head_sha
@@ -1195,6 +1213,9 @@ def test_policy_preview_passes_the_same_intensity_request_as_begin(
         intensity_reason=["wider review"],
     )
     assert verdict.policy.mode is ReviewMode.ITERATIVE
+    assert payload["policy"]["risk_floor"] == 50
+    assert payload["policy"]["effective_intensity"] == 100
+    assert payload["policy"]["mode"] == "iterative"
     assert payload["policy"] == verdict.policy.to_json()
 
 
@@ -1206,7 +1227,10 @@ def test_policy_preview_leaves_existing_review_state_byte_identical(
     repo = _repo(tmp_path)
     monkeypatch.chdir(repo)
     assert main(["begin", "--base", "master", "--runtime", "codex", "--round", "1"]) == 0
-    capsys.readouterr()
+    begin_payload = json.loads(capsys.readouterr().out)
+    assert begin_payload["policy"]["risk_floor"] == 50
+    assert begin_payload["policy"]["effective_intensity"] == 50
+    assert begin_payload["policy"]["mode"] == "single"
     before = _review_tree_digest(repo)
     assert before is not None
     assert (repo / ".review" / "telemetry.json").is_file()
@@ -1367,11 +1391,32 @@ def test_intensity_grant_cli_records_only_after_typed_confirmation(
 
     monkeypatch.setattr(_sys, "stdin", _FakeTty(["lower\n"]))
     assert main(arguments) == 0
-    capsys.readouterr()
+    grant_prompt = capsys.readouterr().err
+    assert "risk_floor: 100  floor mode: iterative" in grant_prompt
+    assert "current effective_intensity: 100  current mode: iterative" in grant_prompt
+    assert "proposed effective_intensity: 50  resulting mode: single" in grant_prompt
+    assert "mode transition from floor: iterative -> single" in grant_prompt
+    assert "0=off, 1-66=single, 67-100=iterative" in grant_prompt
+    assert "off skips review" in grant_prompt
+    assert "single runs one decision round" in grant_prompt
+    assert "iterative allows up to three decision rounds" in grant_prompt
+    assert "scores within a mode do not change review depth or reviewer selection" in grant_prompt
+    assert "numeric scores can still affect policy floors" in grant_prompt
     assert ((repo / ".review" / "intensity-grant.json").stat().st_mode & 0o777) == 0o600
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     assert verdict.policy.request.source == "human_grant"
     assert verdict.policy.effective_intensity == 50
+
+
+def test_relayed_grant_instruction_explains_each_mode_before_choice():
+    skill = (
+        Path(__file__).resolve().parents[2] / "skills/pre-pr-tribunal/SKILL.md"
+    ).read_text(encoding="utf-8")
+    question_instruction = skill.split("4. Generate one projection", 1)[0]
+    assert "Before presenting any lower-mode choice" in question_instruction
+    assert "`off` skips review" in question_instruction
+    assert "`single` runs one decision round" in question_instruction
+    assert "`iterative` allows up to three decision rounds" in question_instruction
 
 
 @pytest.mark.parametrize(
