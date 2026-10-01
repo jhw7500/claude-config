@@ -49,6 +49,7 @@ PACKAGE_NAMES = (
     "pr_override_grant.py",
     "review_context.py",
     "review_store.py",
+    "round_grant.py",
     "shell_scan.py",
     "telemetry.py",
     "verdict_store.py",
