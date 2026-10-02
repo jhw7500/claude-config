@@ -34,9 +34,11 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 6
+REPORT_TEXT_CONTRACT_VERSION = 7
 REFUTED_CLAIM_BLOCKER_CONTRACT_VERSION = 5
 REVIEWER_B_BUDGET_CONTRACT_VERSION = 6
+REVERSAL_COST_CONTRACT_VERSION = 6
+REQUIRED_REVERSAL_COST_CONTRACT_VERSION = 7
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -202,9 +204,10 @@ class Finding:
     line: int | None
     execution_ids: Sequence[str]
     acceptance_condition: str
+    reversal_cost: str | None = None
 
     def to_json(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "id": self.id,
             "reviewer": self.reviewer.value,
             "severity": self.severity.value,
@@ -215,6 +218,9 @@ class Finding:
             "execution_ids": list(self.execution_ids),
             "acceptance_condition": self.acceptance_condition,
         }
+        if self.reversal_cost is not None:
+            value["reversal_cost"] = self.reversal_cost
+        return value
 
 
 @dataclass(frozen=True)
@@ -1107,20 +1113,33 @@ def _parse_execution(
     return Execution(identifier, command, exit_code, stdout, stderr, capture, truncated, reference)
 
 
-def _parse_finding(value: object, *, reviewer: Reviewer, round_number: int) -> Finding:
+def _parse_finding(
+    value: object,
+    *,
+    reviewer: Reviewer,
+    round_number: int,
+    report_contract_version: int,
+) -> Finding:
+    keys = {
+        "id",
+        "reviewer",
+        "severity",
+        "title",
+        "rationale",
+        "path",
+        "line",
+        "execution_ids",
+        "acceptance_condition",
+    }
+    if report_contract_version >= REQUIRED_REVERSAL_COST_CONTRACT_VERSION or (
+        report_contract_version >= REVERSAL_COST_CONTRACT_VERSION
+        and isinstance(value, dict)
+        and "reversal_cost" in value
+    ):
+        keys.add("reversal_cost")
     obj = _object(
         value,
-        {
-            "id",
-            "reviewer",
-            "severity",
-            "title",
-            "rationale",
-            "path",
-            "line",
-            "execution_ids",
-            "acceptance_condition",
-        },
+        keys,
         "FINDING_SCHEMA_INVALID",
     )
     identifier = obj["id"]
@@ -1155,6 +1174,16 @@ def _parse_finding(value: object, *, reviewer: Reviewer, round_number: int) -> F
             raise SchemaError("EXECUTION_REFERENCE_INVALID")
         refs.append(ref)
     acceptance = _text(obj["acceptance_condition"], MAX_EVIDENCE_TEXT_BYTES)
+    reversal_cost = None
+    if "reversal_cost" in obj:
+        reversal_cost = _text(
+            obj["reversal_cost"], MAX_EVIDENCE_TEXT_BYTES, allow_empty=True
+        )
+        if (
+            severity in (Severity.HIGH, Severity.CRITICAL)
+            and not reversal_cost.strip()
+        ):
+            raise SchemaError("FINDING_SCHEMA_INVALID")
     return Finding(
         identifier,
         reviewer,
@@ -1165,6 +1194,7 @@ def _parse_finding(value: object, *, reviewer: Reviewer, round_number: int) -> F
         line_value,
         tuple(refs),
         acceptance,
+        reversal_cost,
     )
 
 
@@ -1327,7 +1357,10 @@ def parse_reviewer_report(
     if len(execution_ids) != len(set(execution_ids)):
         raise SchemaError("EXECUTION_ID_DUPLICATE")
     findings = tuple(
-        _parse_finding(item, reviewer=expected_reviewer, round_number=expected_round)
+        _parse_finding(
+            item, reviewer=expected_reviewer, round_number=expected_round,
+            report_contract_version=report_contract_version,
+        )
         for item in _array(
             obj["findings"], MAX_FINDINGS_PER_REVIEWER, "FINDING_LIMIT_EXCEEDED"
         )

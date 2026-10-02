@@ -73,6 +73,7 @@ def _finding(identifier: str) -> dict[str, object]:
         "line": 1,
         "execution_ids": [],
         "acceptance_condition": "The invalid state is rejected.",
+        "reversal_cost": "After merge, affected deployments require rollback.",
     }
 
 
