@@ -49,6 +49,7 @@ PACKAGE_NAMES = (
     "pr_override_grant.py",
     "review_context.py",
     "review_store.py",
+    "round_grant.py",
     "shell_scan.py",
     "telemetry.py",
     "verdict_store.py",
@@ -599,6 +600,51 @@ def test_merge_preserves_unrelated_top_level_keys_groups_and_order(installer, ho
     assert merged_claude["hooks"]["PreToolUse"][0] == unrelated
     assert list(merged_codex) == ["first", "hooks", "last"]
     assert merged_codex["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "keep-codex"
+
+
+def test_build_plan_preserves_unrelated_user_prompt_handlers(installer, home):
+    claude_path = home / ".claude/settings.json"
+    codex_path = home / ".codex/hooks.json"
+    claude_path.parent.mkdir()
+    codex_path.parent.mkdir()
+    claude_group = {
+        "hooks": [
+            {
+                "type": "command",
+                "command": "keep-claude",
+                "statusMessage": "Keeping context",
+                "timeout": 30,
+            }
+        ]
+    }
+    codex_group = {
+        "hooks": [
+            {
+                "type": "mcp_tool",
+                "server": "scanner",
+                "tool": "inspect",
+                "input": {"prompt": "${prompt}"},
+            }
+        ]
+    }
+    claude_path.write_text(
+        json.dumps({"hooks": {"UserPromptSubmit": [claude_group]}}), encoding="utf-8"
+    )
+    codex_path.write_text(
+        json.dumps({"hooks": {"UserPromptSubmit": [codex_group]}}), encoding="utf-8"
+    )
+
+    plans = {entry.path: entry for entry in installer.build_plan(REPO, home)}
+    claude_groups = json.loads(plans[claude_path].data)["hooks"]["UserPromptSubmit"]
+    codex_groups = json.loads(plans[codex_path].data)["hooks"]["UserPromptSubmit"]
+    assert claude_groups == [
+        claude_group,
+        {"hooks": [{"type": "command", "command": CLAUDE_PROMPT_COMMAND}]},
+    ]
+    assert codex_groups == [
+        codex_group,
+        {"hooks": [{"type": "command", "command": CODEX_PROMPT_COMMAND}]},
+    ]
 
 
 @pytest.mark.parametrize(

@@ -431,6 +431,9 @@ vs Read 646회 (2026-08-24 /insights, 75세션). 위임은 사망 빈도 자체�
 Tribunal을 실행한다면 policy-preview 뒤 활성 reviewer·intensity/mode·예상 소요 범위·한 요청당
 최대 1라운드·중단 조건을 먼저 알린다. FAIL/INCONCLUSIVE 뒤에는 결과를 보고하고 멈춘다.
 수정·커밋·재심사는 결과를 본 사용자의 새로운 명시적 요청이 각각 허용한 범위에서만 한다.
+종료된 verdict 뒤 새 `begin`은 이전 verdict와 목표 스냅샷에 결합된 일회성
+`re-review-grant`도 필요하다. 새 요청을 확인하고 `re-review-preview`의 결합 정보를
+보여 준 뒤 승인 답변을 기록하며, 이전 intensity 승인으로 대체하지 않는다.
 이전의 "끝까지"/연속 실행 지시는 이 중단 경계를 넘지 않는다. 긴 단계는 상태와 누적 시간을
 60초 이내 간격으로 알리고, 취소 요청 시 신규 작업을 시작하지 않은 채 진행 중인 reviewer의
 상태와 증거를 보존한다.

@@ -43,7 +43,7 @@ if __package__ in {None, ""}:
         validate_stored_reviewer_report,
     )
     from pre_pr_tribunal import telemetry, evidence_runtime, evidence_store, evidence_lifecycle  # type: ignore
-    from pre_pr_tribunal import intensity_grant, pr_override_grant  # type: ignore
+    from pre_pr_tribunal import intensity_grant, pr_override_grant, round_grant  # type: ignore
     from pre_pr_tribunal.policy import (  # type: ignore
         intensity_mode,
         validate_grant_lowering,
@@ -76,7 +76,7 @@ else:
         validate_stored_reviewer_report,
     )
     from . import telemetry, evidence_runtime, evidence_store, evidence_lifecycle
-    from . import intensity_grant, pr_override_grant
+    from . import intensity_grant, pr_override_grant, round_grant
     from .policy import intensity_mode, validate_grant_lowering
 
 
@@ -148,6 +148,29 @@ def _parser() -> argparse.ArgumentParser:
     override_preview.add_argument(
         "--runtime", required=True, choices=("claude", "codex")
     )
+    re_review_preview = commands.add_parser("re-review-preview", add_help=False)
+    re_review_preview.add_argument("--base", required=True)
+    re_review_preview.add_argument("--runtime", required=True, choices=("claude", "codex"))
+    re_review_preview.add_argument("--round", required=True, type=int, choices=(1, 2, 3))
+    re_review_preview.add_argument("--decisions", type=Path)
+    re_review_preview.add_argument("--evidence-bundle")
+    re_review_preview.add_argument("--intensity", action="append")
+    re_review_preview.add_argument("--intensity-requester", action="append")
+    re_review_preview.add_argument("--intensity-reason", action="append")
+    re_review_grant = commands.add_parser("re-review-grant", add_help=False)
+    re_review_grant.add_argument("--base")
+    re_review_grant.add_argument("--runtime", choices=("claude", "codex"))
+    re_review_grant.add_argument("--round", type=int, choices=(1, 2, 3))
+    re_review_grant.add_argument("--decisions", type=Path)
+    re_review_grant.add_argument("--evidence-bundle")
+    re_review_grant.add_argument("--intensity", action="append")
+    re_review_grant.add_argument("--intensity-requester", action="append")
+    re_review_grant.add_argument("--intensity-reason", action="append")
+    re_review_grant.add_argument("--verdict-sha256")
+    re_review_grant.add_argument("--binding-sha256")
+    re_review_grant.add_argument("--reason")
+    re_review_grant.add_argument("--relayed", action="store_true")
+    re_review_grant.add_argument("--revoke", action="store_true")
     context = commands.add_parser("context", add_help=False)
     context.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     submit = commands.add_parser("submit-report", add_help=False)
@@ -591,6 +614,91 @@ def _pr_override_grant(cwd, arguments, *, wall_clock=utc_now):
     )
 
 
+def _re_review_grant(cwd, arguments, *, wall_clock=utc_now):
+    if arguments.revoke:
+        if any(
+            value is not None
+            for value in (
+                arguments.base, arguments.runtime, arguments.round,
+                arguments.decisions, arguments.verdict_sha256,
+                arguments.binding_sha256, arguments.reason,
+                arguments.evidence_bundle,
+                arguments.intensity, arguments.intensity_requester,
+                arguments.intensity_reason,
+            )
+        ) or arguments.relayed:
+            raise TribunalError("RE_REVIEW_GRANT_INVALID")
+        return {"revoked": round_grant.revoke_grant(cwd)}
+    if (
+        arguments.base is None
+        or arguments.runtime is None
+        or arguments.round is None
+        or arguments.reason is None
+    ):
+        raise TribunalError("RE_REVIEW_GRANT_INVALID")
+    if not arguments.relayed and not sys.stdin.isatty():
+        raise TribunalError("RE_REVIEW_GRANT_TTY_REQUIRED")
+    if arguments.relayed:
+        if (
+            arguments.verdict_sha256 is None
+            or arguments.binding_sha256 is None
+        ):
+            raise TribunalError("RE_REVIEW_GRANT_INVALID")
+        expected_verdict = arguments.verdict_sha256
+        expected_binding = arguments.binding_sha256
+    else:
+        if (
+            arguments.verdict_sha256 is not None
+            or arguments.binding_sha256 is not None
+        ):
+            raise TribunalError("RE_REVIEW_GRANT_INVALID")
+        binding = round_grant.preview_grant_binding(
+            cwd, base=arguments.base, runtime=arguments.runtime,
+            round_number=arguments.round, decisions_path=arguments.decisions,
+            intensity_values=arguments.intensity,
+            intensity_requester=arguments.intensity_requester,
+            intensity_reason=arguments.intensity_reason,
+            evidence_bundle_sha256=arguments.evidence_bundle,
+            now=wall_clock,
+        )
+        target = binding["target"]
+        policy = target["policy"]
+        sys.stderr.write(
+            "pre-pr-tribunal one-shot re-review approval\n"
+            f"  prior verdict {binding['verdict_sha256']}\n"
+            f"  binding {binding['binding_sha256']}\n"
+            f"  target head {target['head_sha']}  diff {target['diff_sha256']}\n"
+            f"  target round {target['round']}  runtime {target['runtime']}\n"
+            f"  mode {policy['mode']}  intensity {policy['effective_intensity']}\n"
+            f"  reviewers {','.join(target['active_reviewers']) or 'none'}\n"
+            f"  decisions {target['decisions_sha256'] or 'none'}\n"
+            "  evidence "
+            f"{json.dumps(target['evidence'], ensure_ascii=False, separators=(',', ':'), sort_keys=True)}\n"
+            "Type 're-review' to allow this exact begin once: "
+        )
+        sys.stderr.flush()
+        if sys.stdin.readline().strip() != "re-review":
+            raise TribunalError("RE_REVIEW_CONFIRMATION_MISMATCH")
+        expected_verdict = binding["verdict_sha256"]
+        expected_binding = binding["binding_sha256"]
+    return round_grant.record_grant(
+        cwd,
+        base=arguments.base,
+        runtime=arguments.runtime,
+        round_number=arguments.round,
+        decisions_path=arguments.decisions,
+        intensity_values=arguments.intensity,
+        intensity_requester=arguments.intensity_requester,
+        intensity_reason=arguments.intensity_reason,
+        evidence_bundle_sha256=arguments.evidence_bundle,
+        expected_verdict_sha256=expected_verdict,
+        expected_binding_sha256=expected_binding,
+        reason=arguments.reason,
+        channel="relayed" if arguments.relayed else "tty",
+        now=wall_clock,
+    )
+
+
 def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns) -> int:
     parser = _parser()
     arguments = parser.parse_args(argv)
@@ -674,6 +782,18 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
             payload = pr_override_grant.preview_grant_binding(
                 cwd, runtime=arguments.runtime
             )
+        elif arguments.command == "re-review-preview":
+            payload = round_grant.preview_grant_binding(
+                cwd, base=arguments.base, runtime=arguments.runtime,
+                round_number=arguments.round, decisions_path=arguments.decisions,
+                intensity_values=arguments.intensity,
+                intensity_requester=arguments.intensity_requester,
+                intensity_reason=arguments.intensity_reason,
+                evidence_bundle_sha256=arguments.evidence_bundle,
+                now=wall_clock,
+            )
+        elif arguments.command == "re-review-grant":
+            payload = _re_review_grant(cwd, arguments, wall_clock=wall_clock)
         elif arguments.command.startswith("telemetry-"):
             payload = _telemetry_command(cwd, arguments, wall_clock=wall_clock, monotonic_ns=monotonic_ns)
         elif arguments.command == "context":

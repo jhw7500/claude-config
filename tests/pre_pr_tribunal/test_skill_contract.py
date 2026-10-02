@@ -130,6 +130,11 @@ def test_one_request_stops_after_one_round_and_requires_a_new_request_for_follow
     assert "A general \"keep going\" instruction from before the FAIL" in steps[10]
     assert "at least every 60 seconds" in skill
     assert "A user stop/cancel request halts new dispatch" in skill
+    assert 're-review-preview --base "$BASE" --runtime "$RUNTIME" --round "$ROUND"' in skill
+    assert "--verdict-sha256 \"<shown verdict_sha256>\"" in skill
+    assert "--binding-sha256 \"<shown binding_sha256>\"" in skill
+    assert "consumed once under the review lock" in skill
+    assert "an intensity grant or earlier general instruction" in skill.lower()
 
 
 def test_skill_limits_terminal_user_override_to_exact_one_shot_contract():
