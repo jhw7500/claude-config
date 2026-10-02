@@ -16,6 +16,7 @@ from pre_pr_tribunal.model import (
     RoundSummary,
     SchemaError,
     parse_reviewer_report,
+    reviewer_b_budget,
 )
 from pre_pr_tribunal.review_context import (
     context_sha256,
@@ -144,6 +145,19 @@ def test_context_digest_is_over_canonical_body_and_is_stable(git_repo):
         "context_sha256": hashlib.sha256(canonical).hexdigest(),
     }
     assert context_sha256(pending_verdict, Reviewer.A) == envelope["context_sha256"]
+
+
+def test_reviewer_b_context_uses_snapshot_risk_budget_not_intensity(git_repo):
+    pending = _current_pending(git_repo)
+    for floor in (50, 100):
+        adjusted = replace(pending, policy=replace(pending.policy, risk_floor=floor))
+        body = reviewer_context_body(adjusted, Reviewer.B)
+        assert body["review_budget"] == reviewer_b_budget(floor)
+        assert "review_budget" not in reviewer_context_body(adjusted, Reviewer.A)
+        changed_intensity = replace(
+            adjusted, policy=replace(adjusted.policy, effective_intensity=100)
+        )
+        assert reviewer_context_body(changed_intensity, Reviewer.B)["review_budget"] == body["review_budget"]
 
 
 def test_sealing_peer_does_not_change_pending_reviewer_context(git_repo):

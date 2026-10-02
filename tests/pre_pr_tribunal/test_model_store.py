@@ -25,6 +25,8 @@ from pre_pr_tribunal.model import (
     SchemaError,
     parse_decisions,
     parse_reviewer_report,
+    reviewer_b_budget,
+    validate_reviewer_b_budget,
     validate_report_bytes,
 )
 from pre_pr_tribunal.verdict_store import (
@@ -33,6 +35,7 @@ from pre_pr_tribunal.verdict_store import (
     read_verdict,
     require_current_in_progress,
     store_reviewer_report,
+    submit_reviewer_report,
     validate_stored_reviewer_report,
 )
 from pre_pr_tribunal.review_context import context_sha256, current_contract_binding
@@ -1642,6 +1645,119 @@ def test_reviewer_b_claims_and_behavioral_findings_require_execution(snapshot):
         snapshot=snapshot,
     )
     assert parsed.claims[0].result == "unverified"
+
+
+def test_reviewer_b_budget_preserves_terminal_unverified_claims(snapshot):
+    assert reviewer_b_budget(50) == {
+        "profile": "ordinary", "verified_claims": 10, "fresh_executions": 8,
+        "soft_seconds": 270, "hard_seconds": 300,
+    }
+    assert reviewer_b_budget(100) == {
+        "profile": "high-risk", "verified_claims": 16, "fresh_executions": 12,
+        "soft_seconds": 480, "hard_seconds": 600,
+    }
+    assert reviewer_b_budget(75) == reviewer_b_budget(100)
+    one_execution = execution("B-R1-E001")
+    claims = [
+        {
+            "id": f"B-R1-C{index:03d}",
+            "statement": f"Required behavior {index} is safe.",
+            "result": "supported",
+            "execution_ids": ["B-R1-E001"],
+            "reason": "",
+        }
+        for index in range(1, 12)
+    ]
+    raw = report(snapshot, "B", claims=claims, executions=[one_execution])
+    parsed = parse_reviewer_report(
+        json.dumps(raw).encode(), expected_reviewer=Reviewer.B,
+        expected_round=1, snapshot=snapshot,
+    )
+    with pytest.raises(SchemaError, match="REVIEW_BUDGET_EXCEEDED"):
+        validate_reviewer_b_budget(parsed, 50)
+    validate_reviewer_b_budget(parsed, 100)
+
+    for claim in claims[10:]:
+        claim.update(result="unverified", execution_ids=[],
+                     reason="BUDGET_EXHAUSTED: verified-claim cap")
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "B", claims=claims, executions=[one_execution])).encode(),
+        expected_reviewer=Reviewer.B, expected_round=1, snapshot=snapshot,
+    )
+    validate_reviewer_b_budget(parsed, 50)
+    assert parsed.claims[-1].result == "unverified"
+
+
+def test_reviewer_b_budget_counts_only_fresh_executions(snapshot):
+    evidence = [execution(f"B-R1-E{index:03d}") for index in range(1, 14)]
+    claim = {
+        "id": "B-R1-C001", "statement": "Required behavior is safe.",
+        "result": "supported", "execution_ids": ["B-R1-E001"], "reason": "",
+    }
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "B", claims=[claim], executions=evidence)).encode(),
+        expected_reviewer=Reviewer.B, expected_round=1, snapshot=snapshot,
+    )
+    with pytest.raises(SchemaError, match="REVIEW_BUDGET_EXCEEDED"):
+        validate_reviewer_b_budget(parsed, 100)
+
+
+def test_ordinary_budget_admits_measured_evidence_reuse_shape(snapshot):
+    # The #113 normal bundle arm reported nine supported claims, one
+    # unverified claim, and eight fresh executions; this is a shape canary,
+    # not a replay of that native review or its elapsed time.
+    executions = [execution(f"B-R1-E{index:03d}") for index in range(1, 9)]
+    claims = [
+        {
+            "id": f"B-R1-C{index:03d}",
+            "statement": f"Required behavior {index} is safe.",
+            "result": "supported",
+            "execution_ids": [f"B-R1-E{min(index, 8):03d}"],
+            "reason": "",
+        }
+        for index in range(1, 10)
+    ]
+    claims.append({
+        "id": "B-R1-C010", "statement": "Every lockfile change is necessary.",
+        "result": "unverified", "execution_ids": [],
+        "reason": "Necessity is not proven by executable evidence.",
+    })
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "B", claims=claims, executions=executions)).encode(),
+        expected_reviewer=Reviewer.B, expected_round=1, snapshot=snapshot,
+    )
+    validate_reviewer_b_budget(parsed, 50)
+
+
+def test_submit_rejects_over_budget_but_seals_terminal_budget_report(git_repo):
+    pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert pending.policy.risk_floor == 100
+    evidence = execution("B-R1-E001")
+    claims = [
+        {
+            "id": f"B-R1-C{index:03d}",
+            "statement": f"Required behavior {index} is safe.",
+            "result": "supported",
+            "execution_ids": ["B-R1-E001"],
+            "reason": "",
+        }
+        for index in range(1, 18)
+    ]
+    value = report(pending.snapshot, "B", claims=claims, executions=[evidence])
+    with pytest.raises(SchemaError, match="REVIEW_BUDGET_EXCEEDED"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=json.dumps(value).encode(), now=NOW)
+    pending_slot = read_verdict(git_repo).reviewers["B"]
+    assert pending_slot.status == "pending"
+    assert pending_slot.last_error == "REVIEW_BUDGET_EXCEEDED"
+
+    claims[-1].update(result="unverified", execution_ids=[],
+                      reason="BUDGET_EXHAUSTED: verified-claim cap")
+    value = report(pending.snapshot, "B", claims=claims, executions=[evidence])
+    receipt = submit_reviewer_report(
+        git_repo, reviewer=Reviewer.B, raw=json.dumps(value).encode(), now=NOW,
+    )
+    assert receipt.report_contract_version == REPORT_TEXT_CONTRACT_VERSION
+    assert read_verdict(git_repo).reviewers["B"].status == "sealed"
 
 
 def test_non_scalar_schema_enums_fail_as_bounded_schema_errors(snapshot):

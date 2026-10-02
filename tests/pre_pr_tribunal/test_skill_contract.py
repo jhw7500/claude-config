@@ -822,6 +822,37 @@ def test_empirical_reviewer_forbids_unsupported_claims_and_requires_capture_fiel
         assert token in reviewer
 
 
+def test_reviewer_b_selects_required_claims_and_returns_terminal_budget_report():
+    reviewer = text("references/reviewer-b.md")
+    ordered_sources = (
+        "issue or approved completion conditions",
+        "externally observable behavior",
+        "security, data loss, permission",
+        "quantitative outcome claims",
+    )
+    positions = [reviewer.index(source) for source in ordered_sources]
+    assert positions == sorted(positions)
+    for token in (
+        "review_budget", "risk floor", "not the user's 0/50/100 intensity",
+        "evidence-bundle", "BUDGET_EXHAUSTED:", "status: \"complete\"",
+        "coverage.complete: true", "VERIFICATION_INCOMPLETE",
+        "REVIEW_BUDGET_EXCEEDED",
+    ):
+        assert token in reviewer
+
+    example = json_example(reviewer, "standalone-complete-report")
+    example["executions"] = []
+    example["claims"][0].update(
+        result="unverified", execution_ids=[],
+        reason="BUDGET_EXHAUSTED: fresh-execution cap",
+    )
+    parsed = parse_reviewer_report(
+        json.dumps(example).encode(), expected_reviewer=Reviewer.B,
+        expected_round=1, snapshot=SNAPSHOT,
+    )
+    assert parsed.claims[0].result == "unverified"
+
+
 def test_documented_report_and_decision_examples_pass_the_real_strict_parsers():
     schema = text("references/report-schema.md")
     for label, reviewer in (

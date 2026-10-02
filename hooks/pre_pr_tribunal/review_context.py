@@ -19,6 +19,7 @@ from .model import (
     Reviewer,
     SchemaError,
     Verdict,
+    reviewer_b_budget,
 )
 
 
@@ -96,6 +97,8 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
             "effective_intensity": verdict.policy.effective_intensity,
             "model": selected.model,
         }
+        if reviewer is Reviewer.B:
+            body["review_budget"] = reviewer_b_budget(verdict.policy.risk_floor)
     if (reviewer is Reviewer.B and verdict.schema == VERDICT_SCHEMA_VERSION
         and (verdict.evidence_binding is not None or verdict.evidence_fallback_reason is not None)):
         body['evidence'] = verdict.evidence_binding.to_json() if verdict.evidence_binding else None

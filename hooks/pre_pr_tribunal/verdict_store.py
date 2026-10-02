@@ -1551,6 +1551,12 @@ def _validate_reviewer_closure(
     verdict: Verdict, report: ReviewerReport, *, seen_replacements: set[str] | None = None,
 ) -> None:
     """Check only this role's responses before accepting its immutable report."""
+    if (
+        verdict.contract is not None
+        and verdict.contract.report_text >= m.REVIEWER_B_BUDGET_CONTRACT_VERSION
+        and verdict.policy is not None
+    ):
+        m.validate_reviewer_b_budget(report, verdict.policy.risk_floor)
     decisions = {
         item.id: item for item in verdict.decisions if item.reviewer is report.reviewer
     }

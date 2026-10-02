@@ -7,7 +7,7 @@ from enum import Enum
 import hashlib
 import json
 import re
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, TypedDict
 import unicodedata
 from urllib.parse import urlsplit
 
@@ -34,8 +34,9 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 5
+REPORT_TEXT_CONTRACT_VERSION = 6
 REFUTED_CLAIM_BLOCKER_CONTRACT_VERSION = 5
+REVIEWER_B_BUDGET_CONTRACT_VERSION = 6
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -294,6 +295,45 @@ class ReviewerReport:
         if self.coverage is not None:
             value["coverage"] = self.coverage.to_json()
         return value
+
+
+class ReviewerBBudget(TypedDict):
+    profile: str
+    verified_claims: int
+    fresh_executions: int
+    soft_seconds: int
+    hard_seconds: int
+
+
+def reviewer_b_budget(risk_floor: int) -> ReviewerBBudget:
+    """Bound B by snapshot risk, independently of requested intensity."""
+    if type(risk_floor) is not int or not 0 <= risk_floor <= 100:
+        raise SchemaError("POLICY_INVALID")
+    if risk_floor >= 67:
+        return {
+            "profile": "high-risk",
+            "verified_claims": 16,
+            "fresh_executions": 12,
+            "soft_seconds": 480,
+            "hard_seconds": 600,
+        }
+    return {
+        "profile": "ordinary",
+        "verified_claims": 10,
+        "fresh_executions": 8,
+        "soft_seconds": 270,
+        "hard_seconds": 300,
+    }
+
+
+def validate_reviewer_b_budget(report: ReviewerReport, risk_floor: int) -> None:
+    if report.reviewer is not Reviewer.B:
+        return
+    budget = reviewer_b_budget(risk_floor)
+    verified = sum(claim.result != "unverified" for claim in report.claims)
+    fresh = sum(execution.evidence_ref is None for execution in report.executions)
+    if verified > budget["verified_claims"] or fresh > budget["fresh_executions"]:
+        raise SchemaError("REVIEW_BUDGET_EXCEEDED")
 
 
 @dataclass(frozen=True)
