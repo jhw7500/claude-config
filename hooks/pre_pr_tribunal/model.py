@@ -330,9 +330,28 @@ def validate_reviewer_b_budget(report: ReviewerReport, risk_floor: int) -> None:
     if report.reviewer is not Reviewer.B:
         return
     budget = reviewer_b_budget(risk_floor)
-    verified = sum(claim.result != "unverified" for claim in report.claims)
-    fresh = sum(execution.evidence_ref is None for execution in report.executions)
-    if verified > budget["verified_claims"] or fresh > budget["fresh_executions"]:
+    blocker_execution_ids = {
+        execution_id
+        for claim in report.claims
+        if claim.result == "refuted"
+        for execution_id in claim.execution_ids
+    }
+    blocker_execution_ids.update(
+        execution_id
+        for finding in report.findings
+        if finding.severity in {Severity.CRITICAL, Severity.HIGH}
+        for execution_id in finding.execution_ids
+    )
+    supported = sum(claim.result == "supported" for claim in report.claims)
+    fresh_non_blocking = sum(
+        execution.evidence_ref is None
+        and execution.id not in blocker_execution_ids
+        for execution in report.executions
+    )
+    if (
+        supported > budget["verified_claims"]
+        or fresh_non_blocking > budget["fresh_executions"]
+    ):
         raise SchemaError("REVIEW_BUDGET_EXCEEDED")
 
 

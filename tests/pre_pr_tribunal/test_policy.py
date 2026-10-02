@@ -725,6 +725,59 @@ def test_high_risk_budget_exhaustion_preserves_refuted_blocker(tmp_path):
     assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.BLOCKERS_OPEN
 
 
+def test_high_risk_budget_keeps_independent_refuted_blockers(tmp_path):
+    repo = _repo(tmp_path, path="config/security.yaml")
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.risk_floor == 100
+    submit_reviewer_report(repo, reviewer=Reviewer.A, raw=_report(verdict, "A"), now=NOW)
+
+    executions = []
+    claims = []
+    findings = []
+    for index in range(1, 18):
+        execution_id = f"B-R1-E{index:03d}"
+        claim_id = f"B-R1-C{index:03d}"
+        finding_id = f"B-R1-{index:03d}"
+        evidence = _execution(execution_id)
+        evidence.update(
+            exit_code=1,
+            stdout_excerpt="refuted",
+            capture_sha256=hashlib.sha256(b"refuted").hexdigest(),
+        )
+        executions.append(evidence)
+        claims.append({
+            "id": claim_id,
+            "statement": f"Required behavior {index} remains safe.",
+            "result": "refuted",
+            "execution_ids": [execution_id],
+            "reason": "",
+        })
+        finding = _finding(finding_id, "B", severity="HIGH")
+        finding.update(path="config/security.yaml", execution_ids=[execution_id])
+        findings.append(finding)
+
+    raw = _report(
+        verdict,
+        "B",
+        findings=findings,
+        executions=executions,
+        claims=claims,
+        coverage={
+            "complete": True,
+            "primary_entry_paths": [
+                {"path": "config/security.yaml", "claim_id": "B-R1-C001"},
+            ],
+        },
+    )
+    receipt = submit_reviewer_report(repo, reviewer=Reviewer.B, raw=raw, now=NOW)
+    assert receipt.raw_sha256 == hashlib.sha256(raw).hexdigest()
+
+    final = finalize_round(repo, now=NOW)
+    assert final.gate.status is GateStatus.FAIL
+    assert final.gate.blocking_count == 17
+    assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.BLOCKERS_OPEN
+
+
 def test_inconclusive_restart_cannot_lower_same_snapshot_intensity(tmp_path):
     repo = _repo(tmp_path, path="docs/guide.md")
     verdict = begin_round(

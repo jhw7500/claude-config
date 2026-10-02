@@ -1719,6 +1719,39 @@ def test_reviewer_b_budget_counts_only_fresh_executions(snapshot):
         validate_reviewer_b_budget(parsed, 100)
 
 
+def test_reviewer_b_budget_exempts_blockers_but_keeps_positive_caps(snapshot):
+    evidence = [execution(f"B-R1-E{index:03d}") for index in range(1, 15)]
+    blocker = {
+        "id": "B-R1-C001", "statement": "The boundary is safe.",
+        "result": "refuted", "execution_ids": ["B-R1-E001"], "reason": "",
+    }
+    supported = [
+        {
+            "id": f"B-R1-C{index:03d}", "statement": f"Behavior {index} is safe.",
+            "result": "supported", "execution_ids": ["B-R1-E002"], "reason": "",
+        }
+        for index in range(2, 19)
+    ]
+    blocker_finding = finding("B-R1-001", reviewer="B", execution_ids=("B-R1-E001",))
+
+    def validate(claims, executions):
+        raw = report(
+            snapshot, "B", claims=claims, executions=executions,
+            findings=[blocker_finding],
+        )
+        parsed = parse_reviewer_report(
+            json.dumps(raw).encode(), expected_reviewer=Reviewer.B,
+            expected_round=1, snapshot=snapshot,
+        )
+        validate_reviewer_b_budget(parsed, 100)
+
+    with pytest.raises(SchemaError, match="REVIEW_BUDGET_EXCEEDED"):
+        validate([blocker, *supported], evidence[:13])  # 17 supported, 12 other fresh
+    with pytest.raises(SchemaError, match="REVIEW_BUDGET_EXCEEDED"):
+        validate([blocker, *supported[:16]], evidence)  # 16 supported, 13 other fresh
+    validate([blocker, *supported[:16]], evidence[:13])
+
+
 def test_ordinary_budget_admits_measured_evidence_reuse_shape(snapshot):
     # The #113 normal bundle arm reported nine supported claims, one
     # unverified claim, and eight fresh executions; this is a shape canary,
