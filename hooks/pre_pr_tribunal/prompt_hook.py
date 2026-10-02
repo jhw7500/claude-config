@@ -13,7 +13,13 @@ import sys
 
 MAX_INPUT_BYTES = 64 * 1024
 ESCAPE_PREFIXES = ("#noreminder", "#nr", "#raw", "#silent", "#조용히")
-EXPLICIT_SKILL = re.compile(r"^\s*[$/]pre-pr-tribunal(?![\w-])", re.IGNORECASE)
+EXPLICIT_SKILL = re.compile(r"(?<![\w-])[$/]pre-pr-tribunal(?![\w-])", re.IGNORECASE)
+EXPLICIT_ACTION_BEFORE = re.compile(
+    r"\b(?:please\s+)?(?:run|invoke|use|start|go)\s+(?:the\s+)?$", re.IGNORECASE
+)
+EXPLICIT_ACTION_AFTER = re.compile(
+    r"^\s*(?:진행|실행|호출|시작|돌려|해\s*(?:줘|주세요|줄래)|부탁해)", re.IGNORECASE
+)
 REVIEW_NOUN = r"(?:심사|트리뷰날)(?:를|을)?"
 NATURAL_REVIEW = re.compile(
     REVIEW_NOUN
@@ -23,23 +29,33 @@ NATURAL_REVIEW = re.compile(
     re.IGNORECASE,
 )
 NEGATED_REVIEW = re.compile(
-    r"(?:심사|트리뷰날)\s*(?:하지\s*마|하지\s*말|하지|안\s*해)|"
-    r"(?:심사|트리뷰날).{0,24}?(?:하지\s*마|하지\s*말|취소|중지|그만)|"
-    r"[$/]pre-pr-tribunal.{0,24}?(?:하지\s*마|하지\s*말|취소|중지|그만)",
+    r"(?<!\w)(?:심사|트리뷰날)(?:[은는을를])?\s*"
+    r"(?:하지\s*마|하지\s*말|하지|안\s*해|취소|중지|그만)|"
+    r"(?<![\w-])[$/]pre-pr-tribunal(?![\w-])\s*"
+    r"(?:(?:진행|실행|호출|시작)\s*)?"
+    r"(?:하지\s*마|하지\s*말|하지|안\s*해|취소|중지|그만)|"
+    r"\b(?:do not|don't|never)\s+(?:run|invoke|use|start)\s+"
+    r"[$/]pre-pr-tribunal\b|"
+    r"(?:^|[.!?。]\s*|아니[,\s]+)(?:하지\s*마|취소(?:해줘)?|그만)\s*[.!?。]?$",
     re.IGNORECASE,
 )
 
 
 def classify_request(prompt: str) -> str | None:
     """Classify only explicit invocations and review-action requests."""
-    if not isinstance(prompt, str) or len(prompt) > 400:
+    if not isinstance(prompt, str) or len(prompt) > MAX_INPUT_BYTES:
         return None
     text = prompt.strip()
     if not text or text.lower().startswith(ESCAPE_PREFIXES):
         return None
     if NEGATED_REVIEW.search(text):
         return None
-    if EXPLICIT_SKILL.search(text):
+    skill = EXPLICIT_SKILL.search(text)
+    if skill and (
+        skill.start() == 0
+        or EXPLICIT_ACTION_BEFORE.search(text[:skill.start()])
+        or EXPLICIT_ACTION_AFTER.match(text[skill.end():])
+    ):
         return "explicit"
     if text == "심사" or NATURAL_REVIEW.search(text):
         return "natural"

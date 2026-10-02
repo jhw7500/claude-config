@@ -55,6 +55,21 @@ def test_common_affirmative_phrases_are_natural_requests(prompt):
 
 
 @pytest.mark.parametrize(
+    ("prompt", "kind"),
+    [
+        ("심사해줘. 실패하면 자동 수정하지 마", "natural"),
+        ("$pre-pr-tribunal 진행하되 자동 재심사하지 마", "explicit"),
+        ("please run $pre-pr-tribunal", "explicit"),
+        ("이번에는 $pre-pr-tribunal 진행해줘", "explicit"),
+        ("심사해줘. " + "검토 범위 설명 " * 50, "natural"),
+    ],
+)
+def test_affirmative_review_request_survives_unrelated_limits(prompt, kind):
+    assert classify_request(prompt) == kind
+    assert run_hook("codex", {"prompt": prompt})
+
+
+@pytest.mark.parametrize(
     "prompt",
     [
         "트리뷰날에 A와 B 모델이 다른 이유는?",
@@ -67,6 +82,9 @@ def test_common_affirmative_phrases_are_natural_requests(prompt):
         "심사하면 얼마나 걸려?",
         "심사해야 할까?",
         "$pre-pr-tribunal 하지 마",
+        "심사해줘. 아니, 하지 마",
+        "트리뷰날을 취소해줘",
+        "please don't run $pre-pr-tribunal",
         "명시적 $pre-pr-tribunal과 자연어 심사의 차이는?",
     ],
 )
