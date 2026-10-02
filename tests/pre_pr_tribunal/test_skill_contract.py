@@ -531,6 +531,8 @@ def test_pending_recovery_uses_status_driven_command_sequence():
 
 
 def test_pending_recovery_documents_exact_migration_route_by_schema():
+    assert "under the installed current report contract" in pending_recovery_contract()
+    assert "current contract 5" not in pending_recovery_contract()
     migration_command_by_schema = {}
     for line in pending_recovery_contract().splitlines():
         match = re.match(r"- If `verdict_schema == ([12345])`, (.*)", line)
@@ -657,7 +659,7 @@ def test_docs_separate_retryable_formats_operations_integrity_and_warnings():
         warning_start = body.index("Observation warnings")
         integrity_start = body.index("Integrity stops")
         assert format_start < operation_start < warning_start < integrity_start
-        for code in ("JSON_INVALID", "REPORT_TOO_LARGE", "TEXT_INVALID"):
+        for code in ("JSON_INVALID", "REPORT_TOO_LARGE", "TEXT_INVALID", "REVIEW_BUDGET_EXCEEDED"):
             assert code in body[format_start:operation_start]
         for code in ("DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"):
             assert code in body[operation_start:warning_start]

@@ -11,6 +11,35 @@ an elapsed-time or token saving.
 | [#113 blocker bundle arm](2026-09-12-reviewer-evidence-bundle.md) | Same HIGH blocker and 11 claim outcomes as independent arm; 7 fresh report executions, 22 audited commands, 286.012 s | High-risk 16-verified/12-fresh, 480 s soft/600 s target leaves room for the observed blocker case. |
 | [#114 historical #125 account](https://github.com/jhw7500/claude-config/issues/114) | 15 claims, 17 executions, about 30 min | Historical comparison target, not a matched current-contract run. |
 
+## Same-snapshot observations (not a controlled comparison)
+
+On `c436881daf7874fb5da268e05ec43676f8c90768` with diff SHA-256
+`fec643b0cf55182bbf97e6ced769e962235cac0a92eb66cc6ca532aaf79c2829`,
+the installed contract-5 formal round ended `INCONCLUSIVE`. Its native B
+response took 436,120 ms according to the closed controller telemetry and
+contained 10 supported claims, 3 unverified claims, and 3 fresh report
+executions. The complete round took 937,188 ms. There were no blocking
+findings, but the unverified claims prevented PASS.
+
+An isolated, non-authoritative native B dry-run used the candidate contract-6
+prompt on that same commit and model. Controller dispatch-to-terminal observation
+was at most 391 seconds (04:43:25-04:49:56 UTC). Its response contained 9
+supported claims, 4 unverified claims, and 3 fresh report executions, within
+the high-risk limits of 16 verified claims and 12 fresh executions. The dry-run
+did not submit to the installed CLI or alter the formal verdict. A broad test
+batch timed out after 150 seconds and is not passing evidence; narrower batches
+reported 33 and 10 passing tests. Separately, 14 candidate-contract tests
+passed in an isolated local run.
+
+These observations have different reviewer instructions and test selections.
+Neither response supplies an audited total native command trace or token count,
+and the candidate dry-run has no authenticated Tribunal receipt or telemetry
+binding. They demonstrate one native response within the pilot's instructed
+time and report-entry limits, but not a matched current-contract cost reduction,
+general deadline enforcement, controller one-round compliance, or axis A
+completion. The formal gate remains `INCONCLUSIVE` until a separately authorized
+review of a new clean snapshot returns a different result.
+
 The contract counts `supported` plus `refuted` claims and fresh executions
 present in the submitted report. Extra required claims remain `unverified`,
 yielding an `INCONCLUSIVE` gate result. Authenticated reused executions do not
