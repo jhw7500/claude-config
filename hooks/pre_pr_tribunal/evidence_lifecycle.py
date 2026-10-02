@@ -62,15 +62,36 @@ def select_evidence(root, snapshot, digest):
         return None, 'EVIDENCE_SELECTION_INVALID'
 
 
+def _stored_terminal_contract(verdict):
+    if (verdict.schema != model.VERDICT_SCHEMA_VERSION
+            or verdict.gate.status is model.GateStatus.IN_PROGRESS
+            or verdict.contract is None
+            or verdict.contract.report_text >= model.REPORT_TEXT_CONTRACT_VERSION):
+        return None
+    return {'report_text': verdict.contract.report_text,
+            'diff_recipe': verdict.contract.diff_recipe,
+            'verdict_schema': verdict.contract.verdict_schema,
+            'evidence': verdict.evidence_contract}
+
+
 def _expected(verdict):
     if verdict.schema != model.VERDICT_SCHEMA_VERSION or verdict.evidence_binding is None:
         raise model.SchemaError('EVIDENCE_NOT_SELECTED')
     selected = parse_selection(verdict.evidence_binding.to_json())
     expected = selected.to_json()['expected_binding']
+    contract = _stored_terminal_contract(verdict) or runtime.contract_binding()
     if (expected['snapshot'] != runtime.snapshot_binding(verdict.snapshot)
-        or expected['contract'] != runtime.contract_binding()):
+        or expected['contract'] != contract):
         raise model.SchemaError('EVIDENCE_BINDING_MISMATCH')
     return selected, expected
+
+
+def verify_selected_evidence(root, verdict):
+    """Recheck immutable evidence; only terminal historical reads use stored contracts."""
+    selected, expected = _expected(verdict)
+    verified = runtime.verify_evidence(root, bundle_sha256=selected.bundle_sha256,
+        expected_binding=expected, stored_contract=_stored_terminal_contract(verdict))
+    return selected, verified
 
 
 def reusable_execution(root, bundle_sha256, entry):
@@ -94,8 +115,7 @@ def authenticate_report(root, verdict, report):
         return frozenset()
     if report.reviewer is not model.Reviewer.B:
         raise model.SchemaError('EVIDENCE_REVIEWER_INVALID')
-    selected, expected = _expected(verdict)
-    verified = runtime.verify_evidence(root, bundle_sha256=selected.bundle_sha256, expected_binding=expected)
+    selected, verified = verify_selected_evidence(root, verdict)
     entries = {entry['id']: entry for entry in verified['eligible']}
     used = set()
     for execution in reused:

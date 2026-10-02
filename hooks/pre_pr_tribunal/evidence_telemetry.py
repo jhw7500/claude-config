@@ -1,7 +1,7 @@
 """Read-only evidence observations; never an input to gate authorization."""
 import time
 
-from . import evidence_lifecycle, evidence_runtime, model
+from . import evidence_lifecycle, model
 from .review_store import locked_review, repository_root
 from .verdict_store import _read_verdict_locked, _read_sealed_report
 
@@ -37,10 +37,7 @@ def _observe(cwd, run):
                   'capture_duration_ms': 0, 'verification_duration_ms': None}
         if verdict.evidence_binding is not None:
             started = time.monotonic_ns()
-            selection = verdict.evidence_binding
-            verified = evidence_runtime.verify_evidence(root,
-                bundle_sha256=selection.bundle_sha256,
-                expected_binding=selection.to_json()['expected_binding'])
+            _, verified = evidence_lifecycle.verify_selected_evidence(root, verdict)
             result.update(eligible_entry_count=len(verified['eligible']),
                 rejected_entry_count=len(verified['rejected']),
                 capture_duration_ms=sum(e['duration_ms'] for e in verified['bundle']['entries']),
