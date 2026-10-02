@@ -25,7 +25,12 @@ EXPLICIT_ACTION_AFTER = re.compile(
     r"|해\s*(?:줘|주세요|줄래)|부탁해)",
     re.IGNORECASE,
 )
-EXPLICIT_ARGUMENT_AFTER = re.compile(r"^\s*(?:--?[\w-]+|\d+)(?=$|\s)")
+EXPLICIT_DISCUSSION_AFTER = re.compile(
+    r"^\s*(?:(?:실행|진행|사용|호출)\s*(?:방법|상황|뜻|차이)"
+    r"|(?:방법|사용법|뜻|차이|설명|알려|어떻게|왜|무엇|뭐)"
+    r"|(?:what|why|how|explain|describe|usage|meaning|difference)\b)",
+    re.IGNORECASE,
+)
 REVIEW_NOUN = r"(?:심사|트리뷰날)(?:를|을)?"
 NATURAL_REVIEW = re.compile(
     REVIEW_NOUN
@@ -62,12 +67,12 @@ def classify_request(prompt: str) -> str | None:
     skill = EXPLICIT_SKILL.search(text)
     after_skill = text[skill.end():] if skill else ""
     if skill and (
-        (skill.start() == 0 and (
-            not after_skill.strip(" \t.!?。")
-            or EXPLICIT_ARGUMENT_AFTER.match(after_skill)
-        ))
-        or EXPLICIT_ACTION_BEFORE.search(text[:skill.start()])
+        EXPLICIT_ACTION_BEFORE.search(text[:skill.start()])
         or EXPLICIT_ACTION_AFTER.match(after_skill)
+        or (skill.start() == 0 and not (
+            EXPLICIT_DISCUSSION_AFTER.match(after_skill)
+            or text.endswith("?")
+        ))
     ):
         return "explicit"
     if text == "심사" or NATURAL_REVIEW.search(text):
