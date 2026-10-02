@@ -147,6 +147,7 @@ def _finding(identifier, reviewer, severity="HIGH"):
         "line": 1,
         "execution_ids": [],
         "acceptance_condition": "The contract is restored.",
+        "reversal_cost": "After merge, clients depending on this contract need migration.",
     }
 
 
