@@ -940,6 +940,7 @@ def test_installed_probe_stops_when_orphan_receipt_discards_new_blocker(tmp_path
         "rationale": "The new terminal response must not be silently discarded.",
         "path": "tracked.txt", "line": 1, "execution_ids": [],
         "acceptance_condition": "Preserve both reports and stop before finalization.",
+        "reversal_cost": "After merge, the discarded blocker cannot be recovered without another review.",
     }]
     private = tmp_path / "terminal-A.json"
     new = (json.dumps(fresh, separators=(",", ":")) + "\n").encode()
@@ -1235,6 +1236,7 @@ def test_installed_capacity_recovery_preserves_receipts_and_runs_only_pending(
                 "rationale": "Dispatch capacity does not invalidate a completed review.",
                 "path": "tracked.txt", "line": 1, "execution_ids": [],
                 "acceptance_condition": "Keep this blocker through pending-only recovery.",
+                "reversal_cost": "After merge, the missed blocker needs a follow-up release.",
             }]
         # Non-canonical whitespace catches accidental parse/re-emit on reuse.
         raw = (json.dumps(report, indent=2) + "\n \n").encode()
@@ -1339,6 +1341,7 @@ def test_installed_probe_seals_blocker_and_finalizes_fail(tmp_path):
                 "rationale": "The installed finalizer must preserve blockers.",
                 "path": "tracked.txt", "line": 1, "execution_ids": [],
                 "acceptance_condition": "The gate remains failed.",
+                "reversal_cost": "After merge, the blocker requires a follow-up release.",
             }]
         return (json.dumps(report, separators=(",", ":")) + "\n").encode()
 

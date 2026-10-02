@@ -102,7 +102,8 @@ def test_legacy_telemetry_cannot_authorize_current_report_bytes(git_repo, teleme
             value["findings"] = [{"id": "A-R1-001", "reviewer": "A", "severity": "HIGH",
                                   "title": "New blocker", "rationale": "Introduces invalid state.",
                                   "path": "tracked.txt", "line": 1, "execution_ids": [],
-                                  "acceptance_condition": "Reject invalid state."}]
+                                  "acceptance_condition": "Reject invalid state.",
+                                  "reversal_cost": "After merge, affected deployments need rollback."}]
             raw = json.dumps(value).encode() + b"\r\n"
             store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, replace_pending_recovery=True)
     elif telemetry_state == "corrupt":
@@ -322,6 +323,7 @@ def test_cli_early_detection_includes_rejected_v2_submission(
                 "title": "invalid\x00title", "rationale": "Invalid report text.",
                 "path": "tracked.txt", "line": 1, "execution_ids": [],
                 "acceptance_condition": "Reject the invalid text.",
+                "reversal_cost": "",
             }],
         )
         raw = json.dumps(report)

@@ -72,6 +72,7 @@ def finding(identifier="A-R1-001", *, reviewer="A", severity="HIGH", execution_i
         "line": 1,
         "execution_ids": list(execution_ids),
         "acceptance_condition": "The invalid state is rejected.",
+        "reversal_cost": "After merge, affected deployments require a coordinated rollback.",
     }
 
 
@@ -296,6 +297,32 @@ def test_persisted_contract_four_pass_keeps_historical_refutation_readable(git_r
     assert historical.contract.report_text == 4
     assert historical.gate.status.value == "pass"
     assert historical.reviewers["B"].report.claims[0].result == "refuted"
+    assert verdict_path.read_bytes() == before
+
+
+def test_persisted_contract_five_blocker_remains_readable_without_cost(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    report_paths(
+        git_repo, pending.snapshot, overrides={"A": {"findings": [finding()]}}
+    )
+    finalized = finalize_round(git_repo, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    payload = finalized.to_json()
+    payload["contract"]["report_text"] = 5
+    for slot in payload["reviewers"].values():
+        if slot["state"] == "sealed":
+            slot["receipt"]["report_contract_version"] = 5
+    payload["reviewers"]["A"]["report"]["findings"][0].pop("reversal_cost")
+    write_json(verdict_path, payload)
+    before = verdict_path.read_bytes()
+
+    historical = read_verdict(git_repo)
+
+    assert historical.contract.report_text == 5
+    assert historical.gate.status.value == "fail"
+    assert "reversal_cost" not in historical.reviewers["A"].report.findings[0].to_json()
     assert verdict_path.read_bytes() == before
 
 
@@ -1121,6 +1148,9 @@ def test_validate_report_bytes_raises_the_same_parser_code(snapshot, mutation, c
         ({"path": "../tracked.txt"}, "PATH_INVALID"),
         ({"line": 0}, "FINDING_SCHEMA_INVALID"),
         ({"title": "bad\x00title"}, "TEXT_INVALID"),
+        ({"reversal_cost": ""}, "FINDING_SCHEMA_INVALID"),
+        ({"reversal_cost": "   "}, "FINDING_SCHEMA_INVALID"),
+        ({"reversal_cost": "bad\x00text"}, "TEXT_INVALID"),
         ({"id": "A-R4-001"}, "FINDING_ID_INVALID"),
         ({"reviewer": "B"}, "FINDING_REVIEWER_MISMATCH"),
     ],
@@ -1136,6 +1166,60 @@ def test_finding_validation_fails_closed(snapshot, change, code):
             expected_round=1,
             snapshot=snapshot,
         )
+
+
+@pytest.mark.parametrize("severity", ("HIGH", "CRITICAL"))
+def test_current_contract_requires_reversal_cost_for_blocker(snapshot, severity):
+    item = finding(severity=severity)
+    item.pop("reversal_cost")
+    raw = json.dumps(report(snapshot, "A", findings=[item])).encode()
+    with pytest.raises(SchemaError, match="^FINDING_SCHEMA_INVALID$"):
+        parse_reviewer_report(
+            raw, expected_reviewer=Reviewer.A, expected_round=1, snapshot=snapshot
+        )
+
+
+@pytest.mark.parametrize("severity", ("LOW", "MEDIUM"))
+def test_current_contract_allows_empty_reversal_cost_for_advisory(snapshot, severity):
+    item = finding(severity=severity)
+    item["reversal_cost"] = ""
+    raw = json.dumps(report(snapshot, "A", findings=[item])).encode()
+    parsed = parse_reviewer_report(
+        raw, expected_reviewer=Reviewer.A, expected_round=1, snapshot=snapshot
+    )
+    assert parsed.findings[0].reversal_cost == ""
+    assert parsed.findings[0].to_json()["reversal_cost"] == ""
+
+
+def test_contract_five_finding_remains_readable_without_reversal_cost(snapshot):
+    item = finding()
+    item.pop("reversal_cost")
+    raw = json.dumps(report(snapshot, "A", findings=[item])).encode()
+    parsed = parse_reviewer_report(
+        raw,
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+        report_contract_version=5,
+    )
+    assert "reversal_cost" not in parsed.findings[0].to_json()
+
+
+@pytest.mark.parametrize("reversal_cost", (None, "", "   "))
+def test_missing_or_blank_blocker_cost_preserves_exact_retry_evidence(git_repo, reversal_cost):
+    pending = write_current_pending(git_repo)
+    item = finding()
+    if reversal_cost is None:
+        item.pop("reversal_cost")
+    else:
+        item["reversal_cost"] = reversal_cost
+    raw = json.dumps(report(pending.snapshot, "A", findings=[item])).encode() + b" \n"
+    with pytest.raises(SchemaError, match="^FINDING_SCHEMA_INVALID$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw, now=NOW)
+    loaded = read_verdict(git_repo)
+    assert loaded.reviewers["A"].status == "pending"
+    assert loaded.reviewers["A"].last_error == "FINDING_SCHEMA_INVALID"
+    assert (git_repo / ".review/attempts/round-1/A/attempt-1.raw").read_bytes() == raw
 
 
 def test_duplicate_finding_and_unknown_execution_references_are_rejected(snapshot):
@@ -1216,6 +1300,7 @@ def test_execution_excerpts_reject_every_other_cc(snapshot, control):
         ("title", "title{control}text"),
         ("rationale", "rationale{control}text"),
         ("acceptance_condition", "acceptance{control}condition"),
+        ("reversal_cost", "reversal{control}cost"),
         ("statement", "statement{control}text"),
         ("reason", "reason{control}text"),
         ("path", "directory{control}/tracked.txt"),
@@ -1225,7 +1310,7 @@ def test_non_excerpt_text_keeps_rejecting_lf_and_tab(snapshot, control, field, v
     value = value.format(control=control)
     item = execution(command=value) if field == "command" else execution()
     report_value = report(snapshot, "A", executions=[item])
-    if field in {"title", "rationale", "acceptance_condition", "path"}:
+    if field in {"title", "rationale", "acceptance_condition", "reversal_cost", "path"}:
         finding_value = finding()
         finding_value[field] = value
         report_value["findings"] = [finding_value]
@@ -2486,6 +2571,7 @@ def test_failed_legacy_verdict_without_head_ref_migrates_on_next_round(git_repo)
     del legacy['evidence_contract']
     del legacy['policy']
     legacy["reviewers"] = {key: slot["report"] for key, slot in legacy["reviewers"].items()}
+    legacy["reviewers"]["A"]["findings"][0].pop("reversal_cost")
     del legacy["head_ref"]
     write_json(verdict_path, legacy)
     commit_fix(git_repo)
