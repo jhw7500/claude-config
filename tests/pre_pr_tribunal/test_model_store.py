@@ -329,6 +329,59 @@ def test_persisted_contract_five_blocker_remains_readable_without_cost(git_repo)
     assert verdict_path.read_bytes() == before
 
 
+@pytest.mark.parametrize("over_budget", ("supported_claims", "fresh_executions"))
+def test_persisted_contract_six_pass_remains_readable_above_new_budget(
+    git_repo, over_budget
+):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    report_paths(git_repo, pending.snapshot)
+    finalized = finalize_round(git_repo, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    payload = finalized.to_json()
+    b_report = payload["reviewers"]["B"]["report"]
+    if over_budget == "supported_claims":
+        b_report["claims"].extend(
+            {
+                "id": f"B-R1-C{index:03d}",
+                "statement": f"Historical supported claim {index}.",
+                "result": "supported",
+                "execution_ids": ["B-R1-E999"],
+                "reason": "",
+            }
+            for index in range(1, 17)
+        )
+    else:
+        b_report["executions"].extend(
+            execution(f"B-R1-E{index:03d}") for index in range(1, 13)
+        )
+
+    write_json(verdict_path, payload)
+    with pytest.raises(SchemaError, match="^REVIEW_BUDGET_EXCEEDED$"):
+        read_verdict(git_repo)
+
+    payload["contract"]["report_text"] = 6
+    for slot in payload["reviewers"].values():
+        if slot["state"] == "sealed":
+            slot["receipt"]["report_contract_version"] = 6
+    write_json(verdict_path, payload)
+    before = verdict_path.read_bytes()
+
+    historical = read_verdict(git_repo)
+
+    assert historical.contract.report_text == 6
+    assert historical.gate.status.value == "pass"
+    b_report = historical.reviewers["B"].report
+    observed = (
+        len(b_report.claims)
+        if over_budget == "supported_claims"
+        else len(b_report.executions)
+    )
+    assert observed == (17 if over_budget == "supported_claims" else 13)
+    assert verdict_path.read_bytes() == before
+
+
 def test_prior_contract_in_progress_refutation_fails_closed_as_drift(git_repo):
     pending = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW

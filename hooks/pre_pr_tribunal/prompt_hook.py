@@ -15,7 +15,8 @@ MAX_INPUT_BYTES = 64 * 1024
 ESCAPE_PREFIXES = ("#noreminder", "#nr", "#raw", "#silent", "#조용히")
 EXPLICIT_SKILL = re.compile(r"(?<![\w-])[$/]pre-pr-tribunal(?![\w-])", re.IGNORECASE)
 EXPLICIT_ACTION_BEFORE = re.compile(
-    r"\b(?:please\s+)?(?:run|invoke|use|start|go)\s+(?:the\s+)?$", re.IGNORECASE
+    r"^\s*(?:(?:please|can you)\s+)?"
+    r"(?:run|invoke|use|start|go)\s+(?:the\s+)?$", re.IGNORECASE
 )
 EXPLICIT_ACTION_AFTER = re.compile(
     r"^\s*(?:진행|실행|호출|시작|돌려|해\s*(?:줘|주세요|줄래)|부탁해)", re.IGNORECASE
@@ -32,10 +33,11 @@ NEGATED_REVIEW = re.compile(
     r"(?<!\w)(?:심사|트리뷰날)(?:[은는을를])?\s*"
     r"(?:하지\s*마|하지\s*말|하지|안\s*해|취소|중지|그만)|"
     r"(?<![\w-])[$/]pre-pr-tribunal(?![\w-])\s*"
-    r"(?:(?:진행|실행|호출|시작)\s*)?"
-    r"(?:하지\s*마|하지\s*말|하지|안\s*해|취소|중지|그만)|"
-    r"\b(?:do not|don't|never)\s+(?:run|invoke|use|start)\s+"
-    r"[$/]pre-pr-tribunal\b|"
+    r"(?:(?:지금은?|이번(?:엔|에는)|오늘은?)\s*)?"
+    r"(?:(?:진행|실행|호출|시작)(?:[은는을를])?\s*)?"
+    r"(?:하지\s*마|하지\s*말|하지|안\s*해|취소(?:해줘)?|중지|그만)|"
+    r"\b(?:do\s+not|don't|never|rather\s+not)\s+(?:ever\s+)?"
+    r"(?:run|invoke|use|start)\s+(?:the\s+)?[$/]pre-pr-tribunal\b|"
     r"(?:^|[.!?。]\s*|아니[,\s]+)(?:하지\s*마|취소(?:해줘)?|그만)\s*[.!?。]?$",
     re.IGNORECASE,
 )
