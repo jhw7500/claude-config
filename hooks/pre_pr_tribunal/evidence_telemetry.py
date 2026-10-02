@@ -9,6 +9,7 @@ from .verdict_store import _read_verdict_locked, _read_sealed_report
 def summarize(cwd, run):
     unknown = dict.fromkeys(('eligible_entry_count', 'rejected_entry_count',
         'reused_entry_count', 'claim_reused_entry_count', 'fresh_execution_count',
+        'fresh_non_blocking_execution_count', 'supported_claim_count',
         'verified_claim_count', 'unverified_claim_count',
         'budget_exhausted_claim_count', 'budget_profile',
         'verified_claim_limit', 'fresh_execution_limit',
@@ -55,6 +56,9 @@ def _observe(cwd, run):
             if verdict.contract.report_text >= model.REVIEWER_B_BUDGET_CONTRACT_VERSION:
                 budget = model.reviewer_b_budget(verdict.policy.risk_floor)
                 result.update(
+                fresh_non_blocking_execution_count=
+                    model.reviewer_b_fresh_non_blocking_execution_count(report),
+                supported_claim_count=sum(c.result == 'supported' for c in report.claims),
                 verified_claim_count=sum(c.result != 'unverified' for c in report.claims),
                 unverified_claim_count=sum(c.result == 'unverified' for c in report.claims),
                 budget_exhausted_claim_count=sum(

@@ -15,7 +15,7 @@ MAX_INPUT_BYTES = 64 * 1024
 ESCAPE_PREFIXES = ("#noreminder", "#nr", "#raw", "#silent", "#조용히")
 EXPLICIT_SKILL = re.compile(r"(?<![\w-])[$/]pre-pr-tribunal(?![\w-])", re.IGNORECASE)
 EXPLICIT_ACTION_BEFORE = re.compile(
-    r"^\s*(?:(?:please|can you)\s+)?"
+    r"^\s*(?:(?:can|could|would)\s+you\s+(?:please\s+)?|please\s+)?"
     r"(?:run|invoke|use|start|go)\s+(?:the\s+)?$", re.IGNORECASE
 )
 EXPLICIT_ACTION_AFTER = re.compile(

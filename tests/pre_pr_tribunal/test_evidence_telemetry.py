@@ -5,6 +5,7 @@ from pre_pr_tribunal.model import Reviewer
 from pre_pr_tribunal.verdict_store import submit_reviewer_report, finalize_round
 from tests.pre_pr_tribunal.test_evidence_lifecycle import bundle, begin, reused, raw_report
 from tests.pre_pr_tribunal.test_evidence_runtime import node_repo
+from tests.pre_pr_tribunal.test_model_store import finding
 
 
 def observed_run(repo, verdict):
@@ -23,7 +24,9 @@ def test_evidence_usage_is_authenticated_and_claim_subset_is_separate(git_repo):
     assert before['eligible_entry_count'] == 1
     assert before['reused_entry_count'] is None
     assert before['fresh_execution_count'] is None
+    assert before['fresh_non_blocking_execution_count'] is None
     assert before['verified_claim_count'] is None
+    assert before['supported_claim_count'] is None
     assert before['budget_profile'] is None
     execution = reused(git_repo, frozen)
     raw = json.loads(raw_report(verdict, 'B', execution))
@@ -41,7 +44,9 @@ def test_evidence_usage_is_authenticated_and_claim_subset_is_separate(git_repo):
     assert result['reused_entry_count'] == 1
     assert result['claim_reused_entry_count'] == 0
     assert result['fresh_execution_count'] == 1
+    assert result['fresh_non_blocking_execution_count'] == 1
     assert result['verified_claim_count'] == 0
+    assert result['supported_claim_count'] == 0
     assert result['unverified_claim_count'] == 1
     assert result['budget_exhausted_claim_count'] == 0
     assert result['budget_profile'] == 'high-risk'
@@ -52,6 +57,28 @@ def test_evidence_usage_is_authenticated_and_claim_subset_is_separate(git_repo):
     assert result['verification_duration_ms'] >= 0
     assert result['measured_saved_elapsed_ms'] is None
     assert result['total_command_count'] is None
+
+
+def test_blocker_execution_is_excluded_from_budget_telemetry(git_repo):
+    verdict = begin(git_repo)
+    run_id = observed_run(git_repo, verdict)
+    raw = json.loads(raw_report(verdict, 'B'))
+    blocker_execution_id = raw['executions'][0]['id']
+    raw['claims'][0]['result'] = 'refuted'
+    raw['claims'][0]['statement'] = 'The reviewed behavior is safe.'
+    raw['claims'][0]['execution_ids'] = [blocker_execution_id]
+    raw['findings'] = [finding('B-R1-001', reviewer='B',
+                               execution_ids=(blocker_execution_id,))]
+    raw['executions'].extend(
+        dict(raw['executions'][0], id=f'B-R1-E{index:03d}')
+        for index in range(1, 13)
+    )
+    submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=json.dumps(raw).encode())
+    result = telemetry.summarize_run(git_repo, run_id=run_id)['evidence']
+    assert result['fresh_execution_count'] == 13
+    assert result['fresh_non_blocking_execution_count'] == 12
+    assert result['supported_claim_count'] == 0
+    assert result['fresh_execution_limit'] == 12
 
 
 def test_claim_reuse_and_telemetry_failure_cannot_change_primary_gate(git_repo, monkeypatch):

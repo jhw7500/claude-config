@@ -332,10 +332,8 @@ def reviewer_b_budget(risk_floor: int) -> ReviewerBBudget:
     }
 
 
-def validate_reviewer_b_budget(report: ReviewerReport, risk_floor: int) -> None:
-    if report.reviewer is not Reviewer.B:
-        return
-    budget = reviewer_b_budget(risk_floor)
+def reviewer_b_fresh_non_blocking_execution_count(report: ReviewerReport) -> int:
+    """Count the fresh report entries governed by Reviewer B's execution cap."""
     blocker_execution_ids = {
         execution_id
         for claim in report.claims
@@ -348,12 +346,19 @@ def validate_reviewer_b_budget(report: ReviewerReport, risk_floor: int) -> None:
         if finding.severity in {Severity.CRITICAL, Severity.HIGH}
         for execution_id in finding.execution_ids
     )
-    supported = sum(claim.result == "supported" for claim in report.claims)
-    fresh_non_blocking = sum(
+    return sum(
         execution.evidence_ref is None
         and execution.id not in blocker_execution_ids
         for execution in report.executions
     )
+
+
+def validate_reviewer_b_budget(report: ReviewerReport, risk_floor: int) -> None:
+    if report.reviewer is not Reviewer.B:
+        return
+    budget = reviewer_b_budget(risk_floor)
+    supported = sum(claim.result == "supported" for claim in report.claims)
+    fresh_non_blocking = reviewer_b_fresh_non_blocking_execution_count(report)
     if (
         supported > budget["verified_claims"]
         or fresh_non_blocking > budget["fresh_executions"]
