@@ -26,9 +26,17 @@ EXPLICIT_ACTION_AFTER = re.compile(
     re.IGNORECASE,
 )
 EXPLICIT_DISCUSSION_AFTER = re.compile(
-    r"^\s*(?:(?:실행|진행|사용|호출)\s*(?:방법|상황|뜻|차이)"
+    r"^\s*(?:[:：]\s*)?(?:(?:은|는|이|가|의|에\s*대해)\s*)?"
+    r"(?:(?:실행|진행|사용|호출)\s*(?:방법|상황|뜻|차이)"
     r"|(?:방법|사용법|뜻|차이|설명|알려|어떻게|왜|무엇|뭐)"
+    r"|(?:동작\s*원리|결과)\s*(?:설명|왜|뭐|무엇)"
     r"|(?:what|why|how|explain|describe|usage|meaning|difference)\b)",
+    re.IGNORECASE,
+)
+EXPLICIT_REJECTION_AFTER = re.compile(
+    r"^\s*(?:(?:은|는|을|를)\s*)?"
+    r"(?:말고|대신|없이|빼고|제외)(?=\s|$)"
+    r"|^\s*(?:필요\s*없|안\s*돌려|not\b|skip\b|later\b|without\b|instead\b)",
     re.IGNORECASE,
 )
 REVIEW_NOUN = r"(?:심사|트리뷰날)(?:를|을)?"
@@ -66,6 +74,8 @@ def classify_request(prompt: str) -> str | None:
         return None
     skill = EXPLICIT_SKILL.search(text)
     after_skill = text[skill.end():] if skill else ""
+    if skill and EXPLICIT_REJECTION_AFTER.match(after_skill):
+        return None
     if skill and (
         EXPLICIT_ACTION_BEFORE.search(text[:skill.start()])
         or EXPLICIT_ACTION_AFTER.match(after_skill)
