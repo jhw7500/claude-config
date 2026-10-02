@@ -1425,6 +1425,7 @@ def validate_report_bytes(
     expected_reviewer: Reviewer,
     expected_round: int,
     snapshot: Snapshot,
+    report_contract_version: int = REPORT_TEXT_CONTRACT_VERSION,
 ) -> tuple[ReviewerReport, str]:
     """Validate one exact reviewer response and return its raw-byte digest."""
     report = parse_reviewer_report(
@@ -1432,8 +1433,11 @@ def validate_report_bytes(
         expected_reviewer=expected_reviewer,
         expected_round=expected_round,
         snapshot=snapshot,
+        report_contract_version=report_contract_version,
     )
-    validate_reviewer_report_semantics(report)
+    validate_reviewer_report_semantics(
+        report, report_contract_version=report_contract_version
+    )
     return report, hashlib.sha256(raw).hexdigest()
 
 

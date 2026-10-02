@@ -31,6 +31,8 @@ from pre_pr_tribunal.model import (
     validate_report_bytes,
 )
 from pre_pr_tribunal.verdict_store import (
+    _read_sealed_report,
+    _read_verdict_locked,
     begin_round,
     finalize_round,
     read_verdict,
@@ -40,6 +42,7 @@ from pre_pr_tribunal.verdict_store import (
     validate_stored_reviewer_report,
 )
 from pre_pr_tribunal.review_context import context_sha256, current_contract_binding
+from pre_pr_tribunal.review_store import locked_review, repository_root
 
 
 def NOW():
@@ -327,6 +330,46 @@ def test_persisted_contract_five_blocker_remains_readable_without_cost(git_repo)
     assert historical.gate.status.value == "fail"
     assert "reversal_cost" not in historical.reviewers["A"].report.findings[0].to_json()
     assert verdict_path.read_bytes() == before
+
+
+def test_sealed_contract_six_report_without_reversal_cost_is_readable(git_repo):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    report_paths(
+        git_repo, pending.snapshot,
+        overrides={"B": {"findings": [finding(
+            "B-R1-001", reviewer="B", execution_ids=("B-R1-E999",)
+        )]}}
+    )
+    finalized = finalize_round(git_repo, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    report_path = git_repo / ".review/inbox/round-1/B.json"
+    raw_report = json.loads(report_path.read_bytes())
+    raw_report["findings"][0].pop("reversal_cost")
+    raw = json.dumps(raw_report).encode()
+    report_path.write_bytes(raw)
+    report_path.chmod(0o600)
+    payload = finalized.to_json()
+    payload["contract"]["report_text"] = 6
+    for slot in payload["reviewers"].values():
+        if slot["state"] == "sealed":
+            slot["receipt"]["report_contract_version"] = 6
+    payload["reviewers"]["B"]["report"]["findings"][0].pop("reversal_cost")
+    payload["reviewers"]["B"]["receipt"]["raw_sha256"] = hashlib.sha256(raw).hexdigest()
+    write_json(verdict_path, payload)
+    historical = read_verdict(git_repo)
+    payload["reviewers"]["B"]["receipt"]["context_sha256"] = context_sha256(
+        historical, Reviewer.B
+    )
+    write_json(verdict_path, payload)
+
+    with locked_review(repository_root(git_repo), create=False) as review_fd:
+        verdict = _read_verdict_locked(review_fd)
+        parsed = _read_sealed_report(
+            review_fd, verdict, Reviewer.B, root=repository_root(git_repo)
+        )
+    assert "reversal_cost" not in parsed.findings[0].to_json()
 
 
 @pytest.mark.parametrize("over_budget", ("supported_claims", "fresh_executions"))

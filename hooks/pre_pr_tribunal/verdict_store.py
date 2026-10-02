@@ -1659,6 +1659,9 @@ def _read_sealed_report(
     parsed, digest = m.validate_report_bytes(
         raw, expected_reviewer=reviewer,
         expected_round=verdict.round, snapshot=verdict.snapshot,
+        report_contract_version=(
+            verdict.contract.report_text if verdict.contract is not None else 1
+        ),
     )
     if digest != slot.receipt.raw_sha256 or parsed != slot.report:
         raise SchemaError("REPORT_RECEIPT_MISMATCH")
