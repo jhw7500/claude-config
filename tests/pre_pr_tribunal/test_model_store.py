@@ -41,7 +41,9 @@ from pre_pr_tribunal.verdict_store import (
     submit_reviewer_report,
     validate_stored_reviewer_report,
 )
-from pre_pr_tribunal.review_context import context_sha256, current_contract_binding
+from pre_pr_tribunal.review_context import (
+    context_sha256, current_contract_binding, reviewer_context_body,
+)
 from pre_pr_tribunal.review_store import locked_review, repository_root
 
 
@@ -332,7 +334,10 @@ def test_persisted_contract_five_blocker_remains_readable_without_cost(git_repo)
     assert verdict_path.read_bytes() == before
 
 
-def test_sealed_contract_six_report_without_reversal_cost_is_readable(git_repo):
+@pytest.mark.parametrize("with_budget", (False, True))
+def test_sealed_contract_six_report_without_reversal_cost_is_readable(
+    git_repo, with_budget
+):
     pending = begin_round(
         git_repo, base="master", runtime="codex", round_number=1, now=NOW
     )
@@ -359,9 +364,14 @@ def test_sealed_contract_six_report_without_reversal_cost_is_readable(git_repo):
     payload["reviewers"]["B"]["receipt"]["raw_sha256"] = hashlib.sha256(raw).hexdigest()
     write_json(verdict_path, payload)
     historical = read_verdict(git_repo)
-    payload["reviewers"]["B"]["receipt"]["context_sha256"] = context_sha256(
-        historical, Reviewer.B
-    )
+    old_context = reviewer_context_body(historical, Reviewer.B)
+    old_context["contract"]["report_text"] = 6
+    if not with_budget:
+        old_context.pop("review_budget")
+    old_context_sha256 = hashlib.sha256(json.dumps(
+        old_context, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    ).encode()).hexdigest()
+    payload["reviewers"]["B"]["receipt"]["context_sha256"] = old_context_sha256
     write_json(verdict_path, payload)
 
     with locked_review(repository_root(git_repo), create=False) as review_fd:

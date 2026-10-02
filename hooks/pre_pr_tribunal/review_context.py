@@ -75,8 +75,14 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
         "own_prior_findings": findings,
         "own_decisions": decisions,
         "contract": {
-            "report_text": REPORT_TEXT_CONTRACT_VERSION,
-            "diff_recipe": DIFF_RECIPE_VERSION,
+            "report_text": (
+                verdict.contract.report_text if verdict.contract is not None
+                else REPORT_TEXT_CONTRACT_VERSION
+            ),
+            "diff_recipe": (
+                verdict.contract.diff_recipe if verdict.contract is not None
+                else DIFF_RECIPE_VERSION
+            ),
         },
         "diff_contract": diff_contract(verdict.snapshot),
         "limits": {
@@ -106,8 +112,12 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
     return body
 
 
-def context_sha256(verdict: Verdict, reviewer: Reviewer) -> str:
+def context_sha256(
+    verdict: Verdict, reviewer: Reviewer, *, include_review_budget: bool = True
+) -> str:
     body = reviewer_context_body(verdict, reviewer)
+    if not include_review_budget:
+        body.pop("review_budget", None)
     raw = json.dumps(
         body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")

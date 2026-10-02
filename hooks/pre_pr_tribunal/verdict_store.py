@@ -1667,6 +1667,15 @@ def _read_sealed_report(
         raise SchemaError("REPORT_RECEIPT_MISMATCH")
     accepted_contexts = {context_sha256(verdict, reviewer)}
     if (
+        reviewer is Reviewer.B
+        and verdict.contract is not None
+        and verdict.contract.report_text < m.REVIEWER_B_BUDGET_CONTRACT_VERSION
+    ):
+        # Contract 6 was issued both with and without the B budget projection.
+        accepted_contexts.add(
+            context_sha256(verdict, reviewer, include_review_budget=False)
+        )
+    if (
         verdict.schema == m.VERDICT_SCHEMA_VERSION
         and verdict.policy is not None
         and verdict.policy.request.fail_closed_reason == "LEGACY_MIGRATION"
