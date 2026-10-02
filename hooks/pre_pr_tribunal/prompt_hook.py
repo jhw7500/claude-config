@@ -19,8 +19,13 @@ EXPLICIT_ACTION_BEFORE = re.compile(
     r"(?:run|invoke|use|start|go)\s+(?:the\s+)?$", re.IGNORECASE
 )
 EXPLICIT_ACTION_AFTER = re.compile(
-    r"^\s*(?:진행|실행|호출|시작|돌려|해\s*(?:줘|주세요|줄래)|부탁해)", re.IGNORECASE
+    r"^\s*(?:(?:진행|실행|호출|시작)"
+    r"(?:하되|하자|해\s*(?:줘|주세요|줄래)|해(?=$|[.!?。])|(?=$|[.!?。]))"
+    r"|돌려(?:\s*(?:줘|주세요)|(?=$|[.!?。]))"
+    r"|해\s*(?:줘|주세요|줄래)|부탁해)",
+    re.IGNORECASE,
 )
+EXPLICIT_ARGUMENT_AFTER = re.compile(r"^\s*(?:--?[\w-]+|\d+)(?=$|\s)")
 REVIEW_NOUN = r"(?:심사|트리뷰날)(?:를|을)?"
 NATURAL_REVIEW = re.compile(
     REVIEW_NOUN
@@ -33,12 +38,14 @@ NEGATED_REVIEW = re.compile(
     r"(?<!\w)(?:심사|트리뷰날)(?:[은는을를])?\s*"
     r"(?:하지\s*마|하지\s*말|하지|안\s*해|취소|중지|그만)|"
     r"(?<![\w-])[$/]pre-pr-tribunal(?![\w-])\s*"
-    r"(?:(?:지금은?|이번(?:엔|에는)|오늘은?)\s*)?"
+    r"(?:(?:은|는|을|를|아직|절대|지금은?|이번(?:엔|에는)|오늘은?)\s*){0,2}"
     r"(?:(?:진행|실행|호출|시작)(?:[은는을를])?\s*)?"
     r"(?:하지\s*마|하지\s*말|하지|안\s*해|취소(?:해줘)?|중지|그만)|"
     r"\b(?:do\s+not|don't|never|rather\s+not)\s+(?:ever\s+)?"
     r"(?:run|invoke|use|start)\s+(?:the\s+)?[$/]pre-pr-tribunal\b|"
-    r"(?:^|[.!?。]\s*|아니[,\s]+)(?:하지\s*마|취소(?:해줘)?|그만)\s*[.!?。]?$",
+    r"(?:^|[.!?。]\s*|아니[,\s]+)"
+    r"(?:(?:오늘은|지금은|이번(?:엔|에는)|아직|절대)\s*)?"
+    r"(?:하지\s*마|취소(?:해줘)?|그만)\s*[.!?。]?$",
     re.IGNORECASE,
 )
 
@@ -53,10 +60,14 @@ def classify_request(prompt: str) -> str | None:
     if NEGATED_REVIEW.search(text):
         return None
     skill = EXPLICIT_SKILL.search(text)
+    after_skill = text[skill.end():] if skill else ""
     if skill and (
-        skill.start() == 0
+        (skill.start() == 0 and (
+            not after_skill.strip(" \t.!?。")
+            or EXPLICIT_ARGUMENT_AFTER.match(after_skill)
+        ))
         or EXPLICIT_ACTION_BEFORE.search(text[:skill.start()])
-        or EXPLICIT_ACTION_AFTER.match(text[skill.end():])
+        or EXPLICIT_ACTION_AFTER.match(after_skill)
     ):
         return "explicit"
     if text == "심사" or NATURAL_REVIEW.search(text):
