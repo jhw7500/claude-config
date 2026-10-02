@@ -35,8 +35,10 @@ EXPLICIT_DISCUSSION_AFTER = re.compile(
 )
 EXPLICIT_REJECTION_AFTER = re.compile(
     r"^\s*(?:(?:은|는|을|를)\s*)?"
-    r"(?:말고|대신|없이|빼고|제외)(?=\s|$)"
-    r"|^\s*(?:필요\s*없|안\s*돌려|not\b|skip\b|later\b|without\b|instead\b)",
+    r"(?:(?:말고|대신|없이|빼고|제외)(?=\s|$)"
+    r"|(?:돌리|쓰|사용하|진행하|실행하|호출하|시작하)지\s*마)"
+    r"|^\s*(?:필요\s*없|안\s*돌려|not\b|skip\b|later\b|without\b|instead\b"
+    r"|(?:do\s+not|don't)\b|no\b)",
     re.IGNORECASE,
 )
 REVIEW_NOUN = r"(?:심사|트리뷰날)(?:를|을)?"
@@ -74,14 +76,15 @@ def classify_request(prompt: str) -> str | None:
         return None
     skill = EXPLICIT_SKILL.search(text)
     after_skill = text[skill.end():] if skill else ""
-    if skill and EXPLICIT_REJECTION_AFTER.match(after_skill):
+    action_before = bool(skill and EXPLICIT_ACTION_BEFORE.search(text[:skill.start()]))
+    if skill and not action_before and EXPLICIT_REJECTION_AFTER.match(after_skill):
         return None
     if skill and (
-        EXPLICIT_ACTION_BEFORE.search(text[:skill.start()])
+        action_before
         or EXPLICIT_ACTION_AFTER.match(after_skill)
         or (skill.start() == 0 and not (
             EXPLICIT_DISCUSSION_AFTER.match(after_skill)
-            or text.endswith("?")
+            or after_skill.strip() in {"?", "？"}
         ))
     ):
         return "explicit"
