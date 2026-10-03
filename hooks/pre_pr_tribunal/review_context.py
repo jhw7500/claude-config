@@ -14,6 +14,7 @@ from .model import (
     MAX_REPORT_BYTES,
     MAX_VERDICT_BYTES,
     REPORT_TEXT_CONTRACT_VERSION,
+    REVIEWER_B_NATIVE_TOOL_CALL_BUDGET_CONTRACT_VERSION,
     VERDICT_SCHEMA_VERSION,
     ContractBinding,
     Reviewer,
@@ -104,7 +105,14 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
             "model": selected.model,
         }
         if reviewer is Reviewer.B:
-            body["review_budget"] = reviewer_b_budget(verdict.policy.risk_floor)
+            budget = reviewer_b_budget(verdict.policy.risk_floor)
+            if (
+                verdict.contract is not None
+                and verdict.contract.report_text
+                < REVIEWER_B_NATIVE_TOOL_CALL_BUDGET_CONTRACT_VERSION
+            ):
+                budget.pop("native_tool_calls")
+            body["review_budget"] = budget
     if (reviewer is Reviewer.B and verdict.schema == VERDICT_SCHEMA_VERSION
         and (verdict.evidence_binding is not None or verdict.evidence_fallback_reason is not None)):
         body['evidence'] = verdict.evidence_binding.to_json() if verdict.evidence_binding else None
