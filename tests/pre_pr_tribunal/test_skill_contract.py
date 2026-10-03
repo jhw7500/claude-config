@@ -630,7 +630,7 @@ def test_report_reference_documents_v5_shapes_and_real_controller_commands():
         shlex.split(command)
         for command in re.findall(r"`((?:status|context|submit-report|record-failure|"
                                    r"migrate-legacy-pending|migrate-v2-pending|"
-                                   r"validate-report|finalize)[^`]*)`",
+                                   r"validate-report|final-validation-seal|finalize)[^`]*)`",
                                    match.group(1))
     ]
     parsed = [cli._parser().parse_args(command) for command in commands]
@@ -638,6 +638,7 @@ def test_report_reference_documents_v5_shapes_and_real_controller_commands():
     assert by_command == {
         "status", "context", "submit-report", "record-failure",
         "migrate-legacy-pending", "migrate-v2-pending", "validate-report", "finalize",
+        "final-validation-seal",
     }
     reasons = {
         arguments.reason for arguments in parsed
@@ -654,7 +655,34 @@ def test_report_reference_documents_internal_v5_lifecycle_identity():
     assert stored_verdict['evidence_contract'] == 2
     assert stored_verdict['evidence_binding'] is None
     assert stored_verdict['evidence_fallback_reason'] is None
+    assert stored_verdict['validation'] == {
+        'phase': 'fix_verification',
+        'requires_full_suite': True,
+        'full_suite_receipt_sha256': None,
+        'escalation_reason': None,
+    }
     assert re.fullmatch(r"[0-9a-f]{32}", stored_verdict["lifecycle_id"])
+
+
+def test_skill_documents_the_two_phase_validation_contract():
+    skill = text("SKILL.md")
+    schema = text("references/report-schema.md")
+    reviewer_b = text("references/reviewer-b.md")
+    for body in (skill, schema):
+        for token in (
+            "fix_verification",
+            "final_validation",
+            "final-validation-seal",
+            "--escalation-reason",
+            "provisional PASS",
+        ):
+            assert token in body
+    assert "finding-reproduction" in skill
+    assert "direct-impact" in skill
+    assert "full suite" in skill
+    assert "phase" in skill and "planned targeted/full validation" in skill
+    assert "authenticated evidence" in reviewer_b
+    assert "full suite" in reviewer_b
 
 
 def test_docs_separate_retryable_formats_operations_integrity_and_warnings():

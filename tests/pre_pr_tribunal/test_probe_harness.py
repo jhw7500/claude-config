@@ -1301,6 +1301,7 @@ def test_installed_probe_migrates_unproven_legacy_reports_and_runs_all_slots(tmp
     verdict.pop('evidence_fallback_reason')
     verdict.pop('evidence_contract')
     verdict.pop('policy')
+    verdict.pop('validation')
     verdict["reviewers"] = {reviewer: {"status": "pending"} for reviewer in "ABC"}
     verdict_path.write_bytes(json.dumps(verdict, separators=(",", ":")).encode())
     verdict_path.chmod(0o600)

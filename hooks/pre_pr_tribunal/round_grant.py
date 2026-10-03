@@ -91,6 +91,7 @@ def grant_binding(
             "round": round_number,
             "policy": policy.to_json(),
             "active_reviewers": list(policy.active_reviewers),
+            "validation": m.followup_validation_binding().to_json(),
             "decisions_sha256": decisions_sha256,
             "evidence": {
                 "requested_bundle_sha256": evidence_bundle_sha256,

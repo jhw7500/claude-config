@@ -223,6 +223,15 @@ controller-created view. A verified terminal exact-view cleanup refusal and tele
 warnings, not verdict gates; uncertain liveness, view identity, ownership, bytes, digest, snapshot, or contract are
 integrity stops. Never use force cleanup or delete a non-empty view root.
 
+Current status also exposes the machine-bound validation phase. A follow-up lifecycle begins in
+`fix_verification`: announce the planned finding-reproduction and direct-impact commands, defer the full suite, and
+stop or escalate on a bounded reason. Reviewer B authenticates and reuses eligible selected evidence before running
+missing focused commands. After sealed reports imply provisional PASS, execute the repository full suite exactly once
+through `evidence-capture`, then bind its successful fresh receipt with `final-validation-seal --receipt`. A non-pass
+provisional result does not run the suite unless a cross-domain, build/runtime configuration, dependency, permission,
+or nondeterministic-failure impact is recorded with `--escalation-reason`. The seal is immutable and `finalize`
+reauthenticates its HEAD, diff, contract, environment, capture, freshness, and zero exit immediately before PASS.
+
 Before pathless `finalize`, require `status` to show all A/B/C slots sealed. Re-run three separate stored validations,
 compare every digest to its receipt, and immediately recheck all report paths for current-user ownership, regular
 non-symlink type, exact `0600`, and unchanged bytes/contract. Any failure stops before `finalize`; two sealed slots can

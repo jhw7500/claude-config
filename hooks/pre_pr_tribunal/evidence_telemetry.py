@@ -13,6 +13,9 @@ def summarize(cwd, run):
         'verified_claim_count', 'unverified_claim_count',
         'budget_exhausted_claim_count', 'budget_profile',
         'verified_claim_limit', 'fresh_execution_limit', 'native_tool_call_limit',
+        'validation_phase', 'full_suite_required',
+        'full_suite_fresh_execution_count', 'full_suite_reused_execution_count',
+        'full_suite_escalation_reason',
         'capture_duration_ms', 'verification_duration_ms', 'measured_saved_elapsed_ms',
         'original_command_count', 'verifier_command_count', 'total_command_count'))
     try:
@@ -35,6 +38,23 @@ def _observe(cwd, run):
             raise ValueError('unmatched lifecycle')
         result = {'eligible_entry_count': 0, 'rejected_entry_count': 0,
                   'capture_duration_ms': 0, 'verification_duration_ms': None}
+        if verdict.validation is not None:
+            validation = verdict.validation
+            result.update(
+                validation_phase=validation.phase.value,
+                full_suite_required=validation.requires_full_suite,
+                full_suite_fresh_execution_count=(
+                    1 if validation.full_suite_receipt_sha256 is not None else 0
+                ),
+                full_suite_reused_execution_count=0,
+                full_suite_escalation_reason=validation.escalation_reason,
+            )
+            if validation.full_suite_receipt_sha256 is not None:
+                from .validation import verify_full_suite_receipt
+
+                verify_full_suite_receipt(
+                    root, verdict, validation.full_suite_receipt_sha256
+                )
         if verdict.evidence_binding is not None:
             started = time.monotonic_ns()
             _, verified = evidence_lifecycle.verify_selected_evidence(root, verdict)
