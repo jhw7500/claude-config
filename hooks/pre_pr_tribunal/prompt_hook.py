@@ -14,6 +14,7 @@ import sys
 MAX_INPUT_BYTES = 64 * 1024
 ESCAPE_PREFIXES = ("#noreminder", "#nr", "#raw", "#silent", "#조용히")
 EXPLICIT_SKILL = re.compile(r"(?<![\w-])[$/]pre-pr-tribunal(?![\w-])", re.IGNORECASE)
+EXPLICIT_SUFFIX_SEPARATOR = re.compile(r"^\s*[:,;：]\s*")
 EXPLICIT_ACTION_BEFORE = re.compile(
     r"^\s*(?:(?:can|could|would)\s+you\s+(?:please\s+)?|please\s+)?"
     r"(?:run|invoke|use|start|go)\s+(?:the\s+)?$", re.IGNORECASE
@@ -33,12 +34,25 @@ EXPLICIT_DISCUSSION_AFTER = re.compile(
     r"|(?:what|why|how|explain|describe|usage|meaning|difference)\b)",
     re.IGNORECASE,
 )
+EXPLICIT_CANCEL_BOUNDARY = r"(?=$|[.!?。,:;]|\s+please\b)"
 EXPLICIT_REJECTION_AFTER = re.compile(
     r"^\s*(?:(?:은|는|을|를)\s*)?"
     r"(?:(?:말고|대신|없이|빼고|제외)(?=\s|$)"
     r"|(?:돌리|쓰|사용하|진행하|실행하|호출하|시작하)지\s*마)"
-    r"|^\s*(?:필요\s*없|안\s*돌려|not\b|skip\b|later\b|without\b|instead\b"
-    r"|(?:do\s+not|don't)\b|no\b)",
+    r"|^\s*(?:필요\s*없|안\s*돌려|not\s+(?:now|today|yet|this\s+time)\b"
+    rf"|not\s+needed{EXPLICIT_CANCEL_BOUNDARY}"
+    r"|skip\s+(?:this\s+time|it|(?:the\s+)?tribunal)"
+    rf"(?:\s+for\s+now)?{EXPLICIT_CANCEL_BOUNDARY}"
+    r"|without\s+(?:running\s+it|(?:the\s+)?tribunal)"
+    rf"(?:\s+(?:now|today|yet))?{EXPLICIT_CANCEL_BOUNDARY}"
+    r"|(?:do\s+not|don't)\s+(?:run|invoke|use|start)\b"
+    r"(?:\s+(?:it|(?:the|this)\s+(?:tribunal|skill)|[$/]pre-pr-tribunal))?"
+    rf"(?:\s+(?:now|today|yet|this\s+time))?{EXPLICIT_CANCEL_BOUNDARY}"
+    rf"|later(?:\s+(?:today|tonight|this\s+week))?{EXPLICIT_CANCEL_BOUNDARY}"
+    rf"|no(?:\s+(?:tribunal|thanks|thank\s+you|need\s+to\s+run))?{EXPLICIT_CANCEL_BOUNDARY}"
+    r"|instead(?:\s*[,;:]\s*|\s+)(?:use|run|do)\s+"
+    r"(?:(?:the|a)\s+)?(?:normal|regular|standard|other|codex)\s+"
+    r"(?:code\s+)?review\b)",
     re.IGNORECASE,
 )
 REVIEW_NOUN = r"(?:심사|트리뷰날)(?:를|을)?"
@@ -75,7 +89,7 @@ def classify_request(prompt: str) -> str | None:
     if NEGATED_REVIEW.search(text):
         return None
     skill = EXPLICIT_SKILL.search(text)
-    after_skill = text[skill.end():] if skill else ""
+    after_skill = EXPLICIT_SUFFIX_SEPARATOR.sub(" ", text[skill.end():], count=1) if skill else ""
     action_before = bool(skill and EXPLICIT_ACTION_BEFORE.search(text[:skill.start()]))
     if skill and not action_before and EXPLICIT_REJECTION_AFTER.match(after_skill):
         return None
