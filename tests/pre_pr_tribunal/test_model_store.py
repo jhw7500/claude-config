@@ -26,17 +26,25 @@ from pre_pr_tribunal.model import (
     SchemaError,
     parse_decisions,
     parse_reviewer_report,
+    reviewer_b_budget,
+    validate_reviewer_b_budget,
     validate_report_bytes,
 )
 from pre_pr_tribunal.verdict_store import (
+    _read_sealed_report,
+    _read_verdict_locked,
     begin_round,
     finalize_round,
     read_verdict,
     require_current_in_progress,
     store_reviewer_report,
+    submit_reviewer_report,
     validate_stored_reviewer_report,
 )
-from pre_pr_tribunal.review_context import context_sha256, current_contract_binding
+from pre_pr_tribunal.review_context import (
+    context_sha256, current_contract_binding, reviewer_context_body,
+)
+from pre_pr_tribunal.review_store import locked_review, repository_root
 
 
 def NOW():
@@ -323,6 +331,107 @@ def test_persisted_contract_five_blocker_remains_readable_without_cost(git_repo)
     assert historical.contract.report_text == 5
     assert historical.gate.status.value == "fail"
     assert "reversal_cost" not in historical.reviewers["A"].report.findings[0].to_json()
+    assert verdict_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("with_budget", (False, True))
+def test_sealed_contract_six_report_without_reversal_cost_is_readable(
+    git_repo, with_budget
+):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    report_paths(
+        git_repo, pending.snapshot,
+        overrides={"B": {"findings": [finding(
+            "B-R1-001", reviewer="B", execution_ids=("B-R1-E999",)
+        )]}}
+    )
+    finalized = finalize_round(git_repo, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    report_path = git_repo / ".review/inbox/round-1/B.json"
+    raw_report = json.loads(report_path.read_bytes())
+    raw_report["findings"][0].pop("reversal_cost")
+    raw = json.dumps(raw_report).encode()
+    report_path.write_bytes(raw)
+    report_path.chmod(0o600)
+    payload = finalized.to_json()
+    payload["contract"]["report_text"] = 6
+    for slot in payload["reviewers"].values():
+        if slot["state"] == "sealed":
+            slot["receipt"]["report_contract_version"] = 6
+    payload["reviewers"]["B"]["report"]["findings"][0].pop("reversal_cost")
+    payload["reviewers"]["B"]["receipt"]["raw_sha256"] = hashlib.sha256(raw).hexdigest()
+    write_json(verdict_path, payload)
+    historical = read_verdict(git_repo)
+    old_context = reviewer_context_body(historical, Reviewer.B)
+    old_context["contract"]["report_text"] = 6
+    if not with_budget:
+        old_context.pop("review_budget")
+    old_context_sha256 = hashlib.sha256(json.dumps(
+        old_context, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    ).encode()).hexdigest()
+    payload["reviewers"]["B"]["receipt"]["context_sha256"] = old_context_sha256
+    write_json(verdict_path, payload)
+
+    with locked_review(repository_root(git_repo), create=False) as review_fd:
+        verdict = _read_verdict_locked(review_fd)
+        parsed = _read_sealed_report(
+            review_fd, verdict, Reviewer.B, root=repository_root(git_repo)
+        )
+    assert "reversal_cost" not in parsed.findings[0].to_json()
+
+
+@pytest.mark.parametrize("over_budget", ("supported_claims", "fresh_executions"))
+def test_persisted_contract_six_pass_remains_readable_above_new_budget(
+    git_repo, over_budget
+):
+    pending = begin_round(
+        git_repo, base="master", runtime="codex", round_number=1, now=NOW
+    )
+    report_paths(git_repo, pending.snapshot)
+    finalized = finalize_round(git_repo, now=NOW)
+    verdict_path = git_repo / ".review/verdict.json"
+    payload = finalized.to_json()
+    b_report = payload["reviewers"]["B"]["report"]
+    if over_budget == "supported_claims":
+        b_report["claims"].extend(
+            {
+                "id": f"B-R1-C{index:03d}",
+                "statement": f"Historical supported claim {index}.",
+                "result": "supported",
+                "execution_ids": ["B-R1-E999"],
+                "reason": "",
+            }
+            for index in range(1, 17)
+        )
+    else:
+        b_report["executions"].extend(
+            execution(f"B-R1-E{index:03d}") for index in range(1, 13)
+        )
+
+    write_json(verdict_path, payload)
+    with pytest.raises(SchemaError, match="^REVIEW_BUDGET_EXCEEDED$"):
+        read_verdict(git_repo)
+
+    payload["contract"]["report_text"] = 6
+    for slot in payload["reviewers"].values():
+        if slot["state"] == "sealed":
+            slot["receipt"]["report_contract_version"] = 6
+    write_json(verdict_path, payload)
+    before = verdict_path.read_bytes()
+
+    historical = read_verdict(git_repo)
+
+    assert historical.contract.report_text == 6
+    assert historical.gate.status.value == "pass"
+    b_report = historical.reviewers["B"].report
+    observed = (
+        len(b_report.claims)
+        if over_budget == "supported_claims"
+        else len(b_report.executions)
+    )
+    assert observed == (17 if over_budget == "supported_claims" else 13)
     assert verdict_path.read_bytes() == before
 
 
@@ -1205,6 +1314,22 @@ def test_contract_five_finding_remains_readable_without_reversal_cost(snapshot):
     assert "reversal_cost" not in parsed.findings[0].to_json()
 
 
+@pytest.mark.parametrize("has_reversal_cost", (False, True))
+def test_historical_contract_six_variants_remain_readable(snapshot, has_reversal_cost):
+    item = finding()
+    if not has_reversal_cost:
+        item.pop("reversal_cost")
+    raw = json.dumps(report(snapshot, "A", findings=[item])).encode()
+    parsed = parse_reviewer_report(
+        raw,
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+        report_contract_version=6,
+    )
+    assert ("reversal_cost" in parsed.findings[0].to_json()) is has_reversal_cost
+
+
 @pytest.mark.parametrize("reversal_cost", (None, "", "   "))
 def test_missing_or_blank_blocker_cost_preserves_exact_retry_evidence(git_repo, reversal_cost):
     pending = write_current_pending(git_repo)
@@ -1744,6 +1869,152 @@ def test_reviewer_b_claims_and_behavioral_findings_require_execution(snapshot):
         snapshot=snapshot,
     )
     assert parsed.claims[0].result == "unverified"
+
+
+def test_reviewer_b_budget_preserves_terminal_unverified_claims(snapshot):
+    assert reviewer_b_budget(50) == {
+        "profile": "ordinary", "verified_claims": 10, "fresh_executions": 8,
+        "soft_seconds": 270, "hard_seconds": 300,
+    }
+    assert reviewer_b_budget(100) == {
+        "profile": "high-risk", "verified_claims": 16, "fresh_executions": 12,
+        "soft_seconds": 480, "hard_seconds": 600,
+    }
+    assert reviewer_b_budget(75) == reviewer_b_budget(100)
+    one_execution = execution("B-R1-E001")
+    claims = [
+        {
+            "id": f"B-R1-C{index:03d}",
+            "statement": f"Required behavior {index} is safe.",
+            "result": "supported",
+            "execution_ids": ["B-R1-E001"],
+            "reason": "",
+        }
+        for index in range(1, 12)
+    ]
+    raw = report(snapshot, "B", claims=claims, executions=[one_execution])
+    parsed = parse_reviewer_report(
+        json.dumps(raw).encode(), expected_reviewer=Reviewer.B,
+        expected_round=1, snapshot=snapshot,
+    )
+    with pytest.raises(SchemaError, match="REVIEW_BUDGET_EXCEEDED"):
+        validate_reviewer_b_budget(parsed, 50)
+    validate_reviewer_b_budget(parsed, 100)
+
+    for claim in claims[10:]:
+        claim.update(result="unverified", execution_ids=[],
+                     reason="BUDGET_EXHAUSTED: verified-claim cap")
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "B", claims=claims, executions=[one_execution])).encode(),
+        expected_reviewer=Reviewer.B, expected_round=1, snapshot=snapshot,
+    )
+    validate_reviewer_b_budget(parsed, 50)
+    assert parsed.claims[-1].result == "unverified"
+
+
+def test_reviewer_b_budget_counts_only_fresh_executions(snapshot):
+    evidence = [execution(f"B-R1-E{index:03d}") for index in range(1, 14)]
+    claim = {
+        "id": "B-R1-C001", "statement": "Required behavior is safe.",
+        "result": "supported", "execution_ids": ["B-R1-E001"], "reason": "",
+    }
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "B", claims=[claim], executions=evidence)).encode(),
+        expected_reviewer=Reviewer.B, expected_round=1, snapshot=snapshot,
+    )
+    with pytest.raises(SchemaError, match="REVIEW_BUDGET_EXCEEDED"):
+        validate_reviewer_b_budget(parsed, 100)
+
+
+def test_reviewer_b_budget_exempts_blockers_but_keeps_positive_caps(snapshot):
+    evidence = [execution(f"B-R1-E{index:03d}") for index in range(1, 15)]
+    blocker = {
+        "id": "B-R1-C001", "statement": "The boundary is safe.",
+        "result": "refuted", "execution_ids": ["B-R1-E001"], "reason": "",
+    }
+    supported = [
+        {
+            "id": f"B-R1-C{index:03d}", "statement": f"Behavior {index} is safe.",
+            "result": "supported", "execution_ids": ["B-R1-E002"], "reason": "",
+        }
+        for index in range(2, 19)
+    ]
+    blocker_finding = finding("B-R1-001", reviewer="B", execution_ids=("B-R1-E001",))
+
+    def validate(claims, executions):
+        raw = report(
+            snapshot, "B", claims=claims, executions=executions,
+            findings=[blocker_finding],
+        )
+        parsed = parse_reviewer_report(
+            json.dumps(raw).encode(), expected_reviewer=Reviewer.B,
+            expected_round=1, snapshot=snapshot,
+        )
+        validate_reviewer_b_budget(parsed, 100)
+
+    with pytest.raises(SchemaError, match="REVIEW_BUDGET_EXCEEDED"):
+        validate([blocker, *supported], evidence[:13])  # 17 supported, 12 other fresh
+    with pytest.raises(SchemaError, match="REVIEW_BUDGET_EXCEEDED"):
+        validate([blocker, *supported[:16]], evidence)  # 16 supported, 13 other fresh
+    validate([blocker, *supported[:16]], evidence[:13])
+
+
+def test_ordinary_budget_admits_measured_evidence_reuse_shape(snapshot):
+    # The #113 normal bundle arm reported nine supported claims, one
+    # unverified claim, and eight fresh executions; this is a shape canary,
+    # not a replay of that native review or its elapsed time.
+    executions = [execution(f"B-R1-E{index:03d}") for index in range(1, 9)]
+    claims = [
+        {
+            "id": f"B-R1-C{index:03d}",
+            "statement": f"Required behavior {index} is safe.",
+            "result": "supported",
+            "execution_ids": [f"B-R1-E{min(index, 8):03d}"],
+            "reason": "",
+        }
+        for index in range(1, 10)
+    ]
+    claims.append({
+        "id": "B-R1-C010", "statement": "Every lockfile change is necessary.",
+        "result": "unverified", "execution_ids": [],
+        "reason": "Necessity is not proven by executable evidence.",
+    })
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "B", claims=claims, executions=executions)).encode(),
+        expected_reviewer=Reviewer.B, expected_round=1, snapshot=snapshot,
+    )
+    validate_reviewer_b_budget(parsed, 50)
+
+
+def test_submit_rejects_over_budget_but_seals_terminal_budget_report(git_repo):
+    pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert pending.policy.risk_floor == 100
+    evidence = execution("B-R1-E001")
+    claims = [
+        {
+            "id": f"B-R1-C{index:03d}",
+            "statement": f"Required behavior {index} is safe.",
+            "result": "supported",
+            "execution_ids": ["B-R1-E001"],
+            "reason": "",
+        }
+        for index in range(1, 18)
+    ]
+    value = report(pending.snapshot, "B", claims=claims, executions=[evidence])
+    with pytest.raises(SchemaError, match="REVIEW_BUDGET_EXCEEDED"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=json.dumps(value).encode(), now=NOW)
+    pending_slot = read_verdict(git_repo).reviewers["B"]
+    assert pending_slot.status == "pending"
+    assert pending_slot.last_error == "REVIEW_BUDGET_EXCEEDED"
+
+    claims[-1].update(result="unverified", execution_ids=[],
+                      reason="BUDGET_EXHAUSTED: verified-claim cap")
+    value = report(pending.snapshot, "B", claims=claims, executions=[evidence])
+    receipt = submit_reviewer_report(
+        git_repo, reviewer=Reviewer.B, raw=json.dumps(value).encode(), now=NOW,
+    )
+    assert receipt.report_contract_version == REPORT_TEXT_CONTRACT_VERSION
+    assert read_verdict(git_repo).reviewers["B"].status == "sealed"
 
 
 def test_non_scalar_schema_enums_fail_as_bounded_schema_errors(snapshot):

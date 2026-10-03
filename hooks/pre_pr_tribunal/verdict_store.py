@@ -1584,6 +1584,12 @@ def _validate_reviewer_closure(
     verdict: Verdict, report: ReviewerReport, *, seen_replacements: set[str] | None = None,
 ) -> None:
     """Check only this role's responses before accepting its immutable report."""
+    if (
+        verdict.contract is not None
+        and verdict.contract.report_text >= m.REVIEWER_B_BUDGET_CONTRACT_VERSION
+        and verdict.policy is not None
+    ):
+        m.validate_reviewer_b_budget(report, verdict.policy.risk_floor)
     decisions = {
         item.id: item for item in verdict.decisions if item.reviewer is report.reviewer
     }
@@ -1653,10 +1659,22 @@ def _read_sealed_report(
     parsed, digest = m.validate_report_bytes(
         raw, expected_reviewer=reviewer,
         expected_round=verdict.round, snapshot=verdict.snapshot,
+        report_contract_version=(
+            verdict.contract.report_text if verdict.contract is not None else 1
+        ),
     )
     if digest != slot.receipt.raw_sha256 or parsed != slot.report:
         raise SchemaError("REPORT_RECEIPT_MISMATCH")
     accepted_contexts = {context_sha256(verdict, reviewer)}
+    if (
+        reviewer is Reviewer.B
+        and verdict.contract is not None
+        and verdict.contract.report_text < m.REVIEWER_B_BUDGET_CONTRACT_VERSION
+    ):
+        # Contract 6 was issued both with and without the B budget projection.
+        accepted_contexts.add(
+            context_sha256(verdict, reviewer, include_review_budget=False)
+        )
     if (
         verdict.schema == m.VERDICT_SCHEMA_VERSION
         and verdict.policy is not None

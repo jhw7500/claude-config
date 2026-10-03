@@ -171,10 +171,10 @@ def snapshot_binding(snapshot):
             'diff_sha256': snapshot.diff_sha256}
 
 
-def _binding(root, base, profile, command_cwd):
+def _binding(root, base, profile, command_cwd, *, stored_contract=None):
     snapshot = capture_snapshot(root, base)
     return {'snapshot': snapshot_binding(snapshot),
-            'contract': contract_binding(),
+            'contract': contract_binding() if stored_contract is None else stored_contract,
             'environment': measure_environment(
                 root, profile, command_cwd, head_sha=snapshot.head_sha)}
 
@@ -299,11 +299,14 @@ def verify_source_tool_environment(cwd, *, expected_environment):
 
 
 @evidence.bounded_errors
-def verify_evidence(cwd, *, bundle_sha256, expected_binding):
+def verify_evidence(cwd, *, bundle_sha256, expected_binding, stored_contract=None):
     evidence.validate_binding(expected_binding, expected_binding)
+    if stored_contract is not None and expected_binding['contract'] != stored_contract:
+        raise SchemaError('EVIDENCE_BINDING_MISMATCH')
     root = _physical_root(Path(cwd))
     environment = expected_binding['environment']
-    current = _binding(root, expected_binding['snapshot']['base']['ref'], environment['profile'], environment['cwd'])
+    current = _binding(root, expected_binding['snapshot']['base']['ref'],
+        environment['profile'], environment['cwd'], stored_contract=stored_contract)
     evidence.validate_binding(current, expected_binding)
     result = evidence_store.verify_bundle(root, bundle_sha256, current)
     for entry in result['bundle']['entries']:
@@ -311,5 +314,6 @@ def verify_evidence(cwd, *, bundle_sha256, expected_binding):
             raise SchemaError('EVIDENCE_BINDING_MISMATCH')
         if entry['freshness'] != validate_command(root, environment['profile'], entry['cwd'], entry['argv']):
             raise SchemaError('EVIDENCE_FRESHNESS_MISMATCH')
-    evidence.validate_binding(current, _binding(root, current['snapshot']['base']['ref'], environment['profile'], environment['cwd']))
+    evidence.validate_binding(current, _binding(root, current['snapshot']['base']['ref'],
+        environment['profile'], environment['cwd'], stored_contract=stored_contract))
     return result

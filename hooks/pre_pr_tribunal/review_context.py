@@ -19,6 +19,7 @@ from .model import (
     Reviewer,
     SchemaError,
     Verdict,
+    reviewer_b_budget,
 )
 
 
@@ -74,8 +75,14 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
         "own_prior_findings": findings,
         "own_decisions": decisions,
         "contract": {
-            "report_text": REPORT_TEXT_CONTRACT_VERSION,
-            "diff_recipe": DIFF_RECIPE_VERSION,
+            "report_text": (
+                verdict.contract.report_text if verdict.contract is not None
+                else REPORT_TEXT_CONTRACT_VERSION
+            ),
+            "diff_recipe": (
+                verdict.contract.diff_recipe if verdict.contract is not None
+                else DIFF_RECIPE_VERSION
+            ),
         },
         "diff_contract": diff_contract(verdict.snapshot),
         "limits": {
@@ -96,6 +103,8 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
             "effective_intensity": verdict.policy.effective_intensity,
             "model": selected.model,
         }
+        if reviewer is Reviewer.B:
+            body["review_budget"] = reviewer_b_budget(verdict.policy.risk_floor)
     if (reviewer is Reviewer.B and verdict.schema == VERDICT_SCHEMA_VERSION
         and (verdict.evidence_binding is not None or verdict.evidence_fallback_reason is not None)):
         body['evidence'] = verdict.evidence_binding.to_json() if verdict.evidence_binding else None
@@ -103,8 +112,12 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
     return body
 
 
-def context_sha256(verdict: Verdict, reviewer: Reviewer) -> str:
+def context_sha256(
+    verdict: Verdict, reviewer: Reviewer, *, include_review_budget: bool = True
+) -> str:
     body = reviewer_context_body(verdict, reviewer)
+    if not include_review_budget:
+        body.pop("review_budget", None)
     raw = json.dumps(
         body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     ).encode("utf-8")

@@ -7,7 +7,7 @@ from enum import Enum
 import hashlib
 import json
 import re
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, TypedDict
 import unicodedata
 from urllib.parse import urlsplit
 
@@ -34,9 +34,11 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 6
+REPORT_TEXT_CONTRACT_VERSION = 7
 REFUTED_CLAIM_BLOCKER_CONTRACT_VERSION = 5
+REVIEWER_B_BUDGET_CONTRACT_VERSION = 7
 REVERSAL_COST_CONTRACT_VERSION = 6
+REQUIRED_REVERSAL_COST_CONTRACT_VERSION = 7
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -299,6 +301,69 @@ class ReviewerReport:
         if self.coverage is not None:
             value["coverage"] = self.coverage.to_json()
         return value
+
+
+class ReviewerBBudget(TypedDict):
+    profile: str
+    verified_claims: int
+    fresh_executions: int
+    soft_seconds: int
+    hard_seconds: int
+
+
+def reviewer_b_budget(risk_floor: int) -> ReviewerBBudget:
+    """Bound B by snapshot risk, independently of requested intensity."""
+    if type(risk_floor) is not int or not 0 <= risk_floor <= 100:
+        raise SchemaError("POLICY_INVALID")
+    if risk_floor >= 67:
+        return {
+            "profile": "high-risk",
+            "verified_claims": 16,
+            "fresh_executions": 12,
+            "soft_seconds": 480,
+            "hard_seconds": 600,
+        }
+    return {
+        "profile": "ordinary",
+        "verified_claims": 10,
+        "fresh_executions": 8,
+        "soft_seconds": 270,
+        "hard_seconds": 300,
+    }
+
+
+def reviewer_b_fresh_non_blocking_execution_count(report: ReviewerReport) -> int:
+    """Count the fresh report entries governed by Reviewer B's execution cap."""
+    blocker_execution_ids = {
+        execution_id
+        for claim in report.claims
+        if claim.result == "refuted"
+        for execution_id in claim.execution_ids
+    }
+    blocker_execution_ids.update(
+        execution_id
+        for finding in report.findings
+        if finding.severity in {Severity.CRITICAL, Severity.HIGH}
+        for execution_id in finding.execution_ids
+    )
+    return sum(
+        execution.evidence_ref is None
+        and execution.id not in blocker_execution_ids
+        for execution in report.executions
+    )
+
+
+def validate_reviewer_b_budget(report: ReviewerReport, risk_floor: int) -> None:
+    if report.reviewer is not Reviewer.B:
+        return
+    budget = reviewer_b_budget(risk_floor)
+    supported = sum(claim.result == "supported" for claim in report.claims)
+    fresh_non_blocking = reviewer_b_fresh_non_blocking_execution_count(report)
+    if (
+        supported > budget["verified_claims"]
+        or fresh_non_blocking > budget["fresh_executions"]
+    ):
+        raise SchemaError("REVIEW_BUDGET_EXCEEDED")
 
 
 @dataclass(frozen=True)
@@ -1071,7 +1136,11 @@ def _parse_finding(
         "execution_ids",
         "acceptance_condition",
     }
-    if report_contract_version >= REVERSAL_COST_CONTRACT_VERSION:
+    if report_contract_version >= REQUIRED_REVERSAL_COST_CONTRACT_VERSION or (
+        report_contract_version >= REVERSAL_COST_CONTRACT_VERSION
+        and isinstance(value, dict)
+        and "reversal_cost" in value
+    ):
         keys.add("reversal_cost")
     obj = _object(
         value,
@@ -1111,7 +1180,7 @@ def _parse_finding(
         refs.append(ref)
     acceptance = _text(obj["acceptance_condition"], MAX_EVIDENCE_TEXT_BYTES)
     reversal_cost = None
-    if report_contract_version >= REVERSAL_COST_CONTRACT_VERSION:
+    if "reversal_cost" in obj:
         reversal_cost = _text(
             obj["reversal_cost"], MAX_EVIDENCE_TEXT_BYTES, allow_empty=True
         )
@@ -1356,6 +1425,7 @@ def validate_report_bytes(
     expected_reviewer: Reviewer,
     expected_round: int,
     snapshot: Snapshot,
+    report_contract_version: int = REPORT_TEXT_CONTRACT_VERSION,
 ) -> tuple[ReviewerReport, str]:
     """Validate one exact reviewer response and return its raw-byte digest."""
     report = parse_reviewer_report(
@@ -1363,8 +1433,11 @@ def validate_report_bytes(
         expected_reviewer=expected_reviewer,
         expected_round=expected_round,
         snapshot=snapshot,
+        report_contract_version=report_contract_version,
     )
-    validate_reviewer_report_semantics(report)
+    validate_reviewer_report_semantics(
+        report, report_contract_version=report_contract_version
+    )
     return report, hashlib.sha256(raw).hexdigest()
 
 

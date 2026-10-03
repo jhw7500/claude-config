@@ -590,7 +590,11 @@ def test_unknown_model_stops_before_dispatch(tmp_path):
         begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
 
 
-def test_active_only_finalize_and_unverified_is_inconclusive(tmp_path):
+@pytest.mark.parametrize("reason", (
+    "The required SDK is unavailable.",
+    "BUDGET_EXHAUSTED: fresh-execution cap",
+))
+def test_active_only_finalize_and_unverified_is_inconclusive(tmp_path, reason):
     repo = _repo(tmp_path)
     verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     submit_reviewer_report(
@@ -601,7 +605,7 @@ def test_active_only_finalize_and_unverified_is_inconclusive(tmp_path):
         "statement": "The documented entry path runs.",
         "result": "unverified",
         "execution_ids": [],
-        "reason": "The required SDK is unavailable.",
+        "reason": reason,
     }
     submit_reviewer_report(
         repo,
@@ -684,6 +688,94 @@ def test_refuted_claim_with_blocker_produces_terminal_failure(tmp_path):
 
     assert final.gate.status is GateStatus.FAIL
     assert final.gate.blocking_count == 1
+    assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.BLOCKERS_OPEN
+
+
+def test_high_risk_budget_exhaustion_preserves_refuted_blocker(tmp_path):
+    repo = _repo(tmp_path, path="config/security.yaml")
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.risk_floor == 100
+    submit_reviewer_report(repo, reviewer=Reviewer.A, raw=_report(verdict, "A"), now=NOW)
+
+    value = json.loads(_refuted_report(
+        verdict, findings=(_finding("B-R1-001", "B", severity="HIGH"),)
+    ))
+    value["findings"][0]["path"] = "config/security.yaml"
+    value["coverage"]["primary_entry_paths"][0]["path"] = "config/security.yaml"
+    value["claims"].extend({
+        "id": f"B-R1-C{index:03d}",
+        "statement": f"Additional required behavior {index} is safe.",
+        "result": "supported",
+        "execution_ids": ["B-R1-E001"],
+        "reason": "",
+    } for index in range(2, 17))
+    value["claims"].append({
+        "id": "B-R1-C017",
+        "statement": "The remaining required path preserves permissions.",
+        "result": "unverified",
+        "execution_ids": [],
+        "reason": "BUDGET_EXHAUSTED: verified-claim cap",
+    })
+    submit_reviewer_report(
+        repo, reviewer=Reviewer.B, raw=json.dumps(value).encode(), now=NOW,
+    )
+
+    final = finalize_round(repo, now=NOW)
+    assert final.gate.status is GateStatus.FAIL
+    assert final.gate.blocking_count == 1
+    assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.BLOCKERS_OPEN
+
+
+def test_high_risk_budget_keeps_independent_refuted_blockers(tmp_path):
+    repo = _repo(tmp_path, path="config/security.yaml")
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    assert verdict.policy.risk_floor == 100
+    submit_reviewer_report(repo, reviewer=Reviewer.A, raw=_report(verdict, "A"), now=NOW)
+
+    executions = []
+    claims = []
+    findings = []
+    for index in range(1, 18):
+        execution_id = f"B-R1-E{index:03d}"
+        claim_id = f"B-R1-C{index:03d}"
+        finding_id = f"B-R1-{index:03d}"
+        evidence = _execution(execution_id)
+        evidence.update(
+            exit_code=1,
+            stdout_excerpt="refuted",
+            capture_sha256=hashlib.sha256(b"refuted").hexdigest(),
+        )
+        executions.append(evidence)
+        claims.append({
+            "id": claim_id,
+            "statement": f"Required behavior {index} remains safe.",
+            "result": "refuted",
+            "execution_ids": [execution_id],
+            "reason": "",
+        })
+        finding = _finding(finding_id, "B", severity="HIGH")
+        finding.update(path="config/security.yaml", execution_ids=[execution_id])
+        findings.append(finding)
+
+    raw = _report(
+        verdict,
+        "B",
+        findings=findings,
+        executions=executions,
+        claims=claims,
+        coverage={
+            "complete": True,
+            "primary_entry_paths": [
+                {"path": "config/security.yaml", "claim_id": "B-R1-C001"},
+            ],
+        },
+    )
+    receipt = submit_reviewer_report(repo, reviewer=Reviewer.B, raw=raw, now=NOW)
+    assert receipt.raw_sha256 == hashlib.sha256(raw).hexdigest()
+
+    final = finalize_round(repo, now=NOW)
+    assert final.gate.status is GateStatus.FAIL
+    assert final.gate.blocking_count == 17
     assert evaluate_gate(repo, BOUND_COMMAND).code is GateCode.BLOCKERS_OPEN
 
 
