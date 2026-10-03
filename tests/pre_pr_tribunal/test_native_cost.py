@@ -131,6 +131,35 @@ def test_cache_write_counter_cannot_decrease_across_missing_record():
         cost.summarize_session(session(*items))
 
 
+def test_event_msg_token_count_uses_cumulative_not_last_usage():
+    items = [json.loads(line) for line in sample_session().splitlines()]
+    for item in items[-2:]:
+        usage = item["payload"]["thread_token_usage"]
+        item["type"] = "event_msg"
+        item["payload"] = {"type": "token_count", "info": {
+            "total_token_usage": {**usage, "cache_write_input_tokens": 4},
+            "last_token_usage": {**usage, "total_tokens": 1},
+        }}
+    items.insert(-2, record("2026-10-03T00:00:01Z", "event_msg", {
+        "type": "token_count", "info": None,
+    }))
+    result = cost.summarize_session(session(*items))
+    assert result["tokens_cumulative_last"] == {
+        "input_tokens": 20, "cached_input_tokens": 5,
+        "output_tokens": 7, "reasoning_output_tokens": 2,
+        "total_tokens": 27, "cache_write_input_tokens": 4,
+    }
+
+
+def test_malformed_event_msg_token_usage_is_rejected():
+    items = [json.loads(line) for line in sample_session().splitlines()[:-2]]
+    items.append(record("2026-10-03T00:00:03Z", "event_msg", {
+        "type": "token_count", "info": {"last_token_usage": {}},
+    }))
+    with pytest.raises(cost.CostError, match="COST_SESSION_INVALID"):
+        cost.summarize_session(session(*items))
+
+
 def test_explicit_file_is_owned_regular_bounded_and_not_symlink(tmp_path, monkeypatch):
     original = tmp_path / "session.jsonl"
     original.write_bytes(sample_session())

@@ -113,8 +113,18 @@ def summarize_session(raw: bytes) -> dict[str, object]:
         payload = item["payload"]
         if kind == "session_meta":
             session_meta_count += 1
-        elif kind == "token_usage_record":
-            usage = payload.get("thread_token_usage")
+        elif kind == "token_usage_record" or (
+            kind == "event_msg" and payload.get("type") == "token_count"
+        ):
+            if kind == "token_usage_record":
+                usage = payload.get("thread_token_usage")
+            else:
+                info = payload.get("info")
+                if info is None:
+                    continue
+                if not isinstance(info, dict):
+                    raise CostError("COST_SESSION_INVALID")
+                usage = info.get("total_token_usage")
             if not isinstance(usage, dict):
                 raise CostError("COST_SESSION_INVALID")
             keys = TOKEN_KEYS + tuple(key for key in OPTIONAL_TOKEN_KEYS if key in usage)
