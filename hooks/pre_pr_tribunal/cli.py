@@ -38,6 +38,7 @@ if __package__ in {None, ""}:
         preview_policy,
         read_verdict,
         record_reviewer_failure,
+        seal_final_validation,
         store_reviewer_report,
         submit_reviewer_report,
         validate_stored_reviewer_report,
@@ -71,6 +72,7 @@ else:
         preview_policy,
         read_verdict,
         record_reviewer_failure,
+        seal_final_validation,
         store_reviewer_report,
         submit_reviewer_report,
         validate_stored_reviewer_report,
@@ -198,6 +200,9 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--reviewer-a", type=Path)
     finalize.add_argument("--reviewer-b", type=Path)
     finalize.add_argument("--reviewer-c", type=Path)
+    final_validation = commands.add_parser("final-validation-seal", add_help=False)
+    final_validation.add_argument("--receipt", required=True)
+    final_validation.add_argument("--escalation-reason")
     commands.add_parser("status", add_help=False)
     start = commands.add_parser("telemetry-start", add_help=False)
     start.add_argument("--run-id", required=True)
@@ -411,6 +416,8 @@ def _status(verdict) -> dict[str, object]:
         payload["policy"] = verdict.policy.to_json()
         payload["active_reviewers"] = list(verdict.policy.active_reviewers)
         payload["pr_appendix"] = _pr_appendix(verdict)
+        if verdict.validation is not None:
+            payload["validation"] = verdict.validation.to_json()
     return payload
 
 
@@ -876,6 +883,13 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                     snapshot=snapshot,
                 )
                 payload = _report_projection(reviewer, verdict.round, "valid", digest)
+        elif arguments.command == "final-validation-seal":
+            verdict = seal_final_validation(
+                cwd,
+                receipt_sha256=arguments.receipt,
+                escalation_reason=arguments.escalation_reason,
+            )
+            payload = _status(verdict)
         elif arguments.command == "finalize":
             supplied = {
                 key: value

@@ -15,10 +15,12 @@ from .model import (
     MAX_VERDICT_BYTES,
     REPORT_TEXT_CONTRACT_VERSION,
     REVIEWER_B_NATIVE_TOOL_CALL_BUDGET_CONTRACT_VERSION,
+    VALIDATION_PHASE_CONTRACT_VERSION,
     VERDICT_SCHEMA_VERSION,
     ContractBinding,
     Reviewer,
     SchemaError,
+    ValidationPhase,
     Verdict,
     reviewer_b_budget,
 )
@@ -113,6 +115,28 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
             ):
                 budget.pop("native_tool_calls")
             body["review_budget"] = budget
+        if (
+            verdict.contract is not None
+            and verdict.contract.report_text >= VALIDATION_PHASE_CONTRACT_VERSION
+        ):
+            if verdict.validation is None:
+                raise SchemaError("VALIDATION_BINDING_INVALID")
+            if verdict.validation.phase is ValidationPhase.FIX_VERIFICATION:
+                body["validation"] = {
+                    "phase": "fix_verification",
+                    "planned": ["finding_reproduction", "direct_impact_tests"],
+                    "full_suite": "deferred_until_provisional_pass",
+                }
+            else:
+                body["validation"] = {
+                    "phase": "final_validation",
+                    "planned": ["full_suite"],
+                    "full_suite": (
+                        "receipt_sealed"
+                        if verdict.validation.full_suite_receipt_sha256 is not None
+                        else "initial_round"
+                    ),
+                }
     if (reviewer is Reviewer.B and verdict.schema == VERDICT_SCHEMA_VERSION
         and (verdict.evidence_binding is not None or verdict.evidence_fallback_reason is not None)):
         body['evidence'] = verdict.evidence_binding.to_json() if verdict.evidence_binding else None

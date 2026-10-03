@@ -342,6 +342,7 @@ def test_old_schema_three_remains_readable_but_not_pending_authority(git_repo):
     value.pop('evidence_binding'); value.pop('evidence_fallback_reason')
     value.pop('evidence_contract')
     value.pop('policy')
+    value.pop('validation')
     path = git_repo / '.review/verdict.json'
     path.write_text(json.dumps(value))
     loaded = read_verdict(git_repo)

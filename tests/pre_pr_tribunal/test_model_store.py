@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-from pre_pr_tribunal import round_grant
+from pre_pr_tribunal import evidence_runtime, round_grant
 from pre_pr_tribunal.git_state import DIFF_RECIPE_VERSION, capture_snapshot
 from pre_pr_tribunal.model import (
     SCHEMA_VERSION,
@@ -37,6 +37,7 @@ from pre_pr_tribunal.verdict_store import (
     finalize_round,
     read_verdict,
     require_current_in_progress,
+    seal_final_validation,
     store_reviewer_report,
     submit_reviewer_report,
     validate_stored_reviewer_report,
@@ -137,6 +138,14 @@ def write_json(path, value):
     return path
 
 
+def seal_test_final_validation(repo):
+    captured = evidence_runtime.capture_evidence(
+        repo, base="master", profile="python-v1", command_cwd=".",
+        argv=["python3", "-I", "-S", "-c", "pass"], timeout_seconds=15,
+    )
+    return seal_final_validation(repo, receipt_sha256=captured["receipt_sha256"])
+
+
 def authorize_next_begin(repo, *, runtime="codex", round_number=1, decisions_path=None):
     """Model a fresh user approval in legacy transition-focused tests."""
     preview = round_grant.preview_grant_binding(
@@ -164,6 +173,23 @@ def report_paths(repo, snapshot, *, round_number=1, overrides=None):
         else:
             submit_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=json.dumps(value).encode(), now=NOW)
         result[reviewer] = path
+    current = read_verdict(repo)
+    validation = current.validation
+    active_reports = [
+        current.reviewers[key].report for key in current.policy.active_reviewers
+    ] if current.policy is not None else []
+    provisional_pass = bool(active_reports) and not any(
+        finding.severity.value in {"CRITICAL", "HIGH"}
+        for report_value in active_reports
+        for finding in report_value.findings
+    ) and not any(
+        claim.result == "unverified"
+        for report_value in active_reports
+        if report_value.reviewer is Reviewer.B
+        for claim in report_value.claims
+    )
+    if validation is not None and validation.requires_full_suite and provisional_pass:
+        seal_test_final_validation(repo)
     return result
 
 
@@ -2841,6 +2867,7 @@ def test_failed_legacy_verdict_without_head_ref_migrates_on_next_round(git_repo)
     del legacy['evidence_fallback_reason']
     del legacy['evidence_contract']
     del legacy['policy']
+    del legacy['validation']
     legacy["reviewers"] = {key: slot["report"] for key, slot in legacy["reviewers"].items()}
     legacy["reviewers"]["A"]["findings"][0].pop("reversal_cost")
     del legacy["head_ref"]
@@ -3245,6 +3272,7 @@ def test_only_originating_reviewer_can_close_decision(git_repo, owner_payload, c
     receipt = submit_reviewer_report(git_repo, reviewer=Reviewer.A,
                                     raw=json.dumps(corrected).encode(), now=NOW)
     assert receipt.attempt == 2
+    seal_test_final_validation(git_repo)
     assert finalize_round(git_repo, now=NOW).gate.status.value == "pass"
 
 
@@ -3655,6 +3683,7 @@ def test_cli_finalize_and_status_emit_only_bounded_projections(git_repo):
         *expected,
         "reviewers",
         "policy",
+        "validation",
         "active_reviewers",
         "pr_appendix",
     }

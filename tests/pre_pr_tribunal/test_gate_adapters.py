@@ -193,6 +193,7 @@ def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo,
         value["schema"] = 1
         del value["contract"]
         del value["lifecycle_id"]
+        del value["validation"]
         value["reviewers"] = {key: slot["report"]
                               for key, slot in value["reviewers"].items()}
         _write_json(path, value)

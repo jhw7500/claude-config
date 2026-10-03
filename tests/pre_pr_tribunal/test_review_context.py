@@ -181,6 +181,21 @@ def test_contract_seven_context_keeps_pre_native_call_budget_shape(git_repo):
     }
 
 
+def test_contract_eight_context_omits_contract_nine_validation_phase(git_repo):
+    pending = _current_pending(git_repo)
+    historical = replace(
+        pending,
+        contract=replace(pending.contract, report_text=8),
+    )
+
+    assert reviewer_context_body(pending, Reviewer.B)["validation"] == {
+        "phase": "final_validation",
+        "planned": ["full_suite"],
+        "full_suite": "initial_round",
+    }
+    assert "validation" not in reviewer_context_body(historical, Reviewer.B)
+
+
 def test_sealing_peer_does_not_change_pending_reviewer_context(git_repo):
     pending_verdict = _with_mixed_prior_reviewer_data(_current_pending(git_repo))
     before = context_sha256(pending_verdict, Reviewer.C)

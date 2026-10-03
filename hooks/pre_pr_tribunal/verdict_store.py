@@ -220,6 +220,7 @@ class _VerdictFields:
     evidence_fallback_reason: str | None
     evidence_contract: int | None
     policy: m.PolicyBinding | None
+    validation: m.ValidationBinding | None
 
 
 def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFields:
@@ -251,6 +252,9 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         valid_shapes = {frozenset(verdict_keys)}
         if schema in m.EVIDENCE_VERDICT_SCHEMAS:
             valid_shapes.add(frozenset((*verdict_keys, 'evidence_contract')))
+        valid_shapes.update(
+            frozenset((*shape, "validation")) for shape in tuple(valid_shapes)
+        )
     else:
         valid_shapes = {
             frozenset(verdict_keys),
@@ -371,6 +375,31 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         from .policy import parse_policy_binding
 
         policy_binding = parse_policy_binding(data["policy"], runtime=runtime)
+    validation_binding = None
+    if "validation" in data:
+        validation_obj = m._object(
+            data["validation"],
+            {
+                "phase",
+                "requires_full_suite",
+                "full_suite_receipt_sha256",
+                "escalation_reason",
+            },
+            "VALIDATION_BINDING_INVALID",
+        )
+        receipt_sha256 = validation_obj["full_suite_receipt_sha256"]
+        reason = validation_obj["escalation_reason"]
+        validation_binding = m.ValidationBinding(
+            m._enum(
+                m.ValidationPhase,
+                validation_obj["phase"],
+                "VALIDATION_BINDING_INVALID",
+            ),
+            validation_obj["requires_full_suite"],
+            receipt_sha256,
+            reason,
+        )
+        validation_binding.to_json()
     return _VerdictFields(
         schema,
         repository,
@@ -394,6 +423,7 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         fallback,
         evidence_contract,
         policy_binding,
+        validation_binding,
     )
 
 
@@ -473,6 +503,7 @@ def _verdict_from_fields(
         fields.evidence_fallback_reason,
         fields.evidence_contract,
         fields.policy,
+        fields.validation,
     )
 
 
@@ -597,6 +628,13 @@ def _parse_v2_receipt(
 def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
     fields = _parse_verdict_fields(data, schema=schema)
     contract = _parse_contract(data["contract"])
+    if (
+        contract.report_text >= m.VALIDATION_PHASE_CONTRACT_VERSION
+        and fields.validation is None
+    ):
+        raise SchemaError("VERDICT_INVALID")
+    if contract.report_text < m.VALIDATION_PHASE_CONTRACT_VERSION:
+        fields = replace(fields, validation=None)
     if fields.evidence_binding is not None:
         evidence_contract = fields.evidence_binding.to_json()['expected_binding']['contract']
         if ({key: evidence_contract[key] for key in contract.to_json()} != contract.to_json()
@@ -1239,6 +1277,7 @@ def _new_current_pending(
     contract: ContractBinding,
     lifecycle_id: str,
     policy: m.PolicyBinding,
+    validation: m.ValidationBinding,
 ) -> Verdict:
     active = set(policy.active_reviewers)
     gate = (
@@ -1270,6 +1309,7 @@ def _new_current_pending(
         lifecycle_id,
         evidence_contract=2,
         policy=policy,
+        validation=validation,
     )
 
 
@@ -1507,6 +1547,11 @@ def begin_round(
             round_number=round_number, decisions=decisions, history=history,
             contract=current_contract_binding(), lifecycle_id=_lifecycle_id(token_hex),
             policy=policy,
+            validation=(
+                m.followup_validation_binding()
+                if stored is not None
+                else m.initial_validation_binding()
+            ),
         )
         if policy.mode is not m.ReviewMode.OFF:
             pending = replace(
@@ -1698,10 +1743,95 @@ def _read_sealed_report(
         )
         accepted_contexts.add(context_sha256(legacy, reviewer))
     if slot.receipt.context_sha256 not in accepted_contexts:
-        raise SchemaError("CONTEXT_DRIFT")
+        if (
+            verdict.validation is not None
+            and verdict.validation.requires_full_suite
+            and verdict.validation.phase is m.ValidationPhase.FINAL_VALIDATION
+        ):
+            accepted_contexts.add(
+                context_sha256(
+                    replace(verdict, validation=m.followup_validation_binding()),
+                    reviewer,
+                )
+            )
+        if slot.receipt.context_sha256 not in accepted_contexts:
+            raise SchemaError("CONTEXT_DRIFT")
     from .evidence_lifecycle import authenticate_report
     authenticate_report(root, verdict, parsed)
     return parsed
+
+
+def _provisional_gate(
+    reports: Mapping[str, ReviewerReport],
+) -> tuple[GateStatus, tuple[m.Finding, ...]]:
+    blockers = tuple(
+        finding
+        for report in reports.values()
+        for finding in report.findings
+        if finding.severity in {Severity.CRITICAL, Severity.HIGH}
+    )
+    reviewer_b = reports.get("B")
+    has_unverified = reviewer_b is not None and any(
+        claim.result == "unverified" for claim in reviewer_b.claims
+    )
+    status = (
+        GateStatus.FAIL
+        if blockers
+        else GateStatus.INCONCLUSIVE
+        if has_unverified
+        else GateStatus.PASS
+    )
+    return status, blockers
+
+
+def seal_final_validation(
+    cwd: Path,
+    *,
+    receipt_sha256: str,
+    escalation_reason: str | None = None,
+) -> Verdict:
+    """Bind one fresh full-suite receipt to the current follow-up lifecycle."""
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        pending = _read_verdict_locked(review_fd)
+        require_current_in_progress(pending)
+        if pending.contract != current_contract_binding():
+            raise SchemaError("CONTRACT_DRIFT")
+        validation = pending.validation
+        if validation is None or not validation.requires_full_suite:
+            raise SchemaError("FINAL_VALIDATION_NOT_REQUIRED")
+        if validation.phase is m.ValidationPhase.FINAL_VALIDATION:
+            raise SchemaError("FINAL_VALIDATION_ALREADY_SEALED")
+        snapshot = capture_snapshot(root, pending.base_ref)
+        if not _snapshot_equal(pending, snapshot):
+            raise SchemaError("SNAPSHOT_CHANGED")
+        if pending.policy is None:
+            raise SchemaError("POLICY_INVALID")
+        reports = {
+            key: _read_sealed_report(
+                review_fd, pending, Reviewer(key), root=root
+            )
+            for key in pending.policy.active_reviewers
+        }
+        _validate_closure(pending, reports)
+        provisional, _blockers_found = _provisional_gate(reports)
+        if provisional is not GateStatus.PASS and escalation_reason is None:
+            raise SchemaError("FINAL_VALIDATION_NOT_READY")
+        sealed_validation = m.ValidationBinding(
+            m.ValidationPhase.FINAL_VALIDATION,
+            True,
+            receipt_sha256,
+            escalation_reason,
+        )
+        sealed_validation.to_json()
+        from .validation import verify_full_suite_receipt
+
+        verify_full_suite_receipt(root, pending, receipt_sha256)
+        sealed = replace(pending, validation=sealed_validation)
+        _atomic_write(review_fd, sealed)
+        return sealed
 
 
 def finalize_round(
@@ -1736,23 +1866,23 @@ def finalize_round(
         for key in active:
             reports[key] = _read_sealed_report(review_fd, pending, Reviewer(key), root=root)
         _validate_closure(pending, reports)
-        blockers = tuple(
-            finding
-            for report in reports.values()
-            for finding in report.findings
-            if finding.severity in {Severity.CRITICAL, Severity.HIGH}
-        )
-        reviewer_b = reports.get("B")
-        has_unverified = reviewer_b is not None and any(
-            claim.result == "unverified" for claim in reviewer_b.claims
-        )
-        status = (
-            GateStatus.FAIL
-            if blockers
-            else GateStatus.INCONCLUSIVE
-            if has_unverified
-            else GateStatus.PASS
-        )
+        status, blockers = _provisional_gate(reports)
+        if pending.validation is not None:
+            validation = pending.validation
+            if validation.requires_full_suite:
+                if status is GateStatus.PASS and (
+                    validation.phase is not m.ValidationPhase.FINAL_VALIDATION
+                    or validation.full_suite_receipt_sha256 is None
+                ):
+                    raise SchemaError("FINAL_VALIDATION_REQUIRED")
+                if validation.phase is m.ValidationPhase.FINAL_VALIDATION:
+                    if validation.full_suite_receipt_sha256 is None:
+                        raise SchemaError("VALIDATION_BINDING_INVALID")
+                    from .validation import verify_full_suite_receipt
+
+                    verify_full_suite_receipt(
+                        root, pending, validation.full_suite_receipt_sha256
+                    )
         final = replace(
             pending, gate=GateSummary(status, len(blockers)), created_at=snapshot.created_at
         )
@@ -1823,6 +1953,7 @@ def migrate_v2_pending_round(
                 runtime=legacy.producer_runtime,
                 request=conservative_legacy_policy(legacy.producer_runtime).request,
             ),
+            validation=m.initial_validation_binding(),
         )
         _atomic_write(review_fd, migrated)
         return PendingMigrationResult(
@@ -1864,6 +1995,7 @@ def migrate_legacy_pending_round(
                 runtime=legacy.producer_runtime,
                 request=conservative_legacy_policy(legacy.producer_runtime).request,
             ),
+            validation=m.initial_validation_binding(),
         )
         round_fd = _round_fd(
             review_fd, legacy.round, create=False, exact_report_directories=True

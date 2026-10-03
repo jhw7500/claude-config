@@ -34,10 +34,11 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 8
+REPORT_TEXT_CONTRACT_VERSION = 9
 REFUTED_CLAIM_BLOCKER_CONTRACT_VERSION = 5
 REVIEWER_B_BUDGET_CONTRACT_VERSION = 7
 REVIEWER_B_NATIVE_TOOL_CALL_BUDGET_CONTRACT_VERSION = 8
+VALIDATION_PHASE_CONTRACT_VERSION = 9
 REVERSAL_COST_CONTRACT_VERSION = 6
 REQUIRED_REVERSAL_COST_CONTRACT_VERSION = 7
 MAX_VERDICT_BYTES = 256 * 1024
@@ -105,6 +106,11 @@ class ReviewMode(str, Enum):
     OFF = "off"
     SINGLE = "single"
     ITERATIVE = "iterative"
+
+
+class ValidationPhase(str, Enum):
+    FIX_VERIFICATION = "fix_verification"
+    FINAL_VALIDATION = "final_validation"
 
 
 @dataclass(frozen=True)
@@ -617,6 +623,59 @@ class PolicyBinding:
 
 
 @dataclass(frozen=True)
+class ValidationBinding:
+    phase: ValidationPhase
+    requires_full_suite: bool
+    full_suite_receipt_sha256: str | None = None
+    escalation_reason: str | None = None
+
+    def to_json(self) -> dict[str, object]:
+        if (
+            not isinstance(self.phase, ValidationPhase)
+            or type(self.requires_full_suite) is not bool
+            or (
+                self.full_suite_receipt_sha256 is not None
+                and (
+                    not isinstance(self.full_suite_receipt_sha256, str)
+                    or _SHA256.fullmatch(self.full_suite_receipt_sha256) is None
+                )
+            )
+        ):
+            raise SchemaError("VALIDATION_BINDING_INVALID")
+        reason = self.escalation_reason
+        if reason is not None:
+            reason = _text(reason, 1024)
+            if not reason.strip() or _SECRET.search(reason) or _contains_home_path(reason):
+                raise SchemaError("VALIDATION_BINDING_INVALID")
+        if self.phase is ValidationPhase.FIX_VERIFICATION:
+            if (
+                not self.requires_full_suite
+                or self.full_suite_receipt_sha256 is not None
+                or reason is not None
+            ):
+                raise SchemaError("VALIDATION_BINDING_INVALID")
+        elif self.requires_full_suite:
+            if self.full_suite_receipt_sha256 is None:
+                raise SchemaError("VALIDATION_BINDING_INVALID")
+        elif self.full_suite_receipt_sha256 is not None or reason is not None:
+            raise SchemaError("VALIDATION_BINDING_INVALID")
+        return {
+            "phase": self.phase.value,
+            "requires_full_suite": self.requires_full_suite,
+            "full_suite_receipt_sha256": self.full_suite_receipt_sha256,
+            "escalation_reason": reason,
+        }
+
+
+def initial_validation_binding() -> ValidationBinding:
+    return ValidationBinding(ValidationPhase.FINAL_VALIDATION, False)
+
+
+def followup_validation_binding() -> ValidationBinding:
+    return ValidationBinding(ValidationPhase.FIX_VERIFICATION, True)
+
+
+@dataclass(frozen=True)
 class Verdict:
     schema: int
     repository: str
@@ -640,6 +699,7 @@ class Verdict:
     evidence_fallback_reason: str | None = None
     evidence_contract: int | None = None
     policy: PolicyBinding | None = None
+    validation: ValidationBinding | None = None
 
     @property
     def snapshot(self) -> Snapshot:
@@ -676,6 +736,11 @@ class Verdict:
                 )
             ):
                 raise SchemaError("VERDICT_INVALID")
+            if (
+                self.contract.report_text >= VALIDATION_PHASE_CONTRACT_VERSION
+                and self.validation is None
+            ):
+                raise SchemaError("VERDICT_INVALID")
             for key in "ABC":
                 receipt = self.reviewers[key].receipt
                 if receipt is not None and (
@@ -689,7 +754,10 @@ class Verdict:
                 ):
                     raise SchemaError("VERDICT_INVALID")
         elif self.schema == SCHEMA_VERSION:
-            if self.contract is not None or self.lifecycle_id is not None:
+            if (
+                self.contract is not None
+                or self.lifecycle_id is not None
+            ):
                 raise SchemaError("VERDICT_INVALID")
         else:
             raise SchemaError("VERDICT_INVALID")
@@ -731,6 +799,12 @@ class Verdict:
             value["policy"] = self.policy.to_json()
         elif self.policy is not None:
             raise SchemaError("VERDICT_INVALID")
+        if (
+            self.validation is not None
+            and self.contract is not None
+            and self.contract.report_text >= VALIDATION_PHASE_CONTRACT_VERSION
+        ):
+            value["validation"] = self.validation.to_json()
         return value
 
 
