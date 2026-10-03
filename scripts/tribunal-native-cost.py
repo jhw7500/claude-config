@@ -30,6 +30,7 @@ TOKEN_KEYS = (
     "input_tokens", "cached_input_tokens", "output_tokens",
     "reasoning_output_tokens", "total_tokens",
 )
+OPTIONAL_TOKEN_KEYS = ("cache_write_input_tokens",)
 
 
 class CostError(Exception):
@@ -100,6 +101,7 @@ def summarize_session(raw: bytes) -> dict[str, object]:
     calls = {}
     outputs = {}
     tokens = None
+    last_seen_tokens = {}
     for line in lines:
         try:
             item = json.loads(line)
@@ -113,13 +115,16 @@ def summarize_session(raw: bytes) -> dict[str, object]:
             session_meta_count += 1
         elif kind == "token_usage_record":
             usage = payload.get("thread_token_usage")
-            if not isinstance(usage, dict) or any(
-                type(usage.get(key)) is not int or usage[key] < 0 for key in TOKEN_KEYS
-            ):
+            if not isinstance(usage, dict):
                 raise CostError("COST_SESSION_INVALID")
-            if tokens is not None and any(usage[key] < tokens[key] for key in TOKEN_KEYS):
+            keys = TOKEN_KEYS + tuple(key for key in OPTIONAL_TOKEN_KEYS if key in usage)
+            if any(type(usage.get(key)) is not int or usage[key] < 0 for key in keys):
                 raise CostError("COST_SESSION_INVALID")
-            tokens = {key: usage[key] for key in TOKEN_KEYS}
+            if any(key in last_seen_tokens and usage[key] < last_seen_tokens[key]
+                   for key in keys):
+                raise CostError("COST_SESSION_INVALID")
+            last_seen_tokens.update((key, usage[key]) for key in keys)
+            tokens = {key: usage[key] for key in keys}
         elif kind == "response_item" and payload.get("type") in (
             "custom_tool_call", "custom_tool_call_output"
         ):

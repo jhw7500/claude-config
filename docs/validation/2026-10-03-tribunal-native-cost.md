@@ -21,7 +21,9 @@ one of several attempts. Per supplied transcript it reports observed top-level
 `custom_tool_call` count, matched
 call/output count, summed and overlap-deduplicated tool wait, and the **last**
 cumulative `thread_token_usage` counters. Missing token records and incomplete
-call/output pairing produce `null` metrics rather than invented zeros. The tool
+call/output pairing produce `null` metrics rather than invented zeros. It includes
+`cache_write_input_tokens` when the last token record supplies it; older records
+without that counter leave it absent rather than treating it as zero. The tool
 never prints tool arguments, tool outputs, message bodies, or file paths.
 Counts cover the entire supplied session, not nested shell commands or an
 automatically isolated Tribunal time window. `telemetry_outcome` is the

@@ -104,6 +104,33 @@ def test_cumulative_token_counter_cannot_decrease():
         cost.summarize_session(session(*items))
 
 
+def test_cache_write_tokens_are_preserved_when_present():
+    items = [json.loads(line) for line in sample_session().splitlines()]
+    items[-2]["payload"]["thread_token_usage"]["cache_write_input_tokens"] = 4
+    items[-1]["payload"]["thread_token_usage"]["cache_write_input_tokens"] = 7
+    result = cost.summarize_session(session(*items))
+    assert result["tokens_cumulative_last"]["cache_write_input_tokens"] == 7
+
+
+@pytest.mark.parametrize("value", [-1, True, "7"])
+def test_invalid_cache_write_counter_is_rejected(value):
+    items = [json.loads(line) for line in sample_session().splitlines()]
+    items[-1]["payload"]["thread_token_usage"]["cache_write_input_tokens"] = value
+    with pytest.raises(cost.CostError, match="COST_SESSION_INVALID"):
+        cost.summarize_session(session(*items))
+
+
+def test_cache_write_counter_cannot_decrease_across_missing_record():
+    items = [json.loads(line) for line in sample_session().splitlines()]
+    items[-2]["payload"]["thread_token_usage"]["cache_write_input_tokens"] = 4
+    items.append(record("2026-10-03T00:00:04Z", "token_usage_record", {
+        "thread_token_usage": {**items[-1]["payload"]["thread_token_usage"],
+                               "cache_write_input_tokens": 3},
+    }))
+    with pytest.raises(cost.CostError, match="COST_SESSION_INVALID"):
+        cost.summarize_session(session(*items))
+
+
 def test_explicit_file_is_owned_regular_bounded_and_not_symlink(tmp_path, monkeypatch):
     original = tmp_path / "session.jsonl"
     original.write_bytes(sample_session())
