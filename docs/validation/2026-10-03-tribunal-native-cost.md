@@ -13,8 +13,12 @@ python3 scripts/tribunal-native-cost.py \
 ```
 
 The JSON output records the telemetry run's HEAD, diff digest, contract,
-invocation duration, and any completed reviewer-total spans. Per supplied
-transcript it reports observed top-level `custom_tool_call` count, matched
+invocation duration, and a reviewer-total duration only when exactly one span
+exists for that supplied reviewer's transcript. A missing or clock-anomalous
+duration remains `null`; multiple spans for one reviewer fail with
+`COST_REVIEWER_ATTEMPT_AMBIGUOUS` because one transcript cannot be assigned to
+one of several attempts. Per supplied transcript it reports observed top-level
+`custom_tool_call` count, matched
 call/output count, summed and overlap-deduplicated tool wait, and the **last**
 cumulative `thread_token_usage` counters. Missing token records and incomplete
 call/output pairing produce `null` metrics rather than invented zeros. The tool

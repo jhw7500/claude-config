@@ -166,3 +166,63 @@ def test_telemetry_requires_private_mode(tmp_path):
     telemetry_path.chmod(0o644)
     with pytest.raises(cost.CostError, match="COST_FILE_UNSAFE"):
         cost.summarize(telemetry_path, "a" * 32, [f"B={tmp_path / 'session.jsonl'}"])
+
+
+def summarize_with_b_totals(tmp_path, spans):
+    t = cost.telemetry
+    binding = t.TelemetryBinding(
+        "bound", "owner/repo", "master", "1" * 40, "refs/heads/topic",
+        "2" * 40, "1" * 40, "3" * 64,
+        {"report_text": 7, "diff_recipe": 1, "telemetry_schema": 3},
+    )
+    run = t.TelemetryRun(
+        "a" * 32, "codex", 1, binding, "2026-10-03T00:00:00Z",
+        "2026-10-03T00:00:03Z", 0, t.TelemetryOutcome.SUCCESS,
+        None, False, False, None, tuple(spans),
+        ended_monotonic_ns=3_000_000_000, lifecycle_id="b" * 32,
+    )
+    telemetry_path = tmp_path / "telemetry.json"
+    telemetry_path.write_text(json.dumps(t.TelemetryLedger(3, (run,)).to_json()))
+    telemetry_path.chmod(0o600)
+    transcript_path = tmp_path / "reviewer.jsonl"
+    transcript_path.write_bytes(sample_session())
+    return cost.summarize(telemetry_path, "a" * 32, [f"B={transcript_path}"])
+
+
+def completed_b_total(attempt):
+    t = cost.telemetry
+    return t.TelemetrySpan(
+        str(attempt) * 32, t.TelemetryStage.REVIEWER_TOTAL, t.Reviewer.B,
+        attempt, "2026-10-03T00:00:00Z", "2026-10-03T00:00:01Z",
+        0, 1_000_000_000, 1000, t.TelemetryOutcome.SUCCESS, None,
+    )
+
+
+def clock_anomaly_b_total(attempt):
+    t = cost.telemetry
+    return t.TelemetrySpan(
+        str(attempt) * 32, t.TelemetryStage.REVIEWER_TOTAL, t.Reviewer.B,
+        attempt, "2026-10-03T00:00:02Z", "2026-10-03T00:00:01Z",
+        2_000_000_000, 1_000_000_000, None,
+        t.TelemetryOutcome.CLOCK_ANOMALY, "TELEMETRY_CLOCK_ANOMALY",
+    )
+
+
+def test_single_reviewer_total_matches_one_supplied_transcript(tmp_path):
+    result = summarize_with_b_totals(tmp_path, [completed_b_total(1)])
+    assert result["reviewers"]["B"]["reviewer_total_ms"] == 1000
+
+
+def test_retried_reviewer_total_cannot_be_combined_with_one_transcript(tmp_path):
+    with pytest.raises(cost.CostError, match="COST_REVIEWER_ATTEMPT_AMBIGUOUS"):
+        summarize_with_b_totals(tmp_path, [completed_b_total(1), completed_b_total(2)])
+
+
+def test_clock_anomaly_reviewer_total_is_unknown(tmp_path):
+    result = summarize_with_b_totals(tmp_path, [clock_anomaly_b_total(1)])
+    assert result["reviewers"]["B"]["reviewer_total_ms"] is None
+
+
+def test_clock_anomaly_cannot_be_dropped_from_multiple_attempts(tmp_path):
+    with pytest.raises(cost.CostError, match="COST_REVIEWER_ATTEMPT_AMBIGUOUS"):
+        summarize_with_b_totals(tmp_path, [completed_b_total(1), clock_anomaly_b_total(2)])

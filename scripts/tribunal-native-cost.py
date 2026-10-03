@@ -182,13 +182,14 @@ def summarize(telemetry_path: Path, run_id: str, transcripts: list[str]) -> dict
         reviewers[role] = summarize_session(read_file(Path(name), MAX_SESSION_BYTES))
     reviewer_totals = {}
     for role in reviewers:
-        durations = [
-            span.duration_ms for span in run.spans
+        total_spans = [
+            span for span in run.spans
             if span.reviewer is not None and span.reviewer.value == role
             and span.stage is telemetry.TelemetryStage.REVIEWER_TOTAL
-            and span.duration_ms is not None
         ]
-        reviewer_totals[role] = sum(durations) if durations else None
+        if len(total_spans) > 1:
+            raise CostError("COST_REVIEWER_ATTEMPT_AMBIGUOUS")
+        reviewer_totals[role] = total_spans[0].duration_ms if total_spans else None
     return {
         "schema": 1,
         "provenance": "user_supplied_transcripts_unbound",
