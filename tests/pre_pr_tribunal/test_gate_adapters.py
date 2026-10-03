@@ -16,6 +16,7 @@ from pre_pr_tribunal import (
     gate,
     hook_common,
     pr_override_grant,
+    round_grant,
 )
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
 from pre_pr_tribunal.model import VERDICT_SCHEMA_VERSION, Reviewer, SchemaError
@@ -72,6 +73,7 @@ def _finding(identifier: str) -> dict[str, object]:
         "line": 1,
         "execution_ids": [],
         "acceptance_condition": "The invalid state is rejected.",
+        "reversal_cost": "After merge, affected deployments require rollback.",
     }
 
 
@@ -252,6 +254,23 @@ def _decision(round_number: int, finding_id: str) -> dict[str, object]:
     }
 
 
+def _authorize_next_round(
+    repo: Path, round_number: int, decisions_path: Path,
+    evidence_bundle_sha256: str | None = None,
+) -> None:
+    preview = round_grant.preview_grant_binding(
+        repo, base="master", runtime="codex", round_number=round_number,
+        decisions_path=decisions_path, evidence_bundle_sha256=evidence_bundle_sha256,
+    )
+    round_grant.record_grant(
+        repo, base="master", runtime="codex", round_number=round_number,
+        decisions_path=decisions_path, evidence_bundle_sha256=evidence_bundle_sha256,
+        expected_verdict_sha256=preview["verdict_sha256"],
+        expected_binding_sha256=preview["binding_sha256"],
+        reason="Fresh test approval after prior result", channel="relayed",
+    )
+
+
 def _round_three_failure(repo: Path):
     first = _finish_round(repo, finding_id="A-R1-001")
     _commit(repo, "round two fix\n")
@@ -259,6 +278,7 @@ def _round_three_failure(repo: Path):
         repo / ".review/inbox/round-1/decisions.json",
         [_decision(1, "A-R1-001")],
     )
+    _authorize_next_round(repo, 2, decisions_one)
     second = begin_round(
         repo,
         base="master",
@@ -286,6 +306,7 @@ def _round_three_failure(repo: Path):
         repo / ".review/inbox/round-2/decisions.json",
         [_decision(2, "A-R2-001")],
     )
+    _authorize_next_round(repo, 3, decisions_two)
     third = begin_round(
         repo,
         base="master",
@@ -484,6 +505,10 @@ def _round_three_reused_evidence_failure(repo: Path):
             [_decision(round_number - 1, f"A-R{round_number - 1}-001")],
         )
         frozen = _evidence_bundle(repo)
+        _authorize_next_round(
+            repo, round_number, decisions,
+            evidence_bundle_sha256=frozen["bundle_sha256"],
+        )
         verdict = begin_round(
             repo,
             base="master",

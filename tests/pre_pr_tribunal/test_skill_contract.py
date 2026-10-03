@@ -130,6 +130,11 @@ def test_one_request_stops_after_one_round_and_requires_a_new_request_for_follow
     assert "A general \"keep going\" instruction from before the FAIL" in steps[10]
     assert "at least every 60 seconds" in skill
     assert "A user stop/cancel request halts new dispatch" in skill
+    assert 're-review-preview --base "$BASE" --runtime "$RUNTIME" --round "$ROUND"' in skill
+    assert "--verdict-sha256 \"<shown verdict_sha256>\"" in skill
+    assert "--binding-sha256 \"<shown binding_sha256>\"" in skill
+    assert "consumed once under the review lock" in skill
+    assert "an intensity grant or earlier general instruction" in skill.lower()
 
 
 def test_skill_limits_terminal_user_override_to_exact_one_shot_contract():
@@ -531,6 +536,8 @@ def test_pending_recovery_uses_status_driven_command_sequence():
 
 
 def test_pending_recovery_documents_exact_migration_route_by_schema():
+    assert "under the installed current report contract" in pending_recovery_contract()
+    assert "current contract 5" not in pending_recovery_contract()
     migration_command_by_schema = {}
     for line in pending_recovery_contract().splitlines():
         match = re.match(r"- If `verdict_schema == ([12345])`, (.*)", line)
@@ -657,7 +664,7 @@ def test_docs_separate_retryable_formats_operations_integrity_and_warnings():
         warning_start = body.index("Observation warnings")
         integrity_start = body.index("Integrity stops")
         assert format_start < operation_start < warning_start < integrity_start
-        for code in ("JSON_INVALID", "REPORT_TOO_LARGE", "TEXT_INVALID"):
+        for code in ("JSON_INVALID", "REPORT_TOO_LARGE", "TEXT_INVALID", "REVIEW_BUDGET_EXCEEDED"):
             assert code in body[format_start:operation_start]
         for code in ("DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"):
             assert code in body[operation_start:warning_start]
@@ -820,6 +827,37 @@ def test_empirical_reviewer_forbids_unsupported_claims_and_requires_capture_fiel
         "REFUTED_CLAIM_REQUIRES_BLOCKER",
     ):
         assert token in reviewer
+
+
+def test_reviewer_b_selects_required_claims_and_returns_terminal_budget_report():
+    reviewer = text("references/reviewer-b.md")
+    ordered_sources = (
+        "issue or approved completion conditions",
+        "externally observable behavior",
+        "security, data loss, permission",
+        "quantitative outcome claims",
+    )
+    positions = [reviewer.index(source) for source in ordered_sources]
+    assert positions == sorted(positions)
+    for token in (
+        "review_budget", "risk floor", "not the user's 0/50/100 intensity",
+        "evidence-bundle", "BUDGET_EXHAUSTED:", "status: \"complete\"",
+        "coverage.complete: true", "VERIFICATION_INCOMPLETE",
+        "REVIEW_BUDGET_EXCEEDED",
+    ):
+        assert token in reviewer
+
+    example = json_example(reviewer, "standalone-complete-report")
+    example["executions"] = []
+    example["claims"][0].update(
+        result="unverified", execution_ids=[],
+        reason="BUDGET_EXHAUSTED: fresh-execution cap",
+    )
+    parsed = parse_reviewer_report(
+        json.dumps(example).encode(), expected_reviewer=Reviewer.B,
+        expected_round=1, snapshot=SNAPSHOT,
+    )
+    assert parsed.claims[0].result == "unverified"
 
 
 def test_documented_report_and_decision_examples_pass_the_real_strict_parsers():
