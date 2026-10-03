@@ -1,0 +1,284 @@
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+
+SCRIPT = Path(__file__).resolve().parents[2] / "scripts/tribunal-native-cost.py"
+SPEC = importlib.util.spec_from_file_location("tribunal_native_cost", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+cost = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(cost)
+
+
+def record(at, kind, payload):
+    return {"timestamp": at, "type": kind, "payload": payload}
+
+
+def session(*items):
+    return ("\n".join(json.dumps(item) for item in items) + "\n").encode()
+
+
+def sample_session():
+    return session(
+        record("2026-10-03T00:00:00Z", "session_meta", {"id": "session"}),
+        record("2026-10-03T00:00:00Z", "response_item", {
+            "type": "custom_tool_call", "call_id": "one", "input": "SECRET"}),
+        record("2026-10-03T00:00:00.500Z", "response_item", {
+            "type": "custom_tool_call", "call_id": "two"}),
+        record("2026-10-03T00:00:01Z", "response_item", {
+            "type": "custom_tool_call_output", "call_id": "one", "output": "SECRET"}),
+        record("2026-10-03T00:00:02Z", "response_item", {
+            "type": "custom_tool_call_output", "call_id": "two"}),
+        record("2026-10-03T00:00:02Z", "token_usage_record", {
+            "thread_token_usage": {"input_tokens": 10, "cached_input_tokens": 2,
+                                   "output_tokens": 3, "reasoning_output_tokens": 1,
+                                   "total_tokens": 13}}),
+        record("2026-10-03T00:00:03Z", "token_usage_record", {
+            "thread_token_usage": {"input_tokens": 20, "cached_input_tokens": 5,
+                                   "output_tokens": 7, "reasoning_output_tokens": 2,
+                                   "total_tokens": 27}}),
+    )
+
+
+def test_session_counts_overlapping_waits_and_last_cumulative_tokens():
+    result = cost.summarize_session(sample_session())
+    assert result == {
+        "native_tool_call_count_observed": 2,
+        "paired_tool_call_count": 2,
+        "pairing_complete": True,
+        "tool_wait_sum_ms": 2500,
+        "tool_wait_union_ms": 2000,
+        "tokens_cumulative_last": {
+            "input_tokens": 20, "cached_input_tokens": 5,
+            "output_tokens": 7, "reasoning_output_tokens": 2,
+            "total_tokens": 27,
+        },
+    }
+    assert "SECRET" not in json.dumps(result)
+
+
+def test_unpaired_call_has_unknown_wait_and_missing_tokens_are_unknown():
+    raw = session(
+        record("2026-10-03T00:00:00Z", "session_meta", {}),
+        record("2026-10-03T00:00:01Z", "response_item", {
+            "type": "custom_tool_call", "call_id": "one"}),
+    )
+    result = cost.summarize_session(raw)
+    assert result["native_tool_call_count_observed"] == 1
+    assert result["paired_tool_call_count"] == 0
+    assert result["pairing_complete"] is False
+    assert result["tool_wait_sum_ms"] is None
+    assert result["tool_wait_union_ms"] is None
+    assert result["tokens_cumulative_last"] is None
+
+
+@pytest.mark.parametrize("raw", [
+    b"not json\n",
+    session(record("2026-10-03T00:00:00Z", "session_meta", {}),
+            record("2026-10-03T00:00:01Z", "response_item", {
+                "type": "custom_tool_call_output", "call_id": "orphan"})),
+    session(record("2026-10-03T00:00:00Z", "session_meta", {}),
+            record("2026-10-03T00:00:01Z", "response_item", {
+                "type": "custom_tool_call", "call_id": "same"}),
+            record("2026-10-03T00:00:02Z", "response_item", {
+                "type": "custom_tool_call", "call_id": "same"})),
+    session(record("2026-10-03T00:00:00Z", "session_meta", {}),
+            record("2026-10-03T00:00:02Z", "response_item", {
+                "type": "custom_tool_call", "call_id": "one"}),
+            record("2026-10-03T00:00:01Z", "response_item", {
+                "type": "custom_tool_call_output", "call_id": "one"})),
+])
+def test_invalid_session_fails_without_partial_measurement(raw):
+    with pytest.raises(cost.CostError, match="COST_SESSION_INVALID"):
+        cost.summarize_session(raw)
+
+
+def test_cumulative_token_counter_cannot_decrease():
+    items = [json.loads(line) for line in sample_session().splitlines()]
+    items[-1]["payload"]["thread_token_usage"]["total_tokens"] = 1
+    with pytest.raises(cost.CostError, match="COST_SESSION_INVALID"):
+        cost.summarize_session(session(*items))
+
+
+def test_cache_write_tokens_are_preserved_when_present():
+    items = [json.loads(line) for line in sample_session().splitlines()]
+    items[-2]["payload"]["thread_token_usage"]["cache_write_input_tokens"] = 4
+    items[-1]["payload"]["thread_token_usage"]["cache_write_input_tokens"] = 7
+    result = cost.summarize_session(session(*items))
+    assert result["tokens_cumulative_last"]["cache_write_input_tokens"] == 7
+
+
+@pytest.mark.parametrize("value", [-1, True, "7"])
+def test_invalid_cache_write_counter_is_rejected(value):
+    items = [json.loads(line) for line in sample_session().splitlines()]
+    items[-1]["payload"]["thread_token_usage"]["cache_write_input_tokens"] = value
+    with pytest.raises(cost.CostError, match="COST_SESSION_INVALID"):
+        cost.summarize_session(session(*items))
+
+
+def test_cache_write_counter_cannot_decrease_across_missing_record():
+    items = [json.loads(line) for line in sample_session().splitlines()]
+    items[-2]["payload"]["thread_token_usage"]["cache_write_input_tokens"] = 4
+    items.append(record("2026-10-03T00:00:04Z", "token_usage_record", {
+        "thread_token_usage": {**items[-1]["payload"]["thread_token_usage"],
+                               "cache_write_input_tokens": 3},
+    }))
+    with pytest.raises(cost.CostError, match="COST_SESSION_INVALID"):
+        cost.summarize_session(session(*items))
+
+
+def test_event_msg_token_count_uses_cumulative_not_last_usage():
+    items = [json.loads(line) for line in sample_session().splitlines()]
+    for item in items[-2:]:
+        usage = item["payload"]["thread_token_usage"]
+        item["type"] = "event_msg"
+        item["payload"] = {"type": "token_count", "info": {
+            "total_token_usage": {**usage, "cache_write_input_tokens": 4},
+            "last_token_usage": {**usage, "total_tokens": 1},
+        }}
+    items.insert(-2, record("2026-10-03T00:00:01Z", "event_msg", {
+        "type": "token_count", "info": None,
+    }))
+    result = cost.summarize_session(session(*items))
+    assert result["tokens_cumulative_last"] == {
+        "input_tokens": 20, "cached_input_tokens": 5,
+        "output_tokens": 7, "reasoning_output_tokens": 2,
+        "total_tokens": 27, "cache_write_input_tokens": 4,
+    }
+
+
+def test_malformed_event_msg_token_usage_is_rejected():
+    items = [json.loads(line) for line in sample_session().splitlines()[:-2]]
+    items.append(record("2026-10-03T00:00:03Z", "event_msg", {
+        "type": "token_count", "info": {"last_token_usage": {}},
+    }))
+    with pytest.raises(cost.CostError, match="COST_SESSION_INVALID"):
+        cost.summarize_session(session(*items))
+
+
+def test_explicit_file_is_owned_regular_bounded_and_not_symlink(tmp_path, monkeypatch):
+    original = tmp_path / "session.jsonl"
+    original.write_bytes(sample_session())
+    original.chmod(0o664)  # Real Codex session files can be group-writable.
+    assert cost.read_file(original, cost.MAX_SESSION_BYTES) == sample_session()
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(original)
+    with pytest.raises(cost.CostError, match="COST_FILE_UNAVAILABLE"):
+        cost.read_file(link, cost.MAX_SESSION_BYTES)
+    with pytest.raises(cost.CostError, match="COST_FILE_TOO_LARGE"):
+        cost.read_file(original, 10)
+    original.chmod(0o666)
+    with pytest.raises(cost.CostError, match="COST_FILE_UNSAFE"):
+        cost.read_file(original, cost.MAX_SESSION_BYTES)
+    original.chmod(0o664)
+    monkeypatch.setattr(cost.os, "geteuid", lambda: -1)
+    with pytest.raises(cost.CostError, match="COST_FILE_UNSAFE"):
+        cost.read_file(original, cost.MAX_SESSION_BYTES)
+
+
+def test_cli_reads_explicit_telemetry_and_transcript_without_writing(git_repo, tmp_path):
+    cli = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    begun = subprocess.run(
+        [sys.executable, str(cli), "begin", "--base", "master",
+         "--runtime", "codex", "--round", "1"],
+        cwd=git_repo, capture_output=True, text=True, check=False,
+    )
+    assert begun.returncode == 0, begun.stderr
+    pending = json.loads(begun.stdout)
+    run_id = pending["telemetry"]["run_id"]
+    telemetry_path = git_repo / ".review/telemetry.json"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_bytes(sample_session())
+    before = telemetry_path.stat()
+    contents = telemetry_path.read_bytes()
+    names = set(telemetry_path.parent.iterdir())
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--telemetry", str(telemetry_path),
+         "--run-id", run_id, "--transcript", f"B={transcript}"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stderr == ""
+    value = json.loads(result.stdout)
+    assert value["provenance"] == "user_supplied_transcripts_unbound"
+    assert value["transcript_scope"] == "entire_supplied_session"
+    assert value["gate_evidence"] is False
+    assert value["binding"]["diff_sha256"] == pending["snapshot"]["diff_sha256"]
+    assert value["reviewers"]["B"]["native_tool_call_count_observed"] == 2
+    assert value["reviewers"]["B"]["reviewer_total_ms"] is None
+    assert "SECRET" not in result.stdout
+    assert telemetry_path.read_bytes() == contents
+    assert telemetry_path.stat().st_mtime_ns == before.st_mtime_ns
+    assert set(telemetry_path.parent.iterdir()) == names
+
+
+def test_telemetry_requires_private_mode(tmp_path):
+    telemetry_path = tmp_path / "telemetry.json"
+    telemetry_path.write_text('{"schema": 3, "runs": []}')
+    telemetry_path.chmod(0o644)
+    with pytest.raises(cost.CostError, match="COST_FILE_UNSAFE"):
+        cost.summarize(telemetry_path, "a" * 32, [f"B={tmp_path / 'session.jsonl'}"])
+
+
+def summarize_with_b_totals(tmp_path, spans):
+    t = cost.telemetry
+    binding = t.TelemetryBinding(
+        "bound", "owner/repo", "master", "1" * 40, "refs/heads/topic",
+        "2" * 40, "1" * 40, "3" * 64,
+        {"report_text": 7, "diff_recipe": 1, "telemetry_schema": 3},
+    )
+    run = t.TelemetryRun(
+        "a" * 32, "codex", 1, binding, "2026-10-03T00:00:00Z",
+        "2026-10-03T00:00:03Z", 0, t.TelemetryOutcome.SUCCESS,
+        None, False, False, None, tuple(spans),
+        ended_monotonic_ns=3_000_000_000, lifecycle_id="b" * 32,
+    )
+    telemetry_path = tmp_path / "telemetry.json"
+    telemetry_path.write_text(json.dumps(t.TelemetryLedger(3, (run,)).to_json()))
+    telemetry_path.chmod(0o600)
+    transcript_path = tmp_path / "reviewer.jsonl"
+    transcript_path.write_bytes(sample_session())
+    return cost.summarize(telemetry_path, "a" * 32, [f"B={transcript_path}"])
+
+
+def completed_b_total(attempt):
+    t = cost.telemetry
+    return t.TelemetrySpan(
+        str(attempt) * 32, t.TelemetryStage.REVIEWER_TOTAL, t.Reviewer.B,
+        attempt, "2026-10-03T00:00:00Z", "2026-10-03T00:00:01Z",
+        0, 1_000_000_000, 1000, t.TelemetryOutcome.SUCCESS, None,
+    )
+
+
+def clock_anomaly_b_total(attempt):
+    t = cost.telemetry
+    return t.TelemetrySpan(
+        str(attempt) * 32, t.TelemetryStage.REVIEWER_TOTAL, t.Reviewer.B,
+        attempt, "2026-10-03T00:00:02Z", "2026-10-03T00:00:01Z",
+        2_000_000_000, 1_000_000_000, None,
+        t.TelemetryOutcome.CLOCK_ANOMALY, "TELEMETRY_CLOCK_ANOMALY",
+    )
+
+
+def test_single_reviewer_total_matches_one_supplied_transcript(tmp_path):
+    result = summarize_with_b_totals(tmp_path, [completed_b_total(1)])
+    assert result["reviewers"]["B"]["reviewer_total_ms"] == 1000
+
+
+def test_retried_reviewer_total_cannot_be_combined_with_one_transcript(tmp_path):
+    with pytest.raises(cost.CostError, match="COST_REVIEWER_ATTEMPT_AMBIGUOUS"):
+        summarize_with_b_totals(tmp_path, [completed_b_total(1), completed_b_total(2)])
+
+
+def test_clock_anomaly_reviewer_total_is_unknown(tmp_path):
+    result = summarize_with_b_totals(tmp_path, [clock_anomaly_b_total(1)])
+    assert result["reviewers"]["B"]["reviewer_total_ms"] is None
+
+
+def test_clock_anomaly_cannot_be_dropped_from_multiple_attempts(tmp_path):
+    with pytest.raises(cost.CostError, match="COST_REVIEWER_ATTEMPT_AMBIGUOUS"):
+        summarize_with_b_totals(tmp_path, [completed_b_total(1), clock_anomaly_b_total(2)])

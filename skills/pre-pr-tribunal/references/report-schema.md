@@ -10,7 +10,7 @@ A finding path may be any normalized repository-relative path, including outside
 
 ## Controller receipt and recovery contract
 
-The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. `submit-report`'s `--run-id` and `--attempt` need an installed runtime from this change or later; an older installed package rejects them at parse time with `PRE_PR_TRIBUNAL:USAGE` on stderr and exit status 2, which is the parser's ordinary usage code rather than one of the report codes above, so nothing is read or stored; `/usr/bin/python3 scripts/install-pre-pr-tribunal.py` resolves it by reinstalling the package and the skill together. Current verdict schema 5 uses report text contract 5, diff recipe 1 and evidence contract 2; reviewer report JSON still has `schema: 1`. Native schema-5 slots are `disabled`, `pending`, or `sealed`; only `submit-report` can turn an active pending slot into a sealed slot. Disabled slots reject context, report, failure, and validation operations. `store-report`, including its legacy replacement option, is v1-only.
+The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. `submit-report`'s `--run-id` and `--attempt` need an installed runtime from this change or later; an older installed package rejects them at parse time with `PRE_PR_TRIBUNAL:USAGE` on stderr and exit status 2, which is the parser's ordinary usage code rather than one of the report codes above, so nothing is read or stored; `/usr/bin/python3 scripts/install-pre-pr-tribunal.py` resolves it by reinstalling the package and the skill together. Current verdict schema 5 uses report text contract 7, diff recipe 1 and evidence contract 2; reviewer report JSON still has `schema: 1`. Native schema-5 slots are `disabled`, `pending`, or `sealed`; only `submit-report` can turn an active pending slot into a sealed slot. Disabled slots reject context, report, failure, and validation operations. `store-report`, including its legacy replacement option, is v1-only.
 
 `status.verdict_schema` selects the workflow. Schema 1 requires an explicit all-slot `migrate-legacy-pending`; compatible schema 2 requires an explicit `migrate-v2-pending`; schemas 3 and 4 have no automatic current-contract migration; schema 5 is current. Neither migration accepts a reviewer subset and both migrate conservatively to iterative A/B/C review. Legacy schema-1 migration preserves available exact raw evidence but leaves slots pending when receipt provenance is unavailable; `LEGACY_PROVENANCE_UNAVAILABLE` never means a fictional native receipt was adopted. Schema-2 migration requires its report/diff contract to match the installed runtime: historical report-contract-2 rounds fail with `CONTRACT_DRIFT`. Compatible migration validates sealed evidence and assigns a new lifecycle identity, so its first telemetry resume reports prior request accounting unknown. Preserve incompatible old rounds for explicit abandonment/restart judgment; readable historical state never upgrades pending authority.
 
@@ -50,7 +50,7 @@ authority input.
       "last_error": null,
       "raw_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "context_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "report_contract_version": 5,
+      "report_contract_version": 7,
       "provenance": "native_submit"
     },
     "B": {
@@ -75,7 +75,7 @@ authority input.
   "state": "sealed",
   "raw_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "context_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "report_contract_version": 5,
+  "report_contract_version": 7,
   "attempt": 1,
   "provenance": "native_submit"
 }
@@ -104,7 +104,9 @@ Schema-1 through schema-4 verdicts remain readable without rewrite. Schema-4 evi
 
 Fresh executions keep the seven fields shown in the B example below. Only Reviewer B may add `evidence_ref`, and it is REQUIRED for reused evidence: exactly `{"bundle_sha256":"<64 lowercase hex>","entry_id":"E001"}` with an entry ID from E001 through E064. A/C executions and controller decision executions keep the legacy shape. The report parser accepts explicit B references under contract 3 or later; sealing then authenticates each against the round's selected evidence binding and exact verifier-returned execution fields. A reference alone grants no authority.
 
-Report contract 4 and later require Reviewer B to submit at least one claim plus `coverage: {"complete": true, "primary_entry_paths": [...]}`. Each primary-entry-path item has exactly `path` and `claim_id`; paths and claim IDs are unique, normalized, and every claim ID must resolve to a B claim in the same report. This makes the reviewer's completeness assertion and entry-path-to-claim mapping explicit before sealing. An empty path list is valid only when the reviewer found no affected documented primary entry path; the non-empty claim requirement still prevents an empty empirical authorization. Report contract 5 additionally requires a B report with any `refuted` claim to contain at least one `CRITICAL` or `HIGH` finding, so execution-backed contradiction cannot produce a PASS through an advisory-only report. Contract-4 in-progress rounds remain readable but fail current resume, submission, validation, and finalization with `CONTRACT_DRIFT`; they require an explicit abandonment/restart decision rather than reinterpretation under contract 5.
+Report contract 4 and later require Reviewer B to submit at least one claim plus `coverage: {"complete": true, "primary_entry_paths": [...]}`. Each primary-entry-path item has exactly `path` and `claim_id`; paths and claim IDs are unique, normalized, and every claim ID must resolve to a B claim in the same report. This makes the reviewer's completeness assertion and entry-path-to-claim mapping explicit before sealing. An empty path list is valid only when the reviewer found no affected documented primary entry path; the non-empty claim requirement still prevents an empty empirical authorization. Contract 5 additionally requires a B report with any `refuted` claim to contain at least one `CRITICAL` or `HIGH` finding, so execution-backed contradiction cannot produce a PASS through an advisory-only report. Two independently deployed contract-6 variants differed on `reversal_cost`; historical reports with or without that field remain readable. Current contract 7 requires every finding to include `reversal_cost`; `HIGH` and `CRITICAL` require a nonblank explanation of why fixing it after merge is costly, while `LOW` and `MEDIUM` may use an empty string. Missing or blank blocker cost is retryable `FINDING_SCHEMA_INVALID`. In-progress rounds with an older contract fail current resume, submission, validation, and finalization with `CONTRACT_DRIFT`; they require an explicit abandonment/restart decision rather than reinterpretation under contract 7.
+
+The Reviewer B pilot budget is an admission rule for current contract 7 only. Historical contract-6 terminal reports remain readable even when they exceed the new positive-verification caps; the budget and its telemetry fields must not be applied retroactively. Read-only historical telemetry may reauthenticate reused evidence against the stored contract and current source/environment measurements, but never grants resume, stored-validation, finalization, or PR authority under an old contract.
 
 For reuse, assign the round-local `id` and copy the trusted verifier's `execution` object unchanged. The command is `cd -- <quoted repository-relative cwd> && <shlex-joined argv>`. Report `capture_sha256` hashes stdout bytes followed by stderr bytes; the immutable store's framed capture has a different digest. Claims cite these report execution IDs only when the inspected command scope, exit, excerpts and truncation support their result. All unique reused entries and the subset cited by claims are distinct telemetry counts.
 
@@ -114,7 +116,7 @@ No bundle or invalid unused evidence permits independent fresh validation. A sea
 
 `JSON_INVALID`, `REPORT_TOO_LARGE`, `TEXT_INVALID`, `REPORT_SCHEMA_INVALID`, `REPORT_REVIEWER_MISMATCH`, `REPORT_ROUND_MISMATCH`, `REPORT_SNAPSHOT_MISMATCH`, and `REPORT_NOT_TERMINAL` describe rejected report content. Preserve the full original response in a controller-private current-user-owned regular non-symlink exact-`0600` file, independent of ambient `umask`; do not trim, reserialize, repair, or silently truncate it. A format-only retry stays on the same reviewer handle when that handle can accept a follow-up.
 
-Bounded content failures also include `FINDING_SCHEMA_INVALID`, `FINDING_LIMIT_EXCEEDED`, `EXECUTION_LIMIT_EXCEEDED`, `CLAIM_LIMIT_EXCEEDED`, `CLAIM_COVERAGE_INVALID`, `PRIOR_DECISION_RESPONSE_MISSING`, `PRIOR_DECISION_RESPONSE_INVALID`, `REFUTED_CLAIM_REQUIRES_BLOCKER`, `REPLACEMENT_FINDING_REQUIRED`, and `REPLACEMENT_FINDING_INVALID`. Fresh submission checks the reviewer's own decision responses, refuted-claim blocker requirement, and replacement references before canonical publication and sealing. Rejected content remains pending with exact bounded failure evidence; corrected same-role submission leaves sealed peers unchanged. Finalization and persisted-verdict parsing repeat the full closure validation. Count/byte limits remain enforced, and invalid existing canonical orphans remain hard integrity failures outside fresh-input retry handling.
+Bounded content failures also include `FINDING_SCHEMA_INVALID`, `FINDING_LIMIT_EXCEEDED`, `EXECUTION_LIMIT_EXCEEDED`, `CLAIM_LIMIT_EXCEEDED`, `CLAIM_COVERAGE_INVALID`, `REVIEW_BUDGET_EXCEEDED`, `PRIOR_DECISION_RESPONSE_MISSING`, `PRIOR_DECISION_RESPONSE_INVALID`, `REFUTED_CLAIM_REQUIRES_BLOCKER`, `REPLACEMENT_FINDING_REQUIRED`, and `REPLACEMENT_FINDING_INVALID`. Fresh submission checks the reviewer's own decision responses, refuted-claim blocker requirement, and replacement references before canonical publication and sealing. Rejected content remains pending with exact bounded failure evidence; corrected same-role submission leaves sealed peers unchanged. Finalization and persisted-verdict parsing repeat the full closure validation. Count/byte limits remain enforced, and invalid existing canonical orphans remain hard integrity failures outside fresh-input retry handling.
 
 ### Operational failures
 
@@ -151,7 +153,8 @@ Uncertain process liveness, uncertain view identity, unsafe ownership/type/mode,
       "path": "src/example.py",
       "line": 12,
       "execution_ids": [],
-      "acceptance_condition": "Revalidate the target immediately before replacement."
+      "acceptance_condition": "Revalidate the target immediately before replacement.",
+      "reversal_cost": "After merge, the unsafe replacement can corrupt persisted targets and require a coordinated recovery."
     }
   ],
   "executions": [],
@@ -159,6 +162,8 @@ Uncertain process liveness, uncertain view identity, unsafe ownership/type/mode,
   "prior_decisions": []
 }
 ```
+
+The current contract binds Reviewer B's `review_budget` to the snapshot risk floor, independently of requested intensity. Its `verified_claims` field is a compatibility name for the positive (`supported`) claim cap: `ordinary` permits 10 supported claims and 8 fresh non-blocker executions; `high-risk` permits 16 supported claims and 12 fresh non-blocker executions. Evidence-backed `refuted` claims and fresh executions cited by a refuted claim or CRITICAL/HIGH finding are exempt from those pilot caps, but remain subject to the global 128-entry limits. Reused authenticated executions also do not consume the fresh cap. Exceeding either positive count is `REVIEW_BUDGET_EXCEEDED`. The reviewer selects required claims in source order but preserves known refutations and blocker evidence before positive verification. The report shape is unchanged: budget exhaustion leaves remaining unproven required claims `unverified` with reasons beginning `BUDGET_EXHAUSTED:`. Without a blocker, that yields `INCONCLUSIVE` and a blocking `VERIFICATION_INCOMPLETE` gate decision, not an execution-free finding; preserved HIGH/CRITICAL findings yield FAIL. The reviewer is instructed to stop fresh work at 270/480 seconds and return before 300/600 seconds; native elapsed time is measured by telemetry, not inferred from report executions. These are pilot values pending matched-snapshot cost measurement. The runtime enforces counts of submitted report entries only; actual tool-call count and elapsed time remain reviewer-governed, not controller-enforced. Telemetry's `verified_claim_count` includes both supported and refuted claims, so it may exceed the positive-claim cap when blockers are preserved. The `supported_claim_count` and `fresh_non_blocking_execution_count` telemetry fields are the counts directly comparable with `verified_claim_limit` and `fresh_execution_limit`; `fresh_execution_count` includes exempt blocker executions.
 
 ## Complete Reviewer B execution and claim report
 

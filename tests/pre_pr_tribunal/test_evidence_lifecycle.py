@@ -1,12 +1,13 @@
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 import sys
 
 import pytest
 
-from pre_pr_tribunal import evidence_runtime as runtime
+from pre_pr_tribunal import evidence_lifecycle, evidence_runtime as runtime, evidence_store
 from pre_pr_tribunal.model import (
     REPORT_TEXT_CONTRACT_VERSION,
     VERDICT_SCHEMA_VERSION,
@@ -164,6 +165,41 @@ def seal(repo, verdict, execution=None):
         raw = raw_report(verdict, reviewer, execution if reviewer == 'B' else None)
         submit_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=raw)
         assert (repo / f'.review/inbox/round-1/{reviewer}.json').read_bytes() == raw
+
+
+def test_terminal_contract_six_reused_evidence_authenticates_without_current_authority(git_repo):
+    frozen = bundle(git_repo)
+    pending = begin(git_repo, frozen['bundle_sha256'])
+    seal(git_repo, pending, reused(git_repo, frozen))
+    finalized = finalize_round(git_repo)
+    historical_binding = json.loads(json.dumps(frozen['binding']))
+    historical_binding['contract']['report_text'] = 6
+    old_bundle = evidence_store.read_bundle(git_repo, frozen['bundle_sha256'])
+    old_digest = evidence_store.put_bundle(
+        git_repo, {**old_bundle, 'binding': historical_binding}
+    )
+    report = finalized.reviewers['B'].report
+    old_execution = replace(
+        report.executions[0],
+        evidence_ref=replace(report.executions[0].evidence_ref, bundle_sha256=old_digest),
+    )
+    historical_report = replace(report, executions=(old_execution,))
+    historical = replace(
+        finalized,
+        contract=replace(finalized.contract, report_text=6),
+        evidence_binding=evidence_lifecycle.parse_selection({
+            'bundle_sha256': old_digest, 'expected_binding': historical_binding,
+        }),
+        reviewers={
+            **finalized.reviewers,
+            'B': replace(finalized.reviewers['B'], report=historical_report),
+        },
+    )
+    assert evidence_lifecycle.authenticate_report(git_repo, historical, historical_report) == {'E001'}
+    with pytest.raises(TribunalError, match='^EVIDENCE_BINDING_MISMATCH$'):
+        evidence_lifecycle.authenticate_report(
+            git_repo, replace(historical, gate=pending.gate), historical_report
+        )
 
 
 def test_complete_reuse_round_and_private_context(git_repo):

@@ -31,6 +31,17 @@ def payload(repo, *args, raw=None):
     return json.loads(result.stdout)
 
 
+def authorize_new_round(repo):
+    args = ("--base", "master", "--runtime", "codex", "--round", "1")
+    preview = payload(repo, "re-review-preview", *args)
+    payload(
+        repo, "re-review-grant", *args,
+        "--verdict-sha256", preview["verdict_sha256"],
+        "--binding-sha256", preview["binding_sha256"],
+        "--reason", "Fresh test approval for this lifecycle", "--relayed",
+    )
+
+
 def report(begun, reviewer):
     value = {
         "schema": 1, "reviewer": reviewer, "round": 1,
@@ -286,6 +297,7 @@ def test_resume_scopes_prior_requests_to_current_lifecycle(git_repo, old_history
     payload(git_repo, "finalize")
     payload(git_repo, "telemetry-close", "--run-id", old_run_id, "--outcome", "success")
 
+    authorize_new_round(git_repo)
     current = payload(
         git_repo, "begin", "--base", "master", "--runtime", "codex", "--round", "1",
     )
@@ -319,6 +331,7 @@ def test_resume_ignores_old_requests_after_current_marker_is_evicted(git_repo):
         "--outcome", "success",
     )
 
+    authorize_new_round(git_repo)
     current = payload(
         git_repo, "begin", "--base", "master", "--runtime", "codex", "--round", "1",
     )
@@ -391,6 +404,7 @@ def test_resume_marks_history_unknown_when_current_begin_telemetry_is_missing(
         "--outcome", "success",
     )
 
+    authorize_new_round(git_repo)
     original_create_run = telemetry.create_run
     monkeypatch.setattr(
         telemetry, "create_run",

@@ -13,7 +13,48 @@ import sys
 
 MAX_INPUT_BYTES = 64 * 1024
 ESCAPE_PREFIXES = ("#noreminder", "#nr", "#raw", "#silent", "#조용히")
-EXPLICIT_SKILL = re.compile(r"^\s*[$/]pre-pr-tribunal(?![\w-])", re.IGNORECASE)
+EXPLICIT_SKILL = re.compile(r"(?<![\w-])[$/]pre-pr-tribunal(?![\w-])", re.IGNORECASE)
+EXPLICIT_SUFFIX_SEPARATOR = re.compile(r"^\s*[:,;：]\s*")
+EXPLICIT_ACTION_BEFORE = re.compile(
+    r"^\s*(?:(?:can|could|would)\s+you\s+(?:please\s+)?|please\s+)?"
+    r"(?:run|invoke|use|start|go)\s+(?:the\s+)?$", re.IGNORECASE
+)
+EXPLICIT_ACTION_AFTER = re.compile(
+    r"^\s*(?:(?:진행|실행|호출|시작)"
+    r"(?:하되|하자|해\s*(?:줘|주세요|줄래)|해(?=$|[.!?。])|(?=$|[.!?。]))"
+    r"|돌려(?:\s*(?:줘|주세요)|(?=$|[.!?。]))"
+    r"|해\s*(?:줘|주세요|줄래)|부탁해)",
+    re.IGNORECASE,
+)
+EXPLICIT_DISCUSSION_AFTER = re.compile(
+    r"^\s*(?:[:：]\s*)?(?:(?:은|는|이|가|의|에\s*대해)\s*)?"
+    r"(?:(?:실행|진행|사용|호출)\s*(?:방법|상황|뜻|차이)"
+    r"|(?:방법|사용법|뜻|차이|설명|알려|어떻게|왜|무엇|뭐)"
+    r"|(?:동작\s*원리|결과)\s*(?:설명|왜|뭐|무엇)"
+    r"|(?:what|why|how|explain|describe|usage|meaning|difference)\b)",
+    re.IGNORECASE,
+)
+EXPLICIT_CANCEL_BOUNDARY = r"(?=$|[.!?。,:;]|\s+please\b)"
+EXPLICIT_REJECTION_AFTER = re.compile(
+    r"^\s*(?:(?:은|는|을|를)\s*)?"
+    r"(?:(?:말고|대신|없이|빼고|제외)(?=\s|$)"
+    r"|(?:돌리|쓰|사용하|진행하|실행하|호출하|시작하)지\s*마)"
+    r"|^\s*(?:필요\s*없|안\s*돌려|not\s+(?:now|today|yet|this\s+time)\b"
+    rf"|not\s+needed{EXPLICIT_CANCEL_BOUNDARY}"
+    r"|skip\s+(?:this\s+time|it|(?:the\s+)?tribunal)"
+    rf"(?:\s+for\s+now)?{EXPLICIT_CANCEL_BOUNDARY}"
+    r"|without\s+(?:running\s+it|(?:the\s+)?tribunal)"
+    rf"(?:\s+(?:now|today|yet))?{EXPLICIT_CANCEL_BOUNDARY}"
+    r"|(?:do\s+not|don't)\s+(?:run|invoke|use|start)\b"
+    r"(?:\s+(?:it|(?:the|this)\s+(?:tribunal|skill)|[$/]pre-pr-tribunal))?"
+    rf"(?:\s+(?:now|today|yet|this\s+time))?{EXPLICIT_CANCEL_BOUNDARY}"
+    rf"|later(?:\s+(?:today|tonight|this\s+week))?{EXPLICIT_CANCEL_BOUNDARY}"
+    rf"|no(?:\s+(?:tribunal|thanks|thank\s+you|need\s+to\s+run))?{EXPLICIT_CANCEL_BOUNDARY}"
+    r"|instead(?:\s*[,;:]\s*|\s+)(?:use|run|do)\s+"
+    r"(?:(?:the|a)\s+)?(?:normal|regular|standard|other|codex)\s+"
+    r"(?:code\s+)?review\b)",
+    re.IGNORECASE,
+)
 REVIEW_NOUN = r"(?:심사|트리뷰날)(?:를|을)?"
 NATURAL_REVIEW = re.compile(
     REVIEW_NOUN
@@ -23,23 +64,43 @@ NATURAL_REVIEW = re.compile(
     re.IGNORECASE,
 )
 NEGATED_REVIEW = re.compile(
-    r"(?:심사|트리뷰날)\s*(?:하지\s*마|하지\s*말|하지|안\s*해)|"
-    r"(?:심사|트리뷰날).{0,24}?(?:하지\s*마|하지\s*말|취소|중지|그만)|"
-    r"[$/]pre-pr-tribunal.{0,24}?(?:하지\s*마|하지\s*말|취소|중지|그만)",
+    r"(?<!\w)(?:심사|트리뷰날)(?:[은는을를])?\s*"
+    r"(?:하지\s*마|하지\s*말|하지|안\s*해|취소|중지|그만)|"
+    r"(?<![\w-])[$/]pre-pr-tribunal(?![\w-])\s*"
+    r"(?:(?:은|는|을|를|아직|절대|지금은?|이번(?:엔|에는)|오늘은?)\s*){0,2}"
+    r"(?:(?:진행|실행|호출|시작)(?:[은는을를])?\s*)?"
+    r"(?:하지\s*마|하지\s*말|하지|안\s*해|취소(?:해줘)?|중지|그만)|"
+    r"\b(?:do\s+not|don't|never|rather\s+not)\s+(?:ever\s+)?"
+    r"(?:run|invoke|use|start)\s+(?:the\s+)?[$/]pre-pr-tribunal\b|"
+    r"(?:^|[.!?。]\s*|아니[,\s]+)"
+    r"(?:(?:오늘은|지금은|이번(?:엔|에는)|아직|절대)\s*)?"
+    r"(?:하지\s*마|취소(?:해줘)?|그만)\s*[.!?。]?$",
     re.IGNORECASE,
 )
 
 
 def classify_request(prompt: str) -> str | None:
     """Classify only explicit invocations and review-action requests."""
-    if not isinstance(prompt, str) or len(prompt) > 400:
+    if not isinstance(prompt, str) or len(prompt) > MAX_INPUT_BYTES:
         return None
     text = prompt.strip()
     if not text or text.lower().startswith(ESCAPE_PREFIXES):
         return None
     if NEGATED_REVIEW.search(text):
         return None
-    if EXPLICIT_SKILL.search(text):
+    skill = EXPLICIT_SKILL.search(text)
+    after_skill = EXPLICIT_SUFFIX_SEPARATOR.sub(" ", text[skill.end():], count=1) if skill else ""
+    action_before = bool(skill and EXPLICIT_ACTION_BEFORE.search(text[:skill.start()]))
+    if skill and EXPLICIT_REJECTION_AFTER.match(after_skill):
+        return None
+    if skill and (
+        action_before
+        or EXPLICIT_ACTION_AFTER.match(after_skill)
+        or (skill.start() == 0 and not (
+            EXPLICIT_DISCUSSION_AFTER.match(after_skill)
+            or after_skill.strip() in {"?", "？"}
+        ))
+    ):
         return "explicit"
     if text == "심사" or NATURAL_REVIEW.search(text):
         return "natural"
