@@ -91,7 +91,7 @@ def classify_request(prompt: str) -> str | None:
     skill = EXPLICIT_SKILL.search(text)
     after_skill = EXPLICIT_SUFFIX_SEPARATOR.sub(" ", text[skill.end():], count=1) if skill else ""
     action_before = bool(skill and EXPLICIT_ACTION_BEFORE.search(text[:skill.start()]))
-    if skill and not action_before and EXPLICIT_REJECTION_AFTER.match(after_skill):
+    if skill and EXPLICIT_REJECTION_AFTER.match(after_skill):
         return None
     if skill and (
         action_before
