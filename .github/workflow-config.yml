@@ -7,8 +7,8 @@
 # - auto: PR 생성 시 자동 실행 여부 (없으면 해당 없음, 수동 트리거는 enabled만 체크)
 
 # Shared workflow version pin for jhw7500/automation.
-automation_ref: v1.79
-automation_commit: dd12d04d5a0392616ead83b9654a8ea1745fbc3d
+automation_ref: v1.80
+automation_commit: 1e2dc6610c96b73bf6ec0f12ea05322f17f3122a
 
 workflows:
   # Repo-specific
