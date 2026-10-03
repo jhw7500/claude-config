@@ -28,6 +28,7 @@ def test_evidence_usage_is_authenticated_and_claim_subset_is_separate(git_repo):
     assert before['verified_claim_count'] is None
     assert before['supported_claim_count'] is None
     assert before['budget_profile'] is None
+    assert before['native_tool_call_limit'] is None
     execution = reused(git_repo, frozen)
     raw = json.loads(raw_report(verdict, 'B', execution))
     raw['claims'] = [{
@@ -52,6 +53,7 @@ def test_evidence_usage_is_authenticated_and_claim_subset_is_separate(git_repo):
     assert result['budget_profile'] == 'high-risk'
     assert result['verified_claim_limit'] == 16
     assert result['fresh_execution_limit'] == 12
+    assert result['native_tool_call_limit'] == 40
     assert result['rejected_entry_count'] == 0
     assert result['capture_duration_ms'] >= 0
     assert result['verification_duration_ms'] >= 0
@@ -135,6 +137,7 @@ def test_pre_budget_contract_does_not_acquire_pilot_limits(git_repo, monkeypatch
     assert result['verified_claim_count'] is None
     assert result['budget_profile'] is None
     assert result['verified_claim_limit'] is None
+    assert result['native_tool_call_limit'] is None
 
 
 def test_old_lifecycle_does_not_borrow_current_verdict(git_repo):

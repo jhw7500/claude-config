@@ -1874,11 +1874,11 @@ def test_reviewer_b_claims_and_behavioral_findings_require_execution(snapshot):
 def test_reviewer_b_budget_preserves_terminal_unverified_claims(snapshot):
     assert reviewer_b_budget(50) == {
         "profile": "ordinary", "verified_claims": 10, "fresh_executions": 8,
-        "soft_seconds": 270, "hard_seconds": 300,
+        "native_tool_calls": 32, "soft_seconds": 270, "hard_seconds": 300,
     }
     assert reviewer_b_budget(100) == {
         "profile": "high-risk", "verified_claims": 16, "fresh_executions": 12,
-        "soft_seconds": 480, "hard_seconds": 600,
+        "native_tool_calls": 40, "soft_seconds": 480, "hard_seconds": 600,
     }
     assert reviewer_b_budget(75) == reviewer_b_budget(100)
     one_execution = execution("B-R1-E001")
