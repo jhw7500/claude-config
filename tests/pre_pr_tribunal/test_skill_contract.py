@@ -843,7 +843,8 @@ def test_reviewer_b_selects_required_claims_and_returns_terminal_budget_report()
         "review_budget", "risk floor", "not the user's 0/50/100 intensity",
         "evidence-bundle", "BUDGET_EXHAUSTED:", "status: \"complete\"",
         "coverage.complete: true", "VERIFICATION_INCOMPLETE",
-        "REVIEW_BUDGET_EXCEEDED",
+        "REVIEW_BUDGET_EXCEEDED", "native_tool_calls", "32", "40",
+        "top-level native tool call",
     ):
         assert token in reviewer
 

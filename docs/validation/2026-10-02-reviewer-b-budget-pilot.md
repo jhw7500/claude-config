@@ -1,8 +1,8 @@
-# Reviewer B budget pilot calibration (#114)
+# Reviewer B budget calibration (#114)
 
-This records the evidence used to choose provisional Reviewer B limits. It is
-not a measurement of the new report-contract-6 reviewer, and it does not claim
-an elapsed-time or token saving.
+This records the evidence used to choose the Reviewer B report-contract-8
+limits. Cross-snapshot observations do not establish an elapsed-time, command,
+or token saving.
 
 | Prior observation | Reviewer B result | Relevance |
 | --- | --- | --- |
@@ -10,6 +10,41 @@ an elapsed-time or token saving.
 | [#113 normal bundle arm](2026-09-12-reviewer-evidence-bundle.md) | 9 supported claims, 1 unverified, 8 fresh report executions, 27 audited commands, 243.885 s | Ordinary 10-supported/8-fresh-non-blocker, 270 s soft/300 s target admits this known shape. |
 | [#113 blocker bundle arm](2026-09-12-reviewer-evidence-bundle.md) | Same HIGH blocker and 11 claim outcomes as independent arm; 7 fresh report executions, 22 audited commands, 286.012 s | High-risk 16-supported/12-fresh-non-blocker, 480 s soft/600 s target leaves room for the observed blocker case. |
 | [#114 historical #125 account](https://github.com/jhw7500/claude-config/issues/114) | 15 claims, 17 executions, about 30 min | Historical comparison target, not a matched current-contract run. |
+
+## Final calibration using the PR #185 offline audit
+
+The merged offline native-cost tool was run against two caller-associated B
+transcripts whose start times, bound HEADs, diff digests, and reviewer prompts
+matched their controller telemetry. The association remains explicitly
+unbound and non-gate evidence, as the tool reports.
+
+| Observation | Supported claims | Report executions | Observed top-level native tool calls | Reviewer total | Last cumulative tokens |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Contract 6 PASS, `d35286a` | 8 | 4 | 35 | 499.929 s | 2,320,839 |
+| Contract 7 PASS for PR #185, `ae8686b` | 8 | 2 | 8 | 160.929 s | 428,921 |
+
+The two rows have different snapshots, diffs, instructions, and workloads, so
+their differences are not a causal speedup claim. They do show that report
+executions cannot stand in for all native tool calls: the first accepted B
+report recorded four executions while its transcript contained 35 top-level
+tool calls. The #113 transcript audits observed 28-30 top-level shell requests
+for ordinary arms and 22-38 for blocker arms. The calibrated self-budget rounds
+those observed envelopes up to 32 ordinary and 40 high-risk top-level native
+tool calls. Nested shell commands are not counted separately.
+
+The final profiles are therefore:
+
+| Profile | Supported claims | Fresh non-blocker executions | Top-level native tool calls | Soft stop | Hard report deadline |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ordinary | 10 | 8 | 32 | 270 s | 300 s |
+| high-risk | 16 | 12 | 40 | 480 s | 600 s |
+
+The parser enforces the two report-entry counts. Reviewer B self-enforces the
+native-call and time budgets; the offline tool audits supplied transcripts but
+does not grant controller authority or alter a verdict. Refuted claims,
+blocking evidence, and unverified required claims remain preserved as specified
+below. No token cap is introduced because #111 and #113 have no comparable
+native token records and the offline totals cover the entire supplied session.
 
 ## Same-snapshot observations (not a controlled comparison)
 

@@ -12,7 +12,7 @@ def summarize(cwd, run):
         'fresh_non_blocking_execution_count', 'supported_claim_count',
         'verified_claim_count', 'unverified_claim_count',
         'budget_exhausted_claim_count', 'budget_profile',
-        'verified_claim_limit', 'fresh_execution_limit',
+        'verified_claim_limit', 'fresh_execution_limit', 'native_tool_call_limit',
         'capture_duration_ms', 'verification_duration_ms', 'measured_saved_elapsed_ms',
         'original_command_count', 'verifier_command_count', 'total_command_count'))
     try:
@@ -63,5 +63,11 @@ def _observe(cwd, run):
                     for c in report.claims),
                 budget_profile=budget['profile'],
                 verified_claim_limit=budget['verified_claims'],
-                fresh_execution_limit=budget['fresh_executions'])
+                fresh_execution_limit=budget['fresh_executions'],
+                native_tool_call_limit=(
+                    budget['native_tool_calls']
+                    if verdict.contract.report_text
+                    >= model.REVIEWER_B_NATIVE_TOOL_CALL_BUDGET_CONTRACT_VERSION
+                    else None
+                ))
         return result

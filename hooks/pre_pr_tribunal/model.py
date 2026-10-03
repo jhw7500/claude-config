@@ -34,9 +34,10 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 7
+REPORT_TEXT_CONTRACT_VERSION = 8
 REFUTED_CLAIM_BLOCKER_CONTRACT_VERSION = 5
 REVIEWER_B_BUDGET_CONTRACT_VERSION = 7
+REVIEWER_B_NATIVE_TOOL_CALL_BUDGET_CONTRACT_VERSION = 8
 REVERSAL_COST_CONTRACT_VERSION = 6
 REQUIRED_REVERSAL_COST_CONTRACT_VERSION = 7
 MAX_VERDICT_BYTES = 256 * 1024
@@ -307,6 +308,7 @@ class ReviewerBBudget(TypedDict):
     profile: str
     verified_claims: int
     fresh_executions: int
+    native_tool_calls: int
     soft_seconds: int
     hard_seconds: int
 
@@ -320,6 +322,7 @@ def reviewer_b_budget(risk_floor: int) -> ReviewerBBudget:
             "profile": "high-risk",
             "verified_claims": 16,
             "fresh_executions": 12,
+            "native_tool_calls": 40,
             "soft_seconds": 480,
             "hard_seconds": 600,
         }
@@ -327,6 +330,7 @@ def reviewer_b_budget(risk_floor: int) -> ReviewerBBudget:
         "profile": "ordinary",
         "verified_claims": 10,
         "fresh_executions": 8,
+        "native_tool_calls": 32,
         "soft_seconds": 270,
         "hard_seconds": 300,
     }
