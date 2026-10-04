@@ -377,18 +377,28 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         policy_binding = parse_policy_binding(data["policy"], runtime=runtime)
     validation_binding = None
     if "validation" in data:
+        validation_keys = {
+            "phase",
+            "requires_full_suite",
+            "full_suite_receipt_sha256",
+            "escalation_reason",
+        }
+        raw_validation = data["validation"]
+        if isinstance(raw_validation, dict) and "full_suite_recipe" in raw_validation:
+            validation_keys.add("full_suite_recipe")
         validation_obj = m._object(
-            data["validation"],
-            {
-                "phase",
-                "requires_full_suite",
-                "full_suite_receipt_sha256",
-                "escalation_reason",
-            },
+            raw_validation,
+            validation_keys,
             "VALIDATION_BINDING_INVALID",
         )
         receipt_sha256 = validation_obj["full_suite_receipt_sha256"]
         reason = validation_obj["escalation_reason"]
+        recipe = (
+            m.parse_full_suite_recipe(validation_obj["full_suite_recipe"])
+            if "full_suite_recipe" in validation_obj
+            and validation_obj["full_suite_recipe"] is not None
+            else None
+        )
         validation_binding = m.ValidationBinding(
             m._enum(
                 m.ValidationPhase,
@@ -398,6 +408,7 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
             validation_obj["requires_full_suite"],
             receipt_sha256,
             reason,
+            recipe,
         )
         validation_binding.to_json()
     return _VerdictFields(
@@ -635,6 +646,13 @@ def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
         raise SchemaError("VERDICT_INVALID")
     if contract.report_text < m.VALIDATION_PHASE_CONTRACT_VERSION:
         fields = replace(fields, validation=None)
+    if (
+        contract.report_text >= m.FULL_SUITE_RECIPE_CONTRACT_VERSION
+        and fields.validation is not None
+        and fields.validation.requires_full_suite
+        and fields.validation.full_suite_recipe is None
+    ):
+        raise SchemaError("VERDICT_INVALID")
     if fields.evidence_binding is not None:
         evidence_contract = fields.evidence_binding.to_json()['expected_binding']['contract']
         if ({key: evidence_contract[key] for key in contract.to_json()} != contract.to_json()
@@ -1365,6 +1383,8 @@ def begin_round(
     intensity_values: Sequence[str] | None = None,
     intensity_requester: str | Sequence[str] | None = None,
     intensity_reason: str | Sequence[str] | None = None,
+    full_suite_kind: m.FullSuiteKind | str = m.FullSuiteKind.PYTHON_PYTEST,
+    full_suite_cwd: str = ".",
     now: Callable[[], str] = utc_now,
     token_hex: Callable[[int], str] = secrets.token_hex,
 ) -> Verdict:
@@ -1542,16 +1562,20 @@ def begin_round(
             evidence_binding, evidence_fallback_reason = select_evidence(
                 root, snapshot, evidence_bundle_sha256
             )
+        validation = (
+            m.followup_validation_binding(
+                full_suite_kind=full_suite_kind,
+                full_suite_cwd=full_suite_cwd,
+            )
+            if stored is not None
+            else m.initial_validation_binding()
+        )
         pending = _new_current_pending(
             snapshot, runtime=runtime, initial_paths=initial_paths,
             round_number=round_number, decisions=decisions, history=history,
             contract=current_contract_binding(), lifecycle_id=_lifecycle_id(token_hex),
             policy=policy,
-            validation=(
-                m.followup_validation_binding()
-                if stored is not None
-                else m.initial_validation_binding()
-            ),
+            validation=validation,
         )
         if policy.mode is not m.ReviewMode.OFF:
             pending = replace(
@@ -1576,6 +1600,7 @@ def begin_round(
                 evidence_bundle_sha256=evidence_bundle_sha256,
                 evidence_binding=evidence_binding,
                 evidence_fallback_reason=evidence_fallback_reason,
+                validation=validation,
             ):
                 raise SchemaError("RE_REVIEW_GRANT_REQUIRED")
         # Without a terminal predecessor, no old fixed namespace has proven
@@ -1629,6 +1654,19 @@ def _validate_reviewer_closure(
     verdict: Verdict, report: ReviewerReport, *, seen_replacements: set[str] | None = None,
 ) -> None:
     """Check only this role's responses before accepting its immutable report."""
+    validation = verdict.validation
+    if (
+        validation is not None
+        and validation.phase is m.ValidationPhase.FIX_VERIFICATION
+        and validation.full_suite_recipe is not None
+    ):
+        from .validation import is_full_suite_execution
+
+        if any(
+            is_full_suite_execution(validation.full_suite_recipe, execution.command)
+            for execution in report.executions
+        ):
+            raise SchemaError("FULL_SUITE_DURING_FIX_VERIFICATION")
     if (
         verdict.contract is not None
         and verdict.contract.report_text >= m.REVIEWER_B_BUDGET_CONTRACT_VERSION
@@ -1824,6 +1862,7 @@ def seal_final_validation(
             True,
             receipt_sha256,
             escalation_reason,
+            validation.full_suite_recipe,
         )
         sealed_validation.to_json()
         from .validation import verify_full_suite_receipt

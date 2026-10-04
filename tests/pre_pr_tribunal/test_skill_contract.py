@@ -13,6 +13,7 @@ from pre_pr_tribunal.model import (
     REPORT_TEXT_CONTRACT_VERSION,
     Reviewer,
     Snapshot,
+    full_suite_recipe,
     parse_decisions,
     parse_reviewer_report,
 )
@@ -660,6 +661,7 @@ def test_report_reference_documents_internal_v5_lifecycle_identity():
         'requires_full_suite': True,
         'full_suite_receipt_sha256': None,
         'escalation_reason': None,
+        'full_suite_recipe': full_suite_recipe().to_json(),
     }
     assert re.fullmatch(r"[0-9a-f]{32}", stored_verdict["lifecycle_id"])
 

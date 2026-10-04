@@ -223,14 +223,17 @@ controller-created view. A verified terminal exact-view cleanup refusal and tele
 warnings, not verdict gates; uncertain liveness, view identity, ownership, bytes, digest, snapshot, or contract are
 integrity stops. Never use force cleanup or delete a non-empty view root.
 
-Current status also exposes the machine-bound validation phase. A follow-up lifecycle begins in
-`fix_verification`: announce the planned finding-reproduction and direct-impact commands, defer the full suite, and
+Current status also exposes the machine-bound validation phase and canonical full-suite recipe. A follow-up lifecycle
+binds `--full-suite-kind` and `--full-suite-cwd` through re-review preview, grant, and begin, then starts in
+`fix_verification`: announce the planned finding-reproduction and direct-impact commands, defer the bound suite, and
 stop or escalate on a bounded reason. Reviewer B authenticates and reuses eligible selected evidence before running
-missing focused commands. After sealed reports imply provisional PASS, execute the repository full suite exactly once
-through `evidence-capture`, then bind its successful fresh receipt with `final-validation-seal --receipt`. A non-pass
-provisional result does not run the suite unless a cross-domain, build/runtime configuration, dependency, permission,
-or nondeterministic-failure impact is recorded with `--escalation-reason`. The seal is immutable and `finalize`
-reauthenticates its HEAD, diff, contract, environment, capture, freshness, and zero exit immediately before PASS.
+missing focused commands; a report that records the recipe's canonical command in this phase is rejected. After sealed
+reports imply provisional PASS, execute the exact recipe profile/cwd/argv once through `evidence-capture`, then bind
+its successful fresh receipt with `final-validation-seal --receipt`. A no-op, targeted command, or recipe mismatch
+cannot seal PASS. A non-pass provisional result does not run the suite unless a cross-domain, build/runtime
+configuration, dependency, permission, or nondeterministic-failure impact is recorded with `--escalation-reason`.
+The seal is immutable and `finalize` reauthenticates its HEAD, diff, contract, recipe, environment, capture, freshness,
+and zero exit immediately before PASS.
 
 Before pathless `finalize`, require `status` to show all A/B/C slots sealed. Re-run three separate stored validations,
 compare every digest to its receipt, and immediately recheck all report paths for current-user ownership, regular

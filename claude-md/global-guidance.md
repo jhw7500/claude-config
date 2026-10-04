@@ -438,13 +438,16 @@ Tribunal을 실행한다면 policy-preview 뒤 활성 reviewer·intensity/mode·
 60초 이내 간격으로 알리고, 취소 요청 시 신규 작업을 시작하지 않은 채 진행 중인 reviewer의
 상태와 증거를 보존한다.
 
-후속 라운드는 machine-readable `fix_verification`으로 시작한다. 상태 보고에는 phase, 재현·직접 영향
-검증 명령, full suite 유예, 중단·escalation 조건을 포함한다. Reviewer B는 선택된 인증 evidence를 먼저
-재사용하고 부족한 focused command만 새로 실행한다. 모든 report가 provisional PASS를 만들 때에만
-`final_validation`으로 전환해 현재 HEAD/diff에 결합된 full suite를 `evidence-capture`로 정확히 한 번
-실행하고, 성공 receipt를 `final-validation-seal`로 봉인한다. provisional non-pass에서 full suite가 꼭
-필요하면 cross-domain·build/runtime 설정·dependency·permission·비결정적 실패 영향 중 하나를 bounded
-escalation reason으로 남긴다. `finalize`는 이 receipt와 환경을 다시 인증하며, seal 반복이나 snapshot
+후속 라운드는 re-review preview/grant/begin에 동일하게 전달한 `--full-suite-kind`와
+`--full-suite-cwd`를 결속하고 machine-readable `fix_verification`으로 시작한다. 상태 보고에는 phase,
+재현·직접 영향 검증 명령, exact full-suite recipe, 유예, 중단·escalation 조건을 포함한다. Reviewer B는
+선택된 인증 evidence를 먼저 재사용하고 부족한 focused command만 새로 실행하며, 이 phase에서 bound
+suite command를 기록한 report는 거부된다. 모든 report가 provisional PASS를 만들 때에만
+`final_validation`으로 전환해 현재 HEAD/diff와 recipe profile·cwd·argv에 결합된 full suite를
+`evidence-capture`로 정확히 한 번 실행하고, 성공 receipt를 `final-validation-seal`로 봉인한다. no-op이나
+targeted command receipt는 PASS를 봉인할 수 없다. provisional non-pass에서 full suite가 꼭 필요하면
+cross-domain·build/runtime 설정·dependency·permission·비결정적 실패 영향 중 하나를 bounded escalation
+reason으로 남긴다. `finalize`는 이 receipt, recipe, 환경을 다시 인증하며, seal 반복이나 snapshot
 불일치에는 실패 폐쇄한다.
 
 1. **한 심사 단위를 작게 유지한다.** 라운드는 델타가 아니라 `base..HEAD` **전체 diff**를 매번

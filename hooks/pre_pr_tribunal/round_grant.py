@@ -75,6 +75,7 @@ def grant_binding(
     evidence_bundle_sha256: str | None,
     evidence_binding: m.EvidenceBinding | None,
     evidence_fallback_reason: str | None,
+    validation: m.ValidationBinding,
 ) -> dict[str, object]:
     """Build the exact prior-verdict and proposed-round approval binding."""
     contract = current_contract_binding()
@@ -91,7 +92,7 @@ def grant_binding(
             "round": round_number,
             "policy": policy.to_json(),
             "active_reviewers": list(policy.active_reviewers),
-            "validation": m.followup_validation_binding().to_json(),
+            "validation": validation.to_json(),
             "decisions_sha256": decisions_sha256,
             "evidence": {
                 "requested_bundle_sha256": evidence_bundle_sha256,
@@ -143,6 +144,8 @@ def _target_binding_locked(
     intensity_requester: str | Sequence[str] | None,
     intensity_reason: str | Sequence[str] | None,
     evidence_bundle_sha256: str | None,
+    full_suite_kind: m.FullSuiteKind | str,
+    full_suite_cwd: str,
     now: Callable[[], str],
 ) -> dict[str, object]:
     """Reproduce the no-explicit-intensity transition used by grant preview."""
@@ -287,6 +290,10 @@ def _target_binding_locked(
         evidence_bundle_sha256=evidence_bundle_sha256,
         evidence_binding=evidence_binding,
         evidence_fallback_reason=evidence_fallback_reason,
+        validation=m.followup_validation_binding(
+            full_suite_kind=full_suite_kind,
+            full_suite_cwd=full_suite_cwd,
+        ),
     )
 
 
@@ -301,6 +308,8 @@ def preview_grant_binding(
     intensity_requester: str | Sequence[str] | None = None,
     intensity_reason: str | Sequence[str] | None = None,
     evidence_bundle_sha256: str | None = None,
+    full_suite_kind: m.FullSuiteKind | str = m.FullSuiteKind.PYTHON_PYTEST,
+    full_suite_cwd: str = ".",
     now: Callable[[], str] = utc_now,
 ) -> dict[str, object]:
     root = repository_root(cwd)
@@ -321,6 +330,8 @@ def preview_grant_binding(
             intensity_requester=intensity_requester,
             intensity_reason=intensity_reason,
             evidence_bundle_sha256=evidence_bundle_sha256,
+            full_suite_kind=full_suite_kind,
+            full_suite_cwd=full_suite_cwd,
             now=now,
         )
 
@@ -336,6 +347,8 @@ def record_grant(
     intensity_requester: str | Sequence[str] | None = None,
     intensity_reason: str | Sequence[str] | None = None,
     evidence_bundle_sha256: str | None = None,
+    full_suite_kind: m.FullSuiteKind | str = m.FullSuiteKind.PYTHON_PYTEST,
+    full_suite_cwd: str = ".",
     expected_verdict_sha256: str,
     expected_binding_sha256: str,
     reason: str,
@@ -371,6 +384,8 @@ def record_grant(
             intensity_requester=intensity_requester,
             intensity_reason=intensity_reason,
             evidence_bundle_sha256=evidence_bundle_sha256,
+            full_suite_kind=full_suite_kind,
+            full_suite_cwd=full_suite_cwd,
             now=now,
         )
         if binding["verdict_sha256"] != expected_verdict_sha256:
@@ -440,6 +455,7 @@ def consume_matching_grant_locked(
     evidence_bundle_sha256: str | None,
     evidence_binding: m.EvidenceBinding | None,
     evidence_fallback_reason: str | None,
+    validation: m.ValidationBinding,
 ) -> bool:
     """Consume one exact grant while the caller holds the review lock."""
     expected = grant_binding(
@@ -453,6 +469,7 @@ def consume_matching_grant_locked(
         evidence_bundle_sha256=evidence_bundle_sha256,
         evidence_binding=evidence_binding,
         evidence_fallback_reason=evidence_fallback_reason,
+        validation=validation,
     )
     try:
         raw = read_named_file(

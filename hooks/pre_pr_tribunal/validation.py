@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shlex
 
 from . import evidence, evidence_runtime, evidence_store, model
 from .evidence_environment import validate_command
+
+
+def is_full_suite_execution(
+    recipe: model.FullSuiteRecipe, command: str
+) -> bool:
+    """Recognize the lifecycle-bound suite command in reviewer evidence."""
+    return command in {
+        recipe.command,
+        f"cd -- {shlex.quote(recipe.cwd)} && {recipe.command}",
+    }
 
 
 def verify_full_suite_receipt(
@@ -30,15 +41,31 @@ def verify_full_suite_receipt(
         if binding["contract"] != expected_contract:
             raise model.SchemaError("FINAL_VALIDATION_CONTRACT_MISMATCH")
         entry = receipt["entry"]
+        validation = verdict.validation
+        recipe = (
+            validation.full_suite_recipe
+            if validation is not None
+            else None
+        )
+        if recipe is None:
+            raise model.SchemaError("FINAL_VALIDATION_RECIPE_MISMATCH")
+        environment = binding["environment"]
+        if (
+            environment["profile"] != recipe.profile
+            or environment["cwd"] != recipe.cwd
+            or entry["cwd"] != recipe.cwd
+            or tuple(entry["argv"]) != recipe.argv
+        ):
+            raise model.SchemaError("FINAL_VALIDATION_RECIPE_MISMATCH")
         evidence.validate_entry_capture(
             entry, evidence_store.read_capture(root, entry["capture_sha256"])
         )
         evidence_runtime.verify_source_tool_environment(
-            root, expected_environment=binding["environment"]
+            root, expected_environment=environment
         )
         if entry["freshness"] != validate_command(
             root,
-            binding["environment"]["profile"],
+            environment["profile"],
             entry["cwd"],
             entry["argv"],
         ):

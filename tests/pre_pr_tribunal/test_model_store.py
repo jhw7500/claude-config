@@ -10,13 +10,14 @@ import sys
 
 import pytest
 
-from pre_pr_tribunal import evidence_runtime, round_grant
+from pre_pr_tribunal import evidence_runtime, evidence_store, round_grant
 from pre_pr_tribunal.git_state import DIFF_RECIPE_VERSION, capture_snapshot
 from pre_pr_tribunal.model import (
     SCHEMA_VERSION,
     SLOT_VERDICT_SCHEMA_VERSION,
     VERDICT_SCHEMA_VERSION,
     ContractBinding,
+    full_suite_recipe,
     MAX_EVIDENCE_TEXT_BYTES,
     MAX_REPORT_BYTES,
     REPORT_TEXT_CONTRACT_VERSION,
@@ -57,7 +58,11 @@ def snapshot(git_repo):
     return capture_snapshot(git_repo, "master", now=NOW)
 
 
-def execution(identifier="A-R1-E001", *, command="python3 -m pytest -q"):
+def execution(
+    identifier="A-R1-E001",
+    *,
+    command="python3 -m pytest -q tests/test_direct_impact.py",
+):
     stdout = "1 passed"
     return {
         "id": identifier,
@@ -143,7 +148,15 @@ def seal_test_final_validation(repo):
         repo, base="master", profile="python-v1", command_cwd=".",
         argv=["python3", "-I", "-S", "-c", "pass"], timeout_seconds=15,
     )
-    return seal_final_validation(repo, receipt_sha256=captured["receipt_sha256"])
+    receipt = evidence_store.read_receipt(repo, captured["receipt_sha256"])
+    recipe = full_suite_recipe()
+    receipt["entry"] = {
+        **receipt["entry"],
+        "argv": list(recipe.argv),
+        "cwd": recipe.cwd,
+    }
+    receipt_sha256 = evidence_store.put_receipt(repo, receipt)
+    return seal_final_validation(repo, receipt_sha256=receipt_sha256)
 
 
 def authorize_next_begin(repo, *, runtime="codex", round_number=1, decisions_path=None):
@@ -3526,7 +3539,8 @@ def test_cli_later_round_context_omits_own_decision_executions(git_repo):
         }
     ]
     assert "executions" not in json.dumps(payload["own_decisions"])
-    assert "python3 -m pytest -q" not in json.dumps(payload)
+    assert "python3 -m pytest -q" not in json.dumps(payload["own_decisions"])
+    assert payload["validation"]["full_suite_recipe"] == full_suite_recipe().to_json()
     assert "1 passed" not in json.dumps(payload)
 
 

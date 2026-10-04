@@ -192,6 +192,7 @@ def test_contract_eight_context_omits_contract_nine_validation_phase(git_repo):
         "phase": "final_validation",
         "planned": ["full_suite"],
         "full_suite": "initial_round",
+        "full_suite_recipe": None,
     }
     assert "validation" not in reviewer_context_body(historical, Reviewer.B)
 

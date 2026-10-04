@@ -10,7 +10,7 @@ A finding path may be any normalized repository-relative path, including outside
 
 ## Controller receipt and recovery contract
 
-The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. `submit-report`'s `--run-id` and `--attempt` need an installed runtime from this change or later; an older installed package rejects them at parse time with `PRE_PR_TRIBUNAL:USAGE` on stderr and exit status 2, which is the parser's ordinary usage code rather than one of the report codes above, so nothing is read or stored; `/usr/bin/python3 scripts/install-pre-pr-tribunal.py` resolves it by reinstalling the package and the skill together. Current verdict schema 5 uses report text contract 9, diff recipe 1 and evidence contract 2; reviewer report JSON still has `schema: 1`. Native schema-5 slots are `disabled`, `pending`, or `sealed`; only `submit-report` can turn an active pending slot into a sealed slot. Disabled slots reject context, report, failure, and validation operations. `store-report`, including its legacy replacement option, is v1-only.
+The installed CLI and its installed contract binding are the source of truth. Do not self-install or execute candidate source during the tribunal. `submit-report`'s `--run-id` and `--attempt` need an installed runtime from this change or later; an older installed package rejects them at parse time with `PRE_PR_TRIBUNAL:USAGE` on stderr and exit status 2, which is the parser's ordinary usage code rather than one of the report codes above, so nothing is read or stored; `/usr/bin/python3 scripts/install-pre-pr-tribunal.py` resolves it by reinstalling the package and the skill together. Current verdict schema 5 uses report text contract 10, diff recipe 1 and evidence contract 2; reviewer report JSON still has `schema: 1`. Native schema-5 slots are `disabled`, `pending`, or `sealed`; only `submit-report` can turn an active pending slot into a sealed slot. Disabled slots reject context, report, failure, and validation operations. `store-report`, including its legacy replacement option, is v1-only.
 
 `status.verdict_schema` selects the workflow. Schema 1 requires an explicit all-slot `migrate-legacy-pending`; compatible schema 2 requires an explicit `migrate-v2-pending`; schemas 3 and 4 have no automatic current-contract migration; schema 5 is current. Neither migration accepts a reviewer subset and both migrate conservatively to iterative A/B/C review. Legacy schema-1 migration preserves available exact raw evidence but leaves slots pending when receipt provenance is unavailable; `LEGACY_PROVENANCE_UNAVAILABLE` never means a fictional native receipt was adopted. Schema-2 migration requires its report/diff contract to match the installed runtime: historical report-contract-2 rounds fail with `CONTRACT_DRIFT`. Compatible migration validates sealed evidence and assigns a new lifecycle identity, so its first telemetry resume reports prior request accounting unknown. Preserve incompatible old rounds for explicit abandonment/restart judgment; readable historical state never upgrades pending authority.
 
@@ -30,7 +30,14 @@ authority input.
     "phase": "fix_verification",
     "requires_full_suite": true,
     "full_suite_receipt_sha256": null,
-    "escalation_reason": null
+    "escalation_reason": null,
+    "full_suite_recipe": {
+      "kind": "python-pytest-v1",
+      "profile": "python-v1",
+      "cwd": ".",
+      "argv": ["python3", "-I", "-S", "-c", "import os, sys; os.execv(sys.executable, [sys.executable, '-m', 'pytest', '-q'])"],
+      "command": "python3 -m pytest -q"
+    }
   },
   "policy": {
     "risk_floor": 50,
@@ -53,7 +60,14 @@ authority input.
     "phase": "fix_verification",
     "requires_full_suite": true,
     "full_suite_receipt_sha256": null,
-    "escalation_reason": null
+    "escalation_reason": null,
+    "full_suite_recipe": {
+      "kind": "python-pytest-v1",
+      "profile": "python-v1",
+      "cwd": ".",
+      "argv": ["python3", "-I", "-S", "-c", "import os, sys; os.execv(sys.executable, [sys.executable, '-m', 'pytest', '-q'])"],
+      "command": "python3 -m pytest -q"
+    }
   },
   "reviewers": {
     "A": {
@@ -62,7 +76,7 @@ authority input.
       "last_error": null,
       "raw_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "context_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "report_contract_version": 9,
+      "report_contract_version": 10,
       "provenance": "native_submit"
     },
     "B": {
@@ -87,7 +101,7 @@ authority input.
   "state": "sealed",
   "raw_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "context_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "report_contract_version": 9,
+  "report_contract_version": 10,
   "attempt": 1,
   "provenance": "native_submit"
 }
@@ -106,6 +120,7 @@ The exact controller command shapes are below. `submit-report` reads exact repor
 | record true terminal timeout | `record-failure --reviewer A --reason REVIEWER_TIMEOUT` |
 | migrate an authentic v1 all-pending round | `migrate-legacy-pending` |
 | migrate an authentic v2 pending round | `migrate-v2-pending` |
+| preview a recipe-bound follow-up | `re-review-preview --base "$BASE" --runtime "$RUNTIME" --round "$ROUND" --full-suite-kind "$FULL_SUITE_KIND" --full-suite-cwd "$FULL_SUITE_CWD"` |
 | authenticate one stored receipt | `validate-report --reviewer A --source stored` |
 | bind the one final full-suite receipt | `final-validation-seal --receipt "$FULL_SUITE_RECEIPT"` |
 | authenticate active reviewers and aggregate | `finalize` |
@@ -117,9 +132,9 @@ Schema-1 through schema-4 verdicts remain readable without rewrite. Schema-4 evi
 
 Fresh executions keep the seven fields shown in the B example below. Only Reviewer B may add `evidence_ref`, and it is REQUIRED for reused evidence: exactly `{"bundle_sha256":"<64 lowercase hex>","entry_id":"E001"}` with an entry ID from E001 through E064. A/C executions and controller decision executions keep the legacy shape. The report parser accepts explicit B references under contract 3 or later; sealing then authenticates each against the round's selected evidence binding and exact verifier-returned execution fields. A reference alone grants no authority.
 
-Report contract 4 and later require Reviewer B to submit at least one claim plus `coverage: {"complete": true, "primary_entry_paths": [...]}`. Each primary-entry-path item has exactly `path` and `claim_id`; paths and claim IDs are unique, normalized, and every claim ID must resolve to a B claim in the same report. This makes the reviewer's completeness assertion and entry-path-to-claim mapping explicit before sealing. An empty path list is valid only when the reviewer found no affected documented primary entry path; the non-empty claim requirement still prevents an empty empirical authorization. Contract 5 additionally requires a B report with any `refuted` claim to contain at least one `CRITICAL` or `HIGH` finding, so execution-backed contradiction cannot produce a PASS through an advisory-only report. Two independently deployed contract-6 variants differed on `reversal_cost`; historical reports with or without that field remain readable. Contract 7 requires every finding to include `reversal_cost`; `HIGH` and `CRITICAL` require a nonblank explanation of why fixing it after merge is costly, while `LOW` and `MEDIUM` may use an empty string. Missing or blank blocker cost is retryable `FINDING_SCHEMA_INVALID`. Contract 8 adds the calibrated `native_tool_calls` self-budget to B's private context without changing report bytes. Contract 9 adds the machine-readable `fix_verification`/`final_validation` lifecycle. Historical contract-7 terminal context digests retain their previous budget shape, and historical contract-8 contexts omit validation phase. In-progress rounds with an older contract fail current resume, submission, validation, and finalization with `CONTRACT_DRIFT`; they require an explicit abandonment/restart decision rather than reinterpretation under contract 9.
+Report contract 4 and later require Reviewer B to submit at least one claim plus `coverage: {"complete": true, "primary_entry_paths": [...]}`. Each primary-entry-path item has exactly `path` and `claim_id`; paths and claim IDs are unique, normalized, and every claim ID must resolve to a B claim in the same report. This makes the reviewer's completeness assertion and entry-path-to-claim mapping explicit before sealing. An empty path list is valid only when the reviewer found no affected documented primary entry path; the non-empty claim requirement still prevents an empty empirical authorization. Contract 5 additionally requires a B report with any `refuted` claim to contain at least one `CRITICAL` or `HIGH` finding, so execution-backed contradiction cannot produce a PASS through an advisory-only report. Two independently deployed contract-6 variants differed on `reversal_cost`; historical reports with or without that field remain readable. Contract 7 requires every finding to include `reversal_cost`; `HIGH` and `CRITICAL` require a nonblank explanation of why fixing it after merge is costly, while `LOW` and `MEDIUM` may use an empty string. Missing or blank blocker cost is retryable `FINDING_SCHEMA_INVALID`. Contract 8 adds the calibrated `native_tool_calls` self-budget to B's private context without changing report bytes. Contract 9 adds the machine-readable `fix_verification`/`final_validation` lifecycle. Contract 10 binds one canonical full-suite recipe (`kind`, `profile`, `cwd`, exact capture `argv`, and human-readable command) into the re-review grant, verdict, status, and reviewer contexts. Historical contract-7 terminal context digests retain their previous budget shape, historical contract-8 contexts omit validation phase, and historical contract-9 contexts omit the recipe. In-progress rounds with an older contract fail current resume, submission, validation, and finalization with `CONTRACT_DRIFT`; they require an explicit abandonment/restart decision rather than reinterpretation under contract 10.
 
-The first lifecycle has `validation.phase: final_validation` with `requires_full_suite: false` for compatibility with its already bound independent review. Every lifecycle started after a terminal verdict is bound by the one-shot re-review grant to `fix_verification`, `requires_full_suite: true`, no receipt, and no escalation reason. Its reviewer contexts retain the complete base-to-HEAD diff and direct reviewers to finding reproduction and direct-impact tests. Once every active report is sealed, a provisional PASS cannot finalize until `final-validation-seal` changes the phase to `final_validation` using exactly one successful fresh evidence receipt. The receipt is reauthenticated during sealing and again by `finalize`; changed HEAD, diff, contract, environment, capture, or nonzero exit fails closed. A blocker or unverified B claim can finalize non-pass without running the full suite. If cross-domain impact nevertheless justifies a full-suite run on a non-pass round, `--escalation-reason` is required and is retained in verdict, status, and telemetry. The sealed receipt is immutable for that lifecycle, so another seal attempt is `FINAL_VALIDATION_ALREADY_SEALED`.
+The first lifecycle has `validation.phase: final_validation` with `requires_full_suite: false` for compatibility with its already bound independent review. Every lifecycle started after a terminal verdict is bound by the one-shot re-review grant to `fix_verification`, `requires_full_suite: true`, no receipt, no escalation reason, and one canonical recipe. The default is `python-pytest-v1` at repository cwd `.`; Node repositories select `node-npm-test-v1` and an explicit cwd with the matching `--full-suite-kind` and `--full-suite-cwd` arguments on preview, grant, and begin. Its reviewer contexts retain the complete base-to-HEAD diff and direct reviewers to finding reproduction and direct-impact tests. A reviewer report that records the bound suite command during `fix_verification` is rejected with `FULL_SUITE_DURING_FIX_VERIFICATION`. Once every active report is sealed, a provisional PASS cannot finalize until `final-validation-seal` changes the phase to `final_validation` using exactly one successful fresh evidence receipt. The receipt's profile, cwd, and argv must exactly match the bound recipe and are reauthenticated during sealing and again by `finalize`; a no-op, targeted command, changed HEAD, diff, contract, environment, capture, or nonzero exit fails closed. A blocker or unverified B claim can finalize non-pass without running the full suite. If cross-domain impact nevertheless justifies a full-suite run on a non-pass round, `--escalation-reason` is required and is retained in verdict, status, and telemetry. The sealed receipt is immutable for that lifecycle, so another seal attempt is `FINAL_VALIDATION_ALREADY_SEALED`.
 
 The Reviewer B report-entry budget is an admission rule for contract 7 and later. Historical contract-6 terminal reports remain readable even when they exceed the positive-verification caps; the budget and its telemetry fields must not be applied retroactively. The native top-level call budget starts with contract 8 and is never projected into a historical contract-7 context. Read-only historical telemetry may reauthenticate reused evidence against the stored contract and current source/environment measurements, but never grants resume, stored-validation, finalization, or PR authority under an old contract.
 
