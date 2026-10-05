@@ -156,7 +156,16 @@ def seal_test_final_validation(repo):
         "cwd": recipe.cwd,
     }
     receipt_sha256 = evidence_store.put_receipt(repo, receipt)
-    return seal_final_validation(repo, receipt_sha256=receipt_sha256)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            evidence_runtime,
+            "capture_evidence",
+            lambda *args, **kwargs: {
+                "exit_code": 0,
+                "receipt_sha256": receipt_sha256,
+            },
+        )
+        return seal_final_validation(repo, timeout_seconds=15)
 
 
 def authorize_next_begin(repo, *, runtime="codex", round_number=1, decisions_path=None):

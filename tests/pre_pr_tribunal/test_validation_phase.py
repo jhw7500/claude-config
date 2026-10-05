@@ -1,4 +1,9 @@
 import json
+import os
+from pathlib import Path
+import shlex
+import sys
+import venv
 
 import pytest
 
@@ -9,6 +14,7 @@ from pre_pr_tribunal import (
     telemetry,
     validation,
 )
+from pre_pr_tribunal import cli
 from pre_pr_tribunal.cli import _status
 from pre_pr_tribunal.evidence_environment import PYTHON_TRACKED_READ_PROGRAM
 from pre_pr_tribunal.model import (
@@ -26,6 +32,7 @@ from pre_pr_tribunal.verdict_store import (
     finalize_round,
     seal_final_validation,
     submit_reviewer_report,
+    validate_stored_reviewer_report,
 )
 from tests.pre_pr_tribunal.test_policy import (
     NOW,
@@ -67,7 +74,7 @@ def _restart_after_fix(repo):
     return preview, restarted
 
 
-def _full_suite_receipt(repo):
+def _relabeled_no_op_receipt(repo):
     recipe = full_suite_recipe()
     source_sha256 = _no_op_receipt(repo)
     receipt = evidence_store.read_receipt(repo, source_sha256)
@@ -77,6 +84,44 @@ def _full_suite_receipt(repo):
         "cwd": recipe.cwd,
     }
     return evidence_store.put_receipt(repo, receipt)
+
+
+def _stub_owned_full_suite(monkeypatch, repo):
+    receipt_sha256 = _relabeled_no_op_receipt(repo)
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"exit_code": 0, "receipt_sha256": receipt_sha256}
+
+    monkeypatch.setattr(evidence_runtime, "capture_evidence", capture)
+    return receipt_sha256, calls
+
+
+def _use_isolated_pytest_runtime(tmp_path, monkeypatch):
+    runtime = tmp_path / "pytest-runtime"
+    venv.EnvBuilder(with_pip=False, symlinks=False).create(runtime)
+    site_packages = (
+        runtime / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    (site_packages / "controller-pytest.pth").write_text(
+        str(Path(pytest.__file__).resolve().parent.parent) + "\n",
+        encoding="utf-8",
+    )
+    shim_bin = tmp_path / "python-shim"
+    shim_bin.mkdir()
+    shim = shim_bin / "python3"
+    shim.write_text(
+        "#!/bin/sh\nexec "
+        + shlex.quote(str(runtime / "bin" / "python3"))
+        + ' "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o700)
+    monkeypatch.setenv(
+        "PATH", f"{shim_bin}:{os.environ.get('PATH', '')}",
+    )
 
 
 def _no_op_receipt(repo):
@@ -170,8 +215,14 @@ def test_followup_round_binds_fix_phase_in_grant_verdict_and_context(tmp_path):
     }
 
 
-def test_followup_pass_requires_one_snapshot_bound_final_validation_receipt(tmp_path):
+def test_followup_pass_runs_owned_bound_recipe_and_finalizes(
+    tmp_path, monkeypatch,
+):
+    _use_isolated_pytest_runtime(tmp_path, monkeypatch)
     repo = _repo(tmp_path)
+    _write(repo, ".gitignore", ".review/\n__pycache__/\n.pytest_cache/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-qm", "ignore test caches")
     _failed_first_round(repo)
     _preview, restarted = _restart_after_fix(repo)
     _seal_direct_impact_reports(repo, restarted)
@@ -179,8 +230,13 @@ def test_followup_pass_requires_one_snapshot_bound_final_validation_receipt(tmp_
     with pytest.raises(SchemaError, match="^FINAL_VALIDATION_REQUIRED$"):
         finalize_round(repo, now=NOW)
 
-    receipt_sha256 = _full_suite_receipt(repo)
-    sealed = seal_final_validation(repo, receipt_sha256=receipt_sha256)
+    sealed = seal_final_validation(repo, timeout_seconds=30)
+    receipt_sha256 = sealed.validation.full_suite_receipt_sha256
+    assert receipt_sha256 is not None
+    receipt = evidence_store.read_receipt(repo, receipt_sha256)
+    assert receipt["entry"]["argv"] == list(full_suite_recipe().argv)
+    assert receipt["entry"]["cwd"] == full_suite_recipe().cwd
+    assert receipt["entry"]["exit_code"] == 0
     assert sealed.validation.to_json() == {
         "phase": "final_validation",
         "requires_full_suite": True,
@@ -189,7 +245,7 @@ def test_followup_pass_requires_one_snapshot_bound_final_validation_receipt(tmp_
         "full_suite_recipe": full_suite_recipe().to_json(),
     }
     with pytest.raises(SchemaError, match="^FINAL_VALIDATION_ALREADY_SEALED$"):
-        seal_final_validation(repo, receipt_sha256=receipt_sha256)
+        seal_final_validation(repo, timeout_seconds=30)
 
     final = finalize_round(repo, now=NOW)
     assert final.gate.status is GateStatus.PASS
@@ -231,14 +287,15 @@ def test_nonpass_escalation_is_retained_and_reauthenticated(
             ),
             now=NOW,
         )
-    receipt_sha256 = _full_suite_receipt(repo)
     with pytest.raises(SchemaError, match="^FINAL_VALIDATION_NOT_READY$"):
-        seal_final_validation(repo, receipt_sha256=receipt_sha256)
+        seal_final_validation(repo, timeout_seconds=15)
+    receipt_sha256, calls = _stub_owned_full_suite(monkeypatch, repo)
     seal_final_validation(
         repo,
-        receipt_sha256=receipt_sha256,
+        timeout_seconds=15,
         escalation_reason="Cross-domain build configuration changed.",
     )
+    assert len(calls) == 1
 
     observed = telemetry.summarize_run(repo, run_id=run.run_id)["evidence"]
     assert observed["validation_phase"] == "final_validation"
@@ -261,7 +318,9 @@ def test_nonpass_escalation_is_retained_and_reauthenticated(
     assert calls == [receipt_sha256]
 
 
-def test_three_round_contract_runs_full_suite_only_for_final_candidate(tmp_path):
+def test_three_round_contract_runs_full_suite_only_for_final_candidate(
+    tmp_path, monkeypatch,
+):
     repo = _repo(tmp_path, path="hooks/guard.py")
     first = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
     for reviewer in first.policy.active_reviewers:
@@ -331,9 +390,10 @@ def test_three_round_contract_runs_full_suite_only_for_final_candidate(tmp_path)
         if round_number == 2:
             assert finalize_round(repo, now=NOW).gate.status is GateStatus.FAIL
         else:
-            receipt_sha256 = _full_suite_receipt(repo)
+            _receipt_sha256, calls = _stub_owned_full_suite(monkeypatch, repo)
             full_suite_executions += 1
-            seal_final_validation(repo, receipt_sha256=receipt_sha256)
+            seal_final_validation(repo, timeout_seconds=15)
+            assert len(calls) == 1
             assert finalize_round(repo, now=NOW).gate.status is GateStatus.PASS
         previous = current
 
@@ -342,7 +402,7 @@ def test_three_round_contract_runs_full_suite_only_for_final_candidate(tmp_path)
 
 
 @pytest.mark.parametrize("receipt_factory", (_no_op_receipt, _targeted_receipt))
-def test_non_suite_receipt_cannot_seal_final_validation(
+def test_caller_cannot_supply_any_receipt_to_final_validation(
     tmp_path, receipt_factory,
 ):
     repo = _repo(tmp_path)
@@ -350,10 +410,22 @@ def test_non_suite_receipt_cannot_seal_final_validation(
     _preview, restarted = _restart_after_fix(repo)
     _seal_direct_impact_reports(repo, restarted)
 
-    with pytest.raises(
-        SchemaError, match="^FINAL_VALIDATION_RECIPE_MISMATCH$"
-    ):
-        seal_final_validation(repo, receipt_sha256=receipt_factory(repo))
+    receipt_sha256 = receipt_factory(repo)
+    with pytest.raises(TypeError, match="receipt_sha256"):
+        seal_final_validation(
+            repo, timeout_seconds=15, receipt_sha256=receipt_sha256,
+        )
+
+
+def test_cli_rejects_external_final_validation_receipt():
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args([
+            "final-validation-seal", "--receipt", "0" * 64,
+        ])
+    parsed = cli._parser().parse_args([
+        "final-validation-seal", "--timeout", "15",
+    ])
+    assert parsed.timeout == 15
 
 
 def test_full_suite_execution_is_rejected_during_fix_verification(tmp_path):
@@ -413,6 +485,81 @@ def test_node_recipe_is_machine_bound_in_grant_and_verdict(tmp_path):
 
     assert preview["target"]["validation"]["full_suite_recipe"] == recipe.to_json()
     assert restarted.validation.full_suite_recipe == recipe
+
+
+@pytest.mark.parametrize(
+    ("kind", "cwd"),
+    (
+        (FullSuiteKind.PYTHON_PYTEST, "python-suite"),
+        (FullSuiteKind.NODE_NPM_TEST, "node-suite"),
+    ),
+)
+def test_bound_recipe_context_survives_seal_stored_validation_and_finalize(
+    tmp_path, monkeypatch, kind, cwd,
+):
+    repo = _repo(tmp_path)
+    _write(repo, f"{cwd}/marker.txt", "suite root\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "add suite root")
+    _failed_first_round(repo)
+    _write(repo, "src/app.py", "fixed\n")
+    _git(repo, "commit", "-qam", "fix")
+    recipe = full_suite_recipe(kind, cwd)
+    preview = round_grant.preview_grant_binding(
+        repo,
+        base="master",
+        runtime="codex",
+        round_number=1,
+        full_suite_kind=recipe.kind,
+        full_suite_cwd=recipe.cwd,
+    )
+    round_grant.record_grant(
+        repo,
+        base="master",
+        runtime="codex",
+        round_number=1,
+        full_suite_kind=recipe.kind,
+        full_suite_cwd=recipe.cwd,
+        expected_verdict_sha256=preview["verdict_sha256"],
+        expected_binding_sha256=preview["binding_sha256"],
+        reason="Bind the non-default suite recipe.",
+        channel="relayed",
+        now=NOW,
+    )
+    restarted = begin_round(
+        repo,
+        base="master",
+        runtime="codex",
+        round_number=1,
+        full_suite_kind=recipe.kind,
+        full_suite_cwd=recipe.cwd,
+        now=NOW,
+    )
+    _seal_direct_impact_reports(repo, restarted)
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"exit_code": 0, "receipt_sha256": "f" * 64}
+
+    monkeypatch.setattr(evidence_runtime, "capture_evidence", capture)
+    monkeypatch.setattr(
+        validation, "verify_full_suite_receipt", lambda *args, **kwargs: {},
+    )
+    sealed = seal_final_validation(repo, timeout_seconds=15)
+
+    assert sealed.validation.full_suite_recipe == recipe
+    assert len(calls) == 1
+    assert calls[0][1] == {
+        "base": "master",
+        "profile": recipe.profile,
+        "command_cwd": recipe.cwd,
+        "argv": list(recipe.argv),
+        "timeout_seconds": 15,
+    }
+    for reviewer in restarted.policy.active_reviewers:
+        validate_stored_reviewer_report(repo, reviewer=Reviewer(reviewer))
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.PASS
 
 
 def test_begin_cannot_change_the_granted_full_suite_recipe(tmp_path):

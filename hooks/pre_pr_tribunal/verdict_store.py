@@ -1786,9 +1786,18 @@ def _read_sealed_report(
             and verdict.validation.requires_full_suite
             and verdict.validation.phase is m.ValidationPhase.FINAL_VALIDATION
         ):
+            recipe = verdict.validation.full_suite_recipe
+            if recipe is None:
+                raise SchemaError("VALIDATION_BINDING_INVALID")
             accepted_contexts.add(
                 context_sha256(
-                    replace(verdict, validation=m.followup_validation_binding()),
+                    replace(
+                        verdict,
+                        validation=m.followup_validation_binding(
+                            full_suite_kind=recipe.kind,
+                            full_suite_cwd=recipe.cwd,
+                        ),
+                    ),
                     reviewer,
                 )
             )
@@ -1822,47 +1831,86 @@ def _provisional_gate(
     return status, blockers
 
 
+def _final_validation_candidate_locked(
+    root: Path, review_fd: int, *, escalation_reason: str | None,
+) -> Verdict:
+    pending = _read_verdict_locked(review_fd)
+    require_current_in_progress(pending)
+    if pending.contract != current_contract_binding():
+        raise SchemaError("CONTRACT_DRIFT")
+    validation = pending.validation
+    if validation is None or not validation.requires_full_suite:
+        raise SchemaError("FINAL_VALIDATION_NOT_REQUIRED")
+    if validation.phase is m.ValidationPhase.FINAL_VALIDATION:
+        raise SchemaError("FINAL_VALIDATION_ALREADY_SEALED")
+    if validation.full_suite_recipe is None:
+        raise SchemaError("VALIDATION_BINDING_INVALID")
+    snapshot = capture_snapshot(root, pending.base_ref)
+    if not _snapshot_equal(pending, snapshot):
+        raise SchemaError("SNAPSHOT_CHANGED")
+    if pending.policy is None:
+        raise SchemaError("POLICY_INVALID")
+    reports = {
+        key: _read_sealed_report(review_fd, pending, Reviewer(key), root=root)
+        for key in pending.policy.active_reviewers
+    }
+    _validate_closure(pending, reports)
+    provisional, _blockers_found = _provisional_gate(reports)
+    if provisional is not GateStatus.PASS and escalation_reason is None:
+        raise SchemaError("FINAL_VALIDATION_NOT_READY")
+    # Validate a supplied reason before the owned suite process is started.
+    m.ValidationBinding(
+        m.ValidationPhase.FINAL_VALIDATION,
+        True,
+        "0" * 64,
+        escalation_reason,
+        validation.full_suite_recipe,
+    ).to_json()
+    return pending
+
+
 def seal_final_validation(
     cwd: Path,
     *,
-    receipt_sha256: str,
+    timeout_seconds: int | float,
     escalation_reason: str | None = None,
 ) -> Verdict:
-    """Bind one fresh full-suite receipt to the current follow-up lifecycle."""
+    """Execute and bind the lifecycle's full-suite recipe as one owned action."""
     root = repository_root(cwd)
     preflight_review_directory(root)
     check_ignored(root)
     with locked_review(root, create=False) as review_fd:
-        pending = _read_verdict_locked(review_fd)
-        require_current_in_progress(pending)
-        if pending.contract != current_contract_binding():
-            raise SchemaError("CONTRACT_DRIFT")
-        validation = pending.validation
-        if validation is None or not validation.requires_full_suite:
-            raise SchemaError("FINAL_VALIDATION_NOT_REQUIRED")
-        if validation.phase is m.ValidationPhase.FINAL_VALIDATION:
-            raise SchemaError("FINAL_VALIDATION_ALREADY_SEALED")
-        snapshot = capture_snapshot(root, pending.base_ref)
-        if not _snapshot_equal(pending, snapshot):
-            raise SchemaError("SNAPSHOT_CHANGED")
-        if pending.policy is None:
-            raise SchemaError("POLICY_INVALID")
-        reports = {
-            key: _read_sealed_report(
-                review_fd, pending, Reviewer(key), root=root
-            )
-            for key in pending.policy.active_reviewers
-        }
-        _validate_closure(pending, reports)
-        provisional, _blockers_found = _provisional_gate(reports)
-        if provisional is not GateStatus.PASS and escalation_reason is None:
-            raise SchemaError("FINAL_VALIDATION_NOT_READY")
+        expected = _final_validation_candidate_locked(
+            root, review_fd, escalation_reason=escalation_reason,
+        )
+    recipe = expected.validation.full_suite_recipe
+    if recipe is None:  # Kept explicit for type narrowing and fail-closed safety.
+        raise SchemaError("VALIDATION_BINDING_INVALID")
+    from . import evidence_runtime
+
+    captured = evidence_runtime.capture_evidence(
+        root,
+        base=expected.base_ref,
+        profile=recipe.profile,
+        command_cwd=recipe.cwd,
+        argv=list(recipe.argv),
+        timeout_seconds=timeout_seconds,
+    )
+    receipt_sha256 = captured.get("receipt_sha256")
+    if captured.get("exit_code") != 0 or not isinstance(receipt_sha256, str):
+        raise SchemaError("FINAL_VALIDATION_FAILED")
+    with locked_review(root, create=False) as review_fd:
+        pending = _final_validation_candidate_locked(
+            root, review_fd, escalation_reason=escalation_reason,
+        )
+        if pending != expected:
+            raise SchemaError("FINAL_VALIDATION_STATE_CHANGED")
         sealed_validation = m.ValidationBinding(
             m.ValidationPhase.FINAL_VALIDATION,
             True,
             receipt_sha256,
             escalation_reason,
-            validation.full_suite_recipe,
+            recipe,
         )
         sealed_validation.to_json()
         from .validation import verify_full_suite_receipt

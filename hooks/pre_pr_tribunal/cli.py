@@ -215,7 +215,7 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--reviewer-b", type=Path)
     finalize.add_argument("--reviewer-c", type=Path)
     final_validation = commands.add_parser("final-validation-seal", add_help=False)
-    final_validation.add_argument("--receipt", required=True)
+    final_validation.add_argument("--timeout", required=True, type=float)
     final_validation.add_argument("--escalation-reason")
     commands.add_parser("status", add_help=False)
     start = commands.add_parser("telemetry-start", add_help=False)
@@ -923,7 +923,7 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
         elif arguments.command == "final-validation-seal":
             verdict = seal_final_validation(
                 cwd,
-                receipt_sha256=arguments.receipt,
+                timeout_seconds=arguments.timeout,
                 escalation_reason=arguments.escalation_reason,
             )
             payload = _status(verdict)
