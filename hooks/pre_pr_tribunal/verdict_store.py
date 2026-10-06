@@ -6,8 +6,10 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -43,6 +45,7 @@ from .model import (
     SchemaError,
     Severity,
     Snapshot,
+    TribunalError,
     Verdict,
 )
 from .review_context import context_sha256, current_contract_binding
@@ -57,6 +60,10 @@ from .review_store import (
     repository_root,
     safe_file,
 )
+
+
+_FINAL_VALIDATION_RESERVATION = "final-validation-reservation.json"
+_MAX_FINAL_VALIDATION_RESERVATION = 2048
 
 
 def utc_now() -> str:
@@ -220,6 +227,7 @@ class _VerdictFields:
     evidence_fallback_reason: str | None
     evidence_contract: int | None
     policy: m.PolicyBinding | None
+    validation: m.ValidationBinding | None
 
 
 def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFields:
@@ -251,6 +259,9 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         valid_shapes = {frozenset(verdict_keys)}
         if schema in m.EVIDENCE_VERDICT_SCHEMAS:
             valid_shapes.add(frozenset((*verdict_keys, 'evidence_contract')))
+        valid_shapes.update(
+            frozenset((*shape, "validation")) for shape in tuple(valid_shapes)
+        )
     else:
         valid_shapes = {
             frozenset(verdict_keys),
@@ -371,6 +382,45 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         from .policy import parse_policy_binding
 
         policy_binding = parse_policy_binding(data["policy"], runtime=runtime)
+    validation_binding = None
+    if "validation" in data:
+        validation_keys = {
+            "phase",
+            "requires_full_suite",
+            "full_suite_receipt_sha256",
+            "escalation_reason",
+        }
+        raw_validation = data["validation"]
+        if isinstance(raw_validation, dict) and "full_suite_recipe" in raw_validation:
+            validation_keys.add("full_suite_recipe")
+        if isinstance(raw_validation, dict) and "failure_code" in raw_validation:
+            validation_keys.add("failure_code")
+        validation_obj = m._object(
+            raw_validation,
+            validation_keys,
+            "VALIDATION_BINDING_INVALID",
+        )
+        receipt_sha256 = validation_obj["full_suite_receipt_sha256"]
+        reason = validation_obj["escalation_reason"]
+        recipe = (
+            m.parse_full_suite_recipe(validation_obj["full_suite_recipe"])
+            if "full_suite_recipe" in validation_obj
+            and validation_obj["full_suite_recipe"] is not None
+            else None
+        )
+        validation_binding = m.ValidationBinding(
+            m._enum(
+                m.ValidationPhase,
+                validation_obj["phase"],
+                "VALIDATION_BINDING_INVALID",
+            ),
+            validation_obj["requires_full_suite"],
+            receipt_sha256,
+            reason,
+            recipe,
+            validation_obj.get("failure_code"),
+        )
+        validation_binding.to_json()
     return _VerdictFields(
         schema,
         repository,
@@ -394,6 +444,7 @@ def _parse_verdict_fields(data: dict[str, object], *, schema: int) -> _VerdictFi
         fallback,
         evidence_contract,
         policy_binding,
+        validation_binding,
     )
 
 
@@ -473,6 +524,7 @@ def _verdict_from_fields(
         fields.evidence_fallback_reason,
         fields.evidence_contract,
         fields.policy,
+        fields.validation,
     )
 
 
@@ -597,6 +649,26 @@ def _parse_v2_receipt(
 def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
     fields = _parse_verdict_fields(data, schema=schema)
     contract = _parse_contract(data["contract"])
+    if (
+        contract.report_text >= m.VALIDATION_PHASE_CONTRACT_VERSION
+        and fields.validation is None
+    ):
+        raise SchemaError("VERDICT_INVALID")
+    if contract.report_text < m.VALIDATION_PHASE_CONTRACT_VERSION:
+        fields = replace(fields, validation=None)
+    if (
+        contract.report_text >= m.FINAL_VALIDATION_OUTCOME_CONTRACT_VERSION
+        and fields.validation is not None
+        and "failure_code" not in data["validation"]
+    ):
+        raise SchemaError("VERDICT_INVALID")
+    if (
+        contract.report_text >= m.FULL_SUITE_RECIPE_CONTRACT_VERSION
+        and fields.validation is not None
+        and fields.validation.requires_full_suite
+        and fields.validation.full_suite_recipe is None
+    ):
+        raise SchemaError("VERDICT_INVALID")
     if fields.evidence_binding is not None:
         evidence_contract = fields.evidence_binding.to_json()['expected_binding']['contract']
         if ({key: evidence_contract[key] for key in contract.to_json()} != contract.to_json()
@@ -670,6 +742,18 @@ def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
                 raise SchemaError("VERDICT_INVALID")
 
     status = fields.gate.status
+    if (
+        contract.report_text >= m.FINAL_VALIDATION_OUTCOME_CONTRACT_VERSION
+        and status is GateStatus.PASS
+        and (
+            fields.validation is None
+            or fields.validation.phase is not m.ValidationPhase.FINAL_VALIDATION
+            or not fields.validation.requires_full_suite
+            or fields.validation.full_suite_receipt_sha256 is None
+            or fields.validation.full_suite_recipe is None
+        )
+    ):
+        raise SchemaError("VERDICT_INVALID")
     count = fields.gate.blocking_count
     active = (
         fields.policy.active_reviewers
@@ -704,7 +788,11 @@ def _parse_mixed_verdict(data: dict[str, object], *, schema: int) -> Verdict:
         )
         expected = (
             GateStatus.FAIL
-            if count
+            if count or (
+                fields.validation is not None
+                and fields.validation.phase
+                is m.ValidationPhase.FINAL_VALIDATION_FAILED
+            )
             else GateStatus.INCONCLUSIVE
             if has_unverified
             else GateStatus.PASS
@@ -1239,6 +1327,7 @@ def _new_current_pending(
     contract: ContractBinding,
     lifecycle_id: str,
     policy: m.PolicyBinding,
+    validation: m.ValidationBinding,
 ) -> Verdict:
     active = set(policy.active_reviewers)
     gate = (
@@ -1270,6 +1359,7 @@ def _new_current_pending(
         lifecycle_id,
         evidence_contract=2,
         policy=policy,
+        validation=validation,
     )
 
 
@@ -1325,6 +1415,8 @@ def begin_round(
     intensity_values: Sequence[str] | None = None,
     intensity_requester: str | Sequence[str] | None = None,
     intensity_reason: str | Sequence[str] | None = None,
+    full_suite_kind: m.FullSuiteKind | str = m.FullSuiteKind.PYTHON_PYTEST,
+    full_suite_cwd: str = ".",
     now: Callable[[], str] = utc_now,
     token_hex: Callable[[int], str] = secrets.token_hex,
 ) -> Verdict:
@@ -1343,6 +1435,19 @@ def begin_round(
     preflight_review_directory(root)
     check_ignored(root)
     with locked_review(root, create=True) as review_fd:
+        try:
+            read_named_file(
+                review_fd, _FINAL_VALIDATION_RESERVATION,
+                maximum=_MAX_FINAL_VALIDATION_RESERVATION,
+                missing="FINAL_VALIDATION_RESERVATION_MISSING",
+                unsafe="FINAL_VALIDATION_RESERVATION_UNSAFE",
+                exact_mode=0o600,
+            )
+        except SchemaError as error:
+            if error.code != "FINAL_VALIDATION_RESERVATION_MISSING":
+                raise
+        else:
+            raise SchemaError("FINAL_VALIDATION_RECOVERY_REQUIRED")
         try:
             stored_raw = read_named_file(
                 review_fd, "verdict.json", maximum=m.MAX_VERDICT_BYTES,
@@ -1502,11 +1607,23 @@ def begin_round(
             evidence_binding, evidence_fallback_reason = select_evidence(
                 root, snapshot, evidence_bundle_sha256
             )
+        validation = (
+            m.followup_validation_binding(
+                full_suite_kind=full_suite_kind,
+                full_suite_cwd=full_suite_cwd,
+            )
+            if stored is not None
+            else m.initial_validation_binding(
+                full_suite_kind=full_suite_kind,
+                full_suite_cwd=full_suite_cwd,
+            )
+        )
         pending = _new_current_pending(
             snapshot, runtime=runtime, initial_paths=initial_paths,
             round_number=round_number, decisions=decisions, history=history,
             contract=current_contract_binding(), lifecycle_id=_lifecycle_id(token_hex),
             policy=policy,
+            validation=validation,
         )
         if policy.mode is not m.ReviewMode.OFF:
             pending = replace(
@@ -1531,6 +1648,7 @@ def begin_round(
                 evidence_bundle_sha256=evidence_bundle_sha256,
                 evidence_binding=evidence_binding,
                 evidence_fallback_reason=evidence_fallback_reason,
+                validation=validation,
             ):
                 raise SchemaError("RE_REVIEW_GRANT_REQUIRED")
         # Without a terminal predecessor, no old fixed namespace has proven
@@ -1584,6 +1702,33 @@ def _validate_reviewer_closure(
     verdict: Verdict, report: ReviewerReport, *, seen_replacements: set[str] | None = None,
 ) -> None:
     """Check only this role's responses before accepting its immutable report."""
+    validation = verdict.validation
+    current_suite_guard = (
+        verdict.contract is not None
+        and verdict.contract.report_text
+        >= m.FINAL_VALIDATION_OUTCOME_CONTRACT_VERSION
+    )
+    if (
+        validation is not None
+        and validation.requires_full_suite
+        and (
+            validation.full_suite_receipt_sha256 is None
+            if current_suite_guard
+            else validation.phase is m.ValidationPhase.FIX_VERIFICATION
+        )
+        and validation.full_suite_recipe is not None
+    ):
+        from .validation import is_full_suite_execution
+
+        if any(
+            (
+                is_full_suite_execution(validation.full_suite_recipe, execution.command)
+                if current_suite_guard
+                else execution.command == validation.full_suite_recipe.command
+            )
+            for execution in report.executions
+        ):
+            raise SchemaError("FULL_SUITE_DURING_FIX_VERIFICATION")
     if (
         verdict.contract is not None
         and verdict.contract.report_text >= m.REVIEWER_B_BUDGET_CONTRACT_VERSION
@@ -1698,10 +1843,473 @@ def _read_sealed_report(
         )
         accepted_contexts.add(context_sha256(legacy, reviewer))
     if slot.receipt.context_sha256 not in accepted_contexts:
-        raise SchemaError("CONTEXT_DRIFT")
+        if (
+            verdict.validation is not None
+            and verdict.validation.requires_full_suite
+            and (
+                (
+                    verdict.validation.full_suite_receipt_sha256 is not None
+                    and verdict.validation.phase in {
+                        m.ValidationPhase.FINAL_VALIDATION,
+                        m.ValidationPhase.FINAL_VALIDATION_FAILED,
+                    }
+                )
+                or (
+                    verdict.validation.phase
+                    is m.ValidationPhase.FINAL_VALIDATION_FAILED
+                    and verdict.validation.failure_code == "FINAL_VALIDATION_INTERRUPTED"
+                )
+            )
+        ):
+            recipe = verdict.validation.full_suite_recipe
+            if recipe is None:
+                raise SchemaError("VALIDATION_BINDING_INVALID")
+            pending_bindings = [m.followup_validation_binding(
+                full_suite_kind=recipe.kind,
+                full_suite_cwd=recipe.cwd,
+            )]
+            if (
+                verdict.contract is not None
+                and verdict.contract.report_text
+                >= m.FINAL_VALIDATION_OUTCOME_CONTRACT_VERSION
+            ):
+                pending_bindings.append(m.initial_validation_binding(
+                    full_suite_kind=recipe.kind,
+                    full_suite_cwd=recipe.cwd,
+                ))
+            accepted_contexts.update(
+                context_sha256(replace(verdict, validation=binding), reviewer)
+                for binding in pending_bindings
+            )
+        if slot.receipt.context_sha256 not in accepted_contexts:
+            raise SchemaError("CONTEXT_DRIFT")
     from .evidence_lifecycle import authenticate_report
     authenticate_report(root, verdict, parsed)
     return parsed
+
+
+def _provisional_gate(
+    reports: Mapping[str, ReviewerReport],
+) -> tuple[GateStatus, tuple[m.Finding, ...]]:
+    blockers = tuple(
+        finding
+        for report in reports.values()
+        for finding in report.findings
+        if finding.severity in {Severity.CRITICAL, Severity.HIGH}
+    )
+    reviewer_b = reports.get("B")
+    has_unverified = reviewer_b is not None and any(
+        claim.result == "unverified" for claim in reviewer_b.claims
+    )
+    status = (
+        GateStatus.FAIL
+        if blockers
+        else GateStatus.INCONCLUSIVE
+        if has_unverified
+        else GateStatus.PASS
+    )
+    return status, blockers
+
+
+def _final_validation_candidate_locked(
+    root: Path, review_fd: int, *, escalation_reason: str | None,
+) -> Verdict:
+    pending = _read_verdict_locked(review_fd)
+    require_current_in_progress(pending)
+    if pending.contract != current_contract_binding():
+        raise SchemaError("CONTRACT_DRIFT")
+    validation = pending.validation
+    if validation is None or not validation.requires_full_suite:
+        raise SchemaError("FINAL_VALIDATION_NOT_REQUIRED")
+    if (
+        validation.full_suite_receipt_sha256 is not None
+        or validation.phase is m.ValidationPhase.FINAL_VALIDATION_FAILED
+    ):
+        raise SchemaError("FINAL_VALIDATION_ALREADY_SEALED")
+    if validation.full_suite_recipe is None:
+        raise SchemaError("VALIDATION_BINDING_INVALID")
+    if (
+        validation.escalation_reason is not None
+        and validation.escalation_reason != escalation_reason
+    ):
+        raise SchemaError("FINAL_VALIDATION_ESCALATION_CHANGED")
+    snapshot = capture_snapshot(root, pending.base_ref)
+    if not _snapshot_equal(pending, snapshot):
+        raise SchemaError("SNAPSHOT_CHANGED")
+    if pending.policy is None:
+        raise SchemaError("POLICY_INVALID")
+    reports = {
+        key: _read_sealed_report(review_fd, pending, Reviewer(key), root=root)
+        for key in pending.policy.active_reviewers
+    }
+    _validate_closure(pending, reports)
+    provisional, _blockers_found = _provisional_gate(reports)
+    if provisional is not GateStatus.PASS and escalation_reason is None:
+        raise SchemaError("FINAL_VALIDATION_NOT_READY")
+    # Validate a supplied reason before the owned suite process is started.
+    m.ValidationBinding(
+        m.ValidationPhase.FINAL_VALIDATION,
+        True,
+        "0" * 64,
+        escalation_reason,
+        validation.full_suite_recipe,
+    ).to_json()
+    return pending
+
+
+def _reservation_bytes(
+    verdict: Verdict, *, escalation_reason: str | None,
+) -> bytes:
+    recipe = verdict.validation.full_suite_recipe
+    if recipe is None or verdict.lifecycle_id is None:
+        raise SchemaError("VALIDATION_BINDING_INVALID")
+    return json.dumps({
+        "schema": 1,
+        "lifecycle_id": verdict.lifecycle_id,
+        "head_sha": verdict.head_sha,
+        "diff_sha256": verdict.diff_sha256,
+        "full_suite_recipe": recipe.to_json(),
+        "escalation_reason": escalation_reason,
+        "owner_pid": os.getpid(),
+        "nonce": secrets.token_hex(16),
+        "created_at": utc_now(),
+    }, separators=(",", ":")).encode("utf-8")
+
+
+def _reservation_payload(raw: bytes, verdict: Verdict) -> dict[str, object]:
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+    recipe = verdict.validation.full_suite_recipe if verdict.validation else None
+    legacy_keys = {
+        "schema", "lifecycle_id", "head_sha", "diff_sha256",
+        "full_suite_recipe", "owner_pid", "nonce", "created_at",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) not in (legacy_keys, legacy_keys | {"escalation_reason"})
+        or type(value["schema"]) is not int
+        or value["schema"] != 1
+        or value["lifecycle_id"] != verdict.lifecycle_id
+        or value["head_sha"] != verdict.head_sha
+        or value["diff_sha256"] != verdict.diff_sha256
+        or recipe is None
+        or value["full_suite_recipe"] != recipe.to_json()
+        or type(value["owner_pid"]) is not int
+        or value["owner_pid"] <= 0
+        or not isinstance(value["nonce"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", value["nonce"]) is None
+        or not isinstance(value["created_at"], str)
+        or not value["created_at"]
+    ):
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+    legacy_shape = set(value) == legacy_keys
+    escalation_reason = (
+        verdict.validation.escalation_reason
+        if legacy_shape
+        and verdict.contract is not None
+        and verdict.contract.report_text
+        < m.FINAL_VALIDATION_OUTCOME_CONTRACT_VERSION
+        else value.get("escalation_reason")
+    )
+    if (
+        verdict.validation.escalation_reason is not None
+        and escalation_reason != verdict.validation.escalation_reason
+    ):
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+    try:
+        m.ValidationBinding(
+            m.ValidationPhase.FIX_VERIFICATION, True,
+            escalation_reason=escalation_reason,
+            full_suite_recipe=recipe,
+        ).to_json()
+    except SchemaError:
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+    return {**value, "escalation_reason": escalation_reason}
+
+
+def _open_locked_reservation(review_fd: int, verdict: Verdict) -> tuple[int, bytes]:
+    fd = -1
+    ready = False
+    try:
+        fd = os.open(
+            _FINAL_VALIDATION_RESERVATION,
+            os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=review_fd,
+        )
+        safe_file(fd, "FINAL_VALIDATION_RESERVATION_UNSAFE", exact_mode=0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SchemaError("FINAL_VALIDATION_IN_PROGRESS") from None
+        raw = os.read(fd, _MAX_FINAL_VALIDATION_RESERVATION + 1)
+        if not raw or len(raw) > _MAX_FINAL_VALIDATION_RESERVATION:
+            raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+        _reservation_payload(raw, verdict)
+        ready = True
+        return fd, raw
+    except FileNotFoundError:
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_MISSING") from None
+    except SchemaError:
+        raise
+    except OSError:
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+    finally:
+        if fd >= 0 and not ready:
+            os.close(fd)
+
+
+def _verify_reservation_name(review_fd: int, fd: int, raw: bytes) -> None:
+    try:
+        linked = os.stat(
+            _FINAL_VALIDATION_RESERVATION,
+            dir_fd=review_fd,
+            follow_symlinks=False,
+        )
+        opened = safe_file(fd, "FINAL_VALIDATION_RESERVATION_UNSAFE", exact_mode=0o600)
+        if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+            raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+        current = read_named_file(
+            review_fd, _FINAL_VALIDATION_RESERVATION,
+            maximum=_MAX_FINAL_VALIDATION_RESERVATION,
+            missing="FINAL_VALIDATION_RESERVATION_MISSING",
+            unsafe="FINAL_VALIDATION_RESERVATION_UNSAFE",
+            exact_mode=0o600,
+        )
+        if current != raw:
+            raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+    except OSError:
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+
+
+def final_validation_reservation_status(cwd: Path) -> dict[str, object]:
+    """Show the exact interrupted reservation that requires operator judgment."""
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        verdict = _read_verdict_locked(review_fd)
+        raw = read_named_file(
+            review_fd, _FINAL_VALIDATION_RESERVATION,
+            maximum=_MAX_FINAL_VALIDATION_RESERVATION,
+            missing="FINAL_VALIDATION_RESERVATION_MISSING",
+            unsafe="FINAL_VALIDATION_RESERVATION_UNSAFE",
+            exact_mode=0o600,
+        )
+        payload = _reservation_payload(raw, verdict)
+        return {
+            "status": "reserved", "sha256": hashlib.sha256(raw).hexdigest(),
+            "owner_pid": payload["owner_pid"], "head_sha": payload["head_sha"],
+            "created_at": payload["created_at"],
+            "escalation_reason": payload["escalation_reason"],
+        }
+
+
+def recover_final_validation_reservation(
+    cwd: Path, *, expected_sha256: str, confirmed_terminal: bool = False,
+    abandon_pending: bool = False,
+) -> dict[str, object]:
+    """Archive a stopped execution's reservation after explicit operator review.
+
+    The caller must verify that the original process tree is terminal. A free
+    advisory lock alone cannot establish that an orphaned child has stopped.
+    """
+    if confirmed_terminal is not True:
+        raise SchemaError("FINAL_VALIDATION_RECOVERY_CONFIRMATION_REQUIRED")
+    if type(abandon_pending) is not bool:
+        raise SchemaError("FINAL_VALIDATION_RECOVERY_INVALID")
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        verdict = _read_verdict_locked(review_fd)
+        fd, raw = _open_locked_reservation(review_fd, verdict)
+        try:
+            digest = hashlib.sha256(raw).hexdigest()
+            if expected_sha256 != digest:
+                raise SchemaError("FINAL_VALIDATION_RESERVATION_MISMATCH")
+            _verify_reservation_name(review_fd, fd, raw)
+            payload = _reservation_payload(raw, verdict)
+            if verdict.gate.status is GateStatus.IN_PROGRESS and not abandon_pending:
+                if verdict.contract != current_contract_binding():
+                    raise SchemaError("FINAL_VALIDATION_ABANDON_REQUIRED")
+                try:
+                    snapshot = capture_snapshot(root, verdict.base_ref)
+                except (TribunalError, OSError, ValueError):
+                    raise SchemaError("FINAL_VALIDATION_ABANDON_REQUIRED") from None
+                if not _snapshot_equal(verdict, snapshot):
+                    raise SchemaError("FINAL_VALIDATION_ABANDON_REQUIRED")
+            archive = f"final-validation-recovered-{digest}.json"
+            try:
+                os.stat(archive, dir_fd=review_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+            else:
+                raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+            if abandon_pending:
+                if verdict.gate.status is GateStatus.IN_PROGRESS:
+                    if verdict.policy is None or verdict.validation is None:
+                        raise SchemaError("VALIDATION_BINDING_INVALID")
+                    active = verdict.policy.active_reviewers
+                    if any(verdict.reviewers[key].status != "sealed" for key in active):
+                        raise SchemaError("ROUND_NOT_READY")
+                    reports = {key: verdict.reviewers[key].report for key in active}
+                    _validate_closure(verdict, reports)
+                    _, blockers = _provisional_gate(reports)
+                    failed_validation = m.ValidationBinding(
+                        m.ValidationPhase.FINAL_VALIDATION_FAILED,
+                        True,
+                        escalation_reason=payload["escalation_reason"],
+                        full_suite_recipe=verdict.validation.full_suite_recipe,
+                        failure_code="FINAL_VALIDATION_INTERRUPTED",
+                    )
+                    terminal = replace(
+                        verdict, validation=failed_validation,
+                        gate=GateSummary(GateStatus.FAIL, len(blockers)),
+                    )
+                    terminal.to_json()
+                    _atomic_write(review_fd, terminal)
+                elif (
+                    verdict.validation is None
+                    or verdict.validation.phase
+                    is not m.ValidationPhase.FINAL_VALIDATION_FAILED
+                    or verdict.validation.failure_code
+                    != "FINAL_VALIDATION_INTERRUPTED"
+                ):
+                    raise SchemaError("FINAL_VALIDATION_ABANDON_INVALID")
+            try:
+                os.rename(
+                    _FINAL_VALIDATION_RESERVATION, archive,
+                    src_dir_fd=review_fd, dst_dir_fd=review_fd,
+                )
+                os.fsync(review_fd)
+            except OSError:
+                raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+            return {
+                "status": "abandoned" if abandon_pending else "recovered",
+                "sha256": digest,
+                "archive_path": f".review/{archive}",
+            }
+        finally:
+            os.close(fd)
+
+
+def seal_final_validation(
+    cwd: Path,
+    *,
+    timeout_seconds: int | float,
+    escalation_reason: str | None = None,
+) -> Verdict:
+    """Execute and bind the lifecycle's full-suite recipe as one owned action."""
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise SchemaError("EVIDENCE_TIMEOUT_INVALID")
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    from . import evidence_runtime
+
+    with locked_review(root, create=False) as review_fd:
+        expected = _final_validation_candidate_locked(
+            root, review_fd, escalation_reason=escalation_reason,
+        )
+        recipe = expected.validation.full_suite_recipe
+        if recipe is None:
+            raise SchemaError("VALIDATION_BINDING_INVALID")
+        evidence_runtime.preflight_capture(
+            root, base=expected.base_ref, profile=recipe.profile,
+            command_cwd=recipe.cwd, argv=list(recipe.argv),
+        )
+        raw = _reservation_bytes(expected, escalation_reason=escalation_reason)
+        atomic_create_bytes(
+            review_fd, _FINAL_VALIDATION_RESERVATION, raw,
+            maximum=_MAX_FINAL_VALIDATION_RESERVATION,
+            exists="FINAL_VALIDATION_RESERVED",
+            unsafe="FINAL_VALIDATION_RESERVATION_UNSAFE",
+            exact_mode=0o600,
+        )
+        reservation_fd, stored = _open_locked_reservation(review_fd, expected)
+        if stored != raw:
+            os.close(reservation_fd)
+            raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+        if escalation_reason is not None:
+            expected = replace(
+                expected,
+                validation=replace(
+                    expected.validation, escalation_reason=escalation_reason,
+                ),
+            )
+            try:
+                _atomic_write(review_fd, expected)
+            except BaseException:
+                os.close(reservation_fd)
+                raise
+    try:
+        captured = evidence_runtime.capture_evidence(
+            root,
+            base=expected.base_ref,
+            profile=recipe.profile,
+            command_cwd=recipe.cwd,
+            argv=list(recipe.argv),
+            timeout_seconds=timeout_seconds,
+        )
+        receipt_sha256 = captured.get("receipt_sha256")
+        if not isinstance(receipt_sha256, str):
+            raise SchemaError("FINAL_VALIDATION_FAILED")
+        suite_failed = captured.get("exit_code") != 0
+        with locked_review(root, create=False) as review_fd:
+            pending = _final_validation_candidate_locked(
+                root, review_fd, escalation_reason=escalation_reason,
+            )
+            if pending != expected:
+                raise SchemaError("FINAL_VALIDATION_STATE_CHANGED")
+            _verify_reservation_name(review_fd, reservation_fd, raw)
+            sealed_validation = m.ValidationBinding(
+                (
+                    m.ValidationPhase.FINAL_VALIDATION_FAILED
+                    if suite_failed else m.ValidationPhase.FINAL_VALIDATION
+                ),
+                True,
+                receipt_sha256,
+                escalation_reason,
+                recipe,
+                "FINAL_VALIDATION_FAILED" if suite_failed else None,
+            )
+            sealed_validation.to_json()
+            from .validation import verify_full_suite_receipt
+
+            verify_full_suite_receipt(
+                root, pending, receipt_sha256,
+                expected_success=not suite_failed,
+            )
+            sealed = replace(pending, validation=sealed_validation)
+            if suite_failed:
+                reports = {
+                    key: pending.reviewers[key].report
+                    for key in pending.policy.active_reviewers
+                }
+                _, blockers = _provisional_gate(reports)
+                sealed = replace(
+                    sealed, gate=GateSummary(GateStatus.FAIL, len(blockers)),
+                )
+            _atomic_write(review_fd, sealed)
+            try:
+                os.unlink(_FINAL_VALIDATION_RESERVATION, dir_fd=review_fd)
+                os.fsync(review_fd)
+            except OSError:
+                raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+            if suite_failed:
+                raise SchemaError("FINAL_VALIDATION_FAILED")
+            return sealed
+    finally:
+        os.close(reservation_fd)
 
 
 def finalize_round(
@@ -1736,23 +2344,30 @@ def finalize_round(
         for key in active:
             reports[key] = _read_sealed_report(review_fd, pending, Reviewer(key), root=root)
         _validate_closure(pending, reports)
-        blockers = tuple(
-            finding
-            for report in reports.values()
-            for finding in report.findings
-            if finding.severity in {Severity.CRITICAL, Severity.HIGH}
-        )
-        reviewer_b = reports.get("B")
-        has_unverified = reviewer_b is not None and any(
-            claim.result == "unverified" for claim in reviewer_b.claims
-        )
-        status = (
-            GateStatus.FAIL
-            if blockers
-            else GateStatus.INCONCLUSIVE
-            if has_unverified
-            else GateStatus.PASS
-        )
+        status, blockers = _provisional_gate(reports)
+        if pending.validation is not None:
+            validation = pending.validation
+            if validation.requires_full_suite:
+                failed_suite = (
+                    validation.phase is m.ValidationPhase.FINAL_VALIDATION_FAILED
+                )
+                if status is GateStatus.PASS and not failed_suite and (
+                    validation.phase is not m.ValidationPhase.FINAL_VALIDATION
+                    or validation.full_suite_receipt_sha256 is None
+                ):
+                    raise SchemaError("FINAL_VALIDATION_REQUIRED")
+                if validation.phase in {
+                    m.ValidationPhase.FINAL_VALIDATION,
+                    m.ValidationPhase.FINAL_VALIDATION_FAILED,
+                } and validation.full_suite_receipt_sha256 is not None:
+                    from .validation import verify_full_suite_receipt
+
+                    verify_full_suite_receipt(
+                        root, pending, validation.full_suite_receipt_sha256,
+                        expected_success=not failed_suite,
+                    )
+                if failed_suite:
+                    status = GateStatus.FAIL
         final = replace(
             pending, gate=GateSummary(status, len(blockers)), created_at=snapshot.created_at
         )
@@ -1783,10 +2398,15 @@ class PendingMigrationResult:
 
 def migrate_v2_pending_round(
     cwd: Path, *, token_hex: Callable[[int], str] = secrets.token_hex,
+    full_suite_kind: m.FullSuiteKind | str = m.FullSuiteKind.PYTHON_PYTEST,
+    full_suite_cwd: str = ".",
 ) -> PendingMigrationResult:
     """Atomically assign a lifecycle ID to a verified schema-2 pending verdict."""
     from .policy import conservative_legacy_policy, resolve_policy
 
+    validation = m.initial_validation_binding(
+        full_suite_kind=full_suite_kind, full_suite_cwd=full_suite_cwd,
+    )
     root = repository_root(cwd)
     preflight_review_directory(root)
     check_ignored(root)
@@ -1823,6 +2443,7 @@ def migrate_v2_pending_round(
                 runtime=legacy.producer_runtime,
                 request=conservative_legacy_policy(legacy.producer_runtime).request,
             ),
+            validation=validation,
         )
         _atomic_write(review_fd, migrated)
         return PendingMigrationResult(
@@ -1834,6 +2455,8 @@ def migrate_v2_pending_round(
 
 def migrate_legacy_pending_round(
     cwd: Path, *, token_hex: Callable[[int], str] = secrets.token_hex,
+    full_suite_kind: m.FullSuiteKind | str = m.FullSuiteKind.PYTHON_PYTEST,
+    full_suite_cwd: str = ".",
 ) -> LegacyMigrationResult:
     """Preserve all legacy bytes and atomically migrate A/B/C to pending current slots.
 
@@ -1842,6 +2465,9 @@ def migrate_legacy_pending_round(
     """
     from .policy import conservative_legacy_policy, resolve_policy
 
+    validation = m.initial_validation_binding(
+        full_suite_kind=full_suite_kind, full_suite_cwd=full_suite_cwd,
+    )
     root = repository_root(cwd)
     preflight_review_directory(root)
     check_ignored(root)
@@ -1864,6 +2490,7 @@ def migrate_legacy_pending_round(
                 runtime=legacy.producer_runtime,
                 request=conservative_legacy_policy(legacy.producer_runtime).request,
             ),
+            validation=validation,
         )
         round_fd = _round_fd(
             review_fd, legacy.round, create=False, exact_report_directories=True

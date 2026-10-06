@@ -34,9 +34,13 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 7
+REPORT_TEXT_CONTRACT_VERSION = 11
 REFUTED_CLAIM_BLOCKER_CONTRACT_VERSION = 5
 REVIEWER_B_BUDGET_CONTRACT_VERSION = 7
+REVIEWER_B_NATIVE_TOOL_CALL_BUDGET_CONTRACT_VERSION = 8
+VALIDATION_PHASE_CONTRACT_VERSION = 9
+FULL_SUITE_RECIPE_CONTRACT_VERSION = 10
+FINAL_VALIDATION_OUTCOME_CONTRACT_VERSION = 11
 REVERSAL_COST_CONTRACT_VERSION = 6
 REQUIRED_REVERSAL_COST_CONTRACT_VERSION = 7
 MAX_VERDICT_BYTES = 256 * 1024
@@ -50,6 +54,7 @@ MAX_EXECUTIONS_PER_REVIEWER = 128
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LIFECYCLE_ID = re.compile(r"[0-9a-f]{32}\Z")
+_VALIDATION_FAILURE_CODE = re.compile(r"[A-Z][A-Z0-9_]{2,127}\Z")
 _FINDING_ID = re.compile(r"([ABC])-R([1-3])-([0-9]{3})\Z")
 _EXECUTION_ID = re.compile(r"([ABC])-R([1-3])-E([0-9]{3})\Z")
 _DECISION_EXECUTION_ID = re.compile(r"D-R([1-3])-E([0-9]{3})\Z")
@@ -104,6 +109,37 @@ class ReviewMode(str, Enum):
     OFF = "off"
     SINGLE = "single"
     ITERATIVE = "iterative"
+
+
+class ValidationPhase(str, Enum):
+    FIX_VERIFICATION = "fix_verification"
+    FINAL_VALIDATION = "final_validation"
+    FINAL_VALIDATION_FAILED = "final_validation_failed"
+
+
+class FullSuiteKind(str, Enum):
+    PYTHON_PYTEST = "python-pytest-v1"
+    NODE_NPM_TEST = "node-npm-test-v1"
+
+
+PYTHON_PYTEST_FULL_SUITE_PROGRAM = (
+    "import os, sys; "
+    "os.execv(sys.executable, [sys.executable, '-m', 'pytest', '-q'])"
+)
+
+
+_FULL_SUITE_SPECS = {
+    FullSuiteKind.PYTHON_PYTEST: (
+        "python-v1",
+        ("python3", "-I", "-S", "-c", PYTHON_PYTEST_FULL_SUITE_PROGRAM),
+        "python3 -m pytest -q",
+    ),
+    FullSuiteKind.NODE_NPM_TEST: (
+        "node-sandbox-v1",
+        ("npm", "test"),
+        "npm test",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -307,6 +343,7 @@ class ReviewerBBudget(TypedDict):
     profile: str
     verified_claims: int
     fresh_executions: int
+    native_tool_calls: int
     soft_seconds: int
     hard_seconds: int
 
@@ -320,6 +357,7 @@ def reviewer_b_budget(risk_floor: int) -> ReviewerBBudget:
             "profile": "high-risk",
             "verified_claims": 16,
             "fresh_executions": 12,
+            "native_tool_calls": 40,
             "soft_seconds": 480,
             "hard_seconds": 600,
         }
@@ -327,6 +365,7 @@ def reviewer_b_budget(risk_floor: int) -> ReviewerBBudget:
         "profile": "ordinary",
         "verified_claims": 10,
         "fresh_executions": 8,
+        "native_tool_calls": 32,
         "soft_seconds": 270,
         "hard_seconds": 300,
     }
@@ -613,6 +652,157 @@ class PolicyBinding:
 
 
 @dataclass(frozen=True)
+class FullSuiteRecipe:
+    kind: FullSuiteKind
+    profile: str
+    cwd: str
+    argv: tuple[str, ...]
+    command: str
+
+    def to_json(self) -> dict[str, object]:
+        expected = full_suite_recipe(self.kind, self.cwd)
+        if self != expected:
+            raise SchemaError("FULL_SUITE_RECIPE_INVALID")
+        return {
+            "kind": self.kind.value,
+            "profile": self.profile,
+            "cwd": self.cwd,
+            "argv": list(self.argv),
+            "command": self.command,
+        }
+
+
+def _full_suite_cwd(value: object) -> str:
+    try:
+        return "." if value == "." else _path(value)
+    except SchemaError:
+        raise SchemaError("FULL_SUITE_RECIPE_INVALID") from None
+
+
+def full_suite_recipe(
+    kind: FullSuiteKind | str = FullSuiteKind.PYTHON_PYTEST,
+    cwd: str = ".",
+) -> FullSuiteRecipe:
+    if not isinstance(kind, FullSuiteKind):
+        try:
+            kind = FullSuiteKind(kind)
+        except (TypeError, ValueError):
+            raise SchemaError("FULL_SUITE_RECIPE_INVALID") from None
+    normalized_cwd = _full_suite_cwd(cwd)
+    profile, argv, command = _FULL_SUITE_SPECS[kind]
+    return FullSuiteRecipe(kind, profile, normalized_cwd, argv, command)
+
+
+def parse_full_suite_recipe(value: object) -> FullSuiteRecipe:
+    obj = _object(
+        value,
+        {"kind", "profile", "cwd", "argv", "command"},
+        "FULL_SUITE_RECIPE_INVALID",
+    )
+    recipe = full_suite_recipe(obj["kind"], obj["cwd"])
+    if obj != recipe.to_json():
+        raise SchemaError("FULL_SUITE_RECIPE_INVALID")
+    return recipe
+
+
+@dataclass(frozen=True)
+class ValidationBinding:
+    phase: ValidationPhase
+    requires_full_suite: bool
+    full_suite_receipt_sha256: str | None = None
+    escalation_reason: str | None = None
+    full_suite_recipe: FullSuiteRecipe | None = None
+    failure_code: str | None = None
+
+    def to_json(self) -> dict[str, object]:
+        if (
+            not isinstance(self.phase, ValidationPhase)
+            or type(self.requires_full_suite) is not bool
+            or (
+                self.full_suite_receipt_sha256 is not None
+                and (
+                    not isinstance(self.full_suite_receipt_sha256, str)
+                    or _SHA256.fullmatch(self.full_suite_receipt_sha256) is None
+                )
+            )
+        ):
+            raise SchemaError("VALIDATION_BINDING_INVALID")
+        reason = self.escalation_reason
+        if reason is not None:
+            reason = _text(reason, 1024)
+            if not reason.strip() or _SECRET.search(reason) or _contains_home_path(reason):
+                raise SchemaError("VALIDATION_BINDING_INVALID")
+        failure_code = self.failure_code
+        if failure_code is not None and (
+            not isinstance(failure_code, str)
+            or _VALIDATION_FAILURE_CODE.fullmatch(failure_code) is None
+        ):
+            raise SchemaError("VALIDATION_BINDING_INVALID")
+        if self.phase is ValidationPhase.FIX_VERIFICATION:
+            if (
+                not self.requires_full_suite
+                or self.full_suite_receipt_sha256 is not None
+                or failure_code is not None
+            ):
+                raise SchemaError("VALIDATION_BINDING_INVALID")
+        elif self.phase is ValidationPhase.FINAL_VALIDATION_FAILED:
+            if not self.requires_full_suite or not (
+                (
+                    failure_code == "FINAL_VALIDATION_FAILED"
+                    and self.full_suite_receipt_sha256 is not None
+                )
+                or (
+                    failure_code == "FINAL_VALIDATION_INTERRUPTED"
+                    and self.full_suite_receipt_sha256 is None
+                )
+            ):
+                raise SchemaError("VALIDATION_BINDING_INVALID")
+        elif failure_code is not None:
+            raise SchemaError("VALIDATION_BINDING_INVALID")
+        elif not self.requires_full_suite and (
+            self.full_suite_receipt_sha256 is not None or reason is not None
+        ):
+            raise SchemaError("VALIDATION_BINDING_INVALID")
+        recipe = self.full_suite_recipe
+        if recipe is not None:
+            if not self.requires_full_suite:
+                raise SchemaError("VALIDATION_BINDING_INVALID")
+            recipe.to_json()
+        return {
+            "phase": self.phase.value,
+            "requires_full_suite": self.requires_full_suite,
+            "full_suite_receipt_sha256": self.full_suite_receipt_sha256,
+            "escalation_reason": reason,
+            "full_suite_recipe": recipe.to_json() if recipe is not None else None,
+            "failure_code": failure_code,
+        }
+
+
+def initial_validation_binding(
+    *,
+    full_suite_kind: FullSuiteKind | str = FullSuiteKind.PYTHON_PYTEST,
+    full_suite_cwd: str = ".",
+) -> ValidationBinding:
+    return ValidationBinding(
+        ValidationPhase.FINAL_VALIDATION,
+        True,
+        full_suite_recipe=full_suite_recipe(full_suite_kind, full_suite_cwd),
+    )
+
+
+def followup_validation_binding(
+    *,
+    full_suite_kind: FullSuiteKind | str = FullSuiteKind.PYTHON_PYTEST,
+    full_suite_cwd: str = ".",
+) -> ValidationBinding:
+    return ValidationBinding(
+        ValidationPhase.FIX_VERIFICATION,
+        True,
+        full_suite_recipe=full_suite_recipe(full_suite_kind, full_suite_cwd),
+    )
+
+
+@dataclass(frozen=True)
 class Verdict:
     schema: int
     repository: str
@@ -636,6 +826,7 @@ class Verdict:
     evidence_fallback_reason: str | None = None
     evidence_contract: int | None = None
     policy: PolicyBinding | None = None
+    validation: ValidationBinding | None = None
 
     @property
     def snapshot(self) -> Snapshot:
@@ -672,6 +863,18 @@ class Verdict:
                 )
             ):
                 raise SchemaError("VERDICT_INVALID")
+            if (
+                self.contract.report_text >= VALIDATION_PHASE_CONTRACT_VERSION
+                and self.validation is None
+            ):
+                raise SchemaError("VERDICT_INVALID")
+            if (
+                self.contract.report_text >= FULL_SUITE_RECIPE_CONTRACT_VERSION
+                and self.validation is not None
+                and self.validation.requires_full_suite
+                and self.validation.full_suite_recipe is None
+            ):
+                raise SchemaError("VERDICT_INVALID")
             for key in "ABC":
                 receipt = self.reviewers[key].receipt
                 if receipt is not None and (
@@ -685,7 +888,10 @@ class Verdict:
                 ):
                     raise SchemaError("VERDICT_INVALID")
         elif self.schema == SCHEMA_VERSION:
-            if self.contract is not None or self.lifecycle_id is not None:
+            if (
+                self.contract is not None
+                or self.lifecycle_id is not None
+            ):
                 raise SchemaError("VERDICT_INVALID")
         else:
             raise SchemaError("VERDICT_INVALID")
@@ -727,6 +933,12 @@ class Verdict:
             value["policy"] = self.policy.to_json()
         elif self.policy is not None:
             raise SchemaError("VERDICT_INVALID")
+        if (
+            self.validation is not None
+            and self.contract is not None
+            and self.contract.report_text >= VALIDATION_PHASE_CONTRACT_VERSION
+        ):
+            value["validation"] = self.validation.to_json()
         return value
 
 

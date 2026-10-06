@@ -64,6 +64,13 @@ def _binding(verdict: m.Verdict, raw: bytes) -> dict[str, object]:
         "diff_sha256": verdict.diff_sha256,
         "round": verdict.round,
         "gate": verdict.gate.to_json(),
+        "validation": (
+            {
+                "phase": verdict.validation.phase.value,
+                "failure_code": verdict.validation.failure_code,
+            }
+            if verdict.validation is not None else None
+        ),
         "contract": {
             "report_text": contract.report_text,
             "diff_recipe": contract.diff_recipe,

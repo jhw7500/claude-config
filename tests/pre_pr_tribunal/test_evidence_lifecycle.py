@@ -18,6 +18,7 @@ from pre_pr_tribunal.review_context import reviewer_context_envelope
 from pre_pr_tribunal.verdict_store import (begin_round, submit_reviewer_report,
     finalize_round, read_verdict, require_current_in_progress,
     validate_stored_reviewer_report)
+from tests.pre_pr_tribunal.validation_helpers import seal_synthetic_python_suite
 
 
 def bundle(repo):
@@ -97,6 +98,7 @@ def test_contract1_verdict_is_readable_but_has_no_current_authority(git_repo):
     for reviewer in 'ABC':
         submit_reviewer_report(git_repo, reviewer=Reviewer(reviewer),
                                raw=raw_report(verdict, reviewer))
+    seal_synthetic_python_suite(git_repo)
     finalize_round(git_repo)
     set_evidence_contract(git_repo, 1)
     assert read_verdict(git_repo).gate.status.value == 'pass'
@@ -171,6 +173,7 @@ def test_terminal_contract_six_reused_evidence_authenticates_without_current_aut
     frozen = bundle(git_repo)
     pending = begin(git_repo, frozen['bundle_sha256'])
     seal(git_repo, pending, reused(git_repo, frozen))
+    seal_synthetic_python_suite(git_repo)
     finalized = finalize_round(git_repo)
     historical_binding = json.loads(json.dumps(frozen['binding']))
     historical_binding['contract']['report_text'] = 6
@@ -214,6 +217,7 @@ def test_complete_reuse_round_and_private_context(git_repo):
     context = reviewer_context_envelope(verdict, Reviewer.B)
     assert context['evidence']['bundle_sha256'] == frozen['bundle_sha256']
     seal(git_repo, verdict, reused(git_repo, frozen))
+    seal_synthetic_python_suite(git_repo)
     assert finalize_round(git_repo).gate.status.value == 'pass'
 
 
@@ -235,6 +239,7 @@ def test_independent_fallback_ignores_unused_invalid_bundle(git_repo, selected):
     verdict = begin(git_repo, frozen['bundle_sha256'] if selected else 'f' * 64)
     (git_repo / f".review/evidence/bundles/{frozen['bundle_sha256']}.json").write_bytes(b'changed')
     seal(git_repo, verdict)
+    seal_synthetic_python_suite(git_repo)
     assert finalize_round(git_repo).gate.status.value == 'pass'
 
 
@@ -243,10 +248,13 @@ def test_used_capture_tamper_rejects_stored_finalize_and_terminal_gate(git_repo)
     frozen = bundle(git_repo)
     verdict = begin(git_repo, frozen['bundle_sha256'])
     seal(git_repo, verdict, reused(git_repo, frozen))
+    seal_synthetic_python_suite(git_repo)
     final = finalize_round(git_repo)
     command = 'PATH=/usr/bin:/bin /usr/bin/gh pr create --base master'
     assert not evaluate_gate(git_repo, command).block
-    capture = next((git_repo / '.review/evidence/captures').iterdir())
+    source_bundle = evidence_store.read_bundle(git_repo, frozen['bundle_sha256'])
+    source_capture_sha = source_bundle['entries'][0]['capture_sha256']
+    capture = git_repo / '.review/evidence/captures' / f'{source_capture_sha}.bin'
     capture.write_bytes(b'changed')
     with pytest.raises(TribunalError):
         validate_stored_reviewer_report(git_repo, reviewer=Reviewer.B)
@@ -342,6 +350,7 @@ def test_old_schema_three_remains_readable_but_not_pending_authority(git_repo):
     value.pop('evidence_binding'); value.pop('evidence_fallback_reason')
     value.pop('evidence_contract')
     value.pop('policy')
+    value.pop('validation')
     path = git_repo / '.review/verdict.json'
     path.write_text(json.dumps(value))
     loaded = read_verdict(git_repo)
@@ -513,6 +522,7 @@ def test_gate_does_not_mix_two_terminal_report_versions(git_repo, monkeypatch):
     frozen = bundle(git_repo)
     verdict = begin(git_repo, frozen['bundle_sha256'])
     seal(git_repo, verdict, reused(git_repo, frozen))
+    seal_synthetic_python_suite(git_repo)
     final = finalize_round(git_repo)
     original = gate._current_snapshot
     def replace_report_between_checks(root, base):

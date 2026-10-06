@@ -12,6 +12,7 @@ import pytest
 from pre_pr_tribunal import cli, telemetry
 from pre_pr_tribunal.git_state import capture_snapshot
 from pre_pr_tribunal.model import Reviewer, SchemaError
+from tests.pre_pr_tribunal.validation_helpers import seal_synthetic_python_suite
 
 
 CLI = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
@@ -294,6 +295,7 @@ def test_resume_scopes_prior_requests_to_current_lifecycle(git_repo, old_history
         )
     for role in "ABC":
         payload(git_repo, "submit-report", "--reviewer", role, raw=report(old, role))
+    seal_synthetic_python_suite(git_repo)
     payload(git_repo, "finalize")
     payload(git_repo, "telemetry-close", "--run-id", old_run_id, "--outcome", "success")
 
@@ -325,6 +327,7 @@ def test_resume_ignores_old_requests_after_current_marker_is_evicted(git_repo):
     dispatch(git_repo, old["telemetry"]["run_id"], "B", 1)
     for role in "ABC":
         payload(git_repo, "submit-report", "--reviewer", role, raw=report(old, role))
+    seal_synthetic_python_suite(git_repo)
     payload(git_repo, "finalize")
     payload(
         git_repo, "telemetry-close", "--run-id", old["telemetry"]["run_id"],
@@ -398,6 +401,7 @@ def test_resume_marks_history_unknown_when_current_begin_telemetry_is_missing(
     dispatch(git_repo, old["telemetry"]["run_id"], "B", 1)
     for role in "ABC":
         payload(git_repo, "submit-report", "--reviewer", role, raw=report(old, role))
+    seal_synthetic_python_suite(git_repo)
     payload(git_repo, "finalize")
     payload(
         git_repo, "telemetry-close", "--run-id", old["telemetry"]["run_id"],
@@ -443,6 +447,7 @@ def test_resume_refuses_unverifiable_or_ambiguous_observation_without_writes(git
             stream.write(b" ")
     elif change == "terminal_verdict":
         payload(git_repo, "submit-report", "--reviewer", "B", raw=report(begun, "B"))
+        seal_synthetic_python_suite(git_repo)
         payload(git_repo, "finalize")
     paths = [git_repo / ".review/telemetry.json", git_repo / ".review/verdict.json"]
     before = [path.read_bytes() for path in paths]

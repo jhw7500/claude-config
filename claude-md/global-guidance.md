@@ -438,6 +438,20 @@ Tribunal을 실행한다면 policy-preview 뒤 활성 reviewer·intensity/mode·
 60초 이내 간격으로 알리고, 취소 요청 시 신규 작업을 시작하지 않은 채 진행 중인 reviewer의
 상태와 증거를 보존한다.
 
+최초 라운드도 PASS 전에 controller-owned 전체 suite 성공 receipt를 요구한다. 후속 라운드는 re-review preview/grant/begin에 동일하게 전달한 `--full-suite-kind`와
+`--full-suite-cwd`를 결속하고 machine-readable `fix_verification`으로 시작한다. 상태 보고에는 phase,
+재현·직접 영향 검증 명령, exact full-suite recipe, 유예, 중단·escalation 조건을 포함한다. Reviewer B는
+선택된 인증 evidence를 먼저 재사용하고 부족한 focused command만 새로 실행하며, 이 phase에서 bound
+suite command를 기록한 report는 거부된다. 모든 report가 provisional PASS를 만들 때에만
+`final_validation`으로 전환해 현재 HEAD/diff와 recipe profile·cwd·argv에 결합된 full suite를
+`final-validation-seal`이 정확히 한 번 실행·봉인한다. no-op이나
+targeted command receipt는 PASS를 봉인할 수 없다. provisional non-pass에서 full suite가 꼭 필요하면
+cross-domain·build/runtime 설정·dependency·permission·비결정적 실패 영향 중 하나를 bounded escalation
+reason으로 남긴다. `finalize`는 이 receipt, recipe, 환경을 다시 인증하며, seal 반복이나 snapshot
+불일치에는 실패 폐쇄한다. 인증된 nonzero suite receipt는 `final_validation_failed`로 보존하고
+즉시 terminal FAIL을 기록한다. receipt 없는 중단은 프로세스 종료 확인과 digest-bound reservation 복구가
+필요하며, pending HEAD/contract가 바뀌었으면 별도 승인된 `--abandon-pending`만 이전 라운드를 FAIL로 닫는다.
+
 1. **한 심사 단위를 작게 유지한다.** 라운드는 델타가 아니라 `base..HEAD` **전체 diff**를 매번
    다시 심사한다. 따라서 브랜치가 클수록 매 라운드의 표면이 크고, 새 finding이 나올 확률이 높다.
 2. **고치는 행위가 심사 표면을 키운다.** 라운드 N의 blocker를 고치면 그 수정 코드가 라운드 N+1에서

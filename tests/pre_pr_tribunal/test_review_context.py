@@ -160,6 +160,43 @@ def test_reviewer_b_context_uses_snapshot_risk_budget_not_intensity(git_repo):
         assert reviewer_context_body(changed_intensity, Reviewer.B)["review_budget"] == body["review_budget"]
 
 
+def test_contract_seven_context_keeps_pre_native_call_budget_shape(git_repo):
+    pending = _current_pending(git_repo)
+    historical = replace(
+        pending,
+        contract=replace(pending.contract, report_text=7),
+    )
+
+    current_budget = reviewer_context_body(pending, Reviewer.B)["review_budget"]
+    historical_budget = reviewer_context_body(historical, Reviewer.B)["review_budget"]
+
+    assert current_budget["native_tool_calls"] == 40
+    assert "native_tool_calls" not in historical_budget
+    assert historical_budget == {
+        "profile": "high-risk",
+        "verified_claims": 16,
+        "fresh_executions": 12,
+        "soft_seconds": 480,
+        "hard_seconds": 600,
+    }
+
+
+def test_contract_eight_context_omits_contract_nine_validation_phase(git_repo):
+    pending = _current_pending(git_repo)
+    historical = replace(
+        pending,
+        contract=replace(pending.contract, report_text=8),
+    )
+
+    assert reviewer_context_body(pending, Reviewer.B)["validation"] == {
+        "phase": "final_validation",
+        "planned": ["finding_reproduction", "direct_impact_tests"],
+        "full_suite": "deferred_until_provisional_pass",
+        "full_suite_recipe": pending.validation.full_suite_recipe.to_json(),
+    }
+    assert "validation" not in reviewer_context_body(historical, Reviewer.B)
+
+
 def test_sealing_peer_does_not_change_pending_reviewer_context(git_repo):
     pending_verdict = _with_mixed_prior_reviewer_data(_current_pending(git_repo))
     before = context_sha256(pending_verdict, Reviewer.C)

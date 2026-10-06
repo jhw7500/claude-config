@@ -22,6 +22,7 @@ from pre_pr_tribunal.telemetry import (
     summarize_run,
 )
 from pre_pr_tribunal import telemetry as telemetry_module
+from tests.pre_pr_tribunal.validation_helpers import seal_synthetic_python_suite
 
 
 def NOW():
@@ -81,6 +82,7 @@ def test_legacy_telemetry_cannot_authorize_current_report_bytes(git_repo, teleme
     del legacy['evidence_fallback_reason']
     del legacy['evidence_contract']
     del legacy['policy']
+    del legacy['validation']
     legacy["reviewers"] = {key: {"status": "pending"} for key in "ABC"}
     (git_repo / ".review/verdict.json").write_text(json.dumps(legacy))
     value = {"schema": 1, "reviewer": "A", "round": 1,
@@ -473,6 +475,8 @@ def test_telemetry_cannot_alter_tribunal_result(git_repo, tmp_path, monkeypatch,
                 )
                 path = repo / f".review/inbox/round-1/{reviewer}.json"
             report_bytes[reviewer] = path.read_bytes()
+        if not invalid_report:
+            seal_synthetic_python_suite(repo)
         finalized = command(repo, ("finalize",))
         gates = []
         for adapter_name in ("codex_hook.py", "claude_hook.py"):

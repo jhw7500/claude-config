@@ -16,6 +16,7 @@ if __package__ in {None, ""}:
         MAX_REPORT_BYTES,
         MIXED_SLOT_VERDICT_SCHEMAS,
         VERDICT_SCHEMA_VERSION,
+        FullSuiteKind,
         Reviewer,
         TribunalError,
         validate_report_bytes,
@@ -33,11 +34,14 @@ if __package__ in {None, ""}:
     from pre_pr_tribunal.verdict_store import (  # type: ignore
         begin_round,
         finalize_round,
+        final_validation_reservation_status,
         migrate_legacy_pending_round,
         migrate_v2_pending_round,
         preview_policy,
         read_verdict,
         record_reviewer_failure,
+        recover_final_validation_reservation,
+        seal_final_validation,
         store_reviewer_report,
         submit_reviewer_report,
         validate_stored_reviewer_report,
@@ -53,6 +57,7 @@ else:
         MAX_REPORT_BYTES,
         MIXED_SLOT_VERDICT_SCHEMAS,
         VERDICT_SCHEMA_VERSION,
+        FullSuiteKind,
         Reviewer,
         TribunalError,
         validate_report_bytes,
@@ -66,11 +71,14 @@ else:
     from .verdict_store import (
         begin_round,
         finalize_round,
+        final_validation_reservation_status,
         migrate_legacy_pending_round,
         migrate_v2_pending_round,
         preview_policy,
         read_verdict,
         record_reviewer_failure,
+        recover_final_validation_reservation,
+        seal_final_validation,
         store_reviewer_report,
         submit_reviewer_report,
         validate_stored_reviewer_report,
@@ -123,6 +131,10 @@ def _parser() -> argparse.ArgumentParser:
     begin.add_argument("--intensity", action="append")
     begin.add_argument("--intensity-requester", action="append")
     begin.add_argument("--intensity-reason", action="append")
+    begin.add_argument(
+        "--full-suite-kind", choices=tuple(item.value for item in FullSuiteKind)
+    )
+    begin.add_argument("--full-suite-cwd")
     preview = commands.add_parser("policy-preview", add_help=False)
     preview.add_argument("--base", required=True)
     preview.add_argument("--runtime", required=True, choices=("claude", "codex"))
@@ -157,6 +169,10 @@ def _parser() -> argparse.ArgumentParser:
     re_review_preview.add_argument("--intensity", action="append")
     re_review_preview.add_argument("--intensity-requester", action="append")
     re_review_preview.add_argument("--intensity-reason", action="append")
+    re_review_preview.add_argument(
+        "--full-suite-kind", choices=tuple(item.value for item in FullSuiteKind)
+    )
+    re_review_preview.add_argument("--full-suite-cwd")
     re_review_grant = commands.add_parser("re-review-grant", add_help=False)
     re_review_grant.add_argument("--base")
     re_review_grant.add_argument("--runtime", choices=("claude", "codex"))
@@ -166,6 +182,10 @@ def _parser() -> argparse.ArgumentParser:
     re_review_grant.add_argument("--intensity", action="append")
     re_review_grant.add_argument("--intensity-requester", action="append")
     re_review_grant.add_argument("--intensity-reason", action="append")
+    re_review_grant.add_argument(
+        "--full-suite-kind", choices=tuple(item.value for item in FullSuiteKind)
+    )
+    re_review_grant.add_argument("--full-suite-cwd")
     re_review_grant.add_argument("--verdict-sha256")
     re_review_grant.add_argument("--binding-sha256")
     re_review_grant.add_argument("--reason")
@@ -186,8 +206,12 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         choices=("DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"),
     )
-    commands.add_parser("migrate-legacy-pending", add_help=False)
-    commands.add_parser("migrate-v2-pending", add_help=False)
+    for name in ("migrate-legacy-pending", "migrate-v2-pending"):
+        migration = commands.add_parser(name, add_help=False)
+        migration.add_argument(
+            "--full-suite-kind", choices=tuple(item.value for item in FullSuiteKind)
+        )
+        migration.add_argument("--full-suite-cwd")
     store = commands.add_parser("store-report", add_help=False)
     store.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     store.add_argument("--replace-pending-recovery", action="store_true")
@@ -198,6 +222,14 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--reviewer-a", type=Path)
     finalize.add_argument("--reviewer-b", type=Path)
     finalize.add_argument("--reviewer-c", type=Path)
+    final_validation = commands.add_parser("final-validation-seal", add_help=False)
+    final_validation.add_argument("--timeout", required=True, type=float)
+    final_validation.add_argument("--escalation-reason")
+    commands.add_parser("final-validation-reservation-status", add_help=False)
+    final_recovery = commands.add_parser("final-validation-recover", add_help=False)
+    final_recovery.add_argument("--reservation-sha256", required=True)
+    final_recovery.add_argument("--confirm-process-tree-stopped", action="store_true")
+    final_recovery.add_argument("--abandon-pending", action="store_true")
     commands.add_parser("status", add_help=False)
     start = commands.add_parser("telemetry-start", add_help=False)
     start.add_argument("--run-id", required=True)
@@ -231,6 +263,14 @@ def _telemetry_unavailable(error: Exception) -> dict[str, str]:
     return {"status": "unavailable", "reason_code": code}
 
 
+def _full_suite_options(arguments) -> tuple[str, str]:
+    return (
+        getattr(arguments, "full_suite_kind", None)
+        or FullSuiteKind.PYTHON_PYTEST.value,
+        getattr(arguments, "full_suite_cwd", None) or ".",
+    )
+
+
 def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns):
     run = span = None
     try:
@@ -255,6 +295,7 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
 
     # Keep the primary transaction outside every telemetry exception handler.
     try:
+        full_suite_kind, full_suite_cwd = _full_suite_options(arguments)
         verdict = begin_round(
             cwd, base=arguments.base, runtime=arguments.runtime,
             round_number=arguments.round, decisions_path=arguments.decisions,
@@ -262,6 +303,8 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
             intensity_values=getattr(arguments, "intensity", None),
             intensity_requester=getattr(arguments, "intensity_requester", None),
             intensity_reason=getattr(arguments, "intensity_reason", None),
+            full_suite_kind=full_suite_kind,
+            full_suite_cwd=full_suite_cwd,
         )
     except TribunalError as primary_error:
         try:
@@ -411,6 +454,8 @@ def _status(verdict) -> dict[str, object]:
         payload["policy"] = verdict.policy.to_json()
         payload["active_reviewers"] = list(verdict.policy.active_reviewers)
         payload["pr_appendix"] = _pr_appendix(verdict)
+        if verdict.validation is not None:
+            payload["validation"] = verdict.validation.to_json()
     return payload
 
 
@@ -598,6 +643,8 @@ def _pr_override_grant(cwd, arguments, *, wall_clock=utc_now):
             f"  verdict {binding['verdict_sha256']}\n"
             f"  round {binding['round']}  status {binding['gate']['status']}  "
             f"blockers {binding['gate']['blocking_count']}\n"
+            f"  validation {binding['validation']['phase']}  "
+            f"failure {binding['validation']['failure_code'] or 'none'}\n"
             "Type 'override' to allow one canonical PR create attempt: "
         )
         sys.stderr.flush()
@@ -625,6 +672,7 @@ def _re_review_grant(cwd, arguments, *, wall_clock=utc_now):
                 arguments.evidence_bundle,
                 arguments.intensity, arguments.intensity_requester,
                 arguments.intensity_reason,
+                arguments.full_suite_kind, arguments.full_suite_cwd,
             )
         ) or arguments.relayed:
             raise TribunalError("RE_REVIEW_GRANT_INVALID")
@@ -652,6 +700,7 @@ def _re_review_grant(cwd, arguments, *, wall_clock=utc_now):
             or arguments.binding_sha256 is not None
         ):
             raise TribunalError("RE_REVIEW_GRANT_INVALID")
+        full_suite_kind, full_suite_cwd = _full_suite_options(arguments)
         binding = round_grant.preview_grant_binding(
             cwd, base=arguments.base, runtime=arguments.runtime,
             round_number=arguments.round, decisions_path=arguments.decisions,
@@ -659,6 +708,8 @@ def _re_review_grant(cwd, arguments, *, wall_clock=utc_now):
             intensity_requester=arguments.intensity_requester,
             intensity_reason=arguments.intensity_reason,
             evidence_bundle_sha256=arguments.evidence_bundle,
+            full_suite_kind=full_suite_kind,
+            full_suite_cwd=full_suite_cwd,
             now=wall_clock,
         )
         target = binding["target"]
@@ -672,6 +723,8 @@ def _re_review_grant(cwd, arguments, *, wall_clock=utc_now):
             f"  mode {policy['mode']}  intensity {policy['effective_intensity']}\n"
             f"  reviewers {','.join(target['active_reviewers']) or 'none'}\n"
             f"  decisions {target['decisions_sha256'] or 'none'}\n"
+            "  full suite "
+            f"{json.dumps(target['validation']['full_suite_recipe'], ensure_ascii=False, separators=(',', ':'), sort_keys=True)}\n"
             "  evidence "
             f"{json.dumps(target['evidence'], ensure_ascii=False, separators=(',', ':'), sort_keys=True)}\n"
             "Type 're-review' to allow this exact begin once: "
@@ -681,6 +734,7 @@ def _re_review_grant(cwd, arguments, *, wall_clock=utc_now):
             raise TribunalError("RE_REVIEW_CONFIRMATION_MISMATCH")
         expected_verdict = binding["verdict_sha256"]
         expected_binding = binding["binding_sha256"]
+    full_suite_kind, full_suite_cwd = _full_suite_options(arguments)
     return round_grant.record_grant(
         cwd,
         base=arguments.base,
@@ -691,6 +745,8 @@ def _re_review_grant(cwd, arguments, *, wall_clock=utc_now):
         intensity_requester=arguments.intensity_requester,
         intensity_reason=arguments.intensity_reason,
         evidence_bundle_sha256=arguments.evidence_bundle,
+        full_suite_kind=full_suite_kind,
+        full_suite_cwd=full_suite_cwd,
         expected_verdict_sha256=expected_verdict,
         expected_binding_sha256=expected_binding,
         reason=arguments.reason,
@@ -783,6 +839,7 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 cwd, runtime=arguments.runtime
             )
         elif arguments.command == "re-review-preview":
+            full_suite_kind, full_suite_cwd = _full_suite_options(arguments)
             payload = round_grant.preview_grant_binding(
                 cwd, base=arguments.base, runtime=arguments.runtime,
                 round_number=arguments.round, decisions_path=arguments.decisions,
@@ -790,6 +847,8 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 intensity_requester=arguments.intensity_requester,
                 intensity_reason=arguments.intensity_reason,
                 evidence_bundle_sha256=arguments.evidence_bundle,
+                full_suite_kind=full_suite_kind,
+                full_suite_cwd=full_suite_cwd,
                 now=wall_clock,
             )
         elif arguments.command == "re-review-grant":
@@ -834,13 +893,21 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 "last_error": slot.last_error,
             }
         elif arguments.command == "migrate-legacy-pending":
-            migrated = migrate_legacy_pending_round(cwd)
+            full_suite_kind, full_suite_cwd = _full_suite_options(arguments)
+            migrated = migrate_legacy_pending_round(
+                cwd, full_suite_kind=full_suite_kind,
+                full_suite_cwd=full_suite_cwd,
+            )
             payload = {
                 "round": migrated.round,
                 "reviewers": dict(migrated.reviewers),
             }
         elif arguments.command == "migrate-v2-pending":
-            migrated = migrate_v2_pending_round(cwd)
+            full_suite_kind, full_suite_cwd = _full_suite_options(arguments)
+            migrated = migrate_v2_pending_round(
+                cwd, full_suite_kind=full_suite_kind,
+                full_suite_cwd=full_suite_cwd,
+            )
             payload = {
                 "round": migrated.round,
                 "reviewers": dict(migrated.reviewers),
@@ -876,6 +943,22 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                     snapshot=snapshot,
                 )
                 payload = _report_projection(reviewer, verdict.round, "valid", digest)
+        elif arguments.command == "final-validation-seal":
+            verdict = seal_final_validation(
+                cwd,
+                timeout_seconds=arguments.timeout,
+                escalation_reason=arguments.escalation_reason,
+            )
+            payload = _status(verdict)
+        elif arguments.command == "final-validation-reservation-status":
+            payload = final_validation_reservation_status(cwd)
+        elif arguments.command == "final-validation-recover":
+            payload = recover_final_validation_reservation(
+                cwd,
+                expected_sha256=arguments.reservation_sha256,
+                confirmed_terminal=arguments.confirm_process_tree_stopped,
+                abandon_pending=arguments.abandon_pending,
+            )
         elif arguments.command == "finalize":
             supplied = {
                 key: value

@@ -194,11 +194,8 @@ def _entry(argv, command_cwd, result, freshness):
 
 
 @evidence.bounded_errors
-def capture_evidence(cwd, *, base, profile, command_cwd, argv, timeout_seconds):
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-        raise SchemaError('EVIDENCE_TIMEOUT_INVALID')
-    root = _physical_root(Path(cwd))
-    # Use the strict metadata parser before any command, including fixed probes.
+def preflight_capture(root, *, base, profile, command_cwd, argv):
+    """Validate a capture's static inputs before a lifecycle reserves execution."""
     empty = {'stdout': b'', 'stderr': b'', 'exit_code': 0, 'duration_ms': 0}
     evidence.validate_entry(_entry(argv, command_cwd, empty, 'deterministic'))
     directory = root / command_cwd
@@ -207,7 +204,17 @@ def capture_evidence(cwd, *, base, profile, command_cwd, argv, timeout_seconds):
     if profile not in evidence.PROFILES:
         raise SchemaError('EVIDENCE_PROFILE_UNSUPPORTED')
     freshness = validate_command(root, profile, command_cwd, argv)
-    before = _binding(root, base, profile, command_cwd)
+    return directory, freshness, _binding(root, base, profile, command_cwd)
+
+
+@evidence.bounded_errors
+def capture_evidence(cwd, *, base, profile, command_cwd, argv, timeout_seconds):
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise SchemaError('EVIDENCE_TIMEOUT_INVALID')
+    root = _physical_root(Path(cwd))
+    directory, freshness, before = preflight_capture(
+        root, base=base, profile=profile, command_cwd=command_cwd, argv=argv,
+    )
     with sanitized_environment(profile) as env:
         if profile == 'node-sandbox-v1' and freshness == 'deterministic':
             with _sandboxed_node_command(root, command_cwd, argv, env, before) as execution:

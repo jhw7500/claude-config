@@ -13,6 +13,7 @@ import pytest
 
 from pre_pr_tribunal import (
     evidence_runtime,
+    evidence_store,
     gate,
     hook_common,
     pr_override_grant,
@@ -21,6 +22,7 @@ from pre_pr_tribunal import (
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
 from pre_pr_tribunal.model import VERDICT_SCHEMA_VERSION, Reviewer, SchemaError
 from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict, submit_reviewer_report
+from tests.pre_pr_tribunal.validation_helpers import seal_synthetic_python_suite
 
 
 PACKAGE = Path(__file__).resolve().parents[2] / "hooks" / "pre_pr_tribunal"
@@ -161,15 +163,18 @@ def _finish_round(
     pending = begin_round(
         repo, base="master", runtime="codex", round_number=round_number
     )
+    paths = _reports(
+        repo,
+        pending.snapshot,
+        round_number=round_number,
+        finding_id=finding_id,
+        prior_response=prior_response,
+    )
+    if finding_id is None:
+        seal_synthetic_python_suite(repo)
     return finalize_round(
         repo,
-        reviewer_paths=_reports(
-            repo,
-            pending.snapshot,
-            round_number=round_number,
-            finding_id=finding_id,
-            prior_response=prior_response,
-        ),
+        reviewer_paths=paths,
     )
 
 
@@ -193,6 +198,7 @@ def test_gate_accepts_terminal_versions_and_v2_contract_drift_is_stale(git_repo,
         value["schema"] = 1
         del value["contract"]
         del value["lifecycle_id"]
+        del value["validation"]
         value["reviewers"] = {key: slot["report"]
                               for key, slot in value["reviewers"].items()}
         _write_json(path, value)
@@ -1160,6 +1166,53 @@ def test_round_three_failure_exhausts_the_gate(git_repo: Path):
     assert_decision(git_repo, GateCode.ROUND_LIMIT_EXHAUSTED)
 
 
+def test_failed_suite_receipt_tamper_blocks_round_three_override(
+    git_repo: Path, monkeypatch, capsys,
+):
+    terminal = _round_three_failure(git_repo)
+    captured = evidence_runtime.capture_evidence(
+        git_repo, base="master", profile="python-v1", command_cwd=".",
+        argv=["python3", "-I", "-S", "-c", "import sys; sys.exit(1)"],
+        timeout_seconds=15,
+    )
+    assert captured["exit_code"] == 1
+    receipt = evidence_store.read_receipt(git_repo, captured["receipt_sha256"])
+    receipt["entry"]["argv"] = list(terminal.validation.full_suite_recipe.argv)
+    digest = evidence_store.put_receipt(git_repo, receipt)
+    verdict_path = git_repo / ".review/verdict.json"
+    value = json.loads(verdict_path.read_bytes())
+    value["validation"].update(
+        phase="final_validation_failed",
+        full_suite_receipt_sha256=digest,
+        failure_code="FINAL_VALIDATION_FAILED",
+    )
+    verdict_path.write_text(json.dumps(value))
+    verdict_path.chmod(0o600)
+    assert_decision(git_repo, GateCode.ROUND_LIMIT_EXHAUSTED)
+    binding = pr_override_grant.preview_grant_binding(git_repo, runtime="codex")
+    assert binding["validation"] == {
+        "phase": "final_validation_failed",
+        "failure_code": "FINAL_VALIDATION_FAILED",
+    }
+    from pre_pr_tribunal.cli import main
+
+    monkeypatch.chdir(git_repo)
+    monkeypatch.setattr(sys, "stdin", _OverrideTty("override\n"))
+    assert main([
+        "pr-override-grant", "--runtime", "codex",
+        "--reason", "User approved the terminal result",
+    ]) == 0
+    assert "validation final_validation_failed  failure FINAL_VALIDATION_FAILED" in (
+        capsys.readouterr().err
+    )
+    receipt_path = git_repo / ".review/evidence/receipts" / f"{digest}.json"
+    receipt_path.write_bytes(b"tampered")
+    assert evaluate_gate(
+        git_repo, BOUND_COMMAND, runtime="codex"
+    ).code is GateCode.VERDICT_INVALID
+    assert (git_repo / ".review/pr-override-grant.json").exists()
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     (
@@ -1505,7 +1558,8 @@ def test_command_local_system_path_overrides_inherited_git_lookup(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "git").symlink_to("/usr/bin/false")
-    monkeypatch.setenv("PATH", f"{fake_bin}:/usr/bin:/bin")
+    # Keep the sealed suite's Python tool on PATH while poisoning git lookup.
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
 
     decision = evaluate_gate(git_repo, BOUND_COMMAND)
 

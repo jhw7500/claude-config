@@ -10,13 +10,14 @@ import sys
 
 import pytest
 
-from pre_pr_tribunal import round_grant
+from pre_pr_tribunal import evidence_runtime, evidence_store, round_grant
 from pre_pr_tribunal.git_state import DIFF_RECIPE_VERSION, capture_snapshot
 from pre_pr_tribunal.model import (
     SCHEMA_VERSION,
     SLOT_VERDICT_SCHEMA_VERSION,
     VERDICT_SCHEMA_VERSION,
     ContractBinding,
+    full_suite_recipe,
     MAX_EVIDENCE_TEXT_BYTES,
     MAX_REPORT_BYTES,
     REPORT_TEXT_CONTRACT_VERSION,
@@ -37,6 +38,7 @@ from pre_pr_tribunal.verdict_store import (
     finalize_round,
     read_verdict,
     require_current_in_progress,
+    seal_final_validation,
     store_reviewer_report,
     submit_reviewer_report,
     validate_stored_reviewer_report,
@@ -45,6 +47,7 @@ from pre_pr_tribunal.review_context import (
     context_sha256, current_contract_binding, reviewer_context_body,
 )
 from pre_pr_tribunal.review_store import locked_review, repository_root
+from tests.pre_pr_tribunal.validation_helpers import seal_synthetic_python_suite
 
 
 def NOW():
@@ -56,7 +59,11 @@ def snapshot(git_repo):
     return capture_snapshot(git_repo, "master", now=NOW)
 
 
-def execution(identifier="A-R1-E001", *, command="python3 -m pytest -q"):
+def execution(
+    identifier="A-R1-E001",
+    *,
+    command="python3 -m pytest -q tests/test_direct_impact.py",
+):
     stdout = "1 passed"
     return {
         "id": identifier,
@@ -137,6 +144,31 @@ def write_json(path, value):
     return path
 
 
+def seal_test_final_validation(repo):
+    captured = evidence_runtime.capture_evidence(
+        repo, base="master", profile="python-v1", command_cwd=".",
+        argv=["python3", "-I", "-S", "-c", "pass"], timeout_seconds=15,
+    )
+    receipt = evidence_store.read_receipt(repo, captured["receipt_sha256"])
+    recipe = full_suite_recipe()
+    receipt["entry"] = {
+        **receipt["entry"],
+        "argv": list(recipe.argv),
+        "cwd": recipe.cwd,
+    }
+    receipt_sha256 = evidence_store.put_receipt(repo, receipt)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            evidence_runtime,
+            "capture_evidence",
+            lambda *args, **kwargs: {
+                "exit_code": 0,
+                "receipt_sha256": receipt_sha256,
+            },
+        )
+        return seal_final_validation(repo, timeout_seconds=15)
+
+
 def authorize_next_begin(repo, *, runtime="codex", round_number=1, decisions_path=None):
     """Model a fresh user approval in legacy transition-focused tests."""
     preview = round_grant.preview_grant_binding(
@@ -164,6 +196,23 @@ def report_paths(repo, snapshot, *, round_number=1, overrides=None):
         else:
             submit_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=json.dumps(value).encode(), now=NOW)
         result[reviewer] = path
+    current = read_verdict(repo)
+    validation = current.validation
+    active_reports = [
+        current.reviewers[key].report for key in current.policy.active_reviewers
+    ] if current.policy is not None else []
+    provisional_pass = bool(active_reports) and not any(
+        finding.severity.value in {"CRITICAL", "HIGH"}
+        for report_value in active_reports
+        for finding in report_value.findings
+    ) and not any(
+        claim.result == "unverified"
+        for report_value in active_reports
+        if report_value.reviewer is Reviewer.B
+        for claim in report_value.claims
+    )
+    if validation is not None and validation.requires_full_suite and provisional_pass:
+        seal_test_final_validation(repo)
     return result
 
 
@@ -249,6 +298,7 @@ def test_v2_round_not_ready_and_successful_terminal_roundtrip(git_repo, sealed):
         with pytest.raises(SchemaError, match="^ROUND_NOT_READY$"):
             finalize_round(git_repo, now=NOW)
     else:
+        seal_synthetic_python_suite(git_repo)
         final = finalize_round(git_repo, now=NOW)
         assert final.schema == VERDICT_SCHEMA_VERSION and final.gate.status.value == "pass"
         assert read_verdict(git_repo) == final
@@ -1874,11 +1924,11 @@ def test_reviewer_b_claims_and_behavioral_findings_require_execution(snapshot):
 def test_reviewer_b_budget_preserves_terminal_unverified_claims(snapshot):
     assert reviewer_b_budget(50) == {
         "profile": "ordinary", "verified_claims": 10, "fresh_executions": 8,
-        "soft_seconds": 270, "hard_seconds": 300,
+        "native_tool_calls": 32, "soft_seconds": 270, "hard_seconds": 300,
     }
     assert reviewer_b_budget(100) == {
         "profile": "high-risk", "verified_claims": 16, "fresh_executions": 12,
-        "soft_seconds": 480, "hard_seconds": 600,
+        "native_tool_calls": 40, "soft_seconds": 480, "hard_seconds": 600,
     }
     assert reviewer_b_budget(75) == reviewer_b_budget(100)
     one_execution = execution("B-R1-E001")
@@ -2293,7 +2343,10 @@ def test_migrate_v2_pending_refuses_without_mutating_verdict_or_report(
 def test_cli_migrate_v2_pending_returns_stable_migration_projection(git_repo):
     _v2_mixed_pending(git_repo)
 
-    result = run_cli_bytes(git_repo, "migrate-v2-pending")
+    result = run_cli_bytes(
+        git_repo, "migrate-v2-pending",
+        "--full-suite-kind", "node-npm-test-v1", "--full-suite-cwd", ".",
+    )
 
     assert result.returncode == 0 and result.stderr == b""
     assert json.loads(result.stdout) == {
@@ -2301,6 +2354,10 @@ def test_cli_migrate_v2_pending_returns_stable_migration_projection(git_repo):
         "reviewers": {"A": "sealed", "B": "pending", "C": "pending"},
         "telemetry_history": "unknown",
     }
+    assert read_verdict(git_repo).validation.full_suite_recipe.kind.value == "node-npm-test-v1"
+    assert validate_stored_reviewer_report(
+        git_repo, reviewer=Reviewer.A,
+    )[0].reviewer is Reviewer.A
 
 
 def test_schema_two_parser_accepts_mixed_pending_and_sealed_slots(git_repo):
@@ -2841,6 +2898,7 @@ def test_failed_legacy_verdict_without_head_ref_migrates_on_next_round(git_repo)
     del legacy['evidence_fallback_reason']
     del legacy['evidence_contract']
     del legacy['policy']
+    del legacy['validation']
     legacy["reviewers"] = {key: slot["report"] for key, slot in legacy["reviewers"].items()}
     legacy["reviewers"]["A"]["findings"][0].pop("reversal_cost")
     del legacy["head_ref"]
@@ -3245,6 +3303,7 @@ def test_only_originating_reviewer_can_close_decision(git_repo, owner_payload, c
     receipt = submit_reviewer_report(git_repo, reviewer=Reviewer.A,
                                     raw=json.dumps(corrected).encode(), now=NOW)
     assert receipt.attempt == 2
+    seal_test_final_validation(git_repo)
     assert finalize_round(git_repo, now=NOW).gate.status.value == "pass"
 
 
@@ -3498,7 +3557,8 @@ def test_cli_later_round_context_omits_own_decision_executions(git_repo):
         }
     ]
     assert "executions" not in json.dumps(payload["own_decisions"])
-    assert "python3 -m pytest -q" not in json.dumps(payload)
+    assert "python3 -m pytest -q" not in json.dumps(payload["own_decisions"])
+    assert payload["validation"]["full_suite_recipe"] == full_suite_recipe().to_json()
     assert "1 passed" not in json.dumps(payload)
 
 
@@ -3655,6 +3715,7 @@ def test_cli_finalize_and_status_emit_only_bounded_projections(git_repo):
         *expected,
         "reviewers",
         "policy",
+        "validation",
         "active_reviewers",
         "pr_appendix",
     }
@@ -4169,7 +4230,10 @@ def test_cli_migrate_legacy_pending_reports_all_three_stable_states(git_repo):
     store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
     store_reviewer_report(git_repo, reviewer=Reviewer.B, raw=b'{"schema":1')
 
-    migrated = run_cli_bytes(git_repo, "migrate-legacy-pending")
+    migrated = run_cli_bytes(
+        git_repo, "migrate-legacy-pending",
+        "--full-suite-kind", "node-npm-test-v1", "--full-suite-cwd", ".",
+    )
 
     assert migrated.returncode == 0 and migrated.stderr == b""
     assert json.loads(migrated.stdout) == {
@@ -4182,6 +4246,7 @@ def test_cli_migrate_legacy_pending_reports_all_three_stable_states(git_repo):
     }
     assert migrated.stdout.count(b"\n") == 1
     assert len(migrated.stdout) < 512
+    assert read_verdict(git_repo).validation.full_suite_recipe.kind.value == "node-npm-test-v1"
 
 
 def test_cli_status_discriminates_all_pending_v1_from_v2(git_repo):
@@ -4227,6 +4292,7 @@ def test_cli_finalize_without_paths_authenticates_all_sealed_reports(git_repo):
             git_repo, "submit-report", "--reviewer", reviewer, input=raw
         ).returncode == 0
 
+    seal_synthetic_python_suite(git_repo)
     finalized = run_cli_bytes(git_repo, "finalize")
 
     assert finalized.returncode == 0 and finalized.stderr == b""
