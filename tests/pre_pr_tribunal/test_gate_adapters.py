@@ -1558,7 +1558,8 @@ def test_command_local_system_path_overrides_inherited_git_lookup(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "git").symlink_to("/usr/bin/false")
-    monkeypatch.setenv("PATH", f"{fake_bin}:/usr/bin:/bin")
+    # Keep the sealed suite's Python tool on PATH while poisoning git lookup.
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
 
     decision = evaluate_gate(git_repo, BOUND_COMMAND)
 
