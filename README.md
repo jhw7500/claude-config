@@ -35,6 +35,12 @@ source ~/.bashrc
   - `carl-hook`은 파일만 동기화하고 자동 배선하지 않음(APEX/CARL 사용 시 수동 배선)
 - **Task nudge (Claude/Codex)**: `task_nudge.py`와 Claude/Codex adapter는 심볼릭 링크가 아닌 owner-only 중립 사본으로 설치된다. source update 뒤에는 `./install.sh`를 다시 실행한다. Claude `settings.json`과 Codex `~/.codex/hooks.json`은 기존 항목을 보존하는 additive merge이며, 활성 전역 AGENTS의 `claude-config:task-nudge:START/END` marker 밖 내용도 보존한다.
   - 설치기는 portfolio 조회나 자격증명 접근을 실행하지 않는다. 새 설치 또는 파일 hash가 바뀐 뒤에는 Codex에서 `/hooks`를 열어 변경 hash를 직접 검토한 뒤 trust한다; installer는 trust를 자동 승인하지 않는다.
+- **Change Evidence 안내 (Claude/Codex)**: 커밋 생성 또는 PR 본문 생성·갱신을 준비할 때만 [Contract v1 정본](https://github.com/jhw7500/automation/blob/0d97a63891ba4473a3a189eae643f8059b76eb56/docs/change-evidence-contract-v1.md)과 JHW 작성 스킬을 참조한다. Claude는 `global-guidance.md`, Codex는 별도 `claude-config:change-evidence:START/END` AGENTS 블록으로 같은 조건을 받는다. 새 훅은 없으며 task-nudge의 Task 선택이나 pre-PR Tribunal의 PR 생성 게이트를 변경하지 않는다.
+  - 배포 순서: 먼저 `jhw-notion`의 guarded 설치·활성화 절차로 Claude `/jhw:commit`·`/jhw:pr`와 Codex `$jhw-commit`·`$jhw-pr`가 실제 설치됐는지 확인한다. 그다음 `claude-config`를 갱신하고 `./install.sh`를 다시 실행한다. Claude 지침 `~/.claude/global-guidance.md`는 심볼릭 링크가 아닌 복사본이고 Codex AGENTS 블록도 설치기가 기록하므로, 저장소 갱신만으로는 어느 쪽도 바뀌지 않는다. 두 지침은 새 세션에서 확인한다. 작성 스킬이 없는 호스트에서는 배포 누락을 알리고 계약 준수를 주장하지 않는다.
+  - `install.sh`는 Claude 지침을 먼저 복사한 뒤 task-nudge 설치기로 Codex AGENTS 블록을 기록한다. 설치기가 실패하면(관리 마커 중첩·누락 포함) Claude 지침만 갱신된 채 중단될 수 있으므로 양쪽 활성화가 동기화됐다고 간주하지 말고, 오류를 고친 뒤 재실행하여 두 지침을 확인한다.
+  - 현재 `jhw-notion` PR 작성 절차의 생성 명령은 pre-PR Tribunal 게이트의 canonical command가 아니다. `--repo`뿐 아니라 동적 `--base`와 변수 인자도 게이트가 거부하므로 `--repo`만 빼서 재시도하지 않는다. `$jhw-pr`/`/jhw:pr`는 본문 작성·검증 단계까지만 따르고, 검증을 통과한 본문 파일을 canonical command에 넘겨 PR을 별도 생성한다. 두 흐름을 그대로 이어 실행하거나 gate를 우회하지 않는다.
+  - 설치기는 change-evidence 블록을 제거하지 않으며, 이전 버전의 설치기를 다시 실행해도 이 블록은 남는다. 반대로 이 설치기가 남아 있는 동안에는 블록을 손으로 지워도 다음 `./install.sh` 실행이 블록을 다시 추가한다. 따라서 철회는 `global-guidance.md`의 해당 절과 설치기의 Codex 블록 기록을 함께 되돌린 버전으로 `./install.sh`를 다시 실행한 뒤, 각 호스트의 활성 AGENTS 파일에서 `claude-config:change-evidence:START/END` 블록을 직접 지우는 순서로 한다.
+  - 필드 정의·validator는 이 저장소에 복제하지 않는다. 정본 v1 좌표가 바뀌면 양쪽 지침의 링크를 명시적으로 갱신하고 `tests/task_nudge/test_change_evidence_guidance.py`를 실행한다. 이미 스킬을 적용한 작업은 반복 호출하지 않으며, 일반 git 명령을 추가로 차단하지 않는다.
 - `context-bar`(statusLine 교체)는 **미포함** (현재 OMC HUD와 상호배타라 별도 결정 필요)
 
 ## pre-PR tribunal

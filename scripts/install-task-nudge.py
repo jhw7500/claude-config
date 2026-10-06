@@ -33,6 +33,13 @@ from runtime_hook_installer import (  # noqa: E402
 
 AGENTS_START = "<!-- claude-config:task-nudge:START -->"
 AGENTS_END = "<!-- claude-config:task-nudge:END -->"
+CHANGE_EVIDENCE_START = "<!-- claude-config:change-evidence:START -->"
+CHANGE_EVIDENCE_END = "<!-- claude-config:change-evidence:END -->"
+CHANGE_EVIDENCE_CONTRACT = (
+    "https://github.com/jhw7500/automation/blob/"
+    "0d97a63891ba4473a3a189eae643f8059b76eb56/"
+    "docs/change-evidence-contract-v1.md"
+)
 CLAUDE_MATCHER = "Edit|Write|NotebookEdit"
 CLAUDE_COMMAND = "$HOME/.claude/hooks/task-nudge.sh"
 CODEX_MATCHER = "apply_patch|Edit|Write"
@@ -83,22 +90,60 @@ def select_agents_path(home: Path) -> Path:
     return override if nonempty else codex / "AGENTS.md"
 
 
-def merge_agents_block(original: str, policy: str) -> str:
-    """Append or replace one exact managed pair without changing outside bytes."""
-    start_count = original.count(AGENTS_START)
-    end_count = original.count(AGENTS_END)
+def _managed_block_span(
+    original: str, start_marker: str, end_marker: str, label: str
+) -> tuple[int, int] | None:
+    start_count = original.count(start_marker)
+    end_count = original.count(end_marker)
     if start_count != end_count or start_count not in {0, 1}:
-        raise InstallError("malformed AGENTS task-nudge markers")
-    body = policy.rstrip("\n")
-    block = AGENTS_START + "\n" + body + "\n" + AGENTS_END
+        raise InstallError(f"malformed AGENTS {label} markers")
     if start_count == 0:
+        return None
+    start = original.index(start_marker)
+    end = original.index(end_marker)
+    if end < start:
+        raise InstallError(f"reversed AGENTS {label} markers")
+    return start, end + len(end_marker)
+
+
+def _merge_managed_block(
+    original: str, policy: str, start_marker: str, end_marker: str, label: str
+) -> str:
+    """Append or replace one exact managed pair without changing outside bytes."""
+    span = _managed_block_span(original, start_marker, end_marker, label)
+    block = start_marker + "\n" + policy.rstrip("\n") + "\n" + end_marker
+    if span is None:
         separator = "" if not original or original.endswith("\n") else "\n"
         return original + separator + block + "\n"
-    start = original.index(AGENTS_START)
-    end = original.index(AGENTS_END)
-    if end < start:
-        raise InstallError("reversed AGENTS task-nudge markers")
-    return original[:start] + block + original[end + len(AGENTS_END) :]
+    start, end = span
+    return original[:start] + block + original[end:]
+
+
+def merge_agents_block(original: str, policy: str) -> str:
+    return _merge_managed_block(original, policy, AGENTS_START, AGENTS_END, "task-nudge")
+
+
+def merge_change_evidence_block(original: str, policy: str) -> str:
+    return _merge_managed_block(
+        original, policy, CHANGE_EVIDENCE_START, CHANGE_EVIDENCE_END,
+        "change-evidence",
+    )
+
+
+def merge_guidance_blocks(original: str) -> str:
+    """Reject overlapping managed policies before replacing either one."""
+    task_span = _managed_block_span(original, AGENTS_START, AGENTS_END, "task-nudge")
+    evidence_span = _managed_block_span(
+        original, CHANGE_EVIDENCE_START, CHANGE_EVIDENCE_END, "change-evidence"
+    )
+    if task_span and evidence_span and max(task_span[0], evidence_span[0]) < min(
+        task_span[1], evidence_span[1]
+    ):
+        raise InstallError("AGENTS managed blocks overlap")
+    return merge_change_evidence_block(
+        merge_agents_block(original, agents_policy_block()),
+        change_evidence_policy_block(),
+    )
 
 
 def agents_policy_block() -> str:
@@ -119,6 +164,27 @@ def agents_policy_block() -> str:
         "파일 수나 저장소 안에 있다는 사실은 증거가 아니다.\n"
         "GitHub Issue 생성, Project/Repository 등록, Formal 또는 Temporary Task 시작은 각각 별도의 명시적 사용자 승인 후에만 한다. "
         "앞 단계 승인은 다음 단계를 승인하지 않는다.\n"
+    )
+
+
+def change_evidence_policy_block() -> str:
+    """Mirror the Claude guidance section; only host and skill names differ."""
+    return (
+        "커밋 생성 또는 PR 본문 생성·갱신을 실제로 준비할 때만 적용한다. "
+        "조회·설명·코드 편집만 하는 작업에는 적용하지 않는다.\n"
+        "\n"
+        f"- [Change Evidence Contract v1 정본]({CHANGE_EVIDENCE_CONTRACT})을 참조하고, "
+        "Codex에서는 `$jhw-commit`(직접/PR용 커밋) 또는 `$jhw-pr`(PR 본문 작성·검증)를 참조한다. "
+        "이미 해당 작성 스킬을 적용했다면 중복 호출하지 않는다.\n"
+        "- 커밋 메시지 또는 PR 본문에 변경 이유·실제 검증·확인된 참조가 빠졌다면 실행 전에 "
+        "누락을 알리고 정본 스킬로 보완한다. 검증하지 않은 결과나 Issue/PR 관계를 만들지 않는다. "
+        "스킬이 설치되지 않았다면 배포 누락을 알리고 계약을 충족한 척하지 않는다.\n"
+        "- 이 지침은 안내 전용이며 Issue·PR·commit을 자동 생성하지 않는다. "
+        "Task 선택은 task-nudge, PR 생성 허가는 pre-PR Tribunal가 담당한다. "
+        "PR은 pre-PR Tribunal의 canonical command로만 생성하고, "
+        "`$jhw-pr`의 생성 명령(`--repo`·변수 인자 포함)은 실행하지 않는다. "
+        "PR 본문은 `$jhw-pr`의 작성·검증 단계를 통과한 파일을 그대로 넘긴다. "
+        "일반 git 명령을 추가로 차단하거나 Tribunal 재심사를 호출하지 않는다.\n"
     )
 
 
@@ -202,9 +268,7 @@ def build_plan(
         agents_original = "" if agents_raw is None else agents_raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise InstallError("active AGENTS file is not UTF-8") from error
-    agents_data = merge_agents_block(agents_original, agents_policy_block()).encode(
-        "utf-8"
-    )
+    agents_data = merge_guidance_blocks(agents_original).encode("utf-8")
 
     installed = home / ".local" / "share" / "claude-config" / "hooks"
     plans = [
