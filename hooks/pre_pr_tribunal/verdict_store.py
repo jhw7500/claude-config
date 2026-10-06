@@ -6,8 +6,10 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -57,6 +59,10 @@ from .review_store import (
     repository_root,
     safe_file,
 )
+
+
+_FINAL_VALIDATION_RESERVATION = "final-validation-reservation.json"
+_MAX_FINAL_VALIDATION_RESERVATION = 2048
 
 
 def utc_now() -> str:
@@ -1404,6 +1410,19 @@ def begin_round(
     check_ignored(root)
     with locked_review(root, create=True) as review_fd:
         try:
+            read_named_file(
+                review_fd, _FINAL_VALIDATION_RESERVATION,
+                maximum=_MAX_FINAL_VALIDATION_RESERVATION,
+                missing="FINAL_VALIDATION_RESERVATION_MISSING",
+                unsafe="FINAL_VALIDATION_RESERVATION_UNSAFE",
+                exact_mode=0o600,
+            )
+        except SchemaError as error:
+            if error.code != "FINAL_VALIDATION_RESERVATION_MISSING":
+                raise
+        else:
+            raise SchemaError("FINAL_VALIDATION_RECOVERY_REQUIRED")
+        try:
             stored_raw = read_named_file(
                 review_fd, "verdict.json", maximum=m.MAX_VERDICT_BYTES,
                 missing="VERDICT_MISSING", unsafe="VERDICT_FILE_UNSAFE",
@@ -1869,6 +1888,179 @@ def _final_validation_candidate_locked(
     return pending
 
 
+def _reservation_bytes(verdict: Verdict) -> bytes:
+    recipe = verdict.validation.full_suite_recipe
+    if recipe is None or verdict.lifecycle_id is None:
+        raise SchemaError("VALIDATION_BINDING_INVALID")
+    return json.dumps({
+        "schema": 1,
+        "lifecycle_id": verdict.lifecycle_id,
+        "head_sha": verdict.head_sha,
+        "diff_sha256": verdict.diff_sha256,
+        "full_suite_recipe": recipe.to_json(),
+        "owner_pid": os.getpid(),
+        "nonce": secrets.token_hex(16),
+        "created_at": utc_now(),
+    }, separators=(",", ":")).encode("utf-8")
+
+
+def _reservation_payload(raw: bytes, verdict: Verdict) -> dict[str, object]:
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+    recipe = verdict.validation.full_suite_recipe if verdict.validation else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "schema", "lifecycle_id", "head_sha", "diff_sha256",
+            "full_suite_recipe", "owner_pid", "nonce", "created_at",
+        }
+        or type(value["schema"]) is not int
+        or value["schema"] != 1
+        or value["lifecycle_id"] != verdict.lifecycle_id
+        or value["head_sha"] != verdict.head_sha
+        or value["diff_sha256"] != verdict.diff_sha256
+        or recipe is None
+        or value["full_suite_recipe"] != recipe.to_json()
+        or type(value["owner_pid"]) is not int
+        or value["owner_pid"] <= 0
+        or not isinstance(value["nonce"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", value["nonce"]) is None
+        or not isinstance(value["created_at"], str)
+        or not value["created_at"]
+    ):
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+    return value
+
+
+def _open_locked_reservation(review_fd: int, verdict: Verdict) -> tuple[int, bytes]:
+    fd = -1
+    ready = False
+    try:
+        fd = os.open(
+            _FINAL_VALIDATION_RESERVATION,
+            os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=review_fd,
+        )
+        safe_file(fd, "FINAL_VALIDATION_RESERVATION_UNSAFE", exact_mode=0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SchemaError("FINAL_VALIDATION_IN_PROGRESS") from None
+        raw = os.read(fd, _MAX_FINAL_VALIDATION_RESERVATION + 1)
+        if not raw or len(raw) > _MAX_FINAL_VALIDATION_RESERVATION:
+            raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+        _reservation_payload(raw, verdict)
+        ready = True
+        return fd, raw
+    except FileNotFoundError:
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_MISSING") from None
+    except SchemaError:
+        raise
+    except OSError:
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+    finally:
+        if fd >= 0 and not ready:
+            os.close(fd)
+
+
+def _verify_reservation_name(review_fd: int, fd: int, raw: bytes) -> None:
+    try:
+        linked = os.stat(
+            _FINAL_VALIDATION_RESERVATION,
+            dir_fd=review_fd,
+            follow_symlinks=False,
+        )
+        opened = safe_file(fd, "FINAL_VALIDATION_RESERVATION_UNSAFE", exact_mode=0o600)
+        if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+            raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+        current = read_named_file(
+            review_fd, _FINAL_VALIDATION_RESERVATION,
+            maximum=_MAX_FINAL_VALIDATION_RESERVATION,
+            missing="FINAL_VALIDATION_RESERVATION_MISSING",
+            unsafe="FINAL_VALIDATION_RESERVATION_UNSAFE",
+            exact_mode=0o600,
+        )
+        if current != raw:
+            raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+    except OSError:
+        raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+
+
+def final_validation_reservation_status(cwd: Path) -> dict[str, object]:
+    """Show the exact interrupted reservation that requires operator judgment."""
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        verdict = _read_verdict_locked(review_fd)
+        raw = read_named_file(
+            review_fd, _FINAL_VALIDATION_RESERVATION,
+            maximum=_MAX_FINAL_VALIDATION_RESERVATION,
+            missing="FINAL_VALIDATION_RESERVATION_MISSING",
+            unsafe="FINAL_VALIDATION_RESERVATION_UNSAFE",
+            exact_mode=0o600,
+        )
+        payload = _reservation_payload(raw, verdict)
+        return {
+            "status": "reserved", "sha256": hashlib.sha256(raw).hexdigest(),
+            "owner_pid": payload["owner_pid"], "head_sha": payload["head_sha"],
+            "created_at": payload["created_at"],
+        }
+
+
+def recover_final_validation_reservation(
+    cwd: Path, *, expected_sha256: str, confirmed_terminal: bool = False,
+) -> dict[str, object]:
+    """Archive a stopped execution's reservation after explicit operator review.
+
+    The caller must verify that the original process tree is terminal. A free
+    advisory lock alone cannot establish that an orphaned child has stopped.
+    """
+    if confirmed_terminal is not True:
+        raise SchemaError("FINAL_VALIDATION_RECOVERY_CONFIRMATION_REQUIRED")
+    root = repository_root(cwd)
+    preflight_review_directory(root)
+    check_ignored(root)
+    with locked_review(root, create=False) as review_fd:
+        verdict = _read_verdict_locked(review_fd)
+        if verdict.contract != current_contract_binding():
+            raise SchemaError("CONTRACT_DRIFT")
+        snapshot = capture_snapshot(root, verdict.base_ref)
+        if not _snapshot_equal(verdict, snapshot):
+            raise SchemaError("SNAPSHOT_CHANGED")
+        fd, raw = _open_locked_reservation(review_fd, verdict)
+        try:
+            digest = hashlib.sha256(raw).hexdigest()
+            if expected_sha256 != digest:
+                raise SchemaError("FINAL_VALIDATION_RESERVATION_MISMATCH")
+            _verify_reservation_name(review_fd, fd, raw)
+            archive = f"final-validation-recovered-{digest}.json"
+            try:
+                os.stat(archive, dir_fd=review_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+            else:
+                raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+            try:
+                os.rename(
+                    _FINAL_VALIDATION_RESERVATION, archive,
+                    src_dir_fd=review_fd, dst_dir_fd=review_fd,
+                )
+                os.fsync(review_fd)
+            except OSError:
+                raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+            return {
+                "status": "recovered", "sha256": digest,
+                "archive_path": f".review/{archive}",
+            }
+        finally:
+            os.close(fd)
+
+
 def seal_final_validation(
     cwd: Path,
     *,
@@ -1876,49 +2068,77 @@ def seal_final_validation(
     escalation_reason: str | None = None,
 ) -> Verdict:
     """Execute and bind the lifecycle's full-suite recipe as one owned action."""
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise SchemaError("EVIDENCE_TIMEOUT_INVALID")
     root = repository_root(cwd)
     preflight_review_directory(root)
     check_ignored(root)
+    from . import evidence_runtime
+
     with locked_review(root, create=False) as review_fd:
         expected = _final_validation_candidate_locked(
             root, review_fd, escalation_reason=escalation_reason,
         )
-    recipe = expected.validation.full_suite_recipe
-    if recipe is None:  # Kept explicit for type narrowing and fail-closed safety.
-        raise SchemaError("VALIDATION_BINDING_INVALID")
-    from . import evidence_runtime
-
-    captured = evidence_runtime.capture_evidence(
-        root,
-        base=expected.base_ref,
-        profile=recipe.profile,
-        command_cwd=recipe.cwd,
-        argv=list(recipe.argv),
-        timeout_seconds=timeout_seconds,
-    )
-    receipt_sha256 = captured.get("receipt_sha256")
-    if captured.get("exit_code") != 0 or not isinstance(receipt_sha256, str):
-        raise SchemaError("FINAL_VALIDATION_FAILED")
-    with locked_review(root, create=False) as review_fd:
-        pending = _final_validation_candidate_locked(
-            root, review_fd, escalation_reason=escalation_reason,
+        recipe = expected.validation.full_suite_recipe
+        if recipe is None:
+            raise SchemaError("VALIDATION_BINDING_INVALID")
+        raw = _reservation_bytes(expected)
+        atomic_create_bytes(
+            review_fd, _FINAL_VALIDATION_RESERVATION, raw,
+            maximum=_MAX_FINAL_VALIDATION_RESERVATION,
+            exists="FINAL_VALIDATION_RESERVED",
+            unsafe="FINAL_VALIDATION_RESERVATION_UNSAFE",
+            exact_mode=0o600,
         )
-        if pending != expected:
-            raise SchemaError("FINAL_VALIDATION_STATE_CHANGED")
-        sealed_validation = m.ValidationBinding(
-            m.ValidationPhase.FINAL_VALIDATION,
-            True,
-            receipt_sha256,
-            escalation_reason,
-            recipe,
+        reservation_fd, stored = _open_locked_reservation(review_fd, expected)
+        if stored != raw:
+            os.close(reservation_fd)
+            raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE")
+    try:
+        captured = evidence_runtime.capture_evidence(
+            root,
+            base=expected.base_ref,
+            profile=recipe.profile,
+            command_cwd=recipe.cwd,
+            argv=list(recipe.argv),
+            timeout_seconds=timeout_seconds,
         )
-        sealed_validation.to_json()
-        from .validation import verify_full_suite_receipt
+        receipt_sha256 = captured.get("receipt_sha256")
+        if captured.get("exit_code") != 0 or not isinstance(receipt_sha256, str):
+            raise SchemaError("FINAL_VALIDATION_FAILED")
+        with locked_review(root, create=False) as review_fd:
+            pending = _final_validation_candidate_locked(
+                root, review_fd, escalation_reason=escalation_reason,
+            )
+            if pending != expected:
+                raise SchemaError("FINAL_VALIDATION_STATE_CHANGED")
+            _verify_reservation_name(review_fd, reservation_fd, raw)
+            sealed_validation = m.ValidationBinding(
+                m.ValidationPhase.FINAL_VALIDATION,
+                True,
+                receipt_sha256,
+                escalation_reason,
+                recipe,
+            )
+            sealed_validation.to_json()
+            from .validation import verify_full_suite_receipt
 
-        verify_full_suite_receipt(root, pending, receipt_sha256)
-        sealed = replace(pending, validation=sealed_validation)
-        _atomic_write(review_fd, sealed)
-        return sealed
+            verify_full_suite_receipt(root, pending, receipt_sha256)
+            sealed = replace(pending, validation=sealed_validation)
+            _atomic_write(review_fd, sealed)
+            try:
+                os.unlink(_FINAL_VALIDATION_RESERVATION, dir_fd=review_fd)
+                os.fsync(review_fd)
+            except OSError:
+                raise SchemaError("FINAL_VALIDATION_RESERVATION_UNSAFE") from None
+            return sealed
+    finally:
+        os.close(reservation_fd)
 
 
 def finalize_round(

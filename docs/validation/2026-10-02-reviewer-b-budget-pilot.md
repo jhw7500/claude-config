@@ -46,6 +46,43 @@ blocking evidence, and unverified required claims remain preserved as specified
 below. No token cap is introduced because #111 and #113 have no comparable
 native token records and the offline totals cover the entire supplied session.
 
+## #183 post-calibration observation (not a speedup comparison)
+
+The PR #185 offline tool audited caller-associated A/B transcripts for #183
+round 3 (`ae8ab81`, diff `d4c7fd5`), which ended FAIL. Its association is
+unbound and non-gate evidence; cumulative token counts cover each entire
+supplied session. The controller telemetry recorded no reused evidence.
+
+| Role | Reviewer total | Top-level native calls | Tool-wait union | Last cumulative tokens |
+| --- | ---: | ---: | ---: | ---: |
+| A | 679.958 s | 25 | 32.000 s | 1,908,608 |
+| B | 501.722 s | 22 | 91.833 s | 1,662,267 |
+
+The round took 1,474.402 s end-to-end. B supported all 7 required claims with
+2 fresh report executions, but exceeded the 480 s high-risk soft stop while
+remaining below its 600 s instructed report deadline. Its 22 observed tool
+calls were below the role guide's nominal 40-call high-risk self-budget, but
+the round's contract-7 context did not project `native_tool_calls`; no runtime
+cap enforced that number. The report-entry and instructed tool-call limits
+therefore did not establish lower elapsed time or token use in this round. In
+particular, the 216.384 s #111 lockfile baseline and the #113 bundle arms have
+different snapshots and workloads; none is a matched cost-reduction control
+for #183.
+
+The B transcript shows one broad three-module pytest request timed out after
+180 s without becoming report evidence. Its accepted report instead cited a
+152-test command that passed in 21.03 s and a focused 7-test command that
+passed in 3.82 s. On the later uncommitted #183 fix, two controller-local
+focused selections passed 27 tests in 10.45 s total (7.95 s and 2.50 s).
+Those later results are pre-review checks, not authenticated evidence for a
+new snapshot or a measured native-review speedup. Avoiding the failed broad
+request is the concrete time-saving candidate; only an independent reviewer
+on an authorized new lifecycle can establish its actual effect.
+The historical #183 reports are bound to the old HEAD and diff, the #113 Node
+bundle belongs to another snapshot, and `python-v1` cannot project arbitrary
+pytest captures as reusable evidence. Eligible reuse for a changed #183
+snapshot is therefore currently zero.
+
 ## Same-snapshot observations (not a controlled comparison)
 
 On `c436881daf7874fb5da268e05ec43676f8c90768` with diff SHA-256

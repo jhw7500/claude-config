@@ -34,11 +34,13 @@ if __package__ in {None, ""}:
     from pre_pr_tribunal.verdict_store import (  # type: ignore
         begin_round,
         finalize_round,
+        final_validation_reservation_status,
         migrate_legacy_pending_round,
         migrate_v2_pending_round,
         preview_policy,
         read_verdict,
         record_reviewer_failure,
+        recover_final_validation_reservation,
         seal_final_validation,
         store_reviewer_report,
         submit_reviewer_report,
@@ -69,11 +71,13 @@ else:
     from .verdict_store import (
         begin_round,
         finalize_round,
+        final_validation_reservation_status,
         migrate_legacy_pending_round,
         migrate_v2_pending_round,
         preview_policy,
         read_verdict,
         record_reviewer_failure,
+        recover_final_validation_reservation,
         seal_final_validation,
         store_reviewer_report,
         submit_reviewer_report,
@@ -217,6 +221,10 @@ def _parser() -> argparse.ArgumentParser:
     final_validation = commands.add_parser("final-validation-seal", add_help=False)
     final_validation.add_argument("--timeout", required=True, type=float)
     final_validation.add_argument("--escalation-reason")
+    commands.add_parser("final-validation-reservation-status", add_help=False)
+    final_recovery = commands.add_parser("final-validation-recover", add_help=False)
+    final_recovery.add_argument("--reservation-sha256", required=True)
+    final_recovery.add_argument("--confirm-process-tree-stopped", action="store_true")
     commands.add_parser("status", add_help=False)
     start = commands.add_parser("telemetry-start", add_help=False)
     start.add_argument("--run-id", required=True)
@@ -927,6 +935,14 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 escalation_reason=arguments.escalation_reason,
             )
             payload = _status(verdict)
+        elif arguments.command == "final-validation-reservation-status":
+            payload = final_validation_reservation_status(cwd)
+        elif arguments.command == "final-validation-recover":
+            payload = recover_final_validation_reservation(
+                cwd,
+                expected_sha256=arguments.reservation_sha256,
+                confirmed_terminal=arguments.confirm_process_tree_stopped,
+            )
         elif arguments.command == "finalize":
             supplied = {
                 key: value

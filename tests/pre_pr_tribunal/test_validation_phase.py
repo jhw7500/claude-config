@@ -2,8 +2,11 @@ import json
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
+import threading
 import venv
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -30,6 +33,8 @@ from pre_pr_tribunal.review_context import reviewer_context_body
 from pre_pr_tribunal.verdict_store import (
     begin_round,
     finalize_round,
+    final_validation_reservation_status,
+    recover_final_validation_reservation,
     seal_final_validation,
     submit_reviewer_report,
     validate_stored_reviewer_report,
@@ -252,6 +257,133 @@ def test_followup_pass_runs_owned_bound_recipe_and_finalizes(
     assert _status(final)["validation"] == sealed.validation.to_json()
 
 
+def test_concurrent_final_validation_admits_only_one_capture(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    _failed_first_round(repo)
+    _preview, restarted = _restart_after_fix(repo)
+    _seal_direct_impact_reports(repo, restarted)
+    receipt_sha256 = _relabeled_no_op_receipt(repo)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        assert release.wait(10)
+        return {"exit_code": 0, "receipt_sha256": receipt_sha256}
+
+    monkeypatch.setattr(evidence_runtime, "capture_evidence", capture)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(seal_final_validation, repo, timeout_seconds=15)
+        assert entered.wait(5)
+        try:
+            reservation = final_validation_reservation_status(repo)
+            with pytest.raises(SchemaError, match="^FINAL_VALIDATION_IN_PROGRESS$"):
+                recover_final_validation_reservation(
+                    repo, expected_sha256=reservation["sha256"],
+                    confirmed_terminal=True,
+                )
+            with pytest.raises(SchemaError, match="^FINAL_VALIDATION_RESERVED$"):
+                seal_final_validation(repo, timeout_seconds=15)
+            competing_cli = subprocess.run(
+                [
+                    sys.executable, "-B", str(Path(cli.__file__).resolve()),
+                    "final-validation-seal", "--timeout", "15",
+                ],
+                cwd=repo, capture_output=True, text=True, timeout=5,
+                check=False,
+            )
+            assert competing_cli.returncode == 1
+            assert competing_cli.stderr == "PRE_PR_TRIBUNAL:FINAL_VALIDATION_RESERVED\n"
+            assert competing_cli.stdout == ""
+        finally:
+            release.set()
+        assert first.result().validation.phase is ValidationPhase.FINAL_VALIDATION
+    assert len(calls) == 1
+
+
+def test_interrupted_final_validation_requires_explicit_recovery(
+    tmp_path, monkeypatch, capsys,
+):
+    repo = _repo(tmp_path)
+    _failed_first_round(repo)
+    _preview, restarted = _restart_after_fix(repo)
+    _seal_direct_impact_reports(repo, restarted)
+    receipt_sha256 = _relabeled_no_op_receipt(repo)
+    with pytest.raises(SchemaError, match="^EVIDENCE_TIMEOUT_INVALID$"):
+        seal_final_validation(repo, timeout_seconds=0)
+    assert not (repo / ".review/final-validation-reservation.json").exists()
+    monkeypatch.setattr(
+        evidence_runtime, "capture_evidence", lambda *args, **kwargs: {"exit_code": 1},
+    )
+
+    with pytest.raises(SchemaError, match="^FINAL_VALIDATION_FAILED$"):
+        seal_final_validation(repo, timeout_seconds=15)
+    monkeypatch.chdir(repo)
+    assert cli.main(["final-validation-reservation-status"]) == 0
+    reservation = json.loads(capsys.readouterr().out)
+    assert reservation["status"] == "reserved"
+    marker = repo / ".review/final-validation-reservation.json"
+    assert marker.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(SchemaError, match="^FINAL_VALIDATION_RESERVED$"):
+        seal_final_validation(repo, timeout_seconds=15)
+    marker.chmod(0o644)
+    with pytest.raises(SchemaError, match="^FINAL_VALIDATION_RESERVATION_UNSAFE$"):
+        recover_final_validation_reservation(
+            repo, expected_sha256=reservation["sha256"], confirmed_terminal=True,
+        )
+    marker.chmod(0o600)
+    with pytest.raises(SchemaError, match="^FINAL_VALIDATION_RESERVATION_MISMATCH$"):
+        recover_final_validation_reservation(
+            repo, expected_sha256="0" * 64, confirmed_terminal=True,
+        )
+    with pytest.raises(SchemaError, match="^FINAL_VALIDATION_RECOVERY_CONFIRMATION_REQUIRED$"):
+        recover_final_validation_reservation(repo, expected_sha256=reservation["sha256"])
+
+    assert cli.main([
+        "final-validation-recover", "--reservation-sha256", reservation["sha256"],
+        "--confirm-process-tree-stopped",
+    ]) == 0
+    recovered = json.loads(capsys.readouterr().out)
+    assert recovered["status"] == "recovered"
+    assert not (repo / ".review/final-validation-reservation.json").exists()
+    assert (repo / recovered["archive_path"]).stat().st_mode & 0o777 == 0o600
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append(1)
+        return {"exit_code": 0, "receipt_sha256": receipt_sha256}
+
+    monkeypatch.setattr(evidence_runtime, "capture_evidence", capture)
+    assert seal_final_validation(repo, timeout_seconds=15).validation.full_suite_receipt_sha256 == receipt_sha256
+    assert len(calls) == 1
+
+
+def test_terminal_round_cannot_carry_an_interrupted_reservation(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    _failed_first_round(repo)
+    _preview, restarted = _restart_after_fix(repo)
+    _seal_direct_impact_reports(repo, restarted, blocker=True)
+    monkeypatch.setattr(
+        evidence_runtime, "capture_evidence", lambda *args, **kwargs: {"exit_code": 1},
+    )
+
+    with pytest.raises(SchemaError, match="^FINAL_VALIDATION_FAILED$"):
+        seal_final_validation(
+            repo, timeout_seconds=15,
+            escalation_reason="Cross-domain build configuration changed.",
+        )
+    assert finalize_round(repo, now=NOW).gate.status is GateStatus.FAIL
+    with pytest.raises(SchemaError, match="^FINAL_VALIDATION_RECOVERY_REQUIRED$"):
+        begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+
+    reservation = final_validation_reservation_status(repo)
+    assert recover_final_validation_reservation(
+        repo, expected_sha256=reservation["sha256"], confirmed_terminal=True,
+    )["status"] == "recovered"
+
+
 def test_nonpass_escalation_is_retained_and_reauthenticated(
     tmp_path, monkeypatch,
 ):
@@ -426,6 +558,14 @@ def test_cli_rejects_external_final_validation_receipt():
         "final-validation-seal", "--timeout", "15",
     ])
     assert parsed.timeout == 15
+    assert cli._parser().parse_args([
+        "final-validation-reservation-status",
+    ]).command == "final-validation-reservation-status"
+    recovered = cli._parser().parse_args([
+        "final-validation-recover", "--reservation-sha256", "a" * 64,
+        "--confirm-process-tree-stopped",
+    ])
+    assert recovered.confirm_process_tree_stopped is True
 
 
 def test_full_suite_execution_is_rejected_during_fix_verification(tmp_path):

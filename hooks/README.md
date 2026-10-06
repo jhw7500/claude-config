@@ -234,6 +234,7 @@ targeted command, relabeled receipt, or recipe mismatch cannot seal PASS. A non-
 configuration, dependency, permission, or nondeterministic-failure impact is recorded with `--escalation-reason`.
 The seal is immutable and `finalize` reauthenticates its HEAD, diff, contract, recipe, environment, capture, freshness,
 and zero exit immediately before PASS.
+The command reserves final validation before starting the suite; a competing caller gets `FINAL_VALIDATION_RESERVED` before capture. A failed or interrupted attempt retains its private reservation. After an explicit operator check that the original process tree has stopped, `final-validation-reservation-status` shows its digest and `final-validation-recover --reservation-sha256 DIGEST --confirm-process-tree-stopped` archives it. Recovery never infers child termination from a free file lock.
 
 Before pathless `finalize`, require `status` to show all A/B/C slots sealed. Re-run three separate stored validations,
 compare every digest to its receipt, and immediately recheck all report paths for current-user ownership, regular
