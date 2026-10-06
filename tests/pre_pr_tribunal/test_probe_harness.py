@@ -773,6 +773,23 @@ def _installed_lifecycle(tmp_path):
     return module, home, repo, cli
 
 
+def test_probe_local_full_suite_is_real_and_fails_on_bad_source(tmp_path):
+    from pre_pr_tribunal.model import full_suite_recipe
+
+    module, home, repo, _cli = _installed_lifecycle(tmp_path)
+    recipe = full_suite_recipe()
+    command = list(recipe.argv)
+    clean = subprocess.run(
+        command, cwd=repo, env=module._internal_env(home), capture_output=True,
+    )
+    assert clean.returncode == 0 and b"Ran 1 test" in clean.stderr
+    (repo / "tracked.txt").write_text("wrong\n", encoding="utf-8")
+    changed = subprocess.run(
+        command, cwd=repo, env=module._internal_env(home), capture_output=True,
+    )
+    assert changed.returncode != 0 and b"FAILED" in changed.stderr
+
+
 @pytest.mark.parametrize("mask", (0o000, 0o022, 0o077))
 def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path, monkeypatch, mask):
     module, home, repo, cli = _installed_lifecycle(tmp_path)
@@ -780,6 +797,7 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
     captured = {}
     validations = []
     finalizations = []
+    seal_timeouts = []
 
     def observe(argv, **kwargs):
         if len(argv) > 2 and argv[1] == str(cli):
@@ -787,6 +805,8 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
                 captured[argv[4]] = kwargs["input"]
             elif argv[2] == "validate-report":
                 validations.append(argv[4])
+            elif argv[2] == "final-validation-seal":
+                seal_timeouts.append((float(argv[4]), kwargs["timeout"]))
             elif argv[2] == "finalize":
                 # Every separate pre-final stored validation must have completed.
                 assert validations == list("ABC")
@@ -810,6 +830,10 @@ def test_installed_probe_submits_validates_and_finalizes_exact_reports(tmp_path,
     finally:
         os.umask(previous)
     assert len(finalizations) == 1
+    assert seal_timeouts == [(
+        module.FULL_SUITE_TIMEOUT_SECONDS,
+        module.FULL_SUITE_TIMEOUT_SECONDS + module.INTERNAL_TIMEOUT_SECONDS,
+    )]
     assert result["status"]["gate_status"] == "pass"
     assert result["status"]["verdict_schema"] == 5
     summary = result["telemetry_summary"]
@@ -1386,7 +1410,7 @@ def test_installed_probe_rechecks_each_report_immediately_before_finalize(tmp_pa
     expected = "REPORT_BYTES_MISMATCH" if tamper == "digest" else "FILE_UNSAFE"
     with pytest.raises(module.ProbeFailure, match=f"^{expected}$"):
         module._create_pass_verdict(cli, repo, home, "codex")
-    assert finalizations == [True]
+    assert finalizations == []
     assert json.loads((repo / ".review/verdict.json").read_bytes())["gate"]["status"] == "in_progress"
 
 
@@ -2540,6 +2564,79 @@ def test_control_digest_mismatch_uses_stable_v2_status(tmp_path, monkeypatch):
     )
 
     assert report["status"] == "CANARY_MISMATCH"
+
+
+@pytest.mark.parametrize("code, expected", (
+    ("FINAL_VALIDATION_FAILED", "FINAL_VALIDATION_FAILED"),
+    ("EVIDENCE_TOOL_UNAVAILABLE", "EVIDENCE_TOOL_UNAVAILABLE"),
+    ("ROUND_NOT_READY", "SETUP_FAILED"),
+))
+def test_probe_runtime_preserves_validation_failure_code(tmp_path, monkeypatch, code, expected):
+    module = _load_probe_module()
+    work_dir = tmp_path / "work"
+    repo = work_dir / "repo"
+    home = work_dir / "home"
+    control_root = tmp_path / "control"
+    control_home = control_root / "home"
+    fake_bin = control_root / "fake-bin"
+    hosts_file = control_root / "hosts"
+    for path in (repo, home, control_home, fake_bin):
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    module._make_runtime_targets(control_root)
+
+    def fail_verdict(*_args):
+        raise module.ProbeFailure(code)
+
+    monkeypatch.setattr(module, "_remove_review", lambda *_args: None)
+    monkeypatch.setattr(module, "_create_pass_verdict", fail_verdict)
+    monkeypatch.setattr(module, "_run_sandboxed", lambda *_args, **_kwargs: module.ProcessResult(0, "ZERO"))
+    monkeypatch.setattr(module, "_phase_report", lambda *_args, **_kwargs: ({}, True))
+    monkeypatch.setattr(module, "_protected_digest", lambda *_args: "expected")
+
+    with pytest.raises(module.ProbeFailure, match=f"^{expected}$"):
+        module._probe_runtime(
+            "claude", executable="/usr/bin/true", auth_source="environment",
+            claude_subscription_token=None, codex_auth_fd=None, codex_hooks_fd=42,
+            caller_env={"ANTHROPIC_API_KEY": "synthetic"}, caller_home=None,
+            work_dir=work_dir, home=home, control_root=control_root,
+            control_home=control_home, repo=repo, fake_bin=fake_bin,
+            hosts_file=hosts_file, cli=tmp_path / "cli", control_sha256="expected",
+        )
+
+
+def test_probe_rejects_missing_phase_source_mutation_before_suite(tmp_path, monkeypatch):
+    module = _load_probe_module()
+    work_dir = tmp_path / "work"
+    repo = work_dir / "repo"
+    home = work_dir / "home"
+    control_root = tmp_path / "control"
+    control_home = control_root / "home"
+    fake_bin = control_root / "fake-bin"
+    hosts_file = control_root / "hosts"
+    for path in (repo, home, control_home, fake_bin):
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    (repo / "pytest.py").write_text("original\n", encoding="ascii")
+    module._make_runtime_targets(control_root)
+    called = []
+
+    def mutate_source(*_args, **_kwargs):
+        (repo / "pytest.py").write_text("malicious\n", encoding="ascii")
+        return module.ProcessResult(0, "ZERO")
+
+    monkeypatch.setattr(module, "_run_sandboxed", mutate_source)
+    monkeypatch.setattr(module, "_phase_report", lambda *_args, **_kwargs: ({}, True))
+    monkeypatch.setattr(module, "_create_pass_verdict", lambda *_args: called.append(True))
+    result = module._probe_runtime(
+        "claude", executable="/usr/bin/true", auth_source="environment",
+        claude_subscription_token=None, codex_auth_fd=None, codex_hooks_fd=42,
+        caller_env={"ANTHROPIC_API_KEY": "synthetic"}, caller_home=None,
+        work_dir=work_dir, home=home, control_root=control_root,
+        control_home=control_home, repo=repo, fake_bin=fake_bin,
+        hosts_file=hosts_file, cli=tmp_path / "cli",
+        control_sha256=module._protected_digest((control_root,)),
+    )
+    assert result["status"] == "CANARY_MISMATCH"
+    assert called == []
 
 
 def test_timeout_stop_process_group_does_not_signal_reaped_group(monkeypatch):

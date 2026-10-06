@@ -36,7 +36,8 @@ def test_disposable_installed_cli_reuse_lifecycle_and_sealed_mutation(git_repo, 
         return result
 
     (git_repo / 'package.json').write_text(json.dumps({'name': 'fixture', 'version': '1.0.0',
-        'scripts': {'typecheck': 'tsc --noEmit --project tsconfig.json'}}))
+        'scripts': {'typecheck': 'tsc --noEmit --project tsconfig.json',
+                    'test': "node -e 'console.log(42)'"}}))
     (git_repo / 'package-lock.json').write_text('{"lockfileVersion":3}')
     (git_repo / 'tsconfig.json').write_text('{"compilerOptions":{"noEmit":true}}')
     with (git_repo / '.gitignore').open('a') as file:
@@ -51,7 +52,8 @@ def test_disposable_installed_cli_reuse_lifecycle_and_sealed_mutation(git_repo, 
         '--cwd', '.', '--timeout', '15', '--', 'npm', 'run', 'typecheck')
     frozen = cli('evidence-freeze', '--base', 'master', '--receipt', captured['receipt_sha256'])
     cli('begin', '--base', 'master', '--runtime', 'codex', '--round', '1',
-        '--evidence-bundle', frozen['bundle_sha256'])
+        '--evidence-bundle', frozen['bundle_sha256'],
+        '--full-suite-kind', 'node-npm-test-v1')
     context = cli('context', '--reviewer', 'B')
     assert 'evidence' not in cli('context', '--reviewer', 'A')
     assert 'evidence' not in cli('context', '--reviewer', 'C')
@@ -92,6 +94,7 @@ def test_disposable_installed_cli_reuse_lifecycle_and_sealed_mutation(git_repo, 
         assert path.read_bytes() == raw
         assert path.stat().st_uid == os.geteuid() and stat.S_ISREG(path.lstat().st_mode)
         assert not path.is_symlink() and stat.S_IMODE(path.stat().st_mode) == 0o600
+    cli('final-validation-seal', '--timeout', '15')
     cli('finalize')
     observed = cli('telemetry-summary')['evidence']
     assert observed['reused_entry_count'] == 1

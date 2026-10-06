@@ -47,6 +47,7 @@ from pre_pr_tribunal.review_context import (
     context_sha256, current_contract_binding, reviewer_context_body,
 )
 from pre_pr_tribunal.review_store import locked_review, repository_root
+from tests.pre_pr_tribunal.validation_helpers import seal_synthetic_python_suite
 
 
 def NOW():
@@ -297,6 +298,7 @@ def test_v2_round_not_ready_and_successful_terminal_roundtrip(git_repo, sealed):
         with pytest.raises(SchemaError, match="^ROUND_NOT_READY$"):
             finalize_round(git_repo, now=NOW)
     else:
+        seal_synthetic_python_suite(git_repo)
         final = finalize_round(git_repo, now=NOW)
         assert final.schema == VERDICT_SCHEMA_VERSION and final.gate.status.value == "pass"
         assert read_verdict(git_repo) == final
@@ -2341,7 +2343,10 @@ def test_migrate_v2_pending_refuses_without_mutating_verdict_or_report(
 def test_cli_migrate_v2_pending_returns_stable_migration_projection(git_repo):
     _v2_mixed_pending(git_repo)
 
-    result = run_cli_bytes(git_repo, "migrate-v2-pending")
+    result = run_cli_bytes(
+        git_repo, "migrate-v2-pending",
+        "--full-suite-kind", "node-npm-test-v1", "--full-suite-cwd", ".",
+    )
 
     assert result.returncode == 0 and result.stderr == b""
     assert json.loads(result.stdout) == {
@@ -2349,6 +2354,10 @@ def test_cli_migrate_v2_pending_returns_stable_migration_projection(git_repo):
         "reviewers": {"A": "sealed", "B": "pending", "C": "pending"},
         "telemetry_history": "unknown",
     }
+    assert read_verdict(git_repo).validation.full_suite_recipe.kind.value == "node-npm-test-v1"
+    assert validate_stored_reviewer_report(
+        git_repo, reviewer=Reviewer.A,
+    )[0].reviewer is Reviewer.A
 
 
 def test_schema_two_parser_accepts_mixed_pending_and_sealed_slots(git_repo):
@@ -4221,7 +4230,10 @@ def test_cli_migrate_legacy_pending_reports_all_three_stable_states(git_repo):
     store_reviewer_report(git_repo, reviewer=Reviewer.A, raw=raw)
     store_reviewer_report(git_repo, reviewer=Reviewer.B, raw=b'{"schema":1')
 
-    migrated = run_cli_bytes(git_repo, "migrate-legacy-pending")
+    migrated = run_cli_bytes(
+        git_repo, "migrate-legacy-pending",
+        "--full-suite-kind", "node-npm-test-v1", "--full-suite-cwd", ".",
+    )
 
     assert migrated.returncode == 0 and migrated.stderr == b""
     assert json.loads(migrated.stdout) == {
@@ -4234,6 +4246,7 @@ def test_cli_migrate_legacy_pending_reports_all_three_stable_states(git_repo):
     }
     assert migrated.stdout.count(b"\n") == 1
     assert len(migrated.stdout) < 512
+    assert read_verdict(git_repo).validation.full_suite_recipe.kind.value == "node-npm-test-v1"
 
 
 def test_cli_status_discriminates_all_pending_v1_from_v2(git_repo):
@@ -4279,6 +4292,7 @@ def test_cli_finalize_without_paths_authenticates_all_sealed_reports(git_repo):
             git_repo, "submit-report", "--reviewer", reviewer, input=raw
         ).returncode == 0
 
+    seal_synthetic_python_suite(git_repo)
     finalized = run_cli_bytes(git_repo, "finalize")
 
     assert finalized.returncode == 0 and finalized.stderr == b""

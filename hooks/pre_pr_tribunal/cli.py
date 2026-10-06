@@ -206,8 +206,12 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         choices=("DISPATCH_FAILED", "REVIEWER_FAILED", "REVIEWER_TIMEOUT"),
     )
-    commands.add_parser("migrate-legacy-pending", add_help=False)
-    commands.add_parser("migrate-v2-pending", add_help=False)
+    for name in ("migrate-legacy-pending", "migrate-v2-pending"):
+        migration = commands.add_parser(name, add_help=False)
+        migration.add_argument(
+            "--full-suite-kind", choices=tuple(item.value for item in FullSuiteKind)
+        )
+        migration.add_argument("--full-suite-cwd")
     store = commands.add_parser("store-report", add_help=False)
     store.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     store.add_argument("--replace-pending-recovery", action="store_true")
@@ -225,6 +229,7 @@ def _parser() -> argparse.ArgumentParser:
     final_recovery = commands.add_parser("final-validation-recover", add_help=False)
     final_recovery.add_argument("--reservation-sha256", required=True)
     final_recovery.add_argument("--confirm-process-tree-stopped", action="store_true")
+    final_recovery.add_argument("--abandon-pending", action="store_true")
     commands.add_parser("status", add_help=False)
     start = commands.add_parser("telemetry-start", add_help=False)
     start.add_argument("--run-id", required=True)
@@ -638,6 +643,8 @@ def _pr_override_grant(cwd, arguments, *, wall_clock=utc_now):
             f"  verdict {binding['verdict_sha256']}\n"
             f"  round {binding['round']}  status {binding['gate']['status']}  "
             f"blockers {binding['gate']['blocking_count']}\n"
+            f"  validation {binding['validation']['phase']}  "
+            f"failure {binding['validation']['failure_code'] or 'none'}\n"
             "Type 'override' to allow one canonical PR create attempt: "
         )
         sys.stderr.flush()
@@ -886,13 +893,21 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 "last_error": slot.last_error,
             }
         elif arguments.command == "migrate-legacy-pending":
-            migrated = migrate_legacy_pending_round(cwd)
+            full_suite_kind, full_suite_cwd = _full_suite_options(arguments)
+            migrated = migrate_legacy_pending_round(
+                cwd, full_suite_kind=full_suite_kind,
+                full_suite_cwd=full_suite_cwd,
+            )
             payload = {
                 "round": migrated.round,
                 "reviewers": dict(migrated.reviewers),
             }
         elif arguments.command == "migrate-v2-pending":
-            migrated = migrate_v2_pending_round(cwd)
+            full_suite_kind, full_suite_cwd = _full_suite_options(arguments)
+            migrated = migrate_v2_pending_round(
+                cwd, full_suite_kind=full_suite_kind,
+                full_suite_cwd=full_suite_cwd,
+            )
             payload = {
                 "round": migrated.round,
                 "reviewers": dict(migrated.reviewers),
@@ -942,6 +957,7 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 cwd,
                 expected_sha256=arguments.reservation_sha256,
                 confirmed_terminal=arguments.confirm_process_tree_stopped,
+                abandon_pending=arguments.abandon_pending,
             )
         elif arguments.command == "finalize":
             supplied = {

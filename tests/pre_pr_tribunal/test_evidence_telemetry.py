@@ -1,11 +1,21 @@
 import json
 
-from pre_pr_tribunal import telemetry
-from pre_pr_tribunal.model import Reviewer
-from pre_pr_tribunal.verdict_store import submit_reviewer_report, finalize_round
+import pytest
+
+from pre_pr_tribunal import evidence_runtime, telemetry
+from pre_pr_tribunal.model import Reviewer, SchemaError
+from pre_pr_tribunal.verdict_store import (
+    final_validation_reservation_status,
+    finalize_round,
+    recover_final_validation_reservation,
+    seal_final_validation,
+    submit_reviewer_report,
+    validate_stored_reviewer_report,
+)
 from tests.pre_pr_tribunal.test_evidence_lifecycle import bundle, begin, reused, raw_report
 from tests.pre_pr_tribunal.test_evidence_runtime import node_repo
 from tests.pre_pr_tribunal.test_model_store import finding
+from tests.pre_pr_tribunal.validation_helpers import seal_synthetic_python_suite
 
 
 def observed_run(repo, verdict):
@@ -61,6 +71,35 @@ def test_evidence_usage_is_authenticated_and_claim_subset_is_separate(git_repo):
     assert result['total_command_count'] is None
 
 
+def test_abandoned_suite_keeps_sealed_reports_observable(git_repo, monkeypatch):
+    verdict = begin(git_repo)
+    run_id = observed_run(git_repo, verdict)
+    for reviewer in "ABC":
+        submit_reviewer_report(
+            git_repo, reviewer=Reviewer(reviewer),
+            raw=raw_report(verdict, reviewer),
+        )
+    monkeypatch.setattr(
+        evidence_runtime, "capture_evidence",
+        lambda *args, **kwargs: {"exit_code": 1},
+    )
+    with pytest.raises(SchemaError, match="^FINAL_VALIDATION_FAILED$"):
+        seal_final_validation(git_repo, timeout_seconds=15)
+    digest = final_validation_reservation_status(git_repo)["sha256"]
+    recover_final_validation_reservation(
+        git_repo, expected_sha256=digest, confirmed_terminal=True,
+        abandon_pending=True,
+    )
+    for reviewer in "ABC":
+        assert validate_stored_reviewer_report(
+            git_repo, reviewer=Reviewer(reviewer),
+        )[0].reviewer.value == reviewer
+    evidence = telemetry.summarize_run(git_repo, run_id=run_id)["evidence"]
+    assert evidence["status"] == "observed"
+    assert evidence["validation_phase"] == "final_validation_failed"
+    assert evidence["full_suite_fresh_execution_count"] == 0
+
+
 def test_blocker_execution_is_excluded_from_budget_telemetry(git_repo):
     verdict = begin(git_repo)
     run_id = observed_run(git_repo, verdict)
@@ -98,6 +137,7 @@ def test_claim_reuse_and_telemetry_failure_cannot_change_primary_gate(git_repo, 
     assert telemetry.summarize_run(git_repo, run_id=run_id)['evidence']['eligible_entry_count'] is None
     for reviewer in 'AC':
         submit_reviewer_report(git_repo, reviewer=Reviewer(reviewer), raw=raw_report(verdict, reviewer))
+    seal_synthetic_python_suite(git_repo)
     assert finalize_round(git_repo).gate.status.value == 'pass'
 
 

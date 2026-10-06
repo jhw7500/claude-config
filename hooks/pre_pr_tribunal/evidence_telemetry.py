@@ -53,7 +53,10 @@ def _observe(cwd, run):
                 from .validation import verify_full_suite_receipt
 
                 verify_full_suite_receipt(
-                    root, verdict, validation.full_suite_receipt_sha256
+                    root, verdict, validation.full_suite_receipt_sha256,
+                    expected_success=(
+                        validation.phase is not model.ValidationPhase.FINAL_VALIDATION_FAILED
+                    ),
                 )
         if verdict.evidence_binding is not None:
             started = time.monotonic_ns()

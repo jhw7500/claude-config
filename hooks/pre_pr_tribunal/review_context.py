@@ -16,6 +16,7 @@ from .model import (
     REPORT_TEXT_CONTRACT_VERSION,
     REVIEWER_B_NATIVE_TOOL_CALL_BUDGET_CONTRACT_VERSION,
     FULL_SUITE_RECIPE_CONTRACT_VERSION,
+    FINAL_VALIDATION_OUTCOME_CONTRACT_VERSION,
     VALIDATION_PHASE_CONTRACT_VERSION,
     VERDICT_SCHEMA_VERSION,
     ContractBinding,
@@ -128,13 +129,30 @@ def reviewer_context_body(verdict: Verdict, reviewer: Reviewer) -> dict[str, obj
                     "planned": ["finding_reproduction", "direct_impact_tests"],
                     "full_suite": "deferred_until_provisional_pass",
                 }
+            elif verdict.validation.phase is ValidationPhase.FINAL_VALIDATION_FAILED:
+                validation_body = {
+                    "phase": "final_validation_failed",
+                    "planned": [],
+                    "full_suite": "failed",
+                }
             else:
+                pending_owned_suite = (
+                    verdict.contract.report_text
+                    >= FINAL_VALIDATION_OUTCOME_CONTRACT_VERSION
+                    and verdict.validation.requires_full_suite
+                    and verdict.validation.full_suite_receipt_sha256 is None
+                )
                 validation_body = {
                     "phase": "final_validation",
-                    "planned": ["full_suite"],
+                    "planned": (
+                        ["finding_reproduction", "direct_impact_tests"]
+                        if pending_owned_suite else ["full_suite"]
+                    ),
                     "full_suite": (
                         "receipt_sealed"
                         if verdict.validation.full_suite_receipt_sha256 is not None
+                        else "deferred_until_provisional_pass"
+                        if pending_owned_suite
                         else "initial_round"
                     ),
                 }

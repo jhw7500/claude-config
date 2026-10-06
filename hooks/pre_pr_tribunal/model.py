@@ -34,12 +34,13 @@ SUPPORTED_VERDICT_SCHEMAS = frozenset(
     (SCHEMA_VERSION, *MIXED_SLOT_VERDICT_SCHEMAS)
 )
 RECEIPT_PROVENANCE = frozenset(("native_submit", "legacy_telemetry_v1"))
-REPORT_TEXT_CONTRACT_VERSION = 10
+REPORT_TEXT_CONTRACT_VERSION = 11
 REFUTED_CLAIM_BLOCKER_CONTRACT_VERSION = 5
 REVIEWER_B_BUDGET_CONTRACT_VERSION = 7
 REVIEWER_B_NATIVE_TOOL_CALL_BUDGET_CONTRACT_VERSION = 8
 VALIDATION_PHASE_CONTRACT_VERSION = 9
 FULL_SUITE_RECIPE_CONTRACT_VERSION = 10
+FINAL_VALIDATION_OUTCOME_CONTRACT_VERSION = 11
 REVERSAL_COST_CONTRACT_VERSION = 6
 REQUIRED_REVERSAL_COST_CONTRACT_VERSION = 7
 MAX_VERDICT_BYTES = 256 * 1024
@@ -53,6 +54,7 @@ MAX_EXECUTIONS_PER_REVIEWER = 128
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LIFECYCLE_ID = re.compile(r"[0-9a-f]{32}\Z")
+_VALIDATION_FAILURE_CODE = re.compile(r"[A-Z][A-Z0-9_]{2,127}\Z")
 _FINDING_ID = re.compile(r"([ABC])-R([1-3])-([0-9]{3})\Z")
 _EXECUTION_ID = re.compile(r"([ABC])-R([1-3])-E([0-9]{3})\Z")
 _DECISION_EXECUTION_ID = re.compile(r"D-R([1-3])-E([0-9]{3})\Z")
@@ -112,6 +114,7 @@ class ReviewMode(str, Enum):
 class ValidationPhase(str, Enum):
     FIX_VERIFICATION = "fix_verification"
     FINAL_VALIDATION = "final_validation"
+    FINAL_VALIDATION_FAILED = "final_validation_failed"
 
 
 class FullSuiteKind(str, Enum):
@@ -709,6 +712,7 @@ class ValidationBinding:
     full_suite_receipt_sha256: str | None = None
     escalation_reason: str | None = None
     full_suite_recipe: FullSuiteRecipe | None = None
+    failure_code: str | None = None
 
     def to_json(self) -> dict[str, object]:
         if (
@@ -728,17 +732,36 @@ class ValidationBinding:
             reason = _text(reason, 1024)
             if not reason.strip() or _SECRET.search(reason) or _contains_home_path(reason):
                 raise SchemaError("VALIDATION_BINDING_INVALID")
+        failure_code = self.failure_code
+        if failure_code is not None and (
+            not isinstance(failure_code, str)
+            or _VALIDATION_FAILURE_CODE.fullmatch(failure_code) is None
+        ):
+            raise SchemaError("VALIDATION_BINDING_INVALID")
         if self.phase is ValidationPhase.FIX_VERIFICATION:
             if (
                 not self.requires_full_suite
                 or self.full_suite_receipt_sha256 is not None
-                or reason is not None
+                or failure_code is not None
             ):
                 raise SchemaError("VALIDATION_BINDING_INVALID")
-        elif self.requires_full_suite:
-            if self.full_suite_receipt_sha256 is None:
+        elif self.phase is ValidationPhase.FINAL_VALIDATION_FAILED:
+            if not self.requires_full_suite or not (
+                (
+                    failure_code == "FINAL_VALIDATION_FAILED"
+                    and self.full_suite_receipt_sha256 is not None
+                )
+                or (
+                    failure_code == "FINAL_VALIDATION_INTERRUPTED"
+                    and self.full_suite_receipt_sha256 is None
+                )
+            ):
                 raise SchemaError("VALIDATION_BINDING_INVALID")
-        elif self.full_suite_receipt_sha256 is not None or reason is not None:
+        elif failure_code is not None:
+            raise SchemaError("VALIDATION_BINDING_INVALID")
+        elif not self.requires_full_suite and (
+            self.full_suite_receipt_sha256 is not None or reason is not None
+        ):
             raise SchemaError("VALIDATION_BINDING_INVALID")
         recipe = self.full_suite_recipe
         if recipe is not None:
@@ -751,11 +774,20 @@ class ValidationBinding:
             "full_suite_receipt_sha256": self.full_suite_receipt_sha256,
             "escalation_reason": reason,
             "full_suite_recipe": recipe.to_json() if recipe is not None else None,
+            "failure_code": failure_code,
         }
 
 
-def initial_validation_binding() -> ValidationBinding:
-    return ValidationBinding(ValidationPhase.FINAL_VALIDATION, False)
+def initial_validation_binding(
+    *,
+    full_suite_kind: FullSuiteKind | str = FullSuiteKind.PYTHON_PYTEST,
+    full_suite_cwd: str = ".",
+) -> ValidationBinding:
+    return ValidationBinding(
+        ValidationPhase.FINAL_VALIDATION,
+        True,
+        full_suite_recipe=full_suite_recipe(full_suite_kind, full_suite_cwd),
+    )
 
 
 def followup_validation_binding(

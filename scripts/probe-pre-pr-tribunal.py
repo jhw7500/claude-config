@@ -25,6 +25,7 @@ from typing import Callable, Mapping, Sequence
 SCHEMA_VERSION = 2
 RUNTIME_TIMEOUT_SECONDS = 120.0
 INTERNAL_TIMEOUT_SECONDS = 30.0
+FULL_SUITE_TIMEOUT_SECONDS = 60.0
 HOOK_OUTPUT_LIMIT_BYTES = 64 * 1024
 # Control sources are hashed under their own bounded budget, not the hook I/O budget.
 CONTROL_FILE_LIMIT_BYTES = 256 * 1024
@@ -1290,7 +1291,7 @@ def _create_probe_repo(repo: Path, home: Path) -> None:
         "origin",
         "https://github.com/probe/pre-pr-tribunal.git",
     )
-    _write(repo / ".gitignore", ".review/\n", 0o600)
+    _write(repo / ".gitignore", ".review/\n__pycache__/\n", 0o600)
     _write(
         repo / ".pre-pr-tribunal.toml",
         '[policy]\n"**" = "iterative"\n'
@@ -1298,6 +1299,18 @@ def _create_probe_repo(repo: Path, home: Path) -> None:
         0o600,
     )
     _write(repo / "tracked.txt", "base\n", 0o600)
+    # The disposable repo owns its one-test suite, so the fixed pytest command
+    # works with the same system Python inside and outside the runtime sandbox.
+    _write(
+        repo / "pytest.py",
+        "from pathlib import Path\nimport unittest\n\n"
+        "class ProbeSuite(unittest.TestCase):\n"
+        "    def test_feature(self):\n"
+        "        self.assertEqual(Path('tracked.txt').read_text(), 'base\\nfeature\\n')\n\n"
+        "if __name__ == '__main__':\n"
+        "    unittest.main()\n",
+        0o600,
+    )
     _git(
         repo,
         home,
@@ -1305,6 +1318,7 @@ def _create_probe_repo(repo: Path, home: Path) -> None:
         ".gitignore",
         ".pre-pr-tribunal.toml",
         "tracked.txt",
+        "pytest.py",
     )
     _git(repo, home, "commit", "-qm", "base")
     _git(repo, home, "update-ref", "refs/remotes/origin/master", "HEAD")
@@ -1348,14 +1362,15 @@ def _remove_review(repo: Path) -> None:
 
 
 def _tribunal_cli(
-    cli: Path, repo: Path, home: Path, *arguments: str, raw: bytes = b""
+    cli: Path, repo: Path, home: Path, *arguments: str, raw: bytes = b"",
+    timeout_seconds: float = INTERNAL_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     """Use the installed CLI, preserving stdin bytes and bounded domain failures."""
     try:
         result = subprocess.run(
             [sys.executable, str(cli), *arguments], cwd=repo,
             env=_internal_env(home), input=raw, capture_output=True,
-            timeout=INTERNAL_TIMEOUT_SECONDS, check=False,
+            timeout=timeout_seconds, check=False,
         )
         if len(result.stdout) > HOOK_OUTPUT_LIMIT_BYTES or len(result.stderr) > 128:
             raise ProbeFailure("SETUP_FAILED")
@@ -1630,6 +1645,28 @@ def _create_pass_verdict(
             ))
             if valid.get("raw_sha256") != expected_digest:
                 raise ProbeFailure("REPORT_BYTES_MISMATCH")
+        validation = current.get("validation")
+        if (
+            isinstance(validation, dict)
+            and validation.get("requires_full_suite") is True
+            and validation.get("full_suite_receipt_sha256") is None
+        ):
+            try:
+                sealed = _tribunal_cli(
+                    cli, repo, home, "final-validation-seal", "--timeout",
+                    str(FULL_SUITE_TIMEOUT_SECONDS),
+                    timeout_seconds=FULL_SUITE_TIMEOUT_SECONDS + INTERNAL_TIMEOUT_SECONDS,
+                )
+            except ProbeFailure as error:
+                # A blocker makes the full suite inapplicable; the terminal FAIL
+                # still needs to be recorded by finalize.
+                if error.code != "FINAL_VALIDATION_NOT_READY":
+                    raise
+            else:
+                if not isinstance(sealed.get("validation"), dict) or not sealed[
+                    "validation"
+                ].get("full_suite_receipt_sha256"):
+                    raise ProbeFailure("FINAL_VALIDATION_RECEIPT_INVALID")
         return _tribunal_cli(cli, repo, home, "finalize")
 
     if failure is None:
@@ -2039,15 +2076,26 @@ def _probe_runtime(
 ) -> dict[str, object]:
     phase_results: dict[str, dict[str, object]] = {}
     runtime_mount = _runtime_mount(control_root, runtime, Path(executable))
+    repo_digest: str | None = None
     for phase, expected_hook, expected_gh_calls in (
         ("missing", "DENY", 0),
         ("pass", "ALLOW", 1),
     ):
+        if phase == "pass":
+            try:
+                if _protected_digest((repo,)) != repo_digest:
+                    return {"status": "CANARY_MISMATCH", **phase_results}
+            except ProbeFailure:
+                return {"status": "CANARY_MISMATCH", **phase_results}
         _remove_review(repo)
+        if phase == "missing":
+            repo_digest = _protected_digest((repo,))
         if phase == "pass":
             try:
                 _create_pass_verdict(cli, repo, home, runtime)
-            except ProbeFailure:
+            except ProbeFailure as error:
+                if error.code.startswith(("FINAL_VALIDATION_", "EVIDENCE_")):
+                    raise
                 raise ProbeFailure("SETUP_FAILED") from None
         evidence_dir, hook_log, gh_log = _make_phase_logs(
             work_dir, runtime, phase

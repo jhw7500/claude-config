@@ -24,6 +24,7 @@ from .model import (
     ReviewMode,
     SchemaError,
     TribunalError,
+    ValidationPhase,
 )
 from .review_context import current_contract_binding
 from .shell_scan import ScanKind, is_target_environment_name, scan_pr_create
@@ -301,8 +302,30 @@ def _evaluate_direct_pr_create(
                 return _decision(True, GateCode.VERDICT_INVALID)
         except Exception:
             return _decision(True, GateCode.VERDICT_INVALID)
+    if (
+        verdict.validation is not None
+        and verdict.validation.requires_full_suite
+        and verdict.validation.full_suite_receipt_sha256 is not None
+    ):
+        from .validation import verify_full_suite_receipt
+
+        try:
+            verify_full_suite_receipt(
+                root, verdict, verdict.validation.full_suite_receipt_sha256,
+                expected_success=(
+                    verdict.validation.phase
+                    is not ValidationPhase.FINAL_VALIDATION_FAILED
+                ),
+            )
+        except SchemaError:
+            return _decision(True, GateCode.VERDICT_INVALID)
     if verdict.gate.status is GateStatus.FAIL:
         if verdict.gate.blocking_count <= 0:
+            if (
+                verdict.validation is not None
+                and verdict.validation.phase is ValidationPhase.FINAL_VALIDATION_FAILED
+            ):
+                return _decision(True, GateCode.VERIFICATION_INCOMPLETE)
             return _decision(True, GateCode.VERDICT_INVALID)
         if verdict.round == 3:
             try:

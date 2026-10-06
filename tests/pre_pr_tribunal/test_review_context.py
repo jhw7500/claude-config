@@ -190,9 +190,9 @@ def test_contract_eight_context_omits_contract_nine_validation_phase(git_repo):
 
     assert reviewer_context_body(pending, Reviewer.B)["validation"] == {
         "phase": "final_validation",
-        "planned": ["full_suite"],
-        "full_suite": "initial_round",
-        "full_suite_recipe": None,
+        "planned": ["finding_reproduction", "direct_impact_tests"],
+        "full_suite": "deferred_until_provisional_pass",
+        "full_suite_recipe": pending.validation.full_suite_recipe.to_json(),
     }
     assert "validation" not in reviewer_context_body(historical, Reviewer.B)
 

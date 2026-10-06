@@ -22,6 +22,7 @@ from pre_pr_tribunal.telemetry import (
     summarize_run,
 )
 from pre_pr_tribunal import telemetry as telemetry_module
+from tests.pre_pr_tribunal.validation_helpers import seal_synthetic_python_suite
 
 
 def NOW():
@@ -474,6 +475,8 @@ def test_telemetry_cannot_alter_tribunal_result(git_repo, tmp_path, monkeypatch,
                 )
                 path = repo / f".review/inbox/round-1/{reviewer}.json"
             report_bytes[reviewer] = path.read_bytes()
+        if not invalid_report:
+            seal_synthetic_python_suite(repo)
         finalized = command(repo, ("finalize",))
         gates = []
         for adapter_name in ("codex_hook.py", "claude_hook.py"):

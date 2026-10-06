@@ -662,6 +662,7 @@ def test_report_reference_documents_internal_v5_lifecycle_identity():
         'full_suite_receipt_sha256': None,
         'escalation_reason': None,
         'full_suite_recipe': full_suite_recipe().to_json(),
+        'failure_code': None,
     }
     assert re.fullmatch(r"[0-9a-f]{32}", stored_verdict["lifecycle_id"])
 
@@ -680,6 +681,7 @@ def test_skill_documents_the_two_phase_validation_contract():
         ):
             assert token in body
     assert "finding-reproduction" in skill
+    assert "--abandon-pending" in skill
     assert "direct-impact" in skill
     assert "full suite" in skill
     assert "phase" in skill and "planned targeted/full validation" in skill

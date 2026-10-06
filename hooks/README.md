@@ -185,6 +185,7 @@ Relayed grant는 기존 intensity grant와 마찬가지로 policy-following agen
 
 `status`가 `in_progress`를 반환하면 `verdict_schema`를 먼저 확인한다. Native v2에서는
 `reviewers.A|B|C.state`의 `pending` role만 복구하고 `sealed` role은 다시 실행하거나 교체하지 않는다.
+v1/v2 migration은 `--full-suite-kind`와 `--full-suite-cwd`로 실제 저장소의 suite를 결속한다. 생략하면 Python pytest/`.`가 기본이므로 Node 저장소는 명시적으로 Node recipe와 package cwd를 지정한다.
 v1이면 reviewer subset 없이 `migrate-legacy-pending`을 한 번 실행한 뒤 `status`를 다시 읽는다. Legacy
 raw/context digest로 native receipt provenance를 증명할 수 없으면 migration은 기존 raw evidence를 안전하게
 보존하면서 `LEGACY_PROVENANCE_UNAVAILABLE` 같은 이유로 모든 해당 slot을 pending으로 둔다. v1 A/B를
@@ -223,18 +224,19 @@ controller-created view. A verified terminal exact-view cleanup refusal and tele
 warnings, not verdict gates; uncertain liveness, view identity, ownership, bytes, digest, snapshot, or contract are
 integrity stops. Never use force cleanup or delete a non-empty view root.
 
-Current status also exposes the machine-bound validation phase and canonical full-suite recipe. A follow-up lifecycle
+Current status also exposes the machine-bound validation phase and canonical full-suite recipe. The initial lifecycle
+requires one controller-owned successful suite receipt before PASS; a follow-up lifecycle
 binds `--full-suite-kind` and `--full-suite-cwd` through re-review preview, grant, and begin, then starts in
 `fix_verification`: announce the planned finding-reproduction and direct-impact commands, defer the bound suite, and
 stop or escalate on a bounded reason. Reviewer B authenticates and reuses eligible selected evidence before running
-missing focused commands; a report that records the recipe's canonical command in this phase is rejected. After sealed
+missing focused commands; a report that records the recipe's canonical command or a recognized whole-suite equivalent in this phase is rejected with retained retry evidence. After sealed
 reports imply provisional PASS, run `final-validation-seal --timeout SECONDS`; it owns the exact recipe profile/cwd/argv
 execution and seals only the fresh receipt returned by that process. It accepts no caller-supplied receipt, so a no-op,
 targeted command, relabeled receipt, or recipe mismatch cannot seal PASS. A non-pass provisional result does not run the suite unless a cross-domain, build/runtime
 configuration, dependency, permission, or nondeterministic-failure impact is recorded with `--escalation-reason`.
 The seal is immutable and `finalize` reauthenticates its HEAD, diff, contract, recipe, environment, capture, freshness,
 and zero exit immediately before PASS.
-The command reserves final validation before starting the suite; a competing caller gets `FINAL_VALIDATION_RESERVED` before capture. A failed or interrupted attempt retains its private reservation. After an explicit operator check that the original process tree has stopped, `final-validation-reservation-status` shows its digest and `final-validation-recover --reservation-sha256 DIGEST --confirm-process-tree-stopped` archives it. Recovery never infers child termination from a free file lock.
+The command preflights the recipe before reservation and rejects competing callers before capture. An authenticated nonzero suite receipt immediately closes the round as `final_validation_failed`/FAIL so a new approved fix/review can start. An interrupted attempt without an authenticated receipt retains its private reservation. After an explicit operator check that the original process tree has stopped, `final-validation-reservation-status` shows its digest and `final-validation-recover --reservation-sha256 DIGEST --confirm-process-tree-stopped` archives it. If the pending snapshot or contract changed, recovery requires the separately approved `--abandon-pending` option, which closes only the old round as FAIL. Recovery never infers child termination from a free file lock.
 
 Before pathless `finalize`, require `status` to show all A/B/C slots sealed. Re-run three separate stored validations,
 compare every digest to its receipt, and immediately recheck all report paths for current-user ownership, regular
