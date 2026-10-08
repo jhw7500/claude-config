@@ -2,12 +2,13 @@
 
 ## Question
 
-Does the Reviewer B budget (report contract 7 budget caps plus the contract 8
-native-call self-budget) reduce Reviewer B cost relative to the last
-pre-budget contract, on the same snapshot, runtime, and model, without losing
-the high-risk blocker? This is the comparison that
-`2026-10-02-reviewer-b-budget-pilot.md` requires before axis A of #114 can be
-called complete.
+Does the revised Reviewer B budget (budget contract 7 counting rules plus the
+contract 8 native-call self-budget) reduce Reviewer B cost relative to the
+first pilot budget (budget contract 6), on the same snapshot, runtime, and
+model, without losing the high-risk blocker? This is the matched-snapshot
+current-contract comparison that `2026-10-02-reviewer-b-budget-pilot.md`
+requires before axis A of #114 can be called complete. Both arms carry a
+budget; no budget-free control was run.
 
 ## Setup
 
@@ -18,9 +19,16 @@ called complete.
   (recomputed locally and by both runtimes' `policy-preview`). Default policy:
   floor 100, iterative, reviewers A (opus) and B (sonnet).
 - Control arm C6: runtime `44d7a399a6c11ab8f77d0c97bb6c7a26e9c823ad`
-  (`REPORT_TEXT_CONTRACT_VERSION = 6`, no budget).
+  (report contract 6, budget contract 6). This is the first pilot budget, which
+  replaced report contract 5 in `c436881` (an ancestor of this runtime; the
+  same change is `c98b525` on master). Its high-risk profile allows 16 verified
+  (supported or refuted) claims and 12 fresh executions, with a 480-second soft
+  stop and a 600-second self-enforced report deadline; C6-1's projected
+  `review_budget` carried these values.
 - Treatment arm C11: runtime `d9b0f123b90df1bc3738d9f49242a5e4ea0bbcb3`
-  (report contract 11, budget contract 7, native-call budget contract 8).
+  (report contract 11, budget contract 7, native-call budget contract 8). Its
+  high-risk profile allows 16 supported claims, 12 fresh non-blocker executions,
+  and 40 top-level native tool calls, with the same time limits.
 - Each runtime was exported with `git archive` and installed with
   `scripts/install-pre-pr-tribunal.py` into a fresh temporary HOME. A digest of
   the real HOME's tribunal surfaces (`.claude/settings.json`,
@@ -32,7 +40,7 @@ called complete.
   and report schema (passed by absolute path and SHA-256), and no evidence
   bundle. Runs were sequential and interleaved: C6-1, C11-1, C6-2, C11-2, then
   one full A+B round on C11. All runs happened on 2026-10-07 between 07:44Z and
-  08:11Z.
+  08:10Z.
 
 ## Metrics
 
@@ -56,7 +64,8 @@ used for these Claude runs.
 Means: C6 207859.5 ms, 11.5 tool calls, 106090 tokens; C11 223903 ms, 13 tool
 calls, 114076 tokens. C11 is higher by 7.7% (duration), 13.0% (tool calls), and
 7.5% (tokens). The pre-registered reduction rule (both C11 runs below the C6
-minimum on at least two of the three metrics) is not met.
+minimum on at least two of the three metrics, with the canary holding in all
+four runs) is not met: no C11 run is below the C6 minimum on any metric.
 
 ## Results: full A+B round on C11
 
@@ -103,16 +112,23 @@ six planted violations produced six flags and did not flag a read-only
 
 No reduction was measured. On this snapshot B used three or four claims, three
 to five executions, and about 3.5 minutes under both contracts, far below the
-high-risk caps (16 supported claims, 12 fresh executions, 600 s). The caps never
-bound, so this snapshot cannot show a budget saving; "no reduction" here means
-the measurement could not answer the question, not that the budget is
-ineffective. The C11 increase is consistent with its one or two extra executions;
-with n = 2 per arm it may be within run-to-run variation.
+high-risk caps both arms carry (16 claims, 12 fresh executions, 600 s). The caps
+never bound, so this snapshot cannot show what the contract 7/8 revision saves;
+"no reduction" here means the measurement could not answer the question, not
+that the revision is ineffective. The C11 increase is consistent with its one or
+two extra executions; with n = 2 per arm it may be within run-to-run variation.
+
+Because both arms carry a budget, this comparison says nothing about the effect
+of introducing a budget at all. That would need a report contract 5 control from
+before the budget pilot.
 
 The historical #125 observation (15 claims, 17 executions, about 30 minutes)
-came from a different runtime and contract and is not comparable as a speedup
-claim. C6 already ran in about 3.5 minutes here, so most of the difference from
-that observation is not attributable to the contract 7/8 budget (inference).
+predates the budget pilot: #114's body was last edited on 2026-09-30, and the
+budget arrived on 2026-10-02. It also came from a different snapshot, so it is
+not comparable as a speedup claim. C6 already ran in about 3.5 minutes here, so
+most of the difference from that observation is not attributable to the
+contract 7/8 revision (inference); how much of it comes from the contract 6
+budget instructions is unmeasured.
 
 ## Status against the pilot criterion
 
@@ -120,13 +136,14 @@ Done: matched-snapshot current-contract comparison, audited command trace,
 high-risk blocker, full-diff binding, and recorded reviewer calls, tokens, and
 elapsed time. Not met: #114's condition that a reduction be measured on a
 representative case; the measured result is no reduction on a snapshot where
-the caps do not bind. A follow-up needs either a snapshot on which pre-budget B
-exceeds the caps, or a decision to treat the budget as a ceiling rather than a
-cost reducer.
+the caps do not bind. A follow-up needs either a snapshot on which B reaches the
+caps (with a report contract 5 control if the budget itself is to be measured),
+or a decision to treat the budget as a ceiling rather than a cost reducer.
 
 ## Limitations
 
 - n = 2 per arm, one snapshot, Claude runtime only.
+- No budget-free control: both arms carry a Reviewer B budget.
 - Usage figures are harness-reported observations, not gate evidence.
 - The blocker depends on live advisory data.
 - The measured runtimes are exported installs, not the live pin
