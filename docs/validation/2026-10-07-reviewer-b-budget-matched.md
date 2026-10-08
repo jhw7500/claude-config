@@ -4,11 +4,17 @@
 
 Does the revised Reviewer B budget (budget contract 7 counting rules plus the
 contract 8 native-call self-budget) reduce Reviewer B cost relative to the
-first pilot budget (budget contract 6), on the same snapshot, runtime, and
-model, without losing the high-risk blocker? This is the matched-snapshot
-current-contract comparison that `2026-10-02-reviewer-b-budget-pilot.md`
-requires before axis A of #114 can be called complete. Both arms carry a
-budget; no budget-free control was run.
+first pilot budget (budget contract 6), on the same snapshot, controller
+(Claude Code), and reviewer model, without losing the high-risk blocker? This is
+the matched-snapshot current-contract comparison that
+`2026-10-02-reviewer-b-budget-pilot.md` requires before axis A of #114 can be
+called complete. Both arms carry a budget; no budget-free control was run.
+
+The two arms are different Tribunal runtimes, not one runtime with only the
+budget varied. Besides budget contracts 7 and 8, report contracts 9 to 11 add a
+validation-phase projection (`validation.phase`, `validation.full_suite_recipe`)
+to Reviewer B's instructions and report schema. A cost difference between the
+arms therefore cannot be attributed to contracts 7/8 alone.
 
 ## Setup
 
@@ -144,6 +150,9 @@ or a decision to treat the budget as a ceiling rather than a cost reducer.
 
 - n = 2 per arm, one snapshot, Claude runtime only.
 - No budget-free control: both arms carry a Reviewer B budget.
+- Different Tribunal runtimes: the arms also differ in non-budget Reviewer B
+  instructions (the report contract 9 to 11 validation phase), so the comparison
+  does not isolate the budget revision.
 - Usage figures are harness-reported observations, not gate evidence.
 - The blocker depends on live advisory data.
 - The measured runtimes are exported installs, not the live pin
