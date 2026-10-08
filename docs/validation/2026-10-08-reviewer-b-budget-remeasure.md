@@ -85,11 +85,13 @@ C11 221656 ms, 11, 111485.
 Under the Claude controller with B = sonnet, Reviewer B stays small on this
 snapshot even with no budget: C5 used 3 to 4 claims and 3 to 4 executions. The
 historical 15 claims and 17 executions on the same snapshot came from a Codex
-controller with `gpt-5.6-sol` reviewers and an older runtime, so that size is
-more likely a property of controller and model than of the contract
-(inference; this measurement does not separate those factors). In this
-setting the caps have nothing to cut, so no budget saving can be shown, and
-the budget acts only as an unexercised ceiling.
+controller with `gpt-5.6-sol` reviewers and an older Tribunal runtime
+(`dbffdcb`; 17 commits between it and `fddfbd3` change the Reviewer B role
+reference or the report schema). Because C5 has no budget, the smaller size
+is not caused by a budget, but this measurement changes controller, model, and
+runtime instructions at once, so it cannot tell which of them explains the
+difference. In this setting the caps have nothing to cut, so no budget saving
+can be shown, and the budget acts only as an unexercised ceiling.
 
 Tokens were 108.9k to 113.6k in all six runs, which suggests that fixed reading
 cost (role reference, schema, context) dominates B's token use here

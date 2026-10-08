@@ -138,8 +138,9 @@ differs in snapshot, controller, and model, so it is not comparable as a
 speedup claim. The 2026-10-08 re-measurement on `513033f`
 (`2026-10-08-reviewer-b-budget-remeasure.md`) found that even report contract 5,
 which has no budget, stays at 3 to 4 claims under the Claude controller, so the
-difference is more likely due to controller and model than to any budget
-contract (inference).
+difference is not caused by a budget contract. Whether it comes from the
+controller, the model, or Reviewer B instruction changes between the runtimes
+is not determined.
 
 ## Status against the pilot criterion
 
