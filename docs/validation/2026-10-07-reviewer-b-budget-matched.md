@@ -128,13 +128,19 @@ Because both arms carry a budget, this comparison says nothing about the effect
 of introducing a budget at all. That would need a report contract 5 control from
 before the budget pilot.
 
-The historical #125 observation (15 claims, 17 executions, about 30 minutes)
-predates the budget pilot: #114's body was last edited on 2026-09-30, and the
-budget arrived on 2026-10-02. It also came from a different snapshot, so it is
-not comparable as a speedup claim. C6 already ran in about 3.5 minutes here, so
-most of the difference from that observation is not attributable to the
-contract 7/8 revision (inference); how much of it comes from the contract 6
-budget instructions is unmeasured.
+The historical #125 observation recorded in #114 (15 claims, 17 executions,
+"about 30 minutes") came from a 2026-09-07 round on head `513033f`, an earlier
+head of the same #125 work, with a Codex controller and `gpt-5.6-sol`
+reviewers. Reviewer B's elapsed time in that Codex transcript was 1,230,172 ms
+(about 20.5 minutes); the 30 minutes was the round from `begin` to the first
+`finalize` attempt. The observation predates the budget pilot (2026-10-02) and
+differs in snapshot, controller, and model, so it is not comparable as a
+speedup claim. The 2026-10-08 re-measurement on `513033f`
+(`2026-10-08-reviewer-b-budget-remeasure.md`) found that even report contract 5,
+which has no budget, stays at 3 to 4 claims under the Claude controller, so the
+difference is not caused by a budget contract. Whether it comes from the
+controller, the model, or Reviewer B instruction changes between the runtimes
+is not determined.
 
 ## Status against the pilot criterion
 
