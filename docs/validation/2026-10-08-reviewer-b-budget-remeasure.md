@@ -43,6 +43,10 @@ reduce Reviewer B cost.
   both are above the X maximum on at least two; otherwise no conclusion.
 - A C6 or C11 run "reaches a cap" if it has 16 supported claims, 12 fresh
   executions, any `BUDGET_EXHAUSTED` claim, or at least 600 seconds.
+  Correction after review: C6 counts verified (supported or refuted) claims
+  toward its 16-claim cap, while C11 counts only supported claims, so the
+  claim cap should be read per arm. The result does not change: each C6 run
+  had 3 verified claims and each C11 run had 3 supported claims.
 - Blocker preservation applies only if both C5 runs report a HIGH or CRITICAL
   finding backed by a refuted claim.
 
