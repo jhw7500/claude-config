@@ -448,6 +448,10 @@ Tribunal을 실행한다면 policy-preview 뒤 활성 reviewer·intensity/mode·
 60초 이내 간격으로 알리고, 취소 요청 시 신규 작업을 시작하지 않은 채 진행 중인 reviewer의
 상태와 증거를 보존한다.
 
+**아래 단락은 claude-config PR #190이 도입한 report contract 9~11 흐름이다.** contract 11 도입은
+보류됐다(claude-config #196). 설치본 `~/.claude/skills/pre-pr-tribunal/SKILL.md`에
+`final-validation-seal`이 없으면(`grep -c final-validation-seal ~/.claude/skills/pre-pr-tribunal/SKILL.md`가
+0) 아래 단계는 설치본에 존재하지 않으므로 이 단락을 건너뛰고 설치본 SKILL.md를 따른다.
 최초 라운드도 PASS 전에 controller-owned 전체 suite 성공 receipt를 요구한다. 후속 라운드는 re-review preview/grant/begin에 동일하게 전달한 `--full-suite-kind`와
 `--full-suite-cwd`를 결속하고 machine-readable `fix_verification`으로 시작한다. 상태 보고에는 phase,
 재현·직접 영향 검증 명령, exact full-suite recipe, 유예, 중단·escalation 조건을 포함한다. Reviewer B는
@@ -503,6 +507,13 @@ reason으로 남긴다. `finalize`는 이 receipt, recipe, 환경을 다시 인�
    지적을 먼저 다 모으고(PR을 이미 열었다면 PR 리뷰 결과까지), 한 번에 고친 뒤 lifecycle 한 번으로
    재심사한다. 리뷰 강도를 낮추는 것으로 이 비용을 대신 줄이지 않는다 — `single`도 리뷰어 집합은
    같고, `off`는 심사를 생략하는 것이다.
+
+7. **같은 브랜치에서 FAIL이 이어지면 재심사를 제안하기 전에 범위부터 다시 본다.** FAIL 뒤의
+   재심사도 다음 라운드든 새 lifecycle이든 `base..HEAD` 전체를 다시 심사한다(1번). blocker를 하나
+   고칠 때마다 다시 올리면 그 횟수만큼 전패널 리뷰가 반복된다. 그래서 같은 브랜치에서 FAIL이 두 번
+   이어지면, 다음 재심사를 제안하기 전에 사용자에게 두 가지 중 하나를 먼저 제안한다 — 남은 blocker를
+   모두 재현해 한 번에 고칠지, 통과 가능한 단위로 나눌지(3번). 리뷰 강도를 낮추는 것은 이 선택지에
+   넣지 않는다(6번과 같다).
 
 **적용 안 함**: **실제로 resolve 해 본 floor가 0인** 변경, 게이트가 없는 저장소, 나눌 수 없는
 원자적 변경(스키마 마이그레이션 등) — 뒤 두 경우는 큰 단위임을 인지하고 라운드 예산을 미리 계획한다.
