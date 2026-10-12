@@ -71,7 +71,6 @@ PACKAGE_NAMES = (
     "round_grant.py",
     "shell_scan.py",
     "telemetry.py",
-    "validation.py",
     "verdict_store.py",
 )
 CLAUDE_MATCHER = "Bash"

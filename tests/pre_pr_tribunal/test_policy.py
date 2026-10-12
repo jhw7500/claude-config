@@ -26,7 +26,6 @@ from pre_pr_tribunal.verdict_store import (
     finalize_round,
     submit_reviewer_report,
 )
-from tests.pre_pr_tribunal.validation_helpers import seal_synthetic_python_suite
 
 
 def NOW():
@@ -128,7 +127,7 @@ def _execution(identifier):
     stdout = "ok"
     return {
         "id": identifier,
-        "command": "python3 -m pytest -q tests/test_direct_impact.py",
+        "command": "python3 -m pytest -q",
         "exit_code": 0,
         "stdout_excerpt": stdout,
         "stderr_excerpt": "",
@@ -157,7 +156,6 @@ def _seal_empty(repo, verdict):
         submit_reviewer_report(
             repo, reviewer=Reviewer(key), raw=_report(verdict, key), now=NOW
         )
-    seal_synthetic_python_suite(repo)
 
 
 def _authorize_next_round(
@@ -1202,7 +1200,6 @@ def test_pr_appendix_contains_only_nonblocking_findings(tmp_path):
     submit_reviewer_report(
         repo, reviewer=Reviewer.B, raw=_report(verdict, "B"), now=NOW
     )
-    seal_synthetic_python_suite(repo)
     final = finalize_round(repo, now=NOW)
     status = _status(final)
     assert final.gate.status is GateStatus.PASS
@@ -1231,7 +1228,6 @@ def test_pr_appendix_is_visibly_truncated_before_byte_limit(tmp_path):
     submit_reviewer_report(
         repo, reviewer=Reviewer.B, raw=_report(verdict, "B"), now=NOW
     )
-    seal_synthetic_python_suite(repo)
     final = finalize_round(repo, now=NOW)
     appendix = _status(final)["pr_appendix"]
     assert final.gate.status is GateStatus.PASS
