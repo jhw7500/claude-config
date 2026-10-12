@@ -874,6 +874,8 @@ def test_reviewer_b_judges_unscoped_self_claims_by_base_to_head_difference():
         "outside this rule; select and judge it exactly as before",
         "merge_base_sha", "base-to-head difference", "mktemp -d",
         "never write inside the view", "(advisory ID, package)",
+        "a new installed path or node, a transitive-to-direct change, "
+        "or a dev-only-to-production change",
         "introduces or worsens", "neither a refutation nor a blocker",
         "at most a `MEDIUM` finding citing the base and head executions",
         "does not limit refutation of source (1) conditions or of scoped claims",
