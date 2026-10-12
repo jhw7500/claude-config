@@ -483,10 +483,17 @@ def _append_run(directory: int, ledger: TelemetryLedger, run: TelemetryRun) -> N
     _require(all(item.run_id != run.run_id for item in ledger.runs))
     runs = ledger.runs
     if len(runs) == MAX_TELEMETRY_RUNS:
+        # A dispatch span closed incomplete only because the runtime exposes no
+        # acceptance signal is the documented unavailable path, not an interruption.
         candidates = [item for item in runs if (
             item.outcome not in (None, TelemetryOutcome.INCOMPLETE)
             and not item.telemetry_incomplete
-            and all(span.outcome is not TelemetryOutcome.INCOMPLETE for span in item.spans)
+            and all(
+                span.outcome is not TelemetryOutcome.INCOMPLETE
+                or (span.stage is TelemetryStage.REVIEWER_DISPATCH_WAIT
+                    and span.reason_code == "RUNTIME_SIGNAL_UNAVAILABLE")
+                for span in item.spans
+            )
         )]
         if not candidates:
             raise SchemaError(_TOO_LARGE)
