@@ -861,6 +861,26 @@ def test_reviewer_b_selects_required_claims_and_returns_terminal_budget_report()
     assert parsed.claims[0].result == "unverified"
 
 
+def test_reviewer_b_judges_unscoped_self_claims_by_base_to_head_difference():
+    reviewer = text("references/reviewer-b.md")
+    selection = reviewer[
+        reviewer.index("Select required claims in this fixed order"):
+        reviewer.index("The projected `review_budget`")
+    ]
+    for token in (
+        "does not name its scope",
+        "do not make it a required claim and do not refute it",
+        "Classify by the literal text", "\"all\" or \"every\" alone is not a scope",
+        "outside this rule; select and judge it exactly as before",
+        "merge_base_sha", "base-to-head difference", "mktemp -d",
+        "never write inside the view", "(advisory ID, package)",
+        "introduces or worsens", "neither a refutation nor a blocker",
+        "at most a `MEDIUM` finding citing the base and head executions",
+        "does not limit refutation of source (1) conditions or of scoped claims",
+    ):
+        assert token in selection
+
+
 def test_documented_report_and_decision_examples_pass_the_real_strict_parsers():
     schema = text("references/report-schema.md")
     for label, reviewer in (
