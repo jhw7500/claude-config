@@ -1032,6 +1032,62 @@ def test_running_and_incomplete_runs_are_never_pruned(git_repo):
     assert [item.run_id for item in read_ledger(git_repo).runs] == [f"{n:032x}" for n in range(1, 17)]
 
 
+def closed_run_with_incomplete_span(repo, number, *, stage=TelemetryStage.REVIEWER_DISPATCH_WAIT,
+                                    reason_code="RUNTIME_SIGNAL_UNAVAILABLE"):
+    run = new_run(repo, number)
+    span = start_span(repo, run_id=run.run_id, stage=stage, reviewer=Reviewer.A, attempt=1,
+                      started_at=NOW(), started_monotonic_ns=1,
+                      token_hex=lambda _size: f"{number + 500:032x}")
+    finish_span(repo, run_id=run.run_id, span_id=span.span_id, outcome=TelemetryOutcome.INCOMPLETE,
+                reason_code=reason_code, ended_at=NOW(), ended_monotonic_ns=2)
+    close_run(repo, run_id=run.run_id, outcome=TelemetryOutcome.SUCCESS, reason_code=None,
+              ended_at="2026-09-09T00:00:01Z", ended_monotonic_ns=3)
+    return run
+
+
+def test_closed_run_with_unavailable_dispatch_signal_is_pruned(git_repo):
+    for number in range(1, 17):
+        closed_run_with_incomplete_span(git_repo, number)
+    new_run(git_repo, 17)
+    assert [item.run_id for item in read_ledger(git_repo).runs] == [
+        f"{number:032x}" for number in range(2, 18)
+    ]
+
+
+def test_pruning_skips_protected_run_for_oldest_unavailable_dispatch_run(git_repo):
+    closed_run_with_incomplete_span(git_repo, 1, reason_code="CONTROLLER_INTERRUPTED")
+    for number in range(2, 17):
+        closed_run_with_incomplete_span(git_repo, number)
+    new_run(git_repo, 17)
+    assert [item.run_id for item in read_ledger(git_repo).runs] == [
+        f"{number:032x}" for number in (1, *range(3, 18))
+    ]
+
+
+@pytest.mark.parametrize(("stage", "reason_code"), [
+    (TelemetryStage.REVIEWER_DISPATCH_WAIT, "CONTROLLER_INTERRUPTED"),
+    (TelemetryStage.REVIEWER_TOTAL, "RUNTIME_SIGNAL_UNAVAILABLE"),
+])
+def test_other_incomplete_spans_still_block_pruning(git_repo, stage, reason_code):
+    for number in range(1, 17):
+        closed_run_with_incomplete_span(git_repo, number, stage=stage, reason_code=reason_code)
+    previous = ledger_path(git_repo).read_bytes()
+    with pytest.raises(SchemaError, match="^TELEMETRY_TOO_LARGE$"):
+        new_run(git_repo, 17)
+    assert ledger_path(git_repo).read_bytes() == previous
+
+
+def test_cli_begin_recovers_ledger_full_of_unavailable_dispatch_runs(git_repo):
+    for number in range(1, 17):
+        closed_run_with_incomplete_span(git_repo, number)
+    begun = cli_json(git_repo, "begin", "--base", "master", "--runtime", "claude", "--round", "1")
+    assert begun["telemetry"]["status"] == "active"
+    runs = read_ledger(git_repo).runs
+    assert len(runs) == 16
+    assert runs[-1].run_id == begun["telemetry"]["run_id"]
+    assert f"{1:032x}" not in [item.run_id for item in runs]
+
+
 def test_span_limit_sets_reserved_incomplete_marker(git_repo):
     run = new_run(git_repo)
     for number in range(128):
