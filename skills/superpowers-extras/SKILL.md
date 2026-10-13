@@ -1,6 +1,6 @@
 ---
 name: superpowers-extras
-description: Use together with any superpowers process skill — brainstorming, test-driven-development, verification-before-completion, systematic-debugging, requesting-code-review, receiving-code-review. Carries later corrections to those skills' rules that the plugin-installed copies do not have. Read this whenever one of those six is loaded, before acting on its rules.
+description: Use together with any superpowers process skill — brainstorming, test-driven-development, verification-before-completion, systematic-debugging, requesting-code-review, receiving-code-review, subagent-driven-development. Carries later corrections to those skills' rules that the plugin-installed copies do not have. Read this whenever one of those seven is loaded, before acting on its rules.
 ---
 
 # superpowers — later corrections
@@ -18,7 +18,9 @@ this is a separate `-extras` skill rather than a copy of each original.
 Provenance: observations #1–#5 in the task-observer log, actioned 2026-09-01;
 observations #7–#15, #17, #20, #21, #28–#30, #35–#37, #39, staged 2026-09-07
 and revised 2026-09-10. Staging is not evidence of live installation.
-Base skills are from the `superpowers` plugin (v6.3.0).
+Base skills are from the `superpowers` plugin (v6.3.0). The
+subagent-driven-development section comes from claude-config issue #205
+(2026-10-13) and quotes plugin v7.0.0.
 
 These deltas are maintained **locally only** — they are not contributed
 upstream, by decision. This skill is the canonical home for them: when a
@@ -599,3 +601,96 @@ same run.
 When you do relocate the check, say so in your reply, and record why the
 original layer cannot host it — otherwise the same finding is filed again on the
 next review.
+
+---
+
+## superpowers:subagent-driven-development
+
+The budget rule itself lives in the global guidance
+(`~/.claude/global-guidance.md`, section "리뷰·검증 예산"); this section maps it
+onto this skill's loop. Where the two disagree, the budget rule wins. A scope or
+budget your human partner states in the request beats both.
+
+### Adds to setup — announce the budget
+
+Before dispatching the first implementer, state the budget in one line: the
+number of tasks, which tasks get a task review, and the fix-round cap. If you
+expect to exceed it, ask before continuing — not after the overrun.
+
+### ⚠ Amends an existing rule — "Review the task"
+
+The plugin copy says:
+
+> Never skip the task review, and never accept a report missing either verdict
+
+**Read it as this instead:**
+
+- **Run a task review only for high-risk tasks** — ones that touch
+  permissions, a security boundary, data changes or concurrency. Every other
+  task skips its task review; the final whole-branch review covers its diff.
+- A task review you do run still requires both verdicts, spec compliance AND
+  task quality.
+
+### ⚠ Amends an existing rule — "The fix loop"
+
+The plugin copy says:
+
+> The loop triggers when the review reports spec ❌, any Critical or Important
+> finding, or a ⚠️ item you confirmed as a real gap.
+
+and
+
+> Five rounds maximum per task
+
+**Read it as this instead:**
+
+- **Only three kinds of finding enter the loop:** security, data integrity,
+  and violation of a sentence in the spec or plan. Every other finding,
+  Important included, goes to the ledger's follow-up list beside the deferred
+  Minor findings, for the final review to triage.
+- **Never promote a Minor finding into a fix round.** The plugin already keeps
+  Minor findings out of the loop; the failure seen in practice was the
+  controller routing them back in.
+- **One fix round per task; two only for a security or data-integrity
+  defect.** The rounds 4–5 escalation therefore never happens. A defect that
+  survives its cap goes to your human partner, not to another round.
+
+### Adds to Model Selection
+
+Default to sonnet for implementers and reviewers. Reserve opus for tasks that
+need design judgment and for the final whole-branch review.
+
+### Adds to rulings — decisions outside the plan text
+
+The plugin has you rule on findings that conflict with the plan and ledger the
+ruling. When a ruling adds verification, widens scope, or runs a command the
+plan forbids, announce it to your human partner in one line before acting on
+it. A ledger entry is not that announcement.
+
+### Adds to the implementer brief — verification scope
+
+The global rules "검증: 되돌리면 실패하는가" and "생성·수정 전 주변 열거" have
+been seen to turn an implementer's task into an audit. Inside this loop, a
+blocking defect means one of the three kinds that enter the fix loop above.
+
+- Item 1 of "검증: 되돌리면 실패하는가" (compare against the old behaviour)
+  applies only to blocking defects and to the task's core change: confirm the
+  core change is detected (it fails on the old behaviour), and do not revert
+  each safeguard in turn. A test that pins a guard the task touches (see
+  "Adds to GREEN — minimal code" above) is part of the core change. Its other
+  items still apply.
+- Trigger ② of "생성·수정 전 주변 열거" (enumerate a demonstrated defect's
+  class before fixing it) applies only to blocking defects; do not seal off a
+  whole defect class for a non-blocking finding. Trigger ① is unaffected.
+
+Say so in the brief.
+
+### Adds — the plan header does not mandate the full loop
+
+superpowers:writing-plans puts this header on every plan:
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
+
+That line picks the execution skill. It does not make the plugin's full loop —
+a review per task, five fix rounds — mandatory. The amendments above apply to a
+plan that carries it exactly as they do to any other plan.
