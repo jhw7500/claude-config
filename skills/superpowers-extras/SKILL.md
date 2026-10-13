@@ -630,6 +630,10 @@ The plugin copy says:
   task skips its task review; the final whole-branch review covers its diff.
 - A task review you do run still requires both verdicts, spec compliance AND
   task quality.
+- A task that skipped its task review completes with its own ledger line:
+  `Task <N>: complete (commits <base7>..<head7>, review skipped: not high-risk)`
+  — never `review clean`. Like the plugin's two completion lines, it marks the
+  task DONE when the ledger is read back after compaction.
 
 ### ⚠ Amends an existing rule — "The fix loop"
 
