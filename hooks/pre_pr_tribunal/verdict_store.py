@@ -1036,6 +1036,7 @@ def submit_reviewer_report(
                     authenticate_report(root, pending, parsed)
                     _validate_unexecutable_claims(root, pending, snapshot, parsed)
                     m.validate_reviewer_report_semantics(parsed)
+                    m.validate_submission_admission(parsed)
                 except SchemaError as error:
                     if error.code in REPORT_RETRYABLE_CODES:
                         _record_failure_locked(review_fd, pending, reviewer, error.code, raw)

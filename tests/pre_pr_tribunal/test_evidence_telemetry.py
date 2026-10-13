@@ -36,7 +36,7 @@ def test_evidence_usage_is_authenticated_and_claim_subset_is_separate(git_repo):
         'statement': 'The reused entry is not claimed by this report.',
         'result': 'unverified',
         'execution_ids': [],
-        'reason': 'This test isolates unreferenced evidence accounting.',
+        'reason': 'UNAVAILABLE: This test isolates unreferenced evidence accounting.',
     }]
     fresh = dict(execution, id='B-R1-E002'); fresh.pop('evidence_ref')
     raw['executions'].append(fresh)
@@ -166,7 +166,7 @@ def test_always_fresh_entries_are_rejected_not_reused(node_repo):
         'statement': 'The always-fresh path could not be reused.',
         'result': 'unverified',
         'execution_ids': [],
-        'reason': 'The evidence contract requires a fresh execution.',
+        'reason': 'UNAVAILABLE: The evidence contract requires a fresh execution.',
     }]
     submit_reviewer_report(node_repo, reviewer=Reviewer.B, raw=json.dumps(raw).encode())
     result = telemetry.summarize_run(node_repo, run_id=run_id)['evidence']

@@ -40,6 +40,7 @@ REVIEWER_B_BUDGET_CONTRACT_VERSION = 7
 REVIEWER_B_NATIVE_TOOL_CALL_BUDGET_CONTRACT_VERSION = 8
 REVERSAL_COST_CONTRACT_VERSION = 6
 REQUIRED_REVERSAL_COST_CONTRACT_VERSION = 7
+UNVERIFIED_REASON_PREFIXES = ("UNSAFE:", "UNAVAILABLE:", "UNEXECUTABLE:", "BUDGET_EXHAUSTED:")
 MAX_VERDICT_BYTES = 256 * 1024
 MAX_REPORT_BYTES = 128 * 1024
 MAX_EVIDENCE_TEXT_BYTES = 8 * 1024
@@ -1467,6 +1468,24 @@ def validate_reviewer_report_semantics(
         )
     ):
         raise SchemaError("REFUTED_CLAIM_REQUIRES_BLOCKER")
+
+
+def validate_submission_admission(report: ReviewerReport) -> None:
+    """Admission rules for a fresh submission only.
+
+    Sealed reports are re-parsed on every verdict read, so these rules never run
+    there: a report sealed before them stays readable without a contract bump.
+    """
+    if not isinstance(report, ReviewerReport):
+        raise SchemaError("REPORT_SCHEMA_INVALID")
+    for claim in report.claims:
+        if claim.result == "unverified" and not claim.reason.startswith(
+            UNVERIFIED_REASON_PREFIXES
+        ):
+            raise SchemaError("UNVERIFIED_REASON_INVALID")
+    for item in report.executions:
+        if len(set(item.capture_sha256)) == 1:
+            raise SchemaError("CAPTURE_SHA256_PLACEHOLDER")
 
 
 def _blocker_identity(value: object) -> tuple[str, int, Reviewer]:

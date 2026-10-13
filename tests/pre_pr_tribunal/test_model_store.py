@@ -29,6 +29,7 @@ from pre_pr_tribunal.model import (
     reviewer_b_budget,
     validate_reviewer_b_budget,
     validate_report_bytes,
+    validate_submission_admission,
 )
 from pre_pr_tribunal.verdict_store import (
     _read_sealed_report,
@@ -4327,3 +4328,72 @@ def test_cli_store_report_rejects_v2_before_touching_canonical(git_repo):
     )
     assert target.read_bytes() == sentinel
     assert (git_repo / ".review/verdict.json").read_bytes() == verdict_before
+
+
+def _unverified_b_report(snapshot, reason):
+    return report(snapshot, "B", claims=[{
+        "id": "B-R1-C001",
+        "statement": "The reviewed behavior is executable.",
+        "result": "unverified",
+        "execution_ids": [],
+        "reason": reason,
+    }], coverage={"complete": True, "primary_entry_paths": []})
+
+
+@pytest.mark.parametrize("reason", (
+    "Plugin source was not checked within the review budget and scope.",
+    "Prose consistency was checked by reading the diff only.",
+    "INCONCLUSIVE: the result was ambiguous",
+), ids=("not-tried", "no-executable-check", "inconclusive"))
+def test_submit_rejects_unverified_reason_outside_closed_set(git_repo, reason):
+    pending = write_current_pending(git_repo)
+    raw = json.dumps(_unverified_b_report(pending.snapshot, reason)).encode()
+    with pytest.raises(SchemaError, match="^UNVERIFIED_REASON_INVALID$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=raw, now=NOW)
+    slot = read_verdict(git_repo).reviewers["B"]
+    assert slot.status == "pending"
+    assert slot.attempt_count == 1 and slot.last_error == "UNVERIFIED_REASON_INVALID"
+    assert not (git_repo / ".review/inbox/round-1/B.json").exists()
+    assert (git_repo / ".review/attempts/round-1/B/attempt-1.raw").read_bytes() == raw
+
+
+@pytest.mark.parametrize("reason", (
+    "UNSAFE: running the installer would write outside the view",
+    "UNAVAILABLE: the pinned validator is not installed here",
+    "UNEXECUTABLE: declared unexecutable path",
+    "BUDGET_EXHAUSTED: 40 tool calls and 480 seconds used",
+), ids=("unsafe", "unavailable", "unexecutable", "budget"))
+def test_submit_accepts_closed_set_unverified_reasons(git_repo, reason):
+    pending = write_current_pending(git_repo)
+    raw = json.dumps(_unverified_b_report(pending.snapshot, reason)).encode()
+    receipt = submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=raw, now=NOW)
+    assert receipt.raw_sha256 == hashlib.sha256(raw).hexdigest()
+    assert read_verdict(git_repo).reviewers["B"].status == "sealed"
+
+
+@pytest.mark.parametrize("reviewer", ("A", "C"))
+@pytest.mark.parametrize("digest", ("0" * 64, "f" * 64), ids=("zeros", "repeated-f"))
+def test_submit_rejects_placeholder_capture_digest(git_repo, reviewer, digest):
+    pending = write_current_pending(git_repo)
+    item = execution(f"{reviewer}-R1-E001")
+    item["capture_sha256"] = digest
+    raw = json.dumps(report(pending.snapshot, reviewer, executions=[item])).encode()
+    with pytest.raises(SchemaError, match="^CAPTURE_SHA256_PLACEHOLDER$"):
+        submit_reviewer_report(git_repo, reviewer=Reviewer(reviewer), raw=raw, now=NOW)
+    slot = read_verdict(git_repo).reviewers[reviewer]
+    assert slot.status == "pending" and slot.last_error == "CAPTURE_SHA256_PLACEHOLDER"
+    assert not (git_repo / f".review/inbox/round-1/{reviewer}.json").exists()
+
+
+def test_admission_rules_are_not_applied_when_a_report_is_re_parsed(snapshot):
+    # Sealed reports are re-parsed on every verdict read; a report sealed before
+    # the admission rules must stay readable, so parsing itself stays permissive.
+    raw = json.dumps(_unverified_b_report(
+        snapshot, "Prose consistency was checked by reading the diff only.",
+    )).encode()
+    parsed = parse_reviewer_report(
+        raw, expected_reviewer=Reviewer.B, expected_round=1, snapshot=snapshot,
+    )
+    assert parsed.claims[0].result == "unverified"
+    with pytest.raises(SchemaError, match="^UNVERIFIED_REASON_INVALID$"):
+        validate_submission_admission(parsed)
