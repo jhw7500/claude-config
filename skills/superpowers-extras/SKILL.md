@@ -650,7 +650,11 @@ and
   behaviour). Every other finding, Important included, goes to the ledger's
   follow-up list beside the deferred Minor findings, for the final review to
   triage; an item the final review classes as one of these four kinds enters
-  its fix pass.
+  its fix pass. A finding recorded on that list counts as parked with a ruling
+  for the "5. Complete the task" gate, so the task may move on. Every item the
+  final fix pass leaves unfixed is listed in your final message beside the
+  rulings — the Finish step deletes the workspace, so an item kept only in the
+  ledger would vanish unseen.
 - **Never promote a Minor finding into a fix round.** The plugin already keeps
   Minor findings out of the loop; the failure seen in practice was the
   controller routing them back in.
