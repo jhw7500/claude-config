@@ -137,6 +137,20 @@ def test_one_request_stops_after_one_round_and_requires_a_new_request_for_follow
     assert "an intensity grant or earlier general instruction" in skill.lower()
 
 
+def test_pass_places_pr_appendix_inside_impact_and_risks_field():
+    step = numbered_steps(text("SKILL.md"))[8]
+    assert "append non-empty `pr_appendix` to the PR body" not in step
+    assert step.index(
+        "If `finalize` passes, report the bound HEAD and diff SHA-256"
+    ) < step.index("If `pr_appendix` is non-empty")
+    assert "`### Impact and risks` field, put the appendix inside that field" in step
+    assert "replace the whole field value" in step
+    assert "only an `Unknown:` or `Not applicable:` sentinel" in step
+    assert "never as a new heading or after the last field" in step
+    assert "validate the edited body again before PR creation" in step
+    assert "if that fails, do not create a PR" in step
+
+
 def test_skill_limits_terminal_user_override_to_exact_one_shot_contract():
     skill = text("SKILL.md")
     assert "ROUND_LIMIT_EXHAUSTED" in skill
