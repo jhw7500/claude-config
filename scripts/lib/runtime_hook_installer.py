@@ -188,8 +188,7 @@ def _validated_hook_groups(
             if not isinstance(record, dict):
                 raise InstallError("unknown hook record shape")
             if event != "UserPromptSubmit" and (
-                set(record) != {"type", "command"}
-                or record.get("type") != "command"
+                record.get("type") != "command"
                 or not isinstance(record.get("command"), str)
             ):
                 raise InstallError("unknown hook record shape")

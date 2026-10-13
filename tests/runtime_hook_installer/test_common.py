@@ -1,3 +1,4 @@
+from copy import deepcopy
 import os
 from pathlib import Path
 import stat
@@ -191,6 +192,68 @@ def test_user_prompt_merge_still_rejects_ambiguous_managed_handlers(
     with pytest.raises(common_installer.InstallError):
         common_installer.merge_user_prompt_hook(
             original,
+            command="managed-command",
+            legacy_commands=(),
+            home=Path("/home/test"),
+        )
+
+
+def test_pre_tool_merge_preserves_unrelated_command_handlers_with_extended_fields(
+    common_installer,
+):
+    unrelated = [
+        {
+            "matcher": "Bash",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "keep-command",
+                    "statusMessage": "Keeping context",
+                    "timeout": 30,
+                    "async": True,
+                }
+            ],
+        },
+        {"hooks": [{"type": "command", "command": "keep-other", "timeout": 10}]},
+    ]
+    original = {"hooks": {"PreToolUse": unrelated}, "theme": "dark"}
+    snapshot = deepcopy(original)
+
+    merged = common_installer.merge_pre_tool_hook(
+        original,
+        matcher="Edit|Write",
+        command="managed-command",
+        legacy_commands=(),
+        home=Path("/home/test"),
+    )
+
+    assert merged["hooks"]["PreToolUse"] == [
+        *unrelated,
+        {
+            "matcher": "Edit|Write",
+            "hooks": [{"type": "command", "command": "managed-command"}],
+        },
+    ]
+    assert merged["theme"] == "dark"
+    assert original == snapshot
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"type": "command", "command": "managed-command", "timeout": 30},
+        {"type": "command", "command": "managed-command", "async": True},
+    ],
+)
+def test_pre_tool_merge_still_rejects_extended_managed_handler(common_installer, record):
+    original = {"hooks": {"PreToolUse": [{"hooks": [record]}]}}
+
+    with pytest.raises(
+        common_installer.InstallError, match="managed hook record has unknown fields"
+    ):
+        common_installer.merge_pre_tool_hook(
+            original,
+            matcher=None,
             command="managed-command",
             legacy_commands=(),
             home=Path("/home/test"),
