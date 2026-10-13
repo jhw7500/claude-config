@@ -415,7 +415,7 @@ def _status(verdict) -> dict[str, object]:
 
 
 def _pr_appendix(verdict) -> str:
-    header = ["## Pre-PR tribunal advisory findings", ""]
+    header = ["**Pre-PR tribunal advisory findings**", ""]
     advisory_lines = []
     for key in verdict.policy.active_reviewers:
         report = verdict.reviewers[key].report
@@ -450,7 +450,7 @@ def _pr_appendix(verdict) -> str:
 def _markdown_text(value: str) -> str:
     escaped = []
     for character in value:
-        if character in "\r\n\t":
+        if character in "\r\n\t  ":
             escaped.append(" ")
         elif character in "\\`*_{}[]<>()#+-.!|>":
             escaped.append("\\" + character)

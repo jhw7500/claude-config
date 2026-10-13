@@ -1235,6 +1235,58 @@ def test_pr_appendix_is_visibly_truncated_before_byte_limit(tmp_path):
     assert "Additional advisory findings were omitted" in appendix
 
 
+@pytest.mark.parametrize(
+    ("title", "truncated"),
+    (("Contract regression", False), ("x" * 8000, True)),
+    ids=("normal", "truncated"),
+)
+def test_pr_appendix_uses_bold_label_instead_of_markdown_heading(
+    tmp_path, title, truncated
+):
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    findings = tuple(
+        {**_finding(f"A-R1-{index:03d}", "A", severity="MEDIUM"), "title": title}
+        for index in range(1, 6)
+    )
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.A,
+        raw=_report(verdict, "A", findings=findings),
+        now=NOW,
+    )
+    submit_reviewer_report(
+        repo, reviewer=Reviewer.B, raw=_report(verdict, "B"), now=NOW
+    )
+    appendix = _status(finalize_round(repo, now=NOW))["pr_appendix"]
+    lines = appendix.splitlines()
+    assert ("Additional advisory findings were omitted" in appendix) is truncated
+    assert lines[0] == "**Pre-PR tribunal advisory findings**"
+    assert not any(line.lstrip(" ").startswith("#") for line in lines)
+    assert not any(set(line.strip()) in ({"-"}, {"="}) for line in lines)
+
+
+def test_pr_appendix_replaces_unicode_line_separators(tmp_path):
+    repo = _repo(tmp_path)
+    verdict = begin_round(repo, base="master", runtime="codex", round_number=1, now=NOW)
+    advisory = {
+        **_finding("A-R1-001", "A", severity="LOW"),
+        "title": "first second third",
+    }
+    submit_reviewer_report(
+        repo,
+        reviewer=Reviewer.A,
+        raw=_report(verdict, "A", findings=(advisory,)),
+        now=NOW,
+    )
+    submit_reviewer_report(
+        repo, reviewer=Reviewer.B, raw=_report(verdict, "B"), now=NOW
+    )
+    appendix = _status(finalize_round(repo, now=NOW))["pr_appendix"]
+    assert " " not in appendix and " " not in appendix
+    assert "[LOW] first second third" in appendix
+
+
 UNEXECUTABLE_CONFIG = '[unexecutable]\n"src/**" = "NO_CROSS_SDK"\n'
 
 
