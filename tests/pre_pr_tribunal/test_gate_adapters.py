@@ -361,7 +361,7 @@ def _inconclusive_round(repo: Path):
                             "statement": "The primary PR path is executable.",
                             "result": "unverified",
                             "execution_ids": [],
-                            "reason": "The required runtime was unavailable.",
+                            "reason": "UNAVAILABLE: The required runtime was unavailable.",
                         }
                     ],
                     "coverage": {
@@ -468,7 +468,7 @@ def _evidence_reports(
                     "statement": "A required runtime path remains unverified.",
                     "result": "unverified",
                     "execution_ids": [],
-                    "reason": "The required runtime is unavailable.",
+                    "reason": "UNAVAILABLE: The required runtime is unavailable.",
                 })
             value.update({
                 "executions": [execution],

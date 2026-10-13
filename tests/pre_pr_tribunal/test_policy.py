@@ -591,7 +591,7 @@ def test_unknown_model_stops_before_dispatch(tmp_path):
 
 
 @pytest.mark.parametrize("reason", (
-    "The required SDK is unavailable.",
+    "UNAVAILABLE: The required SDK is unavailable.",
     "BUDGET_EXHAUSTED: fresh-execution cap",
 ))
 def test_active_only_finalize_and_unverified_is_inconclusive(tmp_path, reason):
@@ -799,7 +799,7 @@ def test_inconclusive_restart_cannot_lower_same_snapshot_intensity(tmp_path):
         "statement": "The documented entry path runs.",
         "result": "unverified",
         "execution_ids": [],
-        "reason": "The required SDK is unavailable.",
+        "reason": "UNAVAILABLE: The required SDK is unavailable.",
     }
     submit_reviewer_report(
         repo,
@@ -1300,7 +1300,7 @@ def _unexecutable_report(verdict, *, result, cover=True, path="src/app.py"):
             "statement": "The documented primary entry path runs.",
             "result": "unverified",
             "execution_ids": [],
-            "reason": "This view has no cross SDK.",
+            "reason": "UNEXECUTABLE: This view has no cross SDK.",
         },)
     else:
         executions = (_execution(execution_id),)
@@ -1767,7 +1767,7 @@ def test_human_grant_may_restart_an_inconclusive_snapshot_lower(tmp_path):
         "statement": "The hook entry path runs.",
         "result": "unverified",
         "execution_ids": [],
-        "reason": "The required runtime is unavailable.",
+        "reason": "UNAVAILABLE: The required runtime is unavailable.",
     }
     submit_reviewer_report(
         repo, reviewer=Reviewer.B, raw=_report(verdict, "B", claims=(claim,)), now=NOW
