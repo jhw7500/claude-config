@@ -644,10 +644,13 @@ and
 
 **Read it as this instead:**
 
-- **Only three kinds of finding enter the loop:** security, data integrity,
-  and violation of a sentence in the spec or plan. Every other finding,
-  Important included, goes to the ledger's follow-up list beside the deferred
-  Minor findings, for the final review to triage.
+- **Only four kinds of finding enter the loop:** security, data integrity,
+  violation of a sentence in the spec or plan, and a Critical correctness
+  defect (a crash, a broken build or test, a regression of existing
+  behaviour). Every other finding, Important included, goes to the ledger's
+  follow-up list beside the deferred Minor findings, for the final review to
+  triage; an item the final review classes as one of these four kinds enters
+  its fix pass.
 - **Never promote a Minor finding into a fix round.** The plugin already keeps
   Minor findings out of the loop; the failure seen in practice was the
   controller routing them back in.
@@ -671,7 +674,7 @@ it. A ledger entry is not that announcement.
 
 The global rules "검증: 되돌리면 실패하는가" and "생성·수정 전 주변 열거" have
 been seen to turn an implementer's task into an audit. Inside this loop, a
-blocking defect means one of the three kinds that enter the fix loop above.
+blocking defect means one of the four kinds that enter the fix loop above.
 
 - Item 1 of "검증: 되돌리면 실패하는가" (compare against the old behaviour)
   applies only to blocking defects and to the task's core change: confirm the
