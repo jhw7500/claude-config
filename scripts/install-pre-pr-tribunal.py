@@ -455,10 +455,15 @@ def catalog_warnings(home: Path) -> list[str]:
         skills = home / runtime / "skills"
         label = f"{runtime}/skills/{_CATALOG_SKILL}"
         canonical = skills / _CATALOG_SKILL
-        if canonical.is_symlink() and not canonical.exists():
-            warnings.append(f"{label} link is broken")
-        elif not (canonical / "SKILL.md").is_file():
-            warnings.append(f"{label} has no SKILL.md")
+        # pathlib re-raises errors such as EACCES; an entry that cannot be inspected
+        # gets no verdict rather than turning a refused install into a traceback.
+        try:
+            if canonical.is_symlink() and not canonical.exists():
+                warnings.append(f"{label} link is broken")
+            elif not (canonical / "SKILL.md").is_file():
+                warnings.append(f"{label} has no SKILL.md")
+        except OSError:
+            pass
         try:
             names = sorted(entry.name for entry in skills.iterdir())
         except OSError:
