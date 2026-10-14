@@ -1038,6 +1038,7 @@ def submit_reviewer_report(
                     m.validate_reviewer_report_semantics(parsed)
                     m.validate_submission_admission(parsed)
                 except SchemaError as error:
+                    error.from_submission = True
                     if error.code in REPORT_RETRYABLE_CODES:
                         _record_failure_locked(review_fd, pending, reviewer, error.code, raw)
                     raise

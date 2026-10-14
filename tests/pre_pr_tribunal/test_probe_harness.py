@@ -2799,3 +2799,19 @@ def test_probe_refuses_unsafe_supplied_work_directory(fake_runtimes, tmp_path):
     assert result.returncode != 0
     assert json.loads(result.stdout) == {"schema": 2, "status": "INVALID_WORK_DIR"}
     assert work_dir.is_dir()
+
+
+def test_installed_submit_rejection_with_detail_line_keeps_its_code(tmp_path):
+    """A field-path detail line must not turn a retryable rejection into SETUP_FAILED."""
+    module, home, repo, cli = _installed_lifecycle(tmp_path)
+    begun = module._tribunal_cli(cli, repo, home, "begin", "--base", "master",
+                                "--runtime", "claude", "--round", "1")
+    value = json.loads(module._synthetic_report_bytes("A", 1, begun["snapshot"]))
+    value["findings"] = [{
+        "id": "A-R1-0x1", "reviewer": "A", "severity": "LOW", "title": "t",
+        "rationale": "r", "path": "tracked.txt", "line": 1, "execution_ids": [],
+        "acceptance_condition": "a", "reversal_cost": "",
+    }]
+    raw = json.dumps(value, separators=(",", ":")).encode()
+    with pytest.raises(module.ProbeFailure, match="^FINDING_ID_INVALID$"):
+        module._tribunal_cli(cli, repo, home, "submit-report", "--reviewer", "A", raw=raw)
