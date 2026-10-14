@@ -72,13 +72,32 @@ _MAX_SHELL_NESTING = 64
 
 
 class TribunalError(Exception):
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, path: str | None = None):
         super().__init__(code)
         self.code = code
+        self.path = path
 
 
 class SchemaError(TribunalError):
     pass
+
+
+# Retryable report codes whose rejection names the first violating field. A path is
+# built only from fixed field names and list indices, never from report content.
+DIAGNOSTIC_PATH_CODES = frozenset((
+    "FINDING_ID_INVALID",
+    "BEHAVIOR_EVIDENCE_REQUIRED",
+    "EXECUTION_SCHEMA_INVALID",
+))
+
+
+def _field_error(code: str, field: str) -> SchemaError:
+    return SchemaError(code, path=field)
+
+
+def _prefix_path(error: SchemaError, prefix: str) -> None:
+    if error.code in DIAGNOSTIC_PATH_CODES:
+        error.path = prefix if error.path is None else f"{prefix}.{error.path}"
 
 
 class Reviewer(str, Enum):
@@ -1073,11 +1092,16 @@ def _parse_execution(
     reference = None
     if isinstance(value, dict) and "evidence_ref" in value:
         if reviewer is not Reviewer.B or report_contract_version < 3:
-            raise SchemaError("EXECUTION_SCHEMA_INVALID")
-        ref = _object(value["evidence_ref"], {"bundle_sha256", "entry_id"}, "EXECUTION_SCHEMA_INVALID")
-        if (not isinstance(ref["bundle_sha256"], str) or _SHA256.fullmatch(ref["bundle_sha256"]) is None
-            or not isinstance(ref["entry_id"], str) or re.fullmatch(r"E(?:00[1-9]|0[1-5][0-9]|06[0-4])", ref["entry_id"]) is None):
-            raise SchemaError("EXECUTION_SCHEMA_INVALID")
+            raise _field_error("EXECUTION_SCHEMA_INVALID", "evidence_ref")
+        try:
+            ref = _object(value["evidence_ref"], {"bundle_sha256", "entry_id"}, "EXECUTION_SCHEMA_INVALID")
+        except SchemaError as error:
+            _prefix_path(error, "evidence_ref")
+            raise
+        if not isinstance(ref["bundle_sha256"], str) or _SHA256.fullmatch(ref["bundle_sha256"]) is None:
+            raise _field_error("EXECUTION_SCHEMA_INVALID", "evidence_ref.bundle_sha256")
+        if not isinstance(ref["entry_id"], str) or re.fullmatch(r"E(?:00[1-9]|0[1-5][0-9]|06[0-4])", ref["entry_id"]) is None:
+            raise _field_error("EXECUTION_SCHEMA_INVALID", "evidence_ref.entry_id")
         reference = EvidenceReference(ref["bundle_sha256"], ref["entry_id"])
         value = {key: item for key, item in value.items() if key != "evidence_ref"}
     obj = _object(
@@ -1109,17 +1133,21 @@ def _parse_execution(
     if matched_round != round_number:
         raise SchemaError("EXECUTION_ID_INVALID")
     command = _command(obj["command"])
-    exit_code = _integer(
-        obj["exit_code"], "EXECUTION_SCHEMA_INVALID", minimum=-255, maximum=255
-    )
+    try:
+        exit_code = _integer(
+            obj["exit_code"], "EXECUTION_SCHEMA_INVALID", minimum=-255, maximum=255
+        )
+    except SchemaError as error:
+        _prefix_path(error, "exit_code")
+        raise
     stdout = _execution_excerpt(obj["stdout_excerpt"])
     stderr = _execution_excerpt(obj["stderr_excerpt"])
     capture = obj["capture_sha256"]
     if not isinstance(capture, str) or _SHA256.fullmatch(capture) is None:
-        raise SchemaError("EXECUTION_SCHEMA_INVALID")
+        raise _field_error("EXECUTION_SCHEMA_INVALID", "capture_sha256")
     truncated = obj["truncated"]
     if not isinstance(truncated, bool):
-        raise SchemaError("EXECUTION_SCHEMA_INVALID")
+        raise _field_error("EXECUTION_SCHEMA_INVALID", "truncated")
     return Execution(identifier, command, exit_code, stdout, stderr, capture, truncated, reference)
 
 
@@ -1157,11 +1185,11 @@ def _parse_finding(
         not isinstance(identifier, str)
         or (match := _FINDING_ID.fullmatch(identifier)) is None
     ):
-        raise SchemaError("FINDING_ID_INVALID")
+        raise _field_error("FINDING_ID_INVALID", "id")
     if match.group(1) != reviewer.value or obj["reviewer"] != reviewer.value:
         raise SchemaError("FINDING_REVIEWER_MISMATCH")
     if int(match.group(2)) != round_number:
-        raise SchemaError("FINDING_ID_INVALID")
+        raise _field_error("FINDING_ID_INVALID", "id")
     severity = _enum(Severity, obj["severity"], "FINDING_SCHEMA_INVALID")
     title = _text(obj["title"], MAX_EVIDENCE_TEXT_BYTES)
     rationale = _text(obj["rationale"], MAX_EVIDENCE_TEXT_BYTES)
@@ -1356,33 +1384,43 @@ def parse_reviewer_report(
         or snap["diff_sha256"] != snapshot.diff_sha256
     ):
         raise SchemaError("REPORT_SNAPSHOT_MISMATCH")
-    executions = tuple(
-        _parse_execution(item, reviewer=expected_reviewer, round_number=expected_round,
-                         report_contract_version=report_contract_version)
-        for item in _array(
-            obj["executions"], MAX_EXECUTIONS_PER_REVIEWER, "EXECUTION_LIMIT_EXCEEDED"
-        )
-    )
+    parsed_executions = []
+    for index, item in enumerate(_array(
+        obj["executions"], MAX_EXECUTIONS_PER_REVIEWER, "EXECUTION_LIMIT_EXCEEDED"
+    )):
+        try:
+            parsed_executions.append(_parse_execution(
+                item, reviewer=expected_reviewer, round_number=expected_round,
+                report_contract_version=report_contract_version,
+            ))
+        except SchemaError as error:
+            _prefix_path(error, f"executions[{index}]")
+            raise
+    executions = tuple(parsed_executions)
     execution_ids = [item.id for item in executions]
     if len(execution_ids) != len(set(execution_ids)):
         raise SchemaError("EXECUTION_ID_DUPLICATE")
-    findings = tuple(
-        _parse_finding(
-            item, reviewer=expected_reviewer, round_number=expected_round,
-            report_contract_version=report_contract_version,
-        )
-        for item in _array(
-            obj["findings"], MAX_FINDINGS_PER_REVIEWER, "FINDING_LIMIT_EXCEEDED"
-        )
-    )
+    parsed_findings = []
+    for index, item in enumerate(_array(
+        obj["findings"], MAX_FINDINGS_PER_REVIEWER, "FINDING_LIMIT_EXCEEDED"
+    )):
+        try:
+            parsed_findings.append(_parse_finding(
+                item, reviewer=expected_reviewer, round_number=expected_round,
+                report_contract_version=report_contract_version,
+            ))
+        except SchemaError as error:
+            _prefix_path(error, f"findings[{index}]")
+            raise
+    findings = tuple(parsed_findings)
     if len({item.id for item in findings}) != len(findings):
         raise SchemaError("FINDING_ID_DUPLICATE")
     available = set(execution_ids)
-    for item in findings:
+    for index, item in enumerate(findings):
         if not set(item.execution_ids).issubset(available):
             raise SchemaError("EXECUTION_REFERENCE_INVALID")
         if expected_reviewer is Reviewer.B and not item.execution_ids:
-            raise SchemaError("BEHAVIOR_EVIDENCE_REQUIRED")
+            raise _field_error("BEHAVIOR_EVIDENCE_REQUIRED", f"findings[{index}].execution_ids")
     claims = tuple(
         _parse_claim(
             item,

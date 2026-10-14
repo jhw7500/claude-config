@@ -7,6 +7,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -459,6 +460,26 @@ def _markdown_text(value: str) -> str:
     return "".join(escaped)
 
 
+_DIAGNOSTIC_PATH = re.compile(r"(?:findings|executions)\[[0-9]{1,3}\](?:\.[a-z_][a-z0-9_]*){0,2}")
+_MAX_REJECTION_STDERR_BYTES = 128
+
+
+def _retry_detail(arguments, error: TribunalError, first_line: str) -> str:
+    """Return the bounded second stderr line naming the reviewer and field, or nothing."""
+
+    path = getattr(error, "path", None)
+    if (
+        arguments.command != "submit-report"
+        or not isinstance(path, str)
+        or _DIAGNOSTIC_PATH.fullmatch(path) is None
+    ):
+        return ""
+    detail = f"PRE_PR_TRIBUNAL_DETAIL:reviewer={arguments.reviewer} path={path}\n"
+    if len((first_line + detail).encode("ascii")) >= _MAX_REJECTION_STDERR_BYTES:
+        return ""
+    return detail
+
+
 def _report_stdin() -> bytes:
     return sys.stdin.buffer.read(MAX_REPORT_BYTES + 1)
 
@@ -905,7 +926,8 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
         if arguments.command.startswith('evidence-'):
             sys.stdout.write(json.dumps({'reason_code': code[:64]}) + '\n')
         else:
-            sys.stderr.write(f"PRE_PR_TRIBUNAL:{code[:64]}\n")
+            first_line = f"PRE_PR_TRIBUNAL:{code[:64]}\n"
+            sys.stderr.write(first_line + _retry_detail(arguments, error, first_line))
         return 1
     except Exception:
         if arguments.command.startswith('evidence-'):

@@ -1361,8 +1361,15 @@ def _tribunal_cli(
             raise ProbeFailure("SETUP_FAILED")
         if result.returncode:
             prefix = b"PRE_PR_TRIBUNAL:"
-            code = result.stderr.removeprefix(prefix).removesuffix(b"\n")
-            if (result.stderr == prefix + code + b"\n" and 0 < len(code) <= 64
+            first, separator, detail = result.stderr.partition(b"\n")
+            first += separator
+            if detail and not (
+                detail.startswith(b"PRE_PR_TRIBUNAL_DETAIL:") and detail.endswith(b"\n")
+                and detail.count(b"\n") == 1 and all(32 <= byte < 127 for byte in detail[:-1])
+            ):
+                raise ProbeFailure("SETUP_FAILED")
+            code = first.removeprefix(prefix).removesuffix(b"\n")
+            if (first == prefix + code + b"\n" and 0 < len(code) <= 64
                     and all(byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for byte in code)):
                 raise ProbeFailure(code.decode("ascii"))
             raise ProbeFailure("SETUP_FAILED")
