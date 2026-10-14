@@ -16,3 +16,6 @@ skill-observations/
 
 # Private Project Control handoff state.
 /.ai/handoff.md
+
+# 세션 체크포인트(session-handoff)는 개인 작업 기록이라 커밋하지 않는다.
+/HANDOFF.*.md
