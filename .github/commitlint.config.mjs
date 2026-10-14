@@ -10,6 +10,10 @@ export default {
     ]],
     // 한글 커밋 메시지 허용
     'subject-case': [0],
+    // Change Evidence v1 커밋은 Validation에 재현 명령을 그대로 적는다. 명령을 줄바꿈하면
+    // 재현이 깨지므로 본문·footer 줄 길이 제한은 끈다. 제목 길이(header-max-length)는 유지한다.
+    'body-max-line-length': [0],
+    'footer-max-line-length': [0],
   },
 
   // pre-pr-tribunal 이 지시하는 커밋은 conventional 형식이 아니다.

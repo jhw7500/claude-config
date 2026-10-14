@@ -28,13 +28,15 @@ ESCAPE_PREFIXES = ("#noreminder", "#nr", "#raw", "#silent", "#조용히")
 REMINDER = """<system-reminder>
 [HANDOFF-CHECKPOINT] 세션 작업량이 체크포인트 임계에 도달했다.
 
-지금이 phase 경계(구현 완료 / 리뷰 라운드 종료 / 머지 / 저장 완료)라면 사용자에게
-묻지 말고 repo root의 `HANDOFF.<세션>.md`를 즉시 갱신하라. 경계 중간이라면 다음
-경계 도달 시 갱신하라.
+지금이 phase 경계(구현 완료 / 리뷰 라운드 종료 / 외부 게이트 판정 확정 직후 / 머지 /
+저장 완료)라면 사용자에게 묻지 말고 repo root의 `HANDOFF.<세션>.md`를 즉시 갱신하라.
+경계 중간이라면 다음 경계 도달 시 갱신하라.
 
 - 15줄 이내로 덮어쓴다: ① 완료·검증된 것 ② 다음 구체 액션 1개 ③ 제약
   (코드 프리즈, 보드 예약 등) ④ 열린 PR/이슈 번호.
 - Task 세션이면 tsk-/clm-id를 본문에 남겨 두 기록을 연결한다.
+- 게이트(Tribunal·CI·리뷰 verdict) 판정 직후라면 게이트 식별자(run·round·HEAD)와
+  blocker ID 목록을 남긴다.
 - 세부 규칙: ~/.claude/global-guidance.md > "HANDOFF 체크포인트 (전역)".
 </system-reminder>"""
 
