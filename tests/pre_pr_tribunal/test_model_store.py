@@ -4452,6 +4452,7 @@ def test_cli_retry_detail_is_omitted_for_unsafe_or_unknown_paths(path):
 
     arguments = SimpleNamespace(command="submit-report", reviewer="A")
     error = SchemaError("FINDING_ID_INVALID", path=path)
+    error.from_submission = True
     assert tribunal_cli._retry_detail(arguments, error, "PRE_PR_TRIBUNAL:FINDING_ID_INVALID\n") == ""
 
 
@@ -4461,6 +4462,7 @@ def test_cli_retry_detail_only_for_submit_and_within_stderr_cap():
     from pre_pr_tribunal import cli as tribunal_cli
 
     error = SchemaError("EXECUTION_SCHEMA_INVALID", path="executions[1].capture_sha256")
+    error.from_submission = True
     first = "PRE_PR_TRIBUNAL:EXECUTION_SCHEMA_INVALID\n"
     context = SimpleNamespace(command="context", reviewer="A")
     assert tribunal_cli._retry_detail(context, error, first) == ""
@@ -4473,3 +4475,53 @@ def test_cli_retry_detail_only_for_submit_and_within_stderr_cap():
 def test_schema_error_text_stays_the_code_when_a_path_is_attached():
     error = SchemaError("FINDING_ID_INVALID", path="findings[0].id")
     assert str(error) == "FINDING_ID_INVALID" and error.code == "FINDING_ID_INVALID"
+
+
+def test_cli_retry_detail_requires_an_error_from_the_submitted_input():
+    from types import SimpleNamespace
+
+    from pre_pr_tribunal import cli as tribunal_cli
+
+    error = SchemaError("FINDING_ID_INVALID", path="findings[0].id")
+    submit = SimpleNamespace(command="submit-report", reviewer="B")
+    assert error.from_submission is False
+    assert tribunal_cli._retry_detail(submit, error, "PRE_PR_TRIBUNAL:FINDING_ID_INVALID\n") == ""
+
+
+def test_cli_submit_does_not_attribute_a_sealed_peer_parse_error_to_the_submitter(git_repo):
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    sealed = json.dumps(
+        report(read_verdict(git_repo).snapshot, "A", findings=[finding()]), separators=(",", ":"),
+    ).encode()
+    assert run_cli_bytes(git_repo, "submit-report", "--reviewer", "A", input=sealed).returncode == 0
+    verdict_path = git_repo / ".review/verdict.json"
+    verdict_path.write_bytes(verdict_path.read_bytes().replace(b"A-R1-001", b"A-R1-0x1"))
+
+    failed = run_cli_bytes(git_repo, "submit-report", "--reviewer", "B", input=b"{}")
+
+    assert (failed.returncode, failed.stdout, failed.stderr) == (
+        1, b"", b"PRE_PR_TRIBUNAL:FINDING_ID_INVALID\n",
+    )
+
+
+def test_cli_submit_does_not_attribute_an_orphan_canonical_parse_error_as_a_retry_path(git_repo):
+    begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
+    snapshot = read_verdict(git_repo).snapshot
+    inbox = git_repo / ".review/inbox/round-1"
+    for directory in (git_repo / ".review/inbox", inbox):
+        if not directory.exists():
+            directory.mkdir(mode=0o700)
+    orphan = inbox / "A.json"
+    orphan.write_bytes(json.dumps(
+        report(snapshot, "A", findings=[finding("A-R1-0x1")]), separators=(",", ":"),
+    ).encode())
+    orphan.chmod(0o600)
+
+    failed = run_cli_bytes(
+        git_repo, "submit-report", "--reviewer", "A",
+        input=json.dumps(report(snapshot, "A"), separators=(",", ":")).encode(),
+    )
+
+    assert (failed.returncode, failed.stdout, failed.stderr) == (
+        1, b"", b"PRE_PR_TRIBUNAL:FINDING_ID_INVALID\n",
+    )

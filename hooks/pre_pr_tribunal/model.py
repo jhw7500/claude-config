@@ -76,6 +76,9 @@ class TribunalError(Exception):
         super().__init__(code)
         self.code = code
         self.path = path
+        # Set only where the submitted stdin report is parsed, so a path from a
+        # sealed peer slot or an orphan canonical report is never attributed to it.
+        self.from_submission = False
 
 
 class SchemaError(TribunalError):

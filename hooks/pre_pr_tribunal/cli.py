@@ -470,6 +470,7 @@ def _retry_detail(arguments, error: TribunalError, first_line: str) -> str:
     path = getattr(error, "path", None)
     if (
         arguments.command != "submit-report"
+        or getattr(error, "from_submission", False) is not True
         or not isinstance(path, str)
         or _DIAGNOSTIC_PATH.fullmatch(path) is None
     ):
