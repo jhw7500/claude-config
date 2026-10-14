@@ -503,14 +503,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except InstallError as error:
         print(f"install-pre-pr-tribunal: {error}", file=sys.stderr)
+        # A broken or replaced installed link makes the transaction refuse, so the
+        # catalog state that caused it is reported here rather than after success.
+        _print_catalog_warnings(home)
         return 1
     print(
         f"pre-pr-tribunal installed ({len(changed)} changed); "
         "review Codex hook trust with /hooks"
     )
+    _print_catalog_warnings(home)
+    return 0
+
+
+def _print_catalog_warnings(home: Path) -> None:
     for warning in catalog_warnings(home):
         print(f"install-pre-pr-tribunal: warning: {warning}", file=sys.stderr)
-    return 0
 
 
 if __name__ == "__main__":

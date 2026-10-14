@@ -1052,3 +1052,59 @@ def test_catalog_warnings_report_broken_link_and_missing_skill_file(installer, h
         ".claude/skills/pre-pr-tribunal link is broken",
         ".codex/skills/pre-pr-tribunal has no SKILL.md",
     ]
+
+
+def test_main_reports_a_broken_installed_link_when_the_install_refuses(installer, home, capsys):
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 0
+    capsys.readouterr()
+    link = home / ".claude/skills/pre-pr-tribunal"
+    link.unlink()
+    link.symlink_to(home / "missing-target")
+
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 1
+
+    assert capsys.readouterr().err.splitlines() == [
+        "install-pre-pr-tribunal: symlink target conflicts with planned target",
+        "install-pre-pr-tribunal: warning: .claude/skills/pre-pr-tribunal link is broken",
+    ]
+
+
+def test_main_reports_an_installed_entry_without_skill_file_when_the_install_refuses(
+    installer, home, capsys
+):
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 0
+    capsys.readouterr()
+    entry = home / ".codex/skills/pre-pr-tribunal"
+    entry.unlink()
+    entry.mkdir()
+
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 1
+
+    err = capsys.readouterr().err.splitlines()
+    assert err[-1] == "install-pre-pr-tribunal: warning: .codex/skills/pre-pr-tribunal has no SKILL.md"
+    assert len(err) == 2
+
+
+def test_main_reports_a_duplicate_entry_next_to_a_conflicting_pinned_link(
+    installer, home, tmp_path, capsys
+):
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 0
+    capsys.readouterr()
+    pinned = tmp_path / "pin/skills/pre-pr-tribunal"
+    shutil.copytree(REPO / "skills/pre-pr-tribunal", pinned)
+    for runtime in (".claude", ".codex"):
+        link = home / runtime / "skills/pre-pr-tribunal"
+        link.unlink()
+        link.symlink_to(pinned)
+    (home / ".claude/skills/.pre-pr-tribunal.contract5.d6a59c5").symlink_to(
+        REPO / "skills/pre-pr-tribunal"
+    )
+
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 1
+
+    assert capsys.readouterr().err.splitlines() == [
+        "install-pre-pr-tribunal: symlink target conflicts with planned target",
+        "install-pre-pr-tribunal: warning: .claude/skills has 1 other entries declaring the "
+        "pre-pr-tribunal skill (.pre-pr-tribunal.contract5.d6a59c5); move them outside the "
+        "skills directory so the catalog lists one copy",
+    ]
