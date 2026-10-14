@@ -998,3 +998,57 @@ def test_installer_package_names_cover_every_package_module(installer):
     modules = {path.name for path in source.glob("*.py")}
     assert set(installer.PACKAGE_NAMES) == modules
     assert set(PACKAGE_NAMES) == modules
+
+
+def test_main_reports_no_catalog_warning_after_a_clean_install(installer, home, capsys):
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 0
+    assert capsys.readouterr().err == ""
+    assert installer.catalog_warnings(home) == []
+
+
+def test_main_warns_when_another_catalog_entry_declares_the_tribunal_skill(
+    installer, home, capsys
+):
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 0
+    capsys.readouterr()
+    stale = home / ".claude/skills/.pre-pr-tribunal.contract5.d6a59c5"
+    stale.symlink_to(REPO / "skills/pre-pr-tribunal")
+
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 0
+
+    err = capsys.readouterr().err
+    assert err == (
+        "install-pre-pr-tribunal: warning: .claude/skills has 1 other entries declaring the "
+        "pre-pr-tribunal skill (.pre-pr-tribunal.contract5.d6a59c5); move them outside the "
+        "skills directory so the catalog lists one copy\n"
+    )
+
+
+def test_catalog_warnings_bound_names_and_hide_unsafe_ones(installer, home):
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 0
+    skills = home / ".codex/skills"
+    for name in ("!bad name", "a-copy", "b-copy", "c-copy", "d-copy", "e\nnewline"):
+        (skills / name).symlink_to(REPO / "skills/pre-pr-tribunal")
+    (skills / "unrelated").mkdir()
+    (skills / "unrelated/SKILL.md").write_text("---\nname: other\n---\n", encoding="utf-8")
+
+    (warning,) = installer.catalog_warnings(home)
+
+    assert warning.startswith(".codex/skills has 6 other entries declaring the pre-pr-tribunal skill")
+    assert "(?, a-copy, b-copy, +3 more)" in warning
+    assert "\n" not in warning and "unrelated" not in warning
+
+
+def test_catalog_warnings_report_broken_link_and_missing_skill_file(installer, home):
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 0
+    claude_link = home / ".claude/skills/pre-pr-tribunal"
+    claude_link.unlink()
+    claude_link.symlink_to(home / "missing-target")
+    codex_link = home / ".codex/skills/pre-pr-tribunal"
+    codex_link.unlink()
+    codex_link.mkdir()
+
+    assert installer.catalog_warnings(home) == [
+        ".claude/skills/pre-pr-tribunal link is broken",
+        ".codex/skills/pre-pr-tribunal has no SKILL.md",
+    ]

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 import argparse
 import os
+import re
 import stat
 import sys
 
@@ -423,6 +424,64 @@ def apply_transaction(
     return _apply_transaction(entries, **kwargs)
 
 
+_CATALOG_SKILL = "pre-pr-tribunal"
+_CATALOG_SHOWN_ENTRIES = 3
+_SAFE_CATALOG_ENTRY = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_TRIBUNAL_NAME_LINE = re.compile(r"^name:[ \t]*pre-pr-tribunal[ \t]*$", re.MULTILINE)
+
+
+def _declares_tribunal_skill(directory: Path) -> bool:
+    skill = directory / "SKILL.md"
+    try:
+        if not skill.is_file():
+            return False
+        with open(skill, "rb") as handle:
+            head = handle.read(4096).decode("utf-8", "replace")
+    except OSError:
+        return False
+    parts = head.split("---", 2)
+    return (
+        head.startswith("---")
+        and len(parts) == 3
+        and _TRIBUNAL_NAME_LINE.search(parts[1]) is not None
+    )
+
+
+def catalog_warnings(home: Path) -> list[str]:
+    """Bounded diagnostics for the installed Skill links as the Skill catalog sees them."""
+
+    warnings = []
+    for runtime in (".claude", ".codex"):
+        skills = home / runtime / "skills"
+        label = f"{runtime}/skills/{_CATALOG_SKILL}"
+        canonical = skills / _CATALOG_SKILL
+        if canonical.is_symlink() and not canonical.exists():
+            warnings.append(f"{label} link is broken")
+        elif not (canonical / "SKILL.md").is_file():
+            warnings.append(f"{label} has no SKILL.md")
+        try:
+            names = sorted(entry.name for entry in skills.iterdir())
+        except OSError:
+            continue
+        duplicates = [
+            name for name in names
+            if name != _CATALOG_SKILL and _declares_tribunal_skill(skills / name)
+        ]
+        if duplicates:
+            shown = ", ".join(
+                name if _SAFE_CATALOG_ENTRY.fullmatch(name) else "?"
+                for name in duplicates[:_CATALOG_SHOWN_ENTRIES]
+            )
+            if len(duplicates) > _CATALOG_SHOWN_ENTRIES:
+                shown += f", +{len(duplicates) - _CATALOG_SHOWN_ENTRIES} more"
+            warnings.append(
+                f"{runtime}/skills has {len(duplicates)} other entries declaring the "
+                f"{_CATALOG_SKILL} skill ({shown}); move them outside the skills "
+                "directory so the catalog lists one copy"
+            )
+    return warnings
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Install pre-PR tribunal runtime")
     parser.add_argument("--repo", required=True)
@@ -449,6 +508,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"pre-pr-tribunal installed ({len(changed)} changed); "
         "review Codex hook trust with /hooks"
     )
+    for warning in catalog_warnings(home):
+        print(f"install-pre-pr-tribunal: warning: {warning}", file=sys.stderr)
     return 0
 
 
