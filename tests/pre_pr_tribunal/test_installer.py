@@ -1108,3 +1108,45 @@ def test_main_reports_a_duplicate_entry_next_to_a_conflicting_pinned_link(
         "pre-pr-tribunal skill (.pre-pr-tribunal.contract5.d6a59c5); move them outside the "
         "skills directory so the catalog lists one copy",
     ]
+
+
+def test_main_reports_the_broken_link_when_another_catalog_is_unsearchable(
+    installer, home, capsys
+):
+    for runtime in (".claude", ".codex"):
+        (home / runtime / "skills").mkdir(parents=True)
+    (home / ".claude/skills/pre-pr-tribunal").symlink_to(home / "missing-target")
+    unsearchable = home / ".codex/skills"
+    unsearchable.chmod(0)
+    try:
+        if os.access(unsearchable, os.X_OK):
+            pytest.skip("directory permissions are not enforced for this user")
+        assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 1
+    finally:
+        unsearchable.chmod(0o700)
+
+    assert capsys.readouterr().err.splitlines() == [
+        "install-pre-pr-tribunal: symlink target conflicts with planned target",
+        "install-pre-pr-tribunal: warning: .claude/skills/pre-pr-tribunal link is broken",
+    ]
+
+
+def test_main_gives_no_verdict_for_an_installed_entry_it_cannot_inspect(
+    installer, home, capsys
+):
+    assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 0
+    capsys.readouterr()
+    entry = home / ".codex/skills/pre-pr-tribunal"
+    entry.unlink()
+    entry.mkdir()
+    entry.chmod(0)
+    try:
+        if os.access(entry, os.X_OK):
+            pytest.skip("directory permissions are not enforced for this user")
+        assert installer.main(["--repo", str(REPO), "--home", str(home)]) == 1
+    finally:
+        entry.chmod(0o700)
+
+    assert capsys.readouterr().err.splitlines() == [
+        "install-pre-pr-tribunal: symlink target conflicts with planned target",
+    ]
