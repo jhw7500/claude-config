@@ -26,12 +26,12 @@
    - **재개 우선순위**: Task 세션 재개는 `/jhw:task resume <tsk-id>`가 1순위다. 강제종료 등으로 task handoff가 없으면 `HANDOFF.<세션>.md`를 보조 컨텍스트로 읽되, 두 기록이 어긋나면 jhw-control 기록을 따른다.
 9. **Task 등록 권유 (넛지)** — `[TASK-NUDGE]` 또는 Codex AGENTS fallback을 받으면, 아래 순서에서 **하나만** 추천하고 필요한 승인 또는 복구가 끝날 때까지 후속 실질 변경을 멈춘다.
    - **우선순위**: (1) 이미 결정했거나 제외 작업(조회/Q&A·단순 문서/설정·subagent/서브에이전트)이면 Task 없이 진행한다. (2) backlog는 registered/unregistered 여부와 무관하게 GitHub Issue만 별도 승인 후 제안하고 Task/Claim을 선점하지 않는다. (3) 즉시 작업의 unknown은 등록 여부를 가정하지 않고 현재 변경을 중단해 분류 복구를 알린다. (4) registered(등록) 저장소의 즉시 작업은 기존 Issue 또는 반복·다중 세션 증거가 있으면 Formal Issue Task, 현재 세션에서 끝낼 제한 작업이면 Temporary Task, 조정 비용보다 작으면 Task 없이를 추천한다. (5) unregistered(미등록) 저장소의 즉시 작업은 반복·다중 세션 증거가 있을 때만 Project/Repository 등록을 별도 승인으로 먼저 제안하고, 그렇지 않으면 Task 없이 진행한다.
-   - **적용 시점**: 기존 Issue 작업의 구현을 승인받았으면, 넛지가 첫 Edit에서 걸리기를 기다리지 말고 브랜치 생성·첫 편집 전에 위 우선순위를 먼저 적용한다. 컨테이너(브랜치·worktree·Claim)를 첫 산출물보다 먼저 정해야 이관 비용이 생기지 않는다.
+   - **적용 시점**: 이 세션에서 넛지로 저장소 등록 상태를 이미 받았다면, 기존 Issue 작업의 구현을 승인받은 시점에 넛지가 첫 Edit에서 다시 걸리기를 기다리지 말고 브랜치 생성·첫 편집 전에 위 우선순위를 먼저 적용한다. 컨테이너(브랜치·worktree·Claim)를 첫 산출물보다 먼저 정해야 이관 비용이 생기지 않는다. 등록 상태를 아직 받지 못했으면 이 앞당김을 적용하지 않는다. 상태를 가정하지 않고 첫 넛지를 기다린다.
    - **반복·다중 세션 증거**는 다음 셋만 인정한다: 사용자가 장기·반복·여러 세션 작업임을 명시함, 기존 GitHub Issue·승인된 계획·Handoff가 있음, 또는 여러 구현 단계와 검증이 필요한 아키텍처 작업. 파일 수나 저장소 안에 있다는 사실은 증거가 아니다.
    - **승인 경계**: GitHub Issue 생성, Project/Repository 등록, Formal 또는 Temporary Task 시작은 각각 별도의 명시적 사용자 승인이 필요하며 앞 단계 승인은 다음 단계를 승인하지 않는다. 이미 Task를 시작했거나 사용자가 Task 없이를 선택한 세션에는 다시 묻지 않는다.
    - **승인된 lifecycle**: `/jhw:task` 규격을 유지하고 `"$HOME/.local/bin/jhw-control-host" preflight`가 성공한 뒤 신규 Formal/Temporary Task는 현재 checkout의 exact root와 `"$HOME/.local/bin/jhw-control-host" task start --resolve-from-checkout true`를 사용한다. 기존 Task 재개는 `"$HOME/.local/bin/jhw-control-host" task start --task <tsk-id>`를 사용하며, finish/switch는 `"$HOME/.local/bin/jhw-control-host" task finish`를 사용한다. preflight가 저장소 잠김을 보고하면 사용자 터미널에서 `"$HOME/.local/bin/jhw-control-host" unlock` 한 번만 실행한 뒤 preflight를 재시도한다.
    - **보안 경계**: Project/Repository ID를 추측하거나 portfolio pagination으로 조합하지 않는다. `PROJECT_REPOSITORY_NOT_FOUND`는 정확한 Project Record에 Repository를 등록한 뒤 재시도하고, `PROJECT_REPOSITORY_AMBIGUOUS`는 Repository 연관을 하나로 축소한 뒤 재시도한다. 어느 경우에도 Project를 임의 선택하거나 explicit mode로 자동 fallback하지 않는다. raw CLI 호출·설정 소싱·직접 자격증명 조회·daemon 교체는 금지한다.
-10. **쓰기 직전 다른 작성자 확인** — 커밋, Tribunal `begin`, push 직전에 `git status`와 `git reflog --date=iso`를 보고, 세션 시작 이후 내가 만들지 않은 변경이나 reflog 항목이 있으면 멈추고 알린다. 같은 worktree에 살아 있는 이전 세션도 작성자다. "다른 작성자 없음"은 관측이 아니라 확보해야 하는 전제다.
+10. **쓰기 직전 다른 작성자 확인** — 작업본에 처음 쓰기 전에 기준선(HEAD, `git status --porcelain`, `git reflog --date=iso`의 맨 위 항목)을 기록한다. 커밋, Tribunal `begin`, push 직전에 다시 보고, 기준선 이후 내가 만들지 않은 변경이나 reflog 항목이 있거나 기준선에 이미 내 것이 아닌 미커밋 변경이 있었으면 멈추고 알린다. 같은 worktree에 살아 있는 이전 세션도 작성자다. "다른 작성자 없음"은 관측이 아니라 확보해야 하는 전제다. 이 확인은 같은 파일을 다른 세션이 함께 고친 경우까지 가려내지는 못한다.
 
 ---
 
