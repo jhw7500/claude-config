@@ -557,22 +557,36 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
         return not record.get("isMeta") or (isinstance(origin, dict) and origin.get("kind") == "coordinator")
 
     start = 1 + max((index for index, record in enumerate(records) if is_request(record)), default=-1)
-    turns = [record for record in records[start:] if record.get("type") in {"user", "assistant"}]
-    # The delivered reply is the first stop: an end_turn no assistant record
-    # continues. A stop hook continues the same reply; a later reopen does not.
-    stops = [
-        record
-        for record, following in zip(turns, [*turns[1:], None])
-        if record.get("type") == "assistant"
-        and message(record).get("stop_reason") == "end_turn"
-        and (following is None or following.get("type") != "assistant")
-    ]
+    tail = records[start:]
+
+    def is_stop(position: int) -> bool:
+        # A stop is an assistant record no assistant record continues. Some
+        # Claude Code versions leave stop_reason null on a delivered final
+        # record; the SubagentStop hook record still marks that it stopped.
+        record = tail[position]
+        if record.get("type") != "assistant":
+            return False
+        stop_recorded = False
+        for later in tail[position + 1:]:
+            if later.get("type") == "assistant":
+                return False
+            if later.get("type") == "user":
+                break
+            attachment = later.get("attachment")
+            if isinstance(attachment, dict) and attachment.get("hookEvent") == "SubagentStop":
+                stop_recorded = True
+        reason = message(record).get("stop_reason")
+        return reason == "end_turn" or (reason is None and stop_recorded)
+
+    # The delivered reply is the first stop. A stop hook continues the same
+    # reply; a later reopen does not replace it.
+    stops = [tail[position] for position in range(len(tail)) if is_stop(position)]
     if not stops:
         raise TribunalError("RESPONSE_PENDING")
     reply_id = message(stops[0]).get("id")
     texts = [
         block.get("text")
-        for record in turns
+        for record in tail
         if record.get("type") == "assistant"
         and isinstance(reply_id, str)
         and message(record).get("id") == reply_id

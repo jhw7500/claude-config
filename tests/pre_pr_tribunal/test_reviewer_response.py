@@ -71,6 +71,12 @@ def hook(agent=AGENT):
             "attachment": {"type": "hook_success"}}
 
 
+def subagent_stop(agent=AGENT):
+    # Recorded when the reviewer stops, whatever stop_reason its final record carries.
+    return {"type": "attachment", "agentId": agent, "isSidechain": True,
+            "attachment": {"type": "hook_success", "hookEvent": "SubagentStop"}}
+
+
 def request_blob(role, value, agent=AGENT):
     # Request bookkeeping that repeats conversation text under its own type.
     return {"type": "api-request-blob", "agentId": agent, "hash": "fixture",
@@ -161,11 +167,52 @@ def test_answers_a_follow_up_sent_after_a_background_reopen(tmp_path):
     assert output.read_bytes() == TERMINAL.encode("utf-8")
 
 
+def test_accepts_a_delivered_reply_whose_final_record_has_a_null_stop_reason(tmp_path):
+    result, output = extract(tmp_path, [
+        prompt("review"),
+        assistant("m1", [THINKING]),
+        assistant("m1", [text(TERMINAL)]),
+        subagent_stop(),
+        subagent_stop(),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == TERMINAL.encode("utf-8")
+
+
+def test_accepts_a_null_stop_reason_reply_to_a_follow_up(tmp_path):
+    result, output = extract(tmp_path, [
+        prompt("review"),
+        assistant("m1", [text("rejected format")], "end_turn"),
+        subagent_stop(),
+        follow_up("retry with the format fixed"),
+        assistant("m2", [text(TERMINAL)]),
+        subagent_stop(),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == TERMINAL.encode("utf-8")
+
+
+def test_keeps_a_null_stop_reason_reply_when_a_background_task_reopens_the_reviewer(tmp_path):
+    result, output = extract(tmp_path, [
+        prompt("review"),
+        assistant("m1", [text(TERMINAL)]),
+        subagent_stop(),
+        reopened(),
+        assistant("m2", [text("unrequested reply")], "end_turn"),
+        subagent_stop(),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == TERMINAL.encode("utf-8")
+
+
 def test_takes_the_last_reply_when_a_stop_hook_continues_the_turn(tmp_path):
     result, output = extract(tmp_path, [
         prompt("review"),
         assistant("m1", [text("first stop")], "end_turn"),
-        hook(),
+        subagent_stop(),
         assistant("m2", [THINKING]),
         assistant("m2", [tool_use("t1")], "tool_use"),
         tool_result("t1"),
@@ -202,6 +249,9 @@ PARTIAL_HOOK_LINE = json.dumps(hook()).encode("utf-8")[:20]
          assistant("m2", [tool_use("t1")], "tool_use")],
         b"", id="continuation-running"),
     pytest.param([prompt("review"), assistant("m1", [THINKING])], b"", id="no-reply-yet"),
+    pytest.param(
+        [prompt("review"), assistant("m1", [text(TERMINAL)]), hook()],
+        b"", id="null-stop-reason-without-stop-record"),
     pytest.param(
         [prompt("review"), assistant("m1", [text(TERMINAL)], "end_turn")],
         PARTIAL_HOOK_LINE, id="partial-last-line"),
