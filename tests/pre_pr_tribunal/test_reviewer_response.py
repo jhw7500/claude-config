@@ -71,6 +71,13 @@ def hook(agent=AGENT):
             "attachment": {"type": "hook_success"}}
 
 
+def queued(kind, value="retry with the format fixed", agent=AGENT):
+    # A message that reaches a running reviewer is queued into its turn as an attachment.
+    return {"type": "attachment", "agentId": agent, "isSidechain": True,
+            "attachment": {"type": "queued_command", "prompt": value, "origin": {"kind": kind},
+                           "isMeta": True}}
+
+
 def subagent_stop(agent=AGENT):
     # Recorded when the reviewer stops, whatever stop_reason its final record carries.
     return {"type": "attachment", "agentId": agent, "isSidechain": True,
@@ -161,6 +168,40 @@ def test_answers_a_follow_up_sent_after_a_background_reopen(tmp_path):
         assistant("m2", [text("unrequested reply")], "end_turn"),
         follow_up("retry with the format fixed"),
         assistant("m3", [text(TERMINAL)], "end_turn"),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == TERMINAL.encode("utf-8")
+
+
+def test_answers_a_follow_up_queued_while_the_reviewer_runs(tmp_path):
+    result, output = extract(tmp_path, [
+        prompt("review"),
+        assistant("m1", [text("rejected format")], "end_turn"),
+        subagent_stop(),
+        reopened(),
+        assistant("m2", [tool_use("t1")], "tool_use"),
+        tool_result("t1"),
+        queued("coordinator"),
+        assistant("m3", [text(TERMINAL)], "end_turn"),
+        subagent_stop(),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == TERMINAL.encode("utf-8")
+
+
+def test_does_not_treat_a_queued_background_notification_as_a_request(tmp_path):
+    result, output = extract(tmp_path, [
+        prompt("review"),
+        assistant("m1", [text(TERMINAL)], "end_turn"),
+        subagent_stop(),
+        reopened(),
+        assistant("m2", [tool_use("t1")], "tool_use"),
+        tool_result("t1"),
+        queued("task-notification", "<task-notification>done</task-notification>"),
+        assistant("m3", [text("unrequested reply")], "end_turn"),
+        subagent_stop(),
     ])
 
     assert result.returncode == 0, result.stderr
@@ -366,6 +407,26 @@ def run_in_process(capsys, tmp_path, *, output=None):
 
 def test_rejects_a_transcript_owned_by_another_user(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(cli.os, "geteuid", lambda: os.getuid() + 1)
+
+    status, captured, output = run_in_process(capsys, tmp_path)
+
+    assert status == 1
+    assert captured.err == "PRE_PR_TRIBUNAL:RESPONSE_INVALID\n"
+    assert not os.path.lexists(output)
+
+
+def test_rejects_a_transcript_beyond_the_processing_bound(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_MAX_TRANSCRIPT_BYTES", 128)
+
+    status, captured, output = run_in_process(capsys, tmp_path)
+
+    assert status == 1
+    assert captured.err == "PRE_PR_TRIBUNAL:RESPONSE_INVALID\n"
+    assert not os.path.lexists(output)
+
+
+def test_rejects_a_transcript_record_beyond_the_line_bound(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_MAX_TRANSCRIPT_LINE_BYTES", 128)
 
     status, captured, output = run_in_process(capsys, tmp_path)
 
