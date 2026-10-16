@@ -382,6 +382,22 @@ def test_skill_submits_and_seals_each_terminal_report_before_finalize():
     assert "do not call `finalize`" in steps[7]
 
 
+def test_skill_takes_claude_reviewer_bytes_from_the_transcript_not_the_notification():
+    """A completion notification escapes text for display, so its bytes never match the reply."""
+    step = numbered_steps(text("SKILL.md"))[6]
+    command = f"{CLI} reviewer-response --runtime claude"
+    assert command in step
+    assert step.index("controller-private file") < step.index(command)
+    assert step.index(command) < step.index("submit-report --reviewer X")
+    assert "completion notification" in step
+    assert "first reply after the controller's latest request" in step
+    assert "without a new request is not a new terminal response" in step
+    assert "rerun it once" in step
+    assert "RESPONSE_PENDING" in step and "integrity stop" in step
+    readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
+    assert "reviewer-response --runtime claude" in readme
+
+
 def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate():
     skill = text("SKILL.md")
     for stage in (

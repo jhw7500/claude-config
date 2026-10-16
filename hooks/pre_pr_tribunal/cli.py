@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 import time
 
@@ -180,6 +183,11 @@ def _parser() -> argparse.ArgumentParser:
     # command at parse time, before stdin is read and the report is stored.
     submit.add_argument("--run-id")
     submit.add_argument("--attempt")
+    response = commands.add_parser("reviewer-response", add_help=False)
+    response.add_argument("--runtime", required=True, choices=("claude",))
+    response.add_argument("--transcript", required=True, type=Path)
+    response.add_argument("--agent", required=True)
+    response.add_argument("--output", required=True, type=Path)
     failure = commands.add_parser("record-failure", add_help=False)
     failure.add_argument("--reviewer", required=True, choices=("A", "B", "C"))
     failure.add_argument(
@@ -483,6 +491,137 @@ def _retry_detail(arguments, error: TribunalError, first_line: str) -> str:
 
 def _report_stdin() -> bytes:
     return sys.stdin.buffer.read(MAX_REPORT_BYTES + 1)
+
+
+_AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _claude_reply(transcript: Path, agent: str) -> bytes:
+    """Return the exact text of a Claude subagent's first reply to the controller's latest request.
+
+    `RESPONSE_PENDING` means the reply is not recorded yet. Any other failure
+    means the transcript cannot identify exactly one reply from this agent.
+    """
+
+    if _AGENT_ID.fullmatch(agent) is None:
+        raise TribunalError("RESPONSE_INVALID")
+    try:
+        descriptor = os.open(transcript, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        raise TribunalError("RESPONSE_INVALID") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise TribunalError("RESPONSE_INVALID")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read()
+    except OSError:
+        raise TribunalError("RESPONSE_INVALID") from None
+    finally:
+        os.close(descriptor)
+
+    *lines, tail = raw.split(b"\n")
+    records = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (ValueError, RecursionError):
+            raise TribunalError("RESPONSE_INVALID") from None
+        if not isinstance(record, dict) or record.get("agentId") != agent:
+            raise TribunalError("RESPONSE_INVALID")
+        records.append(record)
+    if tail:
+        raise TribunalError("RESPONSE_PENDING")
+
+    def message(record: dict) -> dict:
+        value = record.get("message")
+        return value if isinstance(value, dict) else {}
+
+    def blocks(record: dict) -> list:
+        content = message(record).get("content")
+        return [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
+
+    def is_request(record: dict) -> bool:
+        # The controller's own prompts: the first one and its follow-ups. A meta
+        # prompt from anything else, such as a finished background task, reopens
+        # a stopped reviewer without asking for a new reply.
+        if record.get("type") != "user":
+            return False
+        if not isinstance(message(record).get("content"), str) and any(
+            block.get("type") == "tool_result" for block in blocks(record)
+        ):
+            return False
+        origin = record.get("origin")
+        return not record.get("isMeta") or (isinstance(origin, dict) and origin.get("kind") == "coordinator")
+
+    start = 1 + max((index for index, record in enumerate(records) if is_request(record)), default=-1)
+    turns = [record for record in records[start:] if record.get("type") in {"user", "assistant"}]
+    # The delivered reply is the first stop: an end_turn no assistant record
+    # continues. A stop hook continues the same reply; a later reopen does not.
+    stops = [
+        record
+        for record, following in zip(turns, [*turns[1:], None])
+        if record.get("type") == "assistant"
+        and message(record).get("stop_reason") == "end_turn"
+        and (following is None or following.get("type") != "assistant")
+    ]
+    if not stops:
+        raise TribunalError("RESPONSE_PENDING")
+    reply_id = message(stops[0]).get("id")
+    texts = [
+        block.get("text")
+        for record in turns
+        if record.get("type") == "assistant"
+        and isinstance(reply_id, str)
+        and message(record).get("id") == reply_id
+        for block in blocks(record)
+        if block.get("type") == "text"
+    ]
+    if len(texts) != 1 or not isinstance(texts[0], str):
+        raise TribunalError("RESPONSE_INVALID")
+    try:
+        return texts[0].encode("utf-8")
+    except UnicodeEncodeError:
+        raise TribunalError("RESPONSE_INVALID") from None
+
+
+def _write_private_response(path: Path, data: bytes) -> None:
+    """Create `path` as a new current-user `0600` file holding exactly `data`."""
+
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        raise TribunalError("RESPONSE_OUTPUT_EXISTS") from None
+    except OSError:
+        raise TribunalError("RESPONSE_OUTPUT_UNSAFE") from None
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(descriptor, view):]
+        os.fsync(descriptor)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or os.pread(descriptor, len(data) + 1, 0) != data
+        ):
+            raise TribunalError("RESPONSE_OUTPUT_UNSAFE")
+    except (OSError, TribunalError):
+        # Remove only the file this call created, never one that replaced it.
+        try:
+            current = os.stat(path, follow_symlinks=False)
+            created = os.fstat(descriptor)
+            if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                os.unlink(path)
+        except OSError:
+            pass
+        raise TribunalError("RESPONSE_OUTPUT_UNSAFE") from None
+    finally:
+        os.close(descriptor)
 
 
 def _report_projection(
@@ -843,6 +982,15 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 "report_contract_version": receipt.report_contract_version,
                 "attempt": receipt.attempt,
                 "provenance": receipt.provenance,
+            }
+        elif arguments.command == "reviewer-response":
+            data = _claude_reply(arguments.transcript, arguments.agent)
+            _write_private_response(arguments.output, data)
+            payload = {
+                "runtime": arguments.runtime,
+                "agent": arguments.agent,
+                "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
             }
         elif arguments.command == "record-failure":
             slot = record_reviewer_failure(
