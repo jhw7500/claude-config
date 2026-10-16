@@ -398,6 +398,25 @@ def test_skill_takes_claude_reviewer_bytes_from_the_transcript_not_the_notificat
     assert "reviewer-response --runtime claude" in readme
 
 
+def test_skill_takes_codex_reviewer_bytes_from_the_controller_rollout():
+    """A Codex controller would have to retype the answer; its own rollout holds the bytes it received."""
+    steps = numbered_steps(text("SKILL.md"))
+    step = steps[6]
+    command = f"{CLI} reviewer-response --runtime codex"
+    assert command in step
+    assert step.index("controller-private file") < step.index(command)
+    assert step.index(command) < step.index("submit-report --reviewer X")
+    assert "printenv CODEX_THREAD_ID" in step and "--thread-id" in step
+    assert "$CODEX_HOME/sessions/" in step
+    # A follow-up can be answered by the reviewer's running turn, ahead of its own answer.
+    assert "send a follow-up only after the previous answer has been extracted and rejected" in step
+    assert "`RESPONSE_REVIEWER_FAILED`" in step
+    assert "supported terminal `REVIEWER_FAILED` outcome" in step
+    assert "not to start subagents or background work" in steps[5]
+    readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
+    assert "reviewer-response --runtime codex" in readme
+
+
 def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate():
     skill = text("SKILL.md")
     for stage in (
