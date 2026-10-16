@@ -494,6 +494,51 @@ def _report_stdin() -> bytes:
 
 
 _AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# The largest local transcripts, Codex controller rollouts, reach about 270 MB
+# with single records up to about 20 MB. Reading stops at these bounds.
+_MAX_TRANSCRIPT_BYTES = 1024 * 1024 * 1024
+_MAX_TRANSCRIPT_LINE_BYTES = 64 * 1024 * 1024
+
+
+def _transcript_records(transcript: Path):
+    """Yield each JSONL object of a current-user regular transcript, reading at most the bound.
+
+    A partial last line means the file is still being written: `RESPONSE_PENDING`
+    after every complete line has parsed. Any other defect is `RESPONSE_INVALID`.
+    """
+
+    try:
+        descriptor = os.open(transcript, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        raise TribunalError("RESPONSE_INVALID") from None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise TribunalError("RESPONSE_INVALID")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            consumed = 0
+            while True:
+                line = handle.readline(min(_MAX_TRANSCRIPT_BYTES + 1 - consumed, _MAX_TRANSCRIPT_LINE_BYTES + 1))
+                if not line:
+                    return
+                consumed += len(line)
+                if consumed > _MAX_TRANSCRIPT_BYTES or len(line) > _MAX_TRANSCRIPT_LINE_BYTES:
+                    raise TribunalError("RESPONSE_INVALID")
+                if not line.endswith(b"\n"):
+                    raise TribunalError("RESPONSE_PENDING")
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line.decode("utf-8"))
+                except (ValueError, RecursionError):
+                    raise TribunalError("RESPONSE_INVALID") from None
+                if not isinstance(record, dict):
+                    raise TribunalError("RESPONSE_INVALID")
+                yield record
+    except OSError:
+        raise TribunalError("RESPONSE_INVALID") from None
+    finally:
+        os.close(descriptor)
 
 
 def _claude_reply(transcript: Path, agent: str) -> bytes:
@@ -505,35 +550,11 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
 
     if _AGENT_ID.fullmatch(agent) is None:
         raise TribunalError("RESPONSE_INVALID")
-    try:
-        descriptor = os.open(transcript, os.O_RDONLY | os.O_NONBLOCK)
-    except OSError:
-        raise TribunalError("RESPONSE_INVALID") from None
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
-            raise TribunalError("RESPONSE_INVALID")
-        with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            raw = handle.read()
-    except OSError:
-        raise TribunalError("RESPONSE_INVALID") from None
-    finally:
-        os.close(descriptor)
-
-    *lines, tail = raw.split(b"\n")
     records = []
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line.decode("utf-8"))
-        except (ValueError, RecursionError):
-            raise TribunalError("RESPONSE_INVALID") from None
-        if not isinstance(record, dict) or record.get("agentId") != agent:
+    for record in _transcript_records(transcript):
+        if record.get("agentId") != agent:
             raise TribunalError("RESPONSE_INVALID")
         records.append(record)
-    if tail:
-        raise TribunalError("RESPONSE_PENDING")
 
     def message(record: dict) -> dict:
         value = record.get("message")
@@ -547,6 +568,15 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
         # The controller's own prompts: the first one and its follow-ups. A meta
         # prompt from anything else, such as a finished background task, reopens
         # a stopped reviewer without asking for a new reply.
+        attachment = record.get("attachment")
+        if record.get("type") == "attachment" and isinstance(attachment, dict):
+            # A follow-up that reaches a running reviewer is queued into its turn.
+            origin = attachment.get("origin")
+            return (
+                attachment.get("type") == "queued_command"
+                and isinstance(origin, dict)
+                and origin.get("kind") == "coordinator"
+            )
         if record.get("type") != "user":
             return False
         if not isinstance(message(record).get("content"), str) and any(
