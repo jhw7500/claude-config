@@ -228,6 +228,10 @@ DEEP_ANSWER_LINE = b'{"payload":{"type":"agent_message"},"x":' + b"[" * 100_000 
     ])], {}, id="two-content-blocks"),
     pytest.param([spawn(), final_answer("", blocks=[{"type": "input_text", "text": None}])], {},
                  id="text-not-a-string"),
+    pytest.param([spawn(), final_answer("rejected format"), follow_up("01a143ed-0000-7000-8000-0000000000aa"),
+                  final_answer(TERMINAL)], {}, id="follow-up-by-agent-id"),
+    pytest.param([spawn(), final_answer(TERMINAL), call("followup_task", {"target": 7, "message": "retry"})], {},
+                 id="follow-up-target-not-a-string"),
     pytest.param([spawn(), call("followup_task", "{not json")], {}, id="unreadable-request-arguments"),
     pytest.param([spawn(), final_answer(TERMINAL), call("followup_task", "[1]")], {},
                  id="request-arguments-not-an-object"),
@@ -272,10 +276,26 @@ def test_rejects_a_thread_id_that_codex_does_not_issue(tmp_path):
     assert not os.path.lexists(output)
 
 
-def test_rejects_a_task_name_that_codex_does_not_issue(tmp_path):
-    agent = "Reviewer-A"
+@pytest.mark.parametrize("records", [
+    pytest.param([spawn(), final_answer(TERMINAL)], id="spawned"),
+    pytest.param([spawn(), final_answer("rejected format"), follow_up(AGENT), final_answer(TERMINAL)],
+                 id="followed-up"),
+])
+def test_accepts_the_task_path_that_spawn_agent_returns(tmp_path, records):
+    result, output = extract(tmp_path, records, agent=f"/root/{AGENT}")
 
-    result, output = extract(tmp_path, [spawn(agent), final_answer(TERMINAL, agent)], agent=agent)
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == TERMINAL.encode("utf-8")
+    assert json.loads(result.stdout)["agent"] == f"/root/{AGENT}"
+
+
+@pytest.mark.parametrize("agent, task", [
+    pytest.param("Reviewer-A", "Reviewer-A", id="name"),
+    pytest.param("/root/Reviewer-A", "Reviewer-A", id="path"),
+    pytest.param(f"/root/{AGENT}/child", f"{AGENT}/child", id="nested-path"),
+])
+def test_rejects_a_task_name_that_codex_does_not_issue(tmp_path, agent, task):
+    result, output = extract(tmp_path, [spawn(task), final_answer(TERMINAL, task)], agent=agent)
 
     assert result.returncode == 1
     assert result.stderr == b"PRE_PR_TRIBUNAL:RESPONSE_INVALID\n"

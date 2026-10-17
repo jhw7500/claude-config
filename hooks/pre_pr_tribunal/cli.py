@@ -652,13 +652,15 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
     """Return the exact payload of a Codex reviewer's first final answer to the controller's latest request.
 
     The transcript is the controller's own rollout, whose first record is the
-    root session `thread_id`. `RESPONSE_PENDING` means the answer is not
-    recorded yet, and `RESPONSE_REVIEWER_FAILED` that the runtime reported the
-    reviewer's turn as failed. Any other failure means the rollout cannot
-    identify exactly one answer from this reviewer.
+    root session `thread_id`. `agent` is the reviewer's task name, bare or as
+    the `/root/<name>` path that `spawn_agent` returns. `RESPONSE_PENDING`
+    means the answer is not recorded yet, and `RESPONSE_REVIEWER_FAILED` that
+    the runtime reported the reviewer's turn as failed. Any other failure means
+    the rollout cannot identify exactly one answer from this reviewer.
     """
 
-    if _CODEX_THREAD_ID.fullmatch(thread_id) is None or _CODEX_TASK_NAME.fullmatch(agent) is None:
+    name = agent[len("/root/"):] if agent.startswith("/root/") else agent
+    if _CODEX_THREAD_ID.fullmatch(thread_id) is None or _CODEX_TASK_NAME.fullmatch(name) is None:
         raise TribunalError("RESPONSE_INVALID")
     if not (transcript.name.startswith("rollout-") and transcript.name.endswith(f"-{thread_id}.jsonl")):
         raise TribunalError("RESPONSE_INVALID")
@@ -670,7 +672,7 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
         keep=lambda number, line: number == 0 or any(marker in line for marker in _CODEX_RECORD_MARKERS),
         wait_for_last_line=False,
     )
-    sender = f"/root/{agent}"
+    sender = f"/root/{name}"
     try:
         session = next(records, None)
         meta = session.get("payload") if session is not None else None
@@ -698,11 +700,17 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
                 if not isinstance(arguments, dict):
                     raise TribunalError("RESPONSE_INVALID")
                 # A spawn names the reviewer's task; a follow-up targets it by name or path.
-                if (
-                    arguments.get("task_name") == agent
-                    if payload["name"] == "spawn_agent"
-                    else arguments.get("target") in (agent, sender)
-                ):
+                if payload["name"] == "spawn_agent":
+                    targets_reviewer = arguments.get("task_name") == name
+                else:
+                    target = arguments.get("target")
+                    # An agent id, or anything else that names no task, may address this reviewer.
+                    if not isinstance(target, str) or not (
+                        target.startswith("/root/") or _CODEX_TASK_NAME.fullmatch(target)
+                    ):
+                        raise TribunalError("RESPONSE_INVALID")
+                    targets_reviewer = target in (name, sender)
+                if targets_reviewer:
                     requested, answer = True, None
             elif payload.get("type") == "agent_message" and payload.get("author") == sender:
                 content = payload.get("content")

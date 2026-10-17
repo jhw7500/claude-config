@@ -410,6 +410,9 @@ def test_skill_takes_codex_reviewer_bytes_from_the_controller_rollout():
     assert "$CODEX_HOME/sessions/" in step
     # A follow-up can be answered by the reviewer's running turn, ahead of its own answer.
     assert "send a follow-up only after the previous answer has been extracted and rejected" in step
+    # An agent-id follow-up is not attributable to one reviewer, so the extractor refuses it.
+    assert "address it to the reviewer's task name, never its agent id" in step
+    assert "or as the `/root/<name>` path that `spawn_agent` returns" in step
     assert "`RESPONSE_REVIEWER_FAILED`" in step
     assert "supported terminal `REVIEWER_FAILED` outcome" in step
     assert "not to start subagents or background work" in steps[5]
