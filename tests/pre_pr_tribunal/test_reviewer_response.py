@@ -311,6 +311,19 @@ def _without_agent(record):
     return record
 
 
+_MISSING = object()
+
+
+def _stop_with_content(content):
+    # A stop whose message content is not a well-formed block list.
+    record = assistant("m1", [THINKING], "end_turn")
+    if content is _MISSING:
+        del record["message"]["content"]
+    else:
+        record["message"]["content"] = content
+    return record
+
+
 @pytest.mark.parametrize("records, tail, agent", [
     pytest.param(
         [prompt("review"), assistant("m1", [text(TERMINAL)], "end_turn", agent=OTHER_AGENT)],
@@ -330,6 +343,12 @@ def _without_agent(record):
     pytest.param(
         [prompt("review"), assistant(None, [text(TERMINAL)], "end_turn")],
         b"", AGENT, id="reply-without-message-id"),
+    pytest.param([prompt("review"), _stop_with_content(_MISSING)], b"", AGENT, id="reply-without-content"),
+    pytest.param([prompt("review"), _stop_with_content(TERMINAL)], b"", AGENT, id="reply-content-not-a-list"),
+    pytest.param([prompt("review"), _stop_with_content([])], b"", AGENT, id="reply-content-empty"),
+    pytest.param([prompt("review"), _stop_with_content([1])], b"", AGENT, id="reply-content-not-objects"),
+    pytest.param([prompt("review"), _stop_with_content([THINKING, 5])], b"", AGENT,
+                 id="reply-content-partly-not-objects"),
     pytest.param(
         [prompt("review"), assistant("m1", [text("part one")]),
          assistant("m1", [text("part two")], "end_turn")],

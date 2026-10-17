@@ -631,9 +631,16 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
         for block in blocks(record)
         if block.get("type") == "text"
     ]
-    # A stop without report text is an empty reply, like an empty text block:
-    # submit-report rejects it as a format failure the reviewer can retry.
+    # A well-formed stop without report text is an empty reply, like an empty
+    # text block: submit-report rejects it as a format failure the reviewer can
+    # retry. Content that is not a block list is a damaged transcript instead.
     if not texts:
+        for record in tail:
+            content = message(record).get("content")
+            if record.get("type") == "assistant" and message(record).get("id") == reply_id and not (
+                isinstance(content, list) and content and all(isinstance(block, dict) for block in content)
+            ):
+                raise TribunalError("RESPONSE_INVALID")
         return b""
     if len(texts) != 1 or not isinstance(texts[0], str):
         raise TribunalError("RESPONSE_INVALID")
