@@ -715,16 +715,16 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
                 # A spawn names the reviewer's task; a follow-up targets it by name or path.
                 if payload["name"] == "spawn_agent":
                     if arguments.get("task_name") == name:
-                        # A spawn restarts the boundary, so no earlier request can matter.
-                        requested, answer, unattributable = True, None, False
+                        requested, answer = True, None
                 else:
                     target = arguments.get("target")
                     if not isinstance(target, str) or not (
                         target.startswith("/root/") or _CODEX_TASK_NAME.fullmatch(target)
                     ):
                         # An agent id, or anything else that names no task, may address
-                        # this reviewer until its next spawn restarts the boundary.
-                        unattributable = True
+                        # this reviewer once it has been asked for an answer. A later spawn
+                        # does not clear it: the rollout cannot show that spawn was accepted.
+                        unattributable = unattributable or requested
                     elif target in (name, sender):
                         requested, answer = True, None
             elif payload.get("type") == "agent_message" and payload.get("author") == sender:
