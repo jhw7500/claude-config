@@ -14,6 +14,7 @@ from tests.pre_pr_tribunal.test_reviewer_response import TERMINAL, write_transcr
 
 
 THREAD = "01a143ed-0000-7000-8000-79bb8a2fa277"
+AGENT_ID = "01a143ed-0000-7000-8000-0000000000aa"
 OTHER_THREAD = "01a143ed-0000-7000-8000-000000000000"
 AGENT = "reviewer_a"
 OTHER_AGENT = "reviewer_b"
@@ -162,6 +163,26 @@ def test_a_request_to_another_reviewer_does_not_move_the_boundary(tmp_path):
     assert output.read_bytes() == TERMINAL.encode("utf-8")
 
 
+@pytest.mark.parametrize("records", [
+    pytest.param([spawn("helper"), follow_up(AGENT_ID), spawn(), final_answer(TERMINAL)], id="agent-id-before-spawn"),
+    pytest.param([call("followup_task", {"target": 7, "message": "retry"}), spawn(), final_answer(TERMINAL)],
+                 id="non-string-target-before-spawn"),
+])
+def test_ignores_an_unattributable_follow_up_before_the_reviewer_is_first_requested(tmp_path, records):
+    # Before this reviewer is first asked for an answer, no request can be one meant for it.
+    result, output = extract(tmp_path, records)
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == TERMINAL.encode("utf-8")
+
+
+def test_writes_an_empty_answer_as_zero_bytes(tmp_path):
+    result, output = extract(tmp_path, [spawn(), final_answer("")])
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == b""
+
+
 def test_ignores_the_controllers_partially_written_last_record(tmp_path):
     partial = json.dumps(call("exec_command", {"cmd": "true"}, "c9")).encode("utf-8")[:40]
 
@@ -228,8 +249,13 @@ DEEP_ANSWER_LINE = b'{"payload":{"type":"agent_message"},"x":' + b"[" * 100_000 
     ])], {}, id="two-content-blocks"),
     pytest.param([spawn(), final_answer("", blocks=[{"type": "input_text", "text": None}])], {},
                  id="text-not-a-string"),
-    pytest.param([spawn(), final_answer("rejected format"), follow_up("01a143ed-0000-7000-8000-0000000000aa"),
-                  final_answer(TERMINAL)], {}, id="follow-up-by-agent-id"),
+    pytest.param([spawn(), final_answer("rejected format"), follow_up(AGENT_ID), final_answer(TERMINAL)], {},
+                 id="follow-up-by-agent-id"),
+    pytest.param([spawn(), final_answer("rejected format"), follow_up(AGENT_ID), follow_up(AGENT),
+                  final_answer(TERMINAL)], {}, id="agent-id-follow-up-then-named-follow-up"),
+    # A rollout cannot prove a later spawn was accepted, so it does not clear the mark.
+    pytest.param([spawn(), final_answer("rejected format"), follow_up(AGENT_ID), spawn(), final_answer(TERMINAL)], {},
+                 id="agent-id-follow-up-then-respawn"),
     pytest.param([spawn(), final_answer(TERMINAL), call("followup_task", {"target": 7, "message": "retry"})], {},
                  id="follow-up-target-not-a-string"),
     pytest.param([spawn(), call("followup_task", "{not json")], {}, id="unreadable-request-arguments"),

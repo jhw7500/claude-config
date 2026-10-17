@@ -420,6 +420,16 @@ def test_skill_takes_codex_reviewer_bytes_from_the_controller_rollout():
     assert "reviewer-response --runtime codex" in readme
 
 
+def test_skill_recovery_takes_reviewer_bytes_with_reviewer_response():
+    """Recovery seals the same bytes as step 6, so it must not fall back to the notification or retyping."""
+    recovery = text("SKILL.md").split("## Pending-round report recovery", 1)[1].split("\n## ", 1)[0]
+    bullet = next(line for line in recovery.splitlines() if line.startswith("- Apply the step 6 retry policy"))
+    assert "`reviewer-response --runtime claude`" in bullet
+    assert "`reviewer-response --runtime codex`" in bullet
+    assert "never from a completion notification or by retyping" in bullet
+    assert bullet.index("reviewer-response") < bullet.index("submit-report --reviewer X")
+
+
 def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate():
     skill = text("SKILL.md")
     for stage in (

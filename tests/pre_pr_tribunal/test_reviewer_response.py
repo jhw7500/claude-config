@@ -311,6 +311,19 @@ def _without_agent(record):
     return record
 
 
+_MISSING = object()
+
+
+def _stop_with_content(content):
+    # A stop whose message content is not a well-formed block list.
+    record = assistant("m1", [THINKING], "end_turn")
+    if content is _MISSING:
+        del record["message"]["content"]
+    else:
+        record["message"]["content"] = content
+    return record
+
+
 @pytest.mark.parametrize("records, tail, agent", [
     pytest.param(
         [prompt("review"), assistant("m1", [text(TERMINAL)], "end_turn", agent=OTHER_AGENT)],
@@ -328,12 +341,18 @@ def _without_agent(record):
         [prompt("review"), assistant("m1", [text("part one"), text("part two")], "end_turn")],
         b"", AGENT, id="two-text-blocks"),
     pytest.param(
+        [prompt("review"), assistant(None, [text(TERMINAL)], "end_turn")],
+        b"", AGENT, id="reply-without-message-id"),
+    pytest.param([prompt("review"), _stop_with_content(_MISSING)], b"", AGENT, id="reply-without-content"),
+    pytest.param([prompt("review"), _stop_with_content(TERMINAL)], b"", AGENT, id="reply-content-not-a-list"),
+    pytest.param([prompt("review"), _stop_with_content([])], b"", AGENT, id="reply-content-empty"),
+    pytest.param([prompt("review"), _stop_with_content([1])], b"", AGENT, id="reply-content-not-objects"),
+    pytest.param([prompt("review"), _stop_with_content([THINKING, 5])], b"", AGENT,
+                 id="reply-content-partly-not-objects"),
+    pytest.param(
         [prompt("review"), assistant("m1", [text("part one")]),
          assistant("m1", [text("part two")], "end_turn")],
         b"", AGENT, id="text-split-across-records"),
-    pytest.param(
-        [prompt("review"), assistant("m1", [THINKING], "end_turn")],
-        b"", AGENT, id="no-text-block"),
     pytest.param(
         [prompt("review"), assistant("m1", [text(TERMINAL)], "end_turn")],
         b"{not json\n", AGENT, id="invalid-json-line"),
@@ -358,6 +377,37 @@ def test_rejects_a_transcript_whose_reply_cannot_be_identified(tmp_path, records
     assert result.stdout == b""
     assert result.stderr == b"PRE_PR_TRIBUNAL:RESPONSE_INVALID\n"
     assert not os.path.lexists(output)
+
+
+@pytest.mark.parametrize("blocks", [
+    pytest.param([text("")], id="empty-text"),
+    pytest.param([THINKING], id="no-text-block"),
+])
+def test_writes_an_empty_reply_when_the_reviewer_stops_without_report_text(tmp_path, blocks):
+    result, output = extract(tmp_path, [prompt("review"), assistant("m1", blocks, "end_turn")])
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_bytes() == b""
+    assert json.loads(result.stdout)["bytes"] == 0
+
+
+def test_an_empty_reply_takes_the_format_retry_path(git_repo, tmp_path):
+    # An empty terminal response is a reviewer format failure, not an unidentifiable transcript.
+    begin_round(git_repo, base="master", runtime="claude", round_number=1, now=NOW)
+    transcript = write_transcript(tmp_path / f"agent-{AGENT}.jsonl", [
+        prompt("review"), assistant("m1", [THINKING], "end_turn"),
+    ])
+    output = tmp_path / "A.json"
+
+    extracted = run_cli_bytes(
+        git_repo, "reviewer-response", "--runtime", "claude", "--transcript", str(transcript),
+        "--agent", AGENT, "--output", str(output),
+    )
+    assert extracted.returncode == 0, extracted.stderr
+    submitted = run_cli_bytes(git_repo, "submit-report", "--reviewer", "A", input=output.read_bytes())
+
+    assert submitted.returncode == 1
+    assert submitted.stderr.splitlines()[0] == b"PRE_PR_TRIBUNAL:JSON_INVALID"
 
 
 def test_rejects_a_missing_transcript(tmp_path):
