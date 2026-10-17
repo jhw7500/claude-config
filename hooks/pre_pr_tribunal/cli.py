@@ -621,15 +621,20 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
     if not stops:
         raise TribunalError("RESPONSE_PENDING")
     reply_id = message(stops[0]).get("id")
+    if not isinstance(reply_id, str):
+        raise TribunalError("RESPONSE_INVALID")
     texts = [
         block.get("text")
         for record in tail
         if record.get("type") == "assistant"
-        and isinstance(reply_id, str)
         and message(record).get("id") == reply_id
         for block in blocks(record)
         if block.get("type") == "text"
     ]
+    # A stop without report text is an empty reply, like an empty text block:
+    # submit-report rejects it as a format failure the reviewer can retry.
+    if not texts:
+        return b""
     if len(texts) != 1 or not isinstance(texts[0], str):
         raise TribunalError("RESPONSE_INVALID")
     try:
@@ -687,6 +692,7 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
             raise TribunalError("RESPONSE_INVALID")
         requested = False
         answer = None
+        unattributable = False
         for record in records:
             payload = record.get("payload")
             if record.get("type") != "response_item" or not isinstance(payload, dict):
@@ -701,17 +707,19 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
                     raise TribunalError("RESPONSE_INVALID")
                 # A spawn names the reviewer's task; a follow-up targets it by name or path.
                 if payload["name"] == "spawn_agent":
-                    targets_reviewer = arguments.get("task_name") == name
+                    if arguments.get("task_name") == name:
+                        # A spawn restarts the boundary, so no earlier request can matter.
+                        requested, answer, unattributable = True, None, False
                 else:
                     target = arguments.get("target")
-                    # An agent id, or anything else that names no task, may address this reviewer.
                     if not isinstance(target, str) or not (
                         target.startswith("/root/") or _CODEX_TASK_NAME.fullmatch(target)
                     ):
-                        raise TribunalError("RESPONSE_INVALID")
-                    targets_reviewer = target in (name, sender)
-                if targets_reviewer:
-                    requested, answer = True, None
+                        # An agent id, or anything else that names no task, may address
+                        # this reviewer until its next spawn restarts the boundary.
+                        unattributable = True
+                    elif target in (name, sender):
+                        requested, answer = True, None
             elif payload.get("type") == "agent_message" and payload.get("author") == sender:
                 content = payload.get("content")
                 first = content[0] if isinstance(content, list) and content else None
@@ -722,7 +730,7 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
                     answer = payload
     finally:
         records.close()
-    if not requested:
+    if not requested or unattributable:
         raise TribunalError("RESPONSE_INVALID")
     if answer is None:
         raise TribunalError("RESPONSE_PENDING")
