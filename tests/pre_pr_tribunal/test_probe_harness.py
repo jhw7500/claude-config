@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 
 import pytest
@@ -287,7 +288,7 @@ def _fake_runtime_source(runtime: str, mode: str, *, caller_home: Path) -> str:
                     "auth_refreshed": True,
                     "hooks_write_failed": write_failed,
                     "hooks_replace_failed": replace_failed,
-                }}),
+                }}) + "\\n",
                 encoding="ascii",
             )
             release = Path(os.environ["TMPDIR"]) / "auth-release"
@@ -483,6 +484,12 @@ def _wait_for(
     assert ready(), f"probe exited before {path.name} was ready"
 
 
+def _read_auth_ready(path: Path, process: subprocess.Popen[str]) -> object:
+    # The file exists before its one-line document is written; wait for the line.
+    _wait_for(path, process, expected_lines=1)
+    return json.loads(path.read_text(encoding="ascii"))
+
+
 @pytest.fixture
 def waiting_process():
     process = subprocess.Popen(
@@ -540,6 +547,20 @@ def test_wait_for_pid_file_rejects_incomplete_lines_after_process_exit(
 
     with pytest.raises(AssertionError):
         _wait_for(pid_file, waiting_process, expected_lines=2)
+
+
+def test_auth_ready_is_read_only_once_its_document_is_complete(tmp_path, waiting_process):
+    # The fake creates auth-ready before it writes the document, so a reader
+    # that only waits for the file can parse an empty one (issue #228).
+    ready = tmp_path / "auth-ready"
+    ready.touch()
+    document = {"auth_refreshed": True, "hooks_write_failed": True, "hooks_replace_failed": True}
+    writer = threading.Timer(0.2, ready.write_text, args=(json.dumps(document) + "\n",), kwargs={"encoding": "ascii"})
+    writer.start()
+    try:
+        assert _read_auth_ready(ready, waiting_process) == document
+    finally:
+        writer.join()
 
 
 def test_wait_for_default_still_accepts_empty_marker(tmp_path, waiting_process):
@@ -2192,8 +2213,7 @@ def test_codex_auth_uses_memfd_tmpfs_without_host_disk_copy(
     process, work_dir, release = _start_probe(fake, tmp_path, runtime="codex")
     try:
         ready = work_dir / "tmp/auth-ready"
-        _wait_for(ready, process)
-        assert json.loads(ready.read_text(encoding="ascii")) == {
+        assert _read_auth_ready(ready, process) == {
             "auth_refreshed": True,
             "hooks_write_failed": True,
             "hooks_replace_failed": True,
