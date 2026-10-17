@@ -349,6 +349,10 @@ def _stop_with_content(content):
     pytest.param([prompt("review"), _stop_with_content([1])], b"", AGENT, id="reply-content-not-objects"),
     pytest.param([prompt("review"), _stop_with_content([THINKING, 5])], b"", AGENT,
                  id="reply-content-partly-not-objects"),
+    pytest.param([prompt("review"), _stop_with_content([text(TERMINAL), 5])], b"", AGENT,
+                 id="reply-text-with-non-object"),
+    pytest.param([prompt("review"), assistant("m1", [text(TERMINAL)]), _stop_with_content("damaged")], b"", AGENT,
+                 id="reply-text-with-damaged-sibling"),
     pytest.param(
         [prompt("review"), assistant("m1", [text("part one")]),
          assistant("m1", [text("part two")], "end_turn")],

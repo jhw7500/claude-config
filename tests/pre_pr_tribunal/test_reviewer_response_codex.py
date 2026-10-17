@@ -1,6 +1,7 @@
 """`reviewer-response --runtime codex` takes a reviewer's final answer from the controller's own rollout."""
 
 import hashlib
+import itertools
 import json
 import os
 import stat
@@ -30,21 +31,34 @@ def session_meta(thread=THREAD, source="exec"):
             "payload": {"id": thread, "session_id": thread, "source": source, "cwd": "/fixture"}}
 
 
-def call(name, arguments, call_id="c1"):
+_CALL_IDS = itertools.count(1)
+
+
+def call(name, arguments, call_id=None):
     return {"type": "response_item", "payload": {
         "type": "function_call", "status": "completed", "name": name, "namespace": "collaboration",
         "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments),
-        "call_id": call_id,
+        "call_id": f"call_{next(_CALL_IDS)}" if call_id is None else call_id,
     }}
 
 
-def spawn(agent=AGENT):
-    return call("spawn_agent", {"task_name": agent, "agent_type": "default", "fork_turns": "none",
-                                "message": "review"})
+def result(request, output):
+    # The execution result Codex records for a function call.
+    return {"type": "response_item", "payload": {
+        "type": "function_call_output", "call_id": request["payload"]["call_id"], "output": output,
+    }}
 
 
-def follow_up(target=f"/root/{AGENT}"):
-    return call("followup_task", {"target": target, "message": "retry with the format fixed"})
+def spawn(agent=AGENT, *, output=None):
+    request = call("spawn_agent", {"task_name": agent, "agent_type": "default", "fork_turns": "none",
+                                   "message": "review"})
+    accepted = json.dumps({"task_name": f"/root/{agent}"})
+    return [request, result(request, accepted if output is None else output)]
+
+
+def follow_up(target=f"/root/{AGENT}", *, output=""):
+    request = call("followup_task", {"target": target, "message": "retry with the format fixed"})
+    return [request, result(request, output)]
 
 
 def envelope(sender):
@@ -104,8 +118,8 @@ def test_writes_the_final_answer_payload_bytes_privately_and_reports_their_diges
     expected = TERMINAL.encode("utf-8")
 
     result, output = extract(tmp_path, [
-        spawn(),
-        spawn(OTHER_AGENT),
+        *spawn(),
+        *spawn(OTHER_AGENT),
         *controller_turn(),
         progress(),
         final_answer("other reviewer's answer", OTHER_AGENT),
@@ -126,9 +140,9 @@ def test_writes_the_final_answer_payload_bytes_privately_and_reports_their_diges
 @pytest.mark.parametrize("target", [f"/root/{AGENT}", AGENT])
 def test_selects_the_answer_to_the_latest_follow_up(tmp_path, target):
     result, output = extract(tmp_path, [
-        spawn(),
+        *spawn(),
         final_answer("rejected format"),
-        follow_up(target),
+        *follow_up(target),
         *controller_turn(),
         final_answer(TERMINAL),
     ])
@@ -139,7 +153,7 @@ def test_selects_the_answer_to_the_latest_follow_up(tmp_path, target):
 
 def test_keeps_the_first_answer_when_the_reviewer_answers_again_unrequested(tmp_path):
     result, output = extract(tmp_path, [
-        spawn(),
+        *spawn(),
         final_answer(TERMINAL),
         final_answer("a later unrequested answer"),
     ])
@@ -150,12 +164,12 @@ def test_keeps_the_first_answer_when_the_reviewer_answers_again_unrequested(tmp_
 
 def test_a_request_to_another_reviewer_does_not_move_the_boundary(tmp_path):
     result, output = extract(tmp_path, [
-        spawn(),
-        spawn(OTHER_AGENT),
+        *spawn(),
+        *spawn(OTHER_AGENT),
         final_answer(TERMINAL),
-        follow_up(f"/root/{OTHER_AGENT}"),
-        follow_up(f"/root/{OTHER_AGENT}/{AGENT}"),
-        spawn(f"{AGENT}_2"),
+        *follow_up(f"/root/{OTHER_AGENT}"),
+        *follow_up(f"/root/{OTHER_AGENT}/{AGENT}"),
+        *spawn(f"{AGENT}_2"),
         final_answer("not this one"),
     ])
 
@@ -164,8 +178,8 @@ def test_a_request_to_another_reviewer_does_not_move_the_boundary(tmp_path):
 
 
 @pytest.mark.parametrize("records", [
-    pytest.param([spawn("helper"), follow_up(AGENT_ID), spawn(), final_answer(TERMINAL)], id="agent-id-before-spawn"),
-    pytest.param([call("followup_task", {"target": 7, "message": "retry"}), spawn(), final_answer(TERMINAL)],
+    pytest.param([*spawn("helper"), *follow_up(AGENT_ID), *spawn(), final_answer(TERMINAL)], id="agent-id-before-spawn"),
+    pytest.param([call("followup_task", {"target": 7, "message": "retry"}), *spawn(), final_answer(TERMINAL)],
                  id="non-string-target-before-spawn"),
 ])
 def test_ignores_an_unattributable_follow_up_before_the_reviewer_is_first_requested(tmp_path, records):
@@ -176,8 +190,94 @@ def test_ignores_an_unattributable_follow_up_before_the_reviewer_is_first_reques
     assert output.read_bytes() == TERMINAL.encode("utf-8")
 
 
+REJECTED_SPAWN = "collab spawn failed: agent thread limit reached"
+REJECTED_FOLLOW_UP = "collab tool failed: agent thread limit reached"
+
+
+def _requests_with_shared_call_id():
+    first = call("spawn_agent", {"task_name": AGENT}, "call_dup")
+    second = call("spawn_agent", {"task_name": AGENT}, "call_dup")
+    accepted = json.dumps({"task_name": f"/root/{AGENT}"})
+    return [first, result(first, accepted), second, result(second, accepted)]
+
+
+def _request_with_two_results():
+    request, accepted = spawn()
+    return [request, accepted, accepted]
+
+
+def _request_with_malformed_call_id():
+    request = call("spawn_agent", {"task_name": AGENT}, 'call"x')
+    return [request, result(request, json.dumps({"task_name": f"/root/{AGENT}"}))]
+
+
+@pytest.mark.parametrize("records", [
+    pytest.param([spawn()[0], final_answer(TERMINAL)], id="spawn-without-result"),
+    pytest.param([*spawn(), final_answer("rejected format"), follow_up()[0], final_answer(TERMINAL)],
+                 id="follow-up-without-result"),
+])
+def test_waits_for_the_result_of_the_latest_request(tmp_path, records):
+    # Whether a request reached the reviewer is known only from its recorded result.
+    result_, output = extract(tmp_path, records)
+
+    assert result_.returncode == 1
+    assert result_.stderr == b"PRE_PR_TRIBUNAL:RESPONSE_PENDING\n"
+    assert not os.path.lexists(output)
+
+
+@pytest.mark.parametrize("records", [
+    pytest.param([*spawn(output=REJECTED_SPAWN), final_answer(TERMINAL)], id="spawn-rejected"),
+    pytest.param([*spawn(), final_answer(TERMINAL), *follow_up(output=REJECTED_FOLLOW_UP)],
+                 id="follow-up-rejected-after-an-answer"),
+    pytest.param([*spawn(output=json.dumps({"task_name": f"/root/{OTHER_AGENT}"})), final_answer(TERMINAL)],
+                 id="spawn-result-names-another-task"),
+    pytest.param([*spawn(output=json.dumps({"task_name": AGENT})), final_answer(TERMINAL)],
+                 id="spawn-result-with-bare-name"),
+    pytest.param([*spawn(), final_answer("rejected format"), *follow_up(output="ok"), final_answer(TERMINAL)],
+                 id="follow-up-result-unknown"),
+    pytest.param([*spawn(output={"task_name": f"/root/{AGENT}"}), final_answer(TERMINAL)],
+                 id="result-not-a-string"),
+    pytest.param([*_requests_with_shared_call_id(), final_answer(TERMINAL)], id="requests-share-a-call-id"),
+    pytest.param([*_request_with_two_results(), final_answer(TERMINAL)], id="request-with-two-results"),
+    pytest.param([*_request_with_malformed_call_id(), final_answer(TERMINAL)], id="malformed-call-id"),
+])
+def test_rejects_an_answer_whose_latest_request_was_not_accepted(tmp_path, records):
+    result_, output = extract(tmp_path, records)
+
+    assert result_.returncode == 1
+    assert result_.stderr == b"PRE_PR_TRIBUNAL:RESPONSE_INVALID\n"
+    assert not os.path.lexists(output)
+
+
+@pytest.mark.parametrize("records", [
+    pytest.param([*spawn(), final_answer("rejected format"), *follow_up(output=REJECTED_FOLLOW_UP),
+                  *follow_up(), final_answer(TERMINAL)], id="capacity-rejection-then-accepted-retry"),
+    pytest.param([*spawn(output="unknown result"), final_answer("rejected format"), *follow_up(),
+                  final_answer(TERMINAL)], id="earlier-result-does-not-matter"),
+])
+def test_selects_the_answer_to_the_latest_accepted_request(tmp_path, records):
+    result_, output = extract(tmp_path, records)
+
+    assert result_.returncode == 0, result_.stderr
+    assert output.read_bytes() == TERMINAL.encode("utf-8")
+
+
+def test_matches_the_result_by_call_id_not_by_a_mention(tmp_path):
+    # Another command's output can quote the request's call id, as reading this rollout would.
+    request, accepted = spawn()
+    mention = {"type": "response_item", "payload": {
+        "type": "function_call_output", "call_id": "c9",
+        "output": json.dumps({"seen": request["payload"]["call_id"]}),
+    }}
+
+    result_, output = extract(tmp_path, [request, mention, accepted, final_answer(TERMINAL)])
+
+    assert result_.returncode == 0, result_.stderr
+    assert output.read_bytes() == TERMINAL.encode("utf-8")
+
+
 def test_writes_an_empty_answer_as_zero_bytes(tmp_path):
-    result, output = extract(tmp_path, [spawn(), final_answer("")])
+    result, output = extract(tmp_path, [*spawn(), final_answer("")])
 
     assert result.returncode == 0, result.stderr
     assert output.read_bytes() == b""
@@ -186,7 +286,7 @@ def test_writes_an_empty_answer_as_zero_bytes(tmp_path):
 def test_ignores_the_controllers_partially_written_last_record(tmp_path):
     partial = json.dumps(call("exec_command", {"cmd": "true"}, "c9")).encode("utf-8")[:40]
 
-    result, output = extract(tmp_path, [spawn(), final_answer(TERMINAL)], tail=partial)
+    result, output = extract(tmp_path, [*spawn(), final_answer(TERMINAL)], tail=partial)
 
     assert result.returncode == 0, result.stderr
     assert output.read_bytes() == TERMINAL.encode("utf-8")
@@ -196,7 +296,7 @@ def test_parses_only_records_that_can_be_a_request_or_an_answer(tmp_path):
     # Controller rollouts reach hundreds of megabytes; other records are never decoded.
     unrelated = b"[" * 100_000 + b"]" * 100_000 + b"\n"
 
-    result, output = extract(tmp_path, [spawn(), final_answer(TERMINAL)], tail=unrelated)
+    result, output = extract(tmp_path, [*spawn(), final_answer(TERMINAL)], tail=unrelated)
 
     assert result.returncode == 0, result.stderr
     assert output.read_bytes() == TERMINAL.encode("utf-8")
@@ -206,12 +306,12 @@ ANSWER_LINE = json.dumps(final_answer(TERMINAL)).encode("utf-8")
 
 
 @pytest.mark.parametrize("records, tail", [
-    pytest.param([spawn(), *controller_turn()], b"", id="spawned-unanswered"),
-    pytest.param([spawn(), progress()], b"", id="progress-only"),
-    pytest.param([spawn(), final_answer("rejected format"), follow_up()], b"", id="follow-up-unanswered"),
-    pytest.param([spawn(), spawn(OTHER_AGENT), final_answer(TERMINAL, OTHER_AGENT)], b"",
+    pytest.param([*spawn(), *controller_turn()], b"", id="spawned-unanswered"),
+    pytest.param([*spawn(), progress()], b"", id="progress-only"),
+    pytest.param([*spawn(), final_answer("rejected format"), *follow_up()], b"", id="follow-up-unanswered"),
+    pytest.param([*spawn(), *spawn(OTHER_AGENT), final_answer(TERMINAL, OTHER_AGENT)], b"",
                  id="other-reviewer-answered"),
-    pytest.param([spawn()], ANSWER_LINE[:60], id="answer-still-being-written"),
+    pytest.param([*spawn()], ANSWER_LINE[:60], id="answer-still-being-written"),
 ])
 def test_reports_pending_without_writing_while_the_answer_is_unrecorded(tmp_path, records, tail):
     result, output = extract(tmp_path, records, tail=tail)
@@ -227,46 +327,46 @@ DEEP_ANSWER_LINE = b'{"payload":{"type":"agent_message"},"x":' + b"[" * 100_000 
 
 @pytest.mark.parametrize("records, options", [
     pytest.param([], {"head": []}, id="empty-rollout"),
-    pytest.param([spawn(), final_answer(TERMINAL)],
+    pytest.param([*spawn(), final_answer(TERMINAL)],
                  {"head": [{"type": "turn_context", "payload": {"id": THREAD, "source": "exec"}}]},
                  id="first-record-not-session-meta"),
-    pytest.param([spawn(), final_answer(TERMINAL)],
+    pytest.param([*spawn(), final_answer(TERMINAL)],
                  {"head": [session_meta(source={"subagent": {"thread_spawn": {}}})]}, id="subagent-rollout"),
-    pytest.param([spawn(), final_answer(TERMINAL)], {"head": [session_meta(OTHER_THREAD)]},
+    pytest.param([*spawn(), final_answer(TERMINAL)], {"head": [session_meta(OTHER_THREAD)]},
                  id="session-of-another-thread"),
-    pytest.param([spawn(), final_answer(TERMINAL)], {"thread": OTHER_THREAD}, id="thread-argument-mismatch"),
-    pytest.param([spawn(), final_answer(TERMINAL)], {"thread": "../x"}, id="malformed-thread-argument"),
-    pytest.param([spawn(), final_answer(TERMINAL)], {"agent": f"../{AGENT}"}, id="malformed-agent-argument"),
+    pytest.param([*spawn(), final_answer(TERMINAL)], {"thread": OTHER_THREAD}, id="thread-argument-mismatch"),
+    pytest.param([*spawn(), final_answer(TERMINAL)], {"thread": "../x"}, id="malformed-thread-argument"),
+    pytest.param([*spawn(), final_answer(TERMINAL)], {"agent": f"../{AGENT}"}, id="malformed-agent-argument"),
     pytest.param([final_answer(TERMINAL)], {}, id="answer-without-request"),
-    pytest.param([spawn(), final_answer(TERMINAL, recipient="/root/elsewhere")], {}, id="answer-to-another-recipient"),
-    pytest.param([spawn(), final_answer("", text=envelope(f"/root/{OTHER_AGENT}") + TERMINAL)], {},
+    pytest.param([*spawn(), final_answer(TERMINAL, recipient="/root/elsewhere")], {}, id="answer-to-another-recipient"),
+    pytest.param([*spawn(), final_answer("", text=envelope(f"/root/{OTHER_AGENT}") + TERMINAL)], {},
                  id="envelope-names-another-sender"),
-    pytest.param([spawn(), final_answer("", text=envelope(f"/root/{AGENT}").replace("Payload:\n", "") + TERMINAL)],
+    pytest.param([*spawn(), final_answer("", text=envelope(f"/root/{AGENT}").replace("Payload:\n", "") + TERMINAL)],
                  {}, id="envelope-without-payload-marker"),
-    pytest.param([spawn(), final_answer("", blocks=[
+    pytest.param([*spawn(), final_answer("", blocks=[
         {"type": "input_text", "text": envelope(f"/root/{AGENT}") + TERMINAL},
         {"type": "encrypted_content", "encrypted_content": "fixture"},
     ])], {}, id="two-content-blocks"),
-    pytest.param([spawn(), final_answer("", blocks=[{"type": "input_text", "text": None}])], {},
+    pytest.param([*spawn(), final_answer("", blocks=[{"type": "input_text", "text": None}])], {},
                  id="text-not-a-string"),
-    pytest.param([spawn(), final_answer("rejected format"), follow_up(AGENT_ID), final_answer(TERMINAL)], {},
+    pytest.param([*spawn(), final_answer("rejected format"), *follow_up(AGENT_ID), final_answer(TERMINAL)], {},
                  id="follow-up-by-agent-id"),
-    pytest.param([spawn(), final_answer("rejected format"), follow_up(AGENT_ID), follow_up(AGENT),
+    pytest.param([*spawn(), final_answer("rejected format"), *follow_up(AGENT_ID), *follow_up(AGENT),
                   final_answer(TERMINAL)], {}, id="agent-id-follow-up-then-named-follow-up"),
     # A rollout cannot prove a later spawn was accepted, so it does not clear the mark.
-    pytest.param([spawn(), final_answer("rejected format"), follow_up(AGENT_ID), spawn(), final_answer(TERMINAL)], {},
+    pytest.param([*spawn(), final_answer("rejected format"), *follow_up(AGENT_ID), *spawn(), final_answer(TERMINAL)], {},
                  id="agent-id-follow-up-then-respawn"),
-    pytest.param([spawn(), final_answer(TERMINAL), call("followup_task", {"target": 7, "message": "retry"})], {},
+    pytest.param([*spawn(), final_answer(TERMINAL), call("followup_task", {"target": 7, "message": "retry"})], {},
                  id="follow-up-target-not-a-string"),
-    pytest.param([spawn(), call("followup_task", "{not json")], {}, id="unreadable-request-arguments"),
-    pytest.param([spawn(), final_answer(TERMINAL), call("followup_task", "[1]")], {},
+    pytest.param([*spawn(), call("followup_task", "{not json")], {}, id="unreadable-request-arguments"),
+    pytest.param([*spawn(), final_answer(TERMINAL), call("followup_task", "[1]")], {},
                  id="request-arguments-not-an-object"),
-    pytest.param([spawn(), final_answer(TERMINAL), {"type": "response_item", "payload": {
+    pytest.param([*spawn(), final_answer(TERMINAL), {"type": "response_item", "payload": {
         "type": "function_call", "name": "followup_task", "namespace": "collaboration", "arguments": None,
     }}], {}, id="request-arguments-not-encoded"),
-    pytest.param([spawn(), final_answer(TERMINAL)], {"tail": b'{"type":"response_item","function_call"\n'},
+    pytest.param([*spawn(), final_answer(TERMINAL)], {"tail": b'{"type":"response_item","function_call"\n'},
                  id="invalid-json-relevant-line"),
-    pytest.param([spawn(), final_answer(TERMINAL)], {"tail": DEEP_ANSWER_LINE}, id="relevant-line-beyond-parser"),
+    pytest.param([*spawn(), final_answer(TERMINAL)], {"tail": DEEP_ANSWER_LINE}, id="relevant-line-beyond-parser"),
 ])
 def test_rejects_a_rollout_whose_answer_cannot_be_identified(tmp_path, records, options):
     result, output = extract(tmp_path, records, **options)
@@ -279,7 +379,7 @@ def test_rejects_a_rollout_whose_answer_cannot_be_identified(tmp_path, records, 
 
 def test_rejects_the_rollout_of_another_thread_by_file_name(tmp_path):
     transcript = write_transcript(rollout_path(tmp_path, OTHER_THREAD), [
-        session_meta(), spawn(), final_answer(TERMINAL),
+        session_meta(), *spawn(), final_answer(TERMINAL),
     ])
 
     result, output = extract(tmp_path, [], transcript=transcript)
@@ -292,7 +392,7 @@ def test_rejects_the_rollout_of_another_thread_by_file_name(tmp_path):
 def test_rejects_a_thread_id_that_codex_does_not_issue(tmp_path):
     thread = THREAD.upper()
     transcript = write_transcript(rollout_path(tmp_path, thread), [
-        session_meta(thread), spawn(), final_answer(TERMINAL),
+        session_meta(thread), *spawn(), final_answer(TERMINAL),
     ])
 
     result, output = extract(tmp_path, [], transcript=transcript, thread=thread)
@@ -303,8 +403,8 @@ def test_rejects_a_thread_id_that_codex_does_not_issue(tmp_path):
 
 
 @pytest.mark.parametrize("records", [
-    pytest.param([spawn(), final_answer(TERMINAL)], id="spawned"),
-    pytest.param([spawn(), final_answer("rejected format"), follow_up(AGENT), final_answer(TERMINAL)],
+    pytest.param([*spawn(), final_answer(TERMINAL)], id="spawned"),
+    pytest.param([*spawn(), final_answer("rejected format"), *follow_up(AGENT), final_answer(TERMINAL)],
                  id="followed-up"),
 ])
 def test_accepts_the_task_path_that_spawn_agent_returns(tmp_path, records):
@@ -321,7 +421,7 @@ def test_accepts_the_task_path_that_spawn_agent_returns(tmp_path, records):
     pytest.param(f"/root/{AGENT}/child", f"{AGENT}/child", id="nested-path"),
 ])
 def test_rejects_a_task_name_that_codex_does_not_issue(tmp_path, agent, task):
-    result, output = extract(tmp_path, [spawn(task), final_answer(TERMINAL, task)], agent=agent)
+    result, output = extract(tmp_path, [*spawn(task), final_answer(TERMINAL, task)], agent=agent)
 
     assert result.returncode == 1
     assert result.stderr == b"PRE_PR_TRIBUNAL:RESPONSE_INVALID\n"
@@ -331,7 +431,7 @@ def test_rejects_a_task_name_that_codex_does_not_issue(tmp_path, agent, task):
 def test_rejects_an_answer_that_is_not_utf8_encodable(tmp_path):
     line = json.dumps(final_answer("\ud800")).encode("ascii") + b"\n"
 
-    result, output = extract(tmp_path, [spawn()], tail=line)
+    result, output = extract(tmp_path, [*spawn()], tail=line)
 
     assert result.returncode == 1
     assert result.stderr == b"PRE_PR_TRIBUNAL:RESPONSE_INVALID\n"
@@ -339,7 +439,7 @@ def test_rejects_an_answer_that_is_not_utf8_encodable(tmp_path):
 
 
 def test_reports_a_runtime_turn_failure_as_a_reviewer_failure(tmp_path):
-    result, output = extract(tmp_path, [spawn(), final_answer(AGENT_ERROR)])
+    result, output = extract(tmp_path, [*spawn(), final_answer(AGENT_ERROR)])
 
     assert result.returncode == 1
     assert result.stdout == b""
@@ -352,7 +452,7 @@ def test_reports_a_runtime_turn_failure_as_a_reviewer_failure(tmp_path):
     pytest.param("claude", ["--thread-id", THREAD], id="claude-with-thread"),
 ])
 def test_requires_a_thread_id_exactly_for_codex(tmp_path, runtime, thread_arguments):
-    transcript = write_transcript(rollout_path(tmp_path), [session_meta(), spawn(), final_answer(TERMINAL)])
+    transcript = write_transcript(rollout_path(tmp_path), [session_meta(), *spawn(), final_answer(TERMINAL)])
     output = tmp_path / "response.json"
 
     result = run_cli_bytes(
@@ -366,11 +466,11 @@ def test_requires_a_thread_id_exactly_for_codex(tmp_path, runtime, thread_argume
 
 
 def test_applies_the_line_bound_to_records_it_does_not_parse(tmp_path, capsys, monkeypatch):
-    records = [session_meta(), spawn(), {"type": "event_msg", "payload": {"type": "token_count"},
+    records = [session_meta(), *spawn(), {"type": "event_msg", "payload": {"type": "token_count"},
                                          "padding": "x" * 2000}, final_answer(TERMINAL)]
     transcript = write_transcript(rollout_path(tmp_path), records)
-    sizes = [len(line) for line in transcript.read_bytes().splitlines(keepends=True)]
-    assert sizes[2] > 1000 and max(sizes[:2] + sizes[3:]) < 1000
+    lines = transcript.read_bytes().splitlines(keepends=True)
+    assert all((len(line) > 1000) == (b'"padding"' in line) for line in lines)
 
     def run(output):
         status = cli.main([
@@ -394,7 +494,7 @@ def test_extracted_answer_seals_with_a_receipt_matching_the_reviewer_bytes(git_r
         ensure_ascii=False, separators=(",", ":"),
     )
     raw = terminal.encode("utf-8")
-    transcript = write_transcript(rollout_path(tmp_path), [session_meta(), spawn(), final_answer(terminal)])
+    transcript = write_transcript(rollout_path(tmp_path), [session_meta(), *spawn(), final_answer(terminal)])
     private = tmp_path / "private"
     private.mkdir(mode=0o700)
     output = private / "A.json"

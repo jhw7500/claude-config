@@ -623,24 +623,17 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
     reply_id = message(stops[0]).get("id")
     if not isinstance(reply_id, str):
         raise TribunalError("RESPONSE_INVALID")
-    texts = [
-        block.get("text")
-        for record in tail
-        if record.get("type") == "assistant"
-        and message(record).get("id") == reply_id
-        for block in blocks(record)
-        if block.get("type") == "text"
-    ]
-    # A well-formed stop without report text is an empty reply, like an empty
-    # text block: submit-report rejects it as a format failure the reviewer can
-    # retry. Content that is not a block list is a damaged transcript instead.
+    reply = [record for record in tail if record.get("type") == "assistant" and message(record).get("id") == reply_id]
+    # Content that is not a block list is a damaged transcript: a dropped item
+    # could have been another text block, so no single reply is established.
+    for record in reply:
+        content = message(record).get("content")
+        if not (isinstance(content, list) and content and all(isinstance(block, dict) for block in content)):
+            raise TribunalError("RESPONSE_INVALID")
+    texts = [block.get("text") for record in reply for block in blocks(record) if block.get("type") == "text"]
+    # A stop without report text is an empty reply, like an empty text block:
+    # submit-report rejects it as a format failure the reviewer can retry.
     if not texts:
-        for record in tail:
-            content = message(record).get("content")
-            if record.get("type") == "assistant" and message(record).get("id") == reply_id and not (
-                isinstance(content, list) and content and all(isinstance(block, dict) for block in content)
-            ):
-                raise TribunalError("RESPONSE_INVALID")
         return b""
     if len(texts) != 1 or not isinstance(texts[0], str):
         raise TribunalError("RESPONSE_INVALID")
@@ -658,6 +651,8 @@ _CODEX_RECORD_MARKERS = (b'"function_call"', b'"agent_message"')
 _CODEX_FINAL_ANSWER = "Message Type: FINAL_ANSWER\n"
 # The runtime's own report in place of an answer when a reviewer's turn fails.
 _CODEX_TURN_FAILURE = b"Agent errored:"
+# A request's result is matched by its call id, so the id must be one Codex issues.
+_CODEX_CALL_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
 def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
@@ -665,10 +660,13 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
 
     The transcript is the controller's own rollout, whose first record is the
     root session `thread_id`. `agent` is the reviewer's task name, bare or as
-    the `/root/<name>` path that `spawn_agent` returns. `RESPONSE_PENDING`
-    means the answer is not recorded yet, and `RESPONSE_REVIEWER_FAILED` that
-    the runtime reported the reviewer's turn as failed. Any other failure means
-    the rollout cannot identify exactly one answer from this reviewer.
+    the `/root/<name>` path that `spawn_agent` returns. The latest request to
+    the reviewer must have a recorded result that shows it was accepted; a
+    rejected request, such as one refused at the agent thread limit, never
+    reached the reviewer. `RESPONSE_PENDING` means the answer or that result is
+    not recorded yet, and `RESPONSE_REVIEWER_FAILED` that the runtime reported
+    the reviewer's turn as failed. Any other failure means the rollout cannot
+    identify exactly one answer from this reviewer.
     """
 
     name = agent[len("/root/"):] if agent.startswith("/root/") else agent
@@ -676,15 +674,22 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
         raise TribunalError("RESPONSE_INVALID")
     if not (transcript.name.startswith("rollout-") and transcript.name.endswith(f"-{thread_id}.jsonl")):
         raise TribunalError("RESPONSE_INVALID")
+    sender = f"/root/{name}"
+    no_result = object()
+    # The latest request to this reviewer and its recorded result.
+    latest = {"call_id": None, "name": None, "marker": None, "result": no_result}
+
+    def keep(number, line):
+        if number == 0 or any(marker in line for marker in _CODEX_RECORD_MARKERS):
+            return True
+        # Results are read only for the latest request; earlier ones cannot change the answer.
+        return latest["marker"] is not None and b'"function_call_output"' in line and latest["marker"] in line
+
     # A partial last line is a record still being written. While this command
     # runs, the controller sends no request, so ignoring that line cannot change
     # which complete answer replies to the latest request.
-    records = _transcript_records(
-        transcript,
-        keep=lambda number, line: number == 0 or any(marker in line for marker in _CODEX_RECORD_MARKERS),
-        wait_for_last_line=False,
-    )
-    sender = f"/root/{name}"
+    records = _transcript_records(transcript, keep=keep, wait_for_last_line=False)
+    seen_calls = set()
     try:
         session = next(records, None)
         meta = session.get("payload") if session is not None else None
@@ -713,9 +718,9 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
                 if not isinstance(arguments, dict):
                     raise TribunalError("RESPONSE_INVALID")
                 # A spawn names the reviewer's task; a follow-up targets it by name or path.
+                targets_reviewer = False
                 if payload["name"] == "spawn_agent":
-                    if arguments.get("task_name") == name:
-                        requested, answer = True, None
+                    targets_reviewer = arguments.get("task_name") == name
                 else:
                     target = arguments.get("target")
                     if not isinstance(target, str) or not (
@@ -725,8 +730,19 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
                         # this reviewer once it has been asked for an answer. A later spawn
                         # does not clear it: the rollout cannot show that spawn was accepted.
                         unattributable = unattributable or requested
-                    elif target in (name, sender):
-                        requested, answer = True, None
+                    else:
+                        targets_reviewer = target in (name, sender)
+                if targets_reviewer:
+                    call_id = payload.get("call_id")
+                    if not isinstance(call_id, str) or _CODEX_CALL_ID.fullmatch(call_id) is None or call_id in seen_calls:
+                        raise TribunalError("RESPONSE_INVALID")
+                    seen_calls.add(call_id)
+                    requested, answer = True, None
+                    latest.update(call_id=call_id, name=payload["name"], marker=f'"{call_id}"'.encode(), result=no_result)
+            elif payload.get("type") == "function_call_output" and latest["call_id"] is not None and payload.get("call_id") == latest["call_id"]:
+                if latest["result"] is not no_result:
+                    raise TribunalError("RESPONSE_INVALID")
+                latest["result"] = payload.get("output")
             elif payload.get("type") == "agent_message" and payload.get("author") == sender:
                 content = payload.get("content")
                 first = content[0] if isinstance(content, list) and content else None
@@ -738,6 +754,20 @@ def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
     finally:
         records.close()
     if not requested or unattributable:
+        raise TribunalError("RESPONSE_INVALID")
+    outcome = latest["result"]
+    if outcome is no_result:
+        raise TribunalError("RESPONSE_PENDING")
+    # An accepted spawn reports the new task's path; an accepted follow-up reports nothing.
+    if latest["name"] == "followup_task":
+        accepted = outcome == ""
+    else:
+        try:
+            spawned = json.loads(outcome) if isinstance(outcome, str) else None
+        except (ValueError, RecursionError):
+            spawned = None
+        accepted = isinstance(spawned, dict) and spawned.get("task_name") == sender
+    if not accepted:
         raise TribunalError("RESPONSE_INVALID")
     if answer is None:
         raise TribunalError("RESPONSE_PENDING")
