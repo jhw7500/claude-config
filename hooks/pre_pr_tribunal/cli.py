@@ -184,8 +184,9 @@ def _parser() -> argparse.ArgumentParser:
     submit.add_argument("--run-id")
     submit.add_argument("--attempt")
     response = commands.add_parser("reviewer-response", add_help=False)
-    response.add_argument("--runtime", required=True, choices=("claude",))
+    response.add_argument("--runtime", required=True, choices=("claude", "codex"))
     response.add_argument("--transcript", required=True, type=Path)
+    response.add_argument("--thread-id")
     response.add_argument("--agent", required=True)
     response.add_argument("--output", required=True, type=Path)
     failure = commands.add_parser("record-failure", add_help=False)
@@ -500,11 +501,13 @@ _MAX_TRANSCRIPT_BYTES = 1024 * 1024 * 1024
 _MAX_TRANSCRIPT_LINE_BYTES = 64 * 1024 * 1024
 
 
-def _transcript_records(transcript: Path):
+def _transcript_records(transcript: Path, *, keep=None, wait_for_last_line=True):
     """Yield each JSONL object of a current-user regular transcript, reading at most the bound.
 
     A partial last line means the file is still being written: `RESPONSE_PENDING`
-    after every complete line has parsed. Any other defect is `RESPONSE_INVALID`.
+    after every complete line has parsed, or the end of the records without
+    `wait_for_last_line`. `keep(number, line)` chooses the lines to parse; every
+    line counts toward the bounds. Any other defect is `RESPONSE_INVALID`.
     """
 
     try:
@@ -517,7 +520,9 @@ def _transcript_records(transcript: Path):
             raise TribunalError("RESPONSE_INVALID")
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             consumed = 0
+            number = -1
             while True:
+                number += 1
                 line = handle.readline(min(_MAX_TRANSCRIPT_BYTES + 1 - consumed, _MAX_TRANSCRIPT_LINE_BYTES + 1))
                 if not line:
                     return
@@ -525,8 +530,10 @@ def _transcript_records(transcript: Path):
                 if consumed > _MAX_TRANSCRIPT_BYTES or len(line) > _MAX_TRANSCRIPT_LINE_BYTES:
                     raise TribunalError("RESPONSE_INVALID")
                 if not line.endswith(b"\n"):
+                    if not wait_for_last_line:
+                        return
                     raise TribunalError("RESPONSE_PENDING")
-                if not line.strip():
+                if not line.strip() or (keep is not None and not keep(number, line)):
                     continue
                 try:
                     record = json.loads(line.decode("utf-8"))
@@ -629,6 +636,109 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
         return texts[0].encode("utf-8")
     except UnicodeEncodeError:
         raise TribunalError("RESPONSE_INVALID") from None
+
+
+_CODEX_THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_CODEX_TASK_NAME = re.compile(r"[a-z0-9_]{1,64}")
+# Requests and answers are the only records read; the rest of a controller
+# rollout, often hundreds of megabytes, is never decoded.
+_CODEX_RECORD_MARKERS = (b'"function_call"', b'"agent_message"')
+_CODEX_FINAL_ANSWER = "Message Type: FINAL_ANSWER\n"
+# The runtime's own report in place of an answer when a reviewer's turn fails.
+_CODEX_TURN_FAILURE = b"Agent errored:"
+
+
+def _codex_reply(transcript: Path, thread_id: str, agent: str) -> bytes:
+    """Return the exact payload of a Codex reviewer's first final answer to the controller's latest request.
+
+    The transcript is the controller's own rollout, whose first record is the
+    root session `thread_id`. `agent` is the reviewer's task name, bare or as
+    the `/root/<name>` path that `spawn_agent` returns. `RESPONSE_PENDING`
+    means the answer is not recorded yet, and `RESPONSE_REVIEWER_FAILED` that
+    the runtime reported the reviewer's turn as failed. Any other failure means
+    the rollout cannot identify exactly one answer from this reviewer.
+    """
+
+    name = agent[len("/root/"):] if agent.startswith("/root/") else agent
+    if _CODEX_THREAD_ID.fullmatch(thread_id) is None or _CODEX_TASK_NAME.fullmatch(name) is None:
+        raise TribunalError("RESPONSE_INVALID")
+    if not (transcript.name.startswith("rollout-") and transcript.name.endswith(f"-{thread_id}.jsonl")):
+        raise TribunalError("RESPONSE_INVALID")
+    # A partial last line is a record still being written. While this command
+    # runs, the controller sends no request, so ignoring that line cannot change
+    # which complete answer replies to the latest request.
+    records = _transcript_records(
+        transcript,
+        keep=lambda number, line: number == 0 or any(marker in line for marker in _CODEX_RECORD_MARKERS),
+        wait_for_last_line=False,
+    )
+    sender = f"/root/{name}"
+    try:
+        session = next(records, None)
+        meta = session.get("payload") if session is not None else None
+        # A subagent's own rollout records its parent in a structured source.
+        if (
+            session is None
+            or session.get("type") != "session_meta"
+            or not isinstance(meta, dict)
+            or meta.get("id") != thread_id
+            or not isinstance(meta.get("source"), str)
+        ):
+            raise TribunalError("RESPONSE_INVALID")
+        requested = False
+        answer = None
+        for record in records:
+            payload = record.get("payload")
+            if record.get("type") != "response_item" or not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "function_call" and payload.get("name") in ("spawn_agent", "followup_task"):
+                encoded = payload.get("arguments")
+                try:
+                    arguments = json.loads(encoded) if isinstance(encoded, str) else None
+                except (ValueError, RecursionError):
+                    raise TribunalError("RESPONSE_INVALID") from None
+                if not isinstance(arguments, dict):
+                    raise TribunalError("RESPONSE_INVALID")
+                # A spawn names the reviewer's task; a follow-up targets it by name or path.
+                if payload["name"] == "spawn_agent":
+                    targets_reviewer = arguments.get("task_name") == name
+                else:
+                    target = arguments.get("target")
+                    # An agent id, or anything else that names no task, may address this reviewer.
+                    if not isinstance(target, str) or not (
+                        target.startswith("/root/") or _CODEX_TASK_NAME.fullmatch(target)
+                    ):
+                        raise TribunalError("RESPONSE_INVALID")
+                    targets_reviewer = target in (name, sender)
+                if targets_reviewer:
+                    requested, answer = True, None
+            elif payload.get("type") == "agent_message" and payload.get("author") == sender:
+                content = payload.get("content")
+                first = content[0] if isinstance(content, list) and content else None
+                text = first.get("text") if isinstance(first, dict) else None
+                # Other message types, such as progress messages, are not answers.
+                is_answer = not isinstance(text, str) or text.startswith(_CODEX_FINAL_ANSWER)
+                if requested and answer is None and is_answer:
+                    answer = payload
+    finally:
+        records.close()
+    if not requested:
+        raise TribunalError("RESPONSE_INVALID")
+    if answer is None:
+        raise TribunalError("RESPONSE_PENDING")
+    envelope = f"{_CODEX_FINAL_ANSWER}Task name: /root\nSender: {sender}\nPayload:\n"
+    content = answer.get("content")
+    block = content[0] if isinstance(content, list) and len(content) == 1 else None
+    text = block.get("text") if isinstance(block, dict) and block.get("type") == "input_text" else None
+    if answer.get("recipient") != "/root" or not isinstance(text, str) or not text.startswith(envelope):
+        raise TribunalError("RESPONSE_INVALID")
+    try:
+        reply = text[len(envelope):].encode("utf-8")
+    except UnicodeEncodeError:
+        raise TribunalError("RESPONSE_INVALID") from None
+    if reply.startswith(_CODEX_TURN_FAILURE):
+        raise TribunalError("RESPONSE_REVIEWER_FAILED")
+    return reply
 
 
 def _write_private_response(path: Path, data: bytes) -> None:
@@ -1028,7 +1138,14 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 "provenance": receipt.provenance,
             }
         elif arguments.command == "reviewer-response":
-            data = _claude_reply(arguments.transcript, arguments.agent)
+            # Only a Codex controller names the thread whose rollout it reads.
+            if (arguments.runtime == "codex") != (arguments.thread_id is not None):
+                parser.error("--thread-id")
+            data = (
+                _codex_reply(arguments.transcript, arguments.thread_id, arguments.agent)
+                if arguments.runtime == "codex"
+                else _claude_reply(arguments.transcript, arguments.agent)
+            )
             _write_private_response(arguments.output, data)
             payload = {
                 "runtime": arguments.runtime,
