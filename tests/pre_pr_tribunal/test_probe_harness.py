@@ -1145,10 +1145,10 @@ def test_installed_resume_measures_b_only_after_a_and_c_seal(tmp_path, runtime):
         module._tribunal_cli(cli, repo, home, "submit-report", "--reviewer", role, raw=raw)
         saved[role] = raw
     for _ in range(3):
-        transcript = (
-            module._claude_reviewer_transcript(b"{") if runtime == "claude" else nullcontext(())
+        captures = (
+            module._claude_reviewer_captures(cli, repo, home) if runtime == "claude" else nullcontext(())
         )
-        with transcript as arguments, pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
+        with captures as arguments, pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
             module._tribunal_cli(cli, repo, home, "submit-report", "--reviewer", "B", *arguments, raw=b"{")
     module._tribunal_cli(cli, repo, home, "telemetry-close", "--run-id", begun["telemetry"]["run_id"],
                         "--outcome", "failure", "--reason-code", "JSON_INVALID")
@@ -1190,8 +1190,10 @@ def test_installed_full_panel_and_selective_recovery_comparison(tmp_path, runtim
     for role in "AC":
         raw = module._synthetic_report_bytes(role, 1, begun["snapshot"])
         module._tribunal_cli(cli, selective_repo, home, "submit-report", "--reviewer", role, raw=raw)
-    transcript = module._claude_reviewer_transcript(b"{") if runtime == "claude" else nullcontext(())
-    with transcript as arguments, pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
+    captures = (
+        module._claude_reviewer_captures(cli, selective_repo, home) if runtime == "claude" else nullcontext(())
+    )
+    with captures as arguments, pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
         module._tribunal_cli(cli, selective_repo, home, "submit-report", "--reviewer", "B", *arguments, raw=b"{")
     module._tribunal_cli(cli, selective_repo, home, "telemetry-close", "--run-id", begun["telemetry"]["run_id"],
                         "--outcome", "failure", "--reason-code", "JSON_INVALID")

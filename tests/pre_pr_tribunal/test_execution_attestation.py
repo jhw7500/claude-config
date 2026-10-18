@@ -1,39 +1,58 @@
-"""In a Claude round, Reviewer B's fresh executions cite only digests its own tool calls computed."""
+"""In a Claude round, each fresh Reviewer B execution must match a capture the installed helper recorded."""
 
 import hashlib
 import json
+import os
 import re
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from pre_pr_tribunal.model import MAX_REPORT_BYTES, Reviewer, ReviewerTranscript, SchemaError
+from pre_pr_tribunal import cli as tribunal_cli
+from pre_pr_tribunal.model import MAX_REPORT_BYTES, CaptureRecord, Reviewer, SchemaError
 from pre_pr_tribunal.verdict_store import begin_round, read_verdict, submit_reviewer_report
 from tests.pre_pr_tribunal.test_evidence_lifecycle import bundle, reused
 from tests.pre_pr_tribunal.test_model_store import NOW, execution, report, run_cli_bytes
-from tests.pre_pr_tribunal.test_reviewer_response import (
-    AGENT, assistant, follow_up, prompt, text, write_transcript,
-)
 
-PRINTED = hashlib.sha256(b"1 passed").hexdigest()
 ROLE_PROMPT = Path(__file__).resolve().parents[2] / "skills/pre-pr-tribunal/references/reviewer-b.md"
+PLAUSIBLE = "1e0c3b7a5d9f4b2c8a6e" + "0123456789abcdef" * 2 + "4f6a8c0e1b3d"
+OUTPUT_LIMIT = getattr(tribunal_cli, "_CAPTURE_OUTPUT_BYTES", 64 * 1024 * 1024)
 
 
-def bash(tool_id, command):
-    return {"type": "tool_use", "id": tool_id, "name": "Bash", "input": {"command": command}}
+def capture_store(tmp_path):
+    path = tmp_path / "captures"
+    path.mkdir()
+    path.chmod(0o700)
+    return path
 
 
-def result(tool_id, content):
+def capture(repo, store, command, *, cwd=None, timeout=None):
+    arguments = ["capture-run", "--store", str(store), "--cwd", str(cwd or repo), "--command", command]
+    if timeout is not None:
+        arguments += ["--timeout", str(timeout)]
+    result = run_cli_bytes(repo, *arguments)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def execution_from(captured, identifier="B-R1-E001"):
+    """The execution an honest reviewer copies from the helper's output."""
     return {
-        "type": "user", "agentId": AGENT, "isSidechain": True, "uuid": f"r-{tool_id}",
-        "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": tool_id, "content": content},
-        ]},
+        "id": identifier,
+        "command": captured["command"],
+        "exit_code": captured["exit_code"],
+        "stdout_excerpt": captured["stdout_excerpt"],
+        "stderr_excerpt": captured["stderr_excerpt"],
+        "capture_sha256": captured["capture_sha256"],
+        "truncated": captured["truncated"],
     }
 
 
-def b_report(snapshot, digest=PRINTED, command="python3 -m pytest -q", evidence=None):
-    item = evidence or {**execution("B-R1-E001", command=command), "capture_sha256": digest}
+def b_report(snapshot, item):
     return json.dumps(report(snapshot, "B", executions=[item], claims=[{
         "id": "B-R1-C001",
         "statement": "The reviewed behavior is executable.",
@@ -43,21 +62,10 @@ def b_report(snapshot, digest=PRINTED, command="python3 -m pytest -q", evidence=
     }], coverage={"complete": True, "primary_entry_paths": []}), ensure_ascii=False)
 
 
-def reviewer_transcript(tmp_path, reply, *, printed=PRINTED, command=None):
-    """A reviewer that ran one command whose output shows `printed`, then replied."""
-    run = command or 'T=$(mktemp -d); python3 -m pytest -q > "$T/out" 2>&1; echo rc=$?; sha256sum "$T/out"'
-    return write_transcript(tmp_path / f"agent-{AGENT}.jsonl", [
-        prompt("review"),
-        assistant("m1", [bash("t1", run)], "tool_use"),
-        result("t1", f"rc=0\n{printed}  out\n"),
-        assistant("m2", [text(reply)], "end_turn"),
-    ])
-
-
-def submit(repo, raw, transcript=None, reviewer="B"):
+def submit(repo, raw, store=None, reviewer="B"):
     arguments = ["submit-report", "--reviewer", reviewer]
-    if transcript is not None:
-        arguments += ["--transcript", str(transcript), "--agent", AGENT]
+    if store is not None:
+        arguments += ["--captures", str(store)]
     return run_cli_bytes(repo, *arguments, input=raw)
 
 
@@ -65,11 +73,35 @@ def claude_round(repo):
     return begin_round(repo, base="master", runtime="claude", round_number=1, now=NOW)
 
 
-def test_a_digest_its_own_command_printed_seals(git_repo, tmp_path):
-    pending = claude_round(git_repo)
-    reply = b_report(pending.snapshot)
+def assert_unattested(repo, submitted, field):
+    assert submitted.returncode == 1
+    assert submitted.stderr.splitlines() == [
+        b"PRE_PR_TRIBUNAL:EXECUTION_UNATTESTED",
+        f"PRE_PR_TRIBUNAL_DETAIL:reviewer=B path=executions[0].{field}".encode(),
+    ]
+    slot = read_verdict(repo).reviewers["B"]
+    assert slot.status == "pending" and slot.last_error == "EXECUTION_UNATTESTED"
+    assert not (repo / ".review/inbox/round-1/B.json").exists()
 
-    submitted = submit(git_repo, reply.encode(), reviewer_transcript(tmp_path, reply))
+
+def test_the_helper_runs_the_command_and_records_its_capture(git_repo, tmp_path):
+    store = capture_store(tmp_path)
+
+    captured = capture(git_repo, store, "printf out; printf err >&2; exit 3")
+
+    assert captured["exit_code"] == 3
+    assert captured["capture_sha256"] == hashlib.sha256(b"outerr").hexdigest()
+    assert (captured["stdout_excerpt"], captured["stderr_excerpt"]) == ("out", "err")
+    records = list(store.iterdir())
+    assert len(records) == 1 and records[0].stat().st_mode & 0o777 == 0o600
+
+
+def test_an_execution_copied_from_the_helper_output_seals(git_repo, tmp_path):
+    pending = claude_round(git_repo)
+    store = capture_store(tmp_path)
+    item = execution_from(capture(git_repo, store, "printf '1 passed'"))
+
+    submitted = submit(git_repo, b_report(pending.snapshot, item).encode(), store)
 
     assert submitted.returncode == 0, submitted.stderr
     assert read_verdict(git_repo).reviewers["B"].status == "sealed"
@@ -78,184 +110,247 @@ def test_a_digest_its_own_command_printed_seals(git_repo, tmp_path):
 @pytest.mark.parametrize(("digest", "command"), (
     # Run 57959256/36368b82: two-character digests and a command that cannot run.
     ("0" * 63 + "1", "python3 -I -c (direct call of catalog_warnings on synthetic homes)"),
-    ("0" * 63 + "2", "python3 -I -c <tmp-home-with-symlink-loop-fifo-and-unreadable-SKILL.md>"),
     # Uses all sixteen hex characters, so no shape check rejects it.
-    ("1e0c3b7a5d9f4b2c8a6e" + "0123456789abcdef" * 2 + "4f6a8c0e1b3d", "python3 -m pytest -q"),
-), ids=("prose-command", "placeholder-command", "plausible-shape"))
-def test_a_digest_no_tool_call_printed_is_rejected_for_retry(git_repo, tmp_path, digest, command):
+    (PLAUSIBLE, "python3 -m pytest -q"),
+    # The role prompt's own example execution, which Reviewer B reads.
+    (re.search(r'"capture_sha256": "([0-9a-f]{64})"', ROLE_PROMPT.read_text(encoding="utf-8")).group(1),
+     "python3 -m pytest -q tests/example.py"),
+), ids=("prose-command", "plausible-shape", "role-prompt-example"))
+def test_a_digest_the_helper_never_recorded_is_rejected_for_retry(git_repo, tmp_path, digest, command):
     pending = claude_round(git_repo)
-    reply = b_report(pending.snapshot, digest=digest, command=command)
+    store = capture_store(tmp_path)
+    capture(git_repo, store, "printf unrelated")
+    item = {**execution("B-R1-E001", command=command), "capture_sha256": digest}
 
-    submitted = submit(git_repo, reply.encode(), reviewer_transcript(tmp_path, reply))
+    submitted = submit(git_repo, b_report(pending.snapshot, item).encode(), store)
 
-    assert submitted.returncode == 1
-    assert submitted.stderr.splitlines() == [
-        b"PRE_PR_TRIBUNAL:EXECUTION_UNATTESTED",
-        b"PRE_PR_TRIBUNAL_DETAIL:reviewer=B path=executions[0].capture_sha256",
-    ]
-    slot = read_verdict(git_repo).reviewers["B"]
-    assert slot.status == "pending" and slot.last_error == "EXECUTION_UNATTESTED"
-    assert not (git_repo / ".review/inbox/round-1/B.json").exists()
+    assert_unattested(git_repo, submitted, "capture_sha256")
 
 
-@pytest.mark.parametrize("command", (
-    'T=$(mktemp -d); python3 -m pytest -q > "$T/out"; sha256sum "$T/out"',
-    'T=$(mktemp -d); python3 -m pytest -q > "$T/out"; shasum -a 256 "$T/out"',
-    "python3 -c 'import hashlib,subprocess; print(hashlib.sha256(subprocess.run([\"true\"]).args[0].encode()).hexdigest())'",
-    'T=$(mktemp -d); python3 -m pytest -q > "$T/out"; openssl dgst -sha256 "$T/out"',
-), ids=("sha256sum", "shasum", "hashlib", "openssl"))
-def test_each_documented_sha256_command_form_attests(git_repo, tmp_path, command):
+@pytest.mark.parametrize(("field", "value"), (
+    ("command", "printf '2 passed'"),
+    ("exit_code", 1),
+    ("stdout_excerpt", "2 passed"),
+    ("stderr_excerpt", "warning"),
+))
+def test_every_copied_field_must_match_the_capture(git_repo, tmp_path, field, value):
     pending = claude_round(git_repo)
-    reply = b_report(pending.snapshot)
+    store = capture_store(tmp_path)
+    item = {**execution_from(capture(git_repo, store, "printf '1 passed'")), field: value}
 
-    submitted = submit(git_repo, reply.encode(), reviewer_transcript(tmp_path, reply, command=command))
+    submitted = submit(git_repo, b_report(pending.snapshot, item).encode(), store)
+
+    assert_unattested(git_repo, submitted, field)
+
+
+def test_a_capture_outside_the_bound_snapshot_does_not_attest(git_repo, tmp_path):
+    pending = claude_round(git_repo)
+    store = capture_store(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    item = execution_from(capture(git_repo, store, "printf '1 passed'", cwd=elsewhere))
+
+    submitted = submit(git_repo, b_report(pending.snapshot, item).encode(), store)
+
+    assert_unattested(git_repo, submitted, "capture_sha256")
+
+
+@pytest.mark.parametrize("change", ("another-helper", "shared-mode"))
+def test_a_record_the_installed_helper_did_not_leave_does_not_attest(git_repo, tmp_path, change):
+    # The candidate source's own cli.py, run from a reviewer view, is not the installed helper.
+    pending = claude_round(git_repo)
+    store = capture_store(tmp_path)
+    item = execution_from(capture(git_repo, store, "printf '1 passed'"))
+    (record,) = store.iterdir()
+    if change == "another-helper":
+        value = json.loads(record.read_text(encoding="utf-8"))
+        record.write_text(json.dumps({**value, "helper": str(tmp_path / "view/hooks/pre_pr_tribunal/cli.py")}))
+    else:
+        record.chmod(0o644)
+
+    submitted = submit(git_repo, b_report(pending.snapshot, item).encode(), store)
+
+    assert_unattested(git_repo, submitted, "capture_sha256")
+
+
+def test_an_unsafe_capture_store_is_refused_by_the_helper_and_the_submission(git_repo, tmp_path):
+    pending = claude_round(git_repo)
+    store = capture_store(tmp_path)
+    item = execution_from(capture(git_repo, store, "printf '1 passed'"))
+    store.chmod(0o755)
+
+    ran = run_cli_bytes(git_repo, "capture-run", "--store", str(store), "--cwd", str(git_repo),
+                        "--command", "true")
+    submitted = submit(git_repo, b_report(pending.snapshot, item).encode(), store)
+
+    assert ran.stderr == b"PRE_PR_TRIBUNAL:CAPTURE_STORE_UNSAFE\n"
+    assert submitted.stderr == b"PRE_PR_TRIBUNAL:CAPTURE_STORE_UNSAFE\n"
+    assert read_verdict(git_repo).reviewers["B"].attempt_count == 0
+
+
+def test_the_helper_stops_a_command_at_its_timeout(git_repo, tmp_path):
+    store = capture_store(tmp_path)
+    started = time.monotonic()
+
+    captured = capture(git_repo, store, "sleep 30 & sleep 30", timeout=1)
+
+    assert time.monotonic() - started < 15
+    assert (captured["exit_code"], captured["timed_out"]) == (124, True)
+
+
+def test_the_helper_returns_when_the_command_exits_and_kills_its_session(git_repo, tmp_path):
+    # Output goes to files, so a background child that keeps writing cannot hold the helper.
+    store = capture_store(tmp_path)
+    pidfile = tmp_path / "child"
+    started = time.monotonic()
+
+    captured = capture(git_repo, store, f"sleep 30 & echo $! > {pidfile}; exit 0", timeout=20)
+
+    assert time.monotonic() - started < 10
+    assert (captured["exit_code"], captured["timed_out"]) == (0, False)
+    child = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        assert time.monotonic() < deadline, "a background child outlived the helper"
+        time.sleep(0.05)
+
+
+def test_a_signal_to_the_helper_kills_the_command_session(git_repo, tmp_path):
+    store = capture_store(tmp_path)
+    pidfile = tmp_path / "pid"
+    cli_path = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    helper = subprocess.Popen(
+        [sys.executable, str(cli_path), "capture-run", "--store", str(store), "--cwd", str(git_repo),
+         "--command", f"echo $$ > {pidfile}; exec sleep 30"],
+        cwd=git_repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 10
+    while not pidfile.exists() or not pidfile.read_text().strip():
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    command_pid = int(pidfile.read_text())
+
+    helper.send_signal(signal.SIGTERM)
+    helper.wait(timeout=10)
+
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            os.kill(command_pid, 0)
+        except ProcessLookupError:
+            break
+        assert time.monotonic() < deadline, "the command outlived the helper"
+        time.sleep(0.05)
+    assert helper.returncode != 0
+
+
+def test_the_helper_stops_unbounded_output_at_its_limit(git_repo, tmp_path):
+    store = capture_store(tmp_path)
+
+    capture(git_repo, store, f"head -c {OUTPUT_LIMIT + 4096} /dev/zero")
+
+    (record,) = store.iterdir()
+    assert json.loads(record.read_text(encoding="utf-8"))["stdout_bytes"] <= OUTPUT_LIMIT
+
+
+def test_a_printed_excerpt_is_the_longest_slice_a_report_accepts(git_repo, tmp_path):
+    pending = claude_round(git_repo)
+    store = capture_store(tmp_path)
+    captured = capture(git_repo, store, r"printf 'ok\r\nmore'")
+    assert captured["stdout_excerpt"] == "ok" and captured["truncated"] is True
+
+    submitted = submit(git_repo, b_report(pending.snapshot, execution_from(captured)).encode(), store)
 
     assert submitted.returncode == 0, submitted.stderr
 
 
-def test_a_digest_printed_before_a_format_retry_still_attests(git_repo, tmp_path):
-    # The retried reply reuses a digest the reviewer computed before the follow-up.
+def test_a_large_honest_capture_still_attests(git_repo, tmp_path):
+    # A megabyte of NUL bytes per stream serializes to six times its size in the record.
     pending = claude_round(git_repo)
-    reply = b_report(pending.snapshot)
-    transcript = write_transcript(tmp_path / f"agent-{AGENT}.jsonl", [
-        prompt("review"),
-        assistant("m1", [bash("t1", 'T=$(mktemp -d); python3 -m pytest -q > "$T/out"; sha256sum "$T/out"')], "tool_use"),
-        result("t1", [{"type": "text", "text": f"{PRINTED}  out"}]),
-        assistant("m2", [text("not json")], "end_turn"),
-        follow_up("retry with the format fixed"),
-        assistant("m3", [text(reply)], "end_turn"),
-    ])
+    store = capture_store(tmp_path)
+    captured = capture(git_repo, store, "head -c 1048576 /dev/zero; head -c 1048576 /dev/zero >&2")
 
-    submitted = submit(git_repo, reply.encode(), transcript)
+    submitted = submit(git_repo, b_report(pending.snapshot, execution_from(captured)).encode(), store)
 
     assert submitted.returncode == 0, submitted.stderr
 
 
-@pytest.mark.parametrize(("command", "output"), (
-    (f"echo {PRINTED}; sha256sum out", f"{PRINTED}\n"),
-    ("sha256sum out; sha512sum out", f"{PRINTED}{'a' * 64}  out\n"),
-    # A command that only shows a file prints a digest it did not compute.
-    ("cat skills/pre-pr-tribunal/references/reviewer-b.md", f'"capture_sha256": "{PRINTED}",\n'),
-), ids=("the-call-contains-it", "inside-a-longer-hex-run", "a-call-that-computes-nothing"))
-def test_output_that_does_not_show_a_computed_digest_does_not_attest(git_repo, tmp_path, command, output):
+@pytest.mark.parametrize(("store_argument", "cwd_argument", "command"), (
+    ("", None, "true"),
+    ("relative-store", None, "true"),
+    (None, "", "true"),
+    (None, None, "cat /home/someone/notes"),
+), ids=("empty-store", "relative-store", "empty-cwd", "home-path-command"))
+def test_the_helper_refuses_inputs_a_report_cannot_carry(git_repo, tmp_path, store_argument, cwd_argument, command):
+    store = capture_store(tmp_path)
+
+    ran = run_cli_bytes(
+        git_repo, "capture-run",
+        "--store", str(store) if store_argument is None else store_argument,
+        "--cwd", str(git_repo) if cwd_argument is None else cwd_argument,
+        "--command", command,
+    )
+
+    assert ran.stderr == b"PRE_PR_TRIBUNAL:CAPTURE_COMMAND_INVALID\n"
+    assert list(store.iterdir()) == []
+
+
+def test_an_empty_capture_store_argument_is_unsafe(git_repo, tmp_path):
     pending = claude_round(git_repo)
-    reply = b_report(pending.snapshot)
-    transcript = write_transcript(tmp_path / f"agent-{AGENT}.jsonl", [
-        prompt("review"),
-        assistant("m1", [bash("t1", command)], "tool_use"),
-        result("t1", output),
-        assistant("m2", [text(reply)], "end_turn"),
-    ])
+    item = execution_from(capture(git_repo, capture_store(tmp_path), "printf '1 passed'"))
 
-    submitted = submit(git_repo, reply.encode(), transcript)
+    submitted = run_cli_bytes(git_repo, "submit-report", "--reviewer", "B", "--captures", "",
+                              input=b_report(pending.snapshot, item).encode())
 
-    assert submitted.stderr.splitlines()[0] == b"PRE_PR_TRIBUNAL:EXECUTION_UNATTESTED"
+    assert submitted.stderr == b"PRE_PR_TRIBUNAL:CAPTURE_STORE_UNSAFE\n"
 
 
-def test_the_role_prompt_example_digest_read_from_its_file_does_not_attest(git_repo, tmp_path):
-    # Reviewer B reads its role prompt, whose example execution carries a real digest.
-    role_prompt = ROLE_PROMPT.read_text(encoding="utf-8")
-    example = re.search(r'"capture_sha256": "([0-9a-f]{64})"', role_prompt).group(1)
+def test_a_claude_reviewer_b_submission_requires_its_capture_store(git_repo, tmp_path):
     pending = claude_round(git_repo)
-    reply = b_report(pending.snapshot, digest=example)
-    transcript = write_transcript(tmp_path / f"agent-{AGENT}.jsonl", [
-        prompt("review"),
-        assistant("m1", [{"type": "tool_use", "id": "t1", "name": "Read",
-                          "input": {"file_path": str(ROLE_PROMPT)}}], "tool_use"),
-        result("t1", role_prompt),
-        assistant("m2", [text(reply)], "end_turn"),
-    ])
+    item = execution_from(capture(git_repo, capture_store(tmp_path), "printf '1 passed'"))
 
-    submitted = submit(git_repo, reply.encode(), transcript)
+    submitted = submit(git_repo, b_report(pending.snapshot, item).encode())
 
-    assert submitted.stderr.splitlines()[0] == b"PRE_PR_TRIBUNAL:EXECUTION_UNATTESTED"
-
-
-def test_recomputing_a_digest_the_request_showed_attests(git_repo, tmp_path):
-    # Reviewer B may recompute a value it was given, such as the snapshot diff digest.
-    pending = claude_round(git_repo)
-    reply = b_report(pending.snapshot)
-    transcript = write_transcript(tmp_path / f"agent-{AGENT}.jsonl", [
-        prompt(f"review; the expected digest is {PRINTED}"),
-        assistant("m1", [bash("t1", "git diff --binary master..HEAD | sha256sum")], "tool_use"),
-        result("t1", f"{PRINTED}  -\n"),
-        assistant("m2", [text(reply)], "end_turn"),
-    ])
-
-    submitted = submit(git_repo, reply.encode(), transcript)
-
-    assert submitted.returncode == 0, submitted.stderr
-
-
-def test_an_oversized_claude_b_reply_takes_the_format_retry_path(git_repo, tmp_path):
-    # The CLI reads at most one byte past the limit, so the bound bytes cannot equal the reply.
-    pending = claude_round(git_repo)
-    value = json.loads(b_report(pending.snapshot))
-    value["claims"][0]["statement"] = "x" * 1024
-    value["claims"] = [{**value["claims"][0], "id": f"B-R1-C{index:03d}"} for index in range(1, 129)]
-    reply = json.dumps(value)
-    assert len(reply.encode()) > MAX_REPORT_BYTES
-
-    submitted = submit(git_repo, reply.encode(), reviewer_transcript(tmp_path, reply))
-
-    assert submitted.stderr.splitlines()[0] == b"PRE_PR_TRIBUNAL:REPORT_TOO_LARGE"
-    slot = read_verdict(git_repo).reviewers["B"]
-    assert slot.status == "pending" and slot.attempt_count == 1 and slot.last_error == "REPORT_TOO_LARGE"
-
-
-def test_a_claude_reviewer_b_submission_requires_its_transcript(git_repo):
-    pending = claude_round(git_repo)
-
-    submitted = submit(git_repo, b_report(pending.snapshot).encode())
-
-    assert submitted.stderr == b"PRE_PR_TRIBUNAL:SUBMISSION_TRANSCRIPT_REQUIRED\n"
-    slot = read_verdict(git_repo).reviewers["B"]
-    assert slot.status == "pending" and slot.attempt_count == 0
-
-
-def test_submitted_bytes_must_be_the_reply_in_that_transcript(git_repo, tmp_path):
-    pending = claude_round(git_repo)
-    reply = b_report(pending.snapshot)
-
-    submitted = submit(git_repo, (reply + "\n").encode(), reviewer_transcript(tmp_path, reply))
-
-    assert submitted.stderr == b"PRE_PR_TRIBUNAL:SUBMISSION_TRANSCRIPT_MISMATCH\n"
+    assert submitted.stderr == b"PRE_PR_TRIBUNAL:SUBMISSION_CAPTURES_REQUIRED\n"
     slot = read_verdict(git_repo).reviewers["B"]
     assert slot.status == "pending" and slot.attempt_count == 0
 
 
 @pytest.mark.parametrize(("runtime", "reviewer"), (("codex", "B"), ("claude", "A")))
-def test_a_transcript_is_refused_where_no_check_uses_it(git_repo, tmp_path, runtime, reviewer):
+def test_a_capture_store_is_refused_where_no_check_uses_it(git_repo, tmp_path, runtime, reviewer):
     pending = begin_round(git_repo, base="master", runtime=runtime, round_number=1, now=NOW)
-    raw = b_report(pending.snapshot) if reviewer == "B" else json.dumps(report(pending.snapshot, "A"))
+    store = capture_store(tmp_path)
+    item = execution_from(capture(git_repo, store, "printf '1 passed'"))
+    raw = b_report(pending.snapshot, item) if reviewer == "B" else json.dumps(report(pending.snapshot, "A"))
 
-    submitted = submit(git_repo, raw.encode(), reviewer_transcript(tmp_path, raw), reviewer=reviewer)
+    submitted = submit(git_repo, raw.encode(), store, reviewer=reviewer)
 
-    assert submitted.stderr == b"PRE_PR_TRIBUNAL:SUBMISSION_TRANSCRIPT_UNEXPECTED\n"
+    assert submitted.stderr == b"PRE_PR_TRIBUNAL:SUBMISSION_CAPTURES_UNEXPECTED\n"
 
 
 def test_a_codex_round_keeps_unchecked_fresh_executions(git_repo):
-    # Codex reviewers' tool calls live in child rollouts this check does not read yet.
+    # Codex reviewers do not run the helper yet; their fresh digests stay unauthenticated.
     pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
-    unprinted = "1e0c3b7a5d9f4b2c8a6e" + "0123456789abcdef" * 2 + "4f6a8c0e1b3d"
+    item = {**execution("B-R1-E001"), "capture_sha256": PLAUSIBLE}
 
-    submitted = submit(git_repo, b_report(pending.snapshot, digest=unprinted).encode())
+    submitted = submit(git_repo, b_report(pending.snapshot, item).encode())
 
     assert submitted.returncode == 0, submitted.stderr
 
 
-def test_a_bundle_execution_is_authenticated_by_its_bundle_not_the_transcript(git_repo):
+def test_a_bundle_execution_is_authenticated_by_its_bundle_not_a_capture(git_repo):
     frozen = bundle(git_repo)
     pending = begin_round(
         git_repo, base="master", runtime="claude", round_number=1,
         evidence_bundle_sha256=frozen["bundle_sha256"],
     )
-    raw = b_report(pending.snapshot, evidence=reused(git_repo, frozen)).encode()
+    raw = b_report(pending.snapshot, reused(git_repo, frozen)).encode()
 
-    receipt = submit_reviewer_report(
-        git_repo, reviewer=Reviewer.B, raw=raw,
-        transcript=ReviewerTranscript(reply=raw, printed_digests=frozenset()),
-    )
+    receipt = submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=raw, captures=())
 
     assert receipt.raw_sha256 == hashlib.sha256(raw).hexdigest()
 
@@ -266,25 +361,31 @@ def test_an_unattested_fresh_execution_beside_a_bundle_one_is_still_rejected(git
         git_repo, base="master", runtime="claude", round_number=1,
         evidence_bundle_sha256=frozen["bundle_sha256"],
     )
-    value = json.loads(b_report(pending.snapshot, evidence=reused(git_repo, frozen)))
+    value = json.loads(b_report(pending.snapshot, reused(git_repo, frozen)))
     value["executions"].append(execution("B-R1-E002"))
     value["claims"][0]["execution_ids"].append("B-R1-E002")
     raw = json.dumps(value).encode()
+    unrelated = CaptureRecord(
+        command="true", head=pending.head_sha, exit_code=0,
+        capture_sha256=hashlib.sha256(b"").hexdigest(), stdout="", stderr="",
+    )
 
     with pytest.raises(SchemaError, match="^EXECUTION_UNATTESTED$") as raised:
-        submit_reviewer_report(
-            git_repo, reviewer=Reviewer.B, raw=raw,
-            transcript=ReviewerTranscript(reply=raw, printed_digests=frozenset()),
-        )
+        submit_reviewer_report(git_repo, reviewer=Reviewer.B, raw=raw, captures=(unrelated,))
     assert raised.value.path == "executions[1].capture_sha256"
 
 
-@pytest.mark.parametrize("given", ("--transcript", "--agent"))
-def test_transcript_and_agent_are_given_together(git_repo, tmp_path, given):
-    claude_round(git_repo)
-    value = str(tmp_path / "t.jsonl") if given == "--transcript" else AGENT
+def test_an_oversized_claude_b_reply_takes_the_format_retry_path(git_repo, tmp_path):
+    pending = claude_round(git_repo)
+    store = capture_store(tmp_path)
+    value = json.loads(b_report(pending.snapshot, execution_from(capture(git_repo, store, "printf '1 passed'"))))
+    value["claims"][0]["statement"] = "x" * 1024
+    value["claims"] = [{**value["claims"][0], "id": f"B-R1-C{index:03d}"} for index in range(1, 129)]
+    raw = json.dumps(value).encode()
+    assert len(raw) > MAX_REPORT_BYTES
 
-    submitted = run_cli_bytes(git_repo, "submit-report", "--reviewer", "B", given, value, input=b"{}")
+    submitted = submit(git_repo, raw, store)
 
-    assert submitted.returncode == 2
-    assert read_verdict(git_repo).reviewers["B"].attempt_count == 0
+    assert submitted.stderr.splitlines()[0] == b"PRE_PR_TRIBUNAL:REPORT_TOO_LARGE"
+    slot = read_verdict(git_repo).reviewers["B"]
+    assert slot.status == "pending" and slot.attempt_count == 1 and slot.last_error == "REPORT_TOO_LARGE"

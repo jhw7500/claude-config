@@ -430,34 +430,38 @@ def test_skill_recovery_takes_reviewer_bytes_with_reviewer_response():
     assert bullet.index("reviewer-response") < bullet.index("submit-report --reviewer X")
 
 
-def test_skill_binds_claude_reviewer_b_executions_to_its_own_tool_output():
-    """A fresh B digest counts only where the reviewer's own tool call printed it."""
+def test_skill_binds_claude_reviewer_b_executions_to_helper_captures():
+    """A fresh Claude-round B execution counts only when the installed helper recorded it."""
     skill = text("SKILL.md")
-    step = numbered_steps(skill)[6]
-    assert "On Claude, for reviewer B also pass `--transcript` and `--agent`" in step
-    assert step.index("submit-report --reviewer X") < step.index("for reviewer B also pass")
+    steps = numbered_steps(skill)
+    assert "before dispatching Reviewer B, create its capture store with `mktemp -d` outside `VIEW_ROOT`" in steps[5]
+    assert "a fresh replacement B gets a fresh store, and a same-handle retry keeps its store" in steps[5]
+    step = steps[6]
+    assert "On Claude, for reviewer B also pass `--captures` with that B's capture store" in step
+    assert step.index("submit-report --reviewer X") < step.index("also pass `--captures`")
     for code in (
-        "SUBMISSION_TRANSCRIPT_MISMATCH", "EXECUTION_UNATTESTED",
-        "SUBMISSION_TRANSCRIPT_REQUIRED", "SUBMISSION_TRANSCRIPT_UNEXPECTED",
+        "EXECUTION_UNATTESTED", "CAPTURE_STORE_UNSAFE",
+        "SUBMISSION_CAPTURES_REQUIRED", "SUBMISSION_CAPTURES_UNEXPECTED",
     ):
         assert f"`{code}`" in step
-    assert "an integrity stop for that role" in step
-    assert "Codex rounds do not yet check fresh B executions" in step
+    assert "Codex reviewers do not run the helper yet" in step
+    assert "do not move the installed runtime across a pending Claude round" in step
     assert "`CAPTURE_SHA256_PLACEHOLDER`, and `EXECUTION_UNATTESTED`" in skill
     recovery = skill.split("## Pending-round report recovery", 1)[1].split("\n## ", 1)[0]
-    assert "with step 6's `--transcript` and `--agent` for a Claude reviewer B" in recovery
+    assert "with step 6's `--captures` for a Claude reviewer B" in recovery
     reviewer_b = " ".join(text("references/reviewer-b.md").split())
-    assert "only a digest that one of your own shell commands computed and printed" in reviewer_b
-    assert "read from a file such as this prompt's example" in reviewer_b
-    assert "Keep the whole output of that command under 2 KiB" in reviewer_b
-    # Reviewer B is read-only: the recipe writes only outside its view.
-    assert "only into a new `mktemp -d` directory outside your view, never inside the view" in reviewer_b
-    assert "own commands that computes SHA-256 (`sha256sum`" in step
+    assert f"{CLI} capture-run --store '<capture store>' --cwd '<your view>' --command '<command>'" in reviewer_b
+    assert "at most 480; keep your Bash tool timeout longer" in reviewer_b
+    assert "the printed excerpts are the longest leading slices a report accepts" in reviewer_b
+    assert "it cannot stop a same-user process that writes a record into the store directly" in step
+    assert "Copy `command`, `exit_code` and `capture_sha256` unchanged" in reviewer_b
+    assert "such as this prompt's example, matches nothing" in reviewer_b
+    assert "Keep `--cwd` your view; to work elsewhere, such as a merge-base copy, put `cd` inside the command" in reviewer_b
     schema = " ".join(text("references/report-schema.md").split())
     assert "The last three are submission admission rules" in schema
-    assert "own commands that computes SHA-256 and does not itself contain it" in schema
+    assert "must match one capture the installed `capture-run` helper recorded for the bound HEAD" in schema
     readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
-    assert "For reviewer B on Claude, also pass `submit-report` the same" in readme
+    assert "For reviewer B on Claude, also pass `submit-report` `--captures <store>`" in readme
 
 
 def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate():

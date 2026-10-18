@@ -982,39 +982,32 @@ def _record_failure_locked(
     return slot
 
 
-def _printed_digests(
-    pending: Verdict, reviewer: Reviewer, raw: bytes, transcript: m.ReviewerTranscript | None,
-) -> frozenset[str] | None:
-    """Return the digests a Claude-round Reviewer B's own tool calls printed, or None where unchecked.
+def _bound_captures(
+    pending: Verdict, reviewer: Reviewer, captures: tuple[m.CaptureRecord, ...] | None,
+) -> tuple[m.CaptureRecord, ...] | None:
+    """Return a Claude-round Reviewer B's captures of the bound HEAD, or None where unchecked.
 
-    Codex reviewers' tool calls are in their own rollouts, which are not read yet.
+    Codex reviewers do not run the capture helper yet.
     """
     checked = reviewer is Reviewer.B and pending.producer_runtime == "claude"
-    if transcript is None:
+    if captures is None:
         if checked:
-            raise SchemaError("SUBMISSION_TRANSCRIPT_REQUIRED")
+            raise SchemaError("SUBMISSION_CAPTURES_REQUIRED")
         return None
     if not checked:
-        raise SchemaError("SUBMISSION_TRANSCRIPT_UNEXPECTED")
-    # The CLI reads one byte past the limit, so an oversized reply cannot match;
-    # it never seals, and parsing rejects it for a format retry.
-    if len(raw) > m.MAX_REPORT_BYTES:
-        return transcript.printed_digests
-    # The digests attest only the reply they were read with.
-    if transcript.reply != raw:
-        raise SchemaError("SUBMISSION_TRANSCRIPT_MISMATCH")
-    return transcript.printed_digests
+        raise SchemaError("SUBMISSION_CAPTURES_UNEXPECTED")
+    return tuple(record for record in captures if record.head == pending.head_sha)
 
 
 def submit_reviewer_report(
     cwd: Path, *, reviewer: Reviewer, raw: bytes, now: Callable[[], str] = utc_now,
-    transcript: m.ReviewerTranscript | None = None,
+    captures: tuple[m.CaptureRecord, ...] | None = None,
 ) -> ReportReceipt:
     """Validate exact bytes, publish the canonical report, and seal one current schema-3 slot."""
     if (
         not isinstance(reviewer, Reviewer)
         or not isinstance(raw, bytes)
-        or not (transcript is None or isinstance(transcript, m.ReviewerTranscript))
+        or not (captures is None or all(isinstance(record, m.CaptureRecord) for record in captures))
     ):
         raise SchemaError("REPORT_SCHEMA_INVALID")
     root = repository_root(cwd)
@@ -1054,7 +1047,7 @@ def submit_reviewer_report(
             else:
                 if len(raw) > MAX_ATTEMPT_RAW_BYTES:
                     raise SchemaError("REPORT_TOO_LARGE")
-                printed = _printed_digests(pending, reviewer, raw, transcript)
+                bound = _bound_captures(pending, reviewer, captures)
                 try:
                     parsed = m.parse_reviewer_report(
                         raw, expected_reviewer=reviewer, expected_round=pending.round,
@@ -1066,7 +1059,7 @@ def submit_reviewer_report(
                     authenticate_report(root, pending, parsed)
                     _validate_unexecutable_claims(root, pending, snapshot, parsed)
                     m.validate_reviewer_report_semantics(parsed)
-                    m.validate_submission_admission(parsed, printed_digests=printed)
+                    m.validate_submission_admission(parsed, captures=bound)
                 except SchemaError as error:
                     error.from_submission = True
                     if error.code in REPORT_RETRYABLE_CODES:

@@ -201,10 +201,11 @@ explicitly enforce and verify current-user ownership, regular non-symlink type, 
 of ambient `umask`, then pipe those same bytes directly to `submit-report --reviewer A|B|C --run-id "$RUN_ID" --attempt "$ATTEMPT"`.
 On Claude, create that file with `reviewer-response --runtime claude --transcript <Agent transcript> --agent <agentId>
 --output <new path>` instead of copying the completion notification, which escapes text for display; its
-`RESPONSE_PENDING` means the reply is not recorded yet. For reviewer B on Claude, also pass `submit-report` the same
-`--transcript <Agent transcript> --agent <agentId>`: it refuses bytes that are not that reply, and it accepts a fresh B
-execution only when its `capture_sha256` was printed by one of the reviewer's own commands that computes SHA-256
-(`EXECUTION_UNATTESTED` otherwise). On Codex, create it with `reviewer-response --runtime codex
+`RESPONSE_PENDING` means the reply is not recorded yet. For reviewer B on Claude, also pass `submit-report`
+`--captures <store>`, the owner-only directory the controller gave that B: it accepts a fresh B execution only when the
+installed `capture-run` helper recorded a matching capture there (`EXECUTION_UNATTESTED` otherwise). A same-user process
+that writes the store directly is not stopped. On Codex, create
+it with `reviewer-response --runtime codex
 --transcript <controller rollout> --thread-id <CODEX_THREAD_ID> --agent <task name> --output <new path>` instead of
 retyping the answer; its `RESPONSE_REVIEWER_FAILED` is a `REVIEWER_FAILED` outcome. Do not trim,
 parse-and-re-emit, reserialize, repair, or silently truncate them. The CLI's bounded read of maximum report size plus
