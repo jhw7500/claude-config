@@ -204,7 +204,8 @@ On Claude, create that file with `reviewer-response --runtime claude --transcrip
 `RESPONSE_PENDING` means the reply is not recorded yet. For reviewer B on Claude, also pass `submit-report`
 `--captures <store>`, the owner-only directory the controller gave that B: it accepts a fresh B execution only when the
 installed `capture-run` helper recorded a matching capture there (`EXECUTION_UNATTESTED` otherwise). A same-user process
-that writes the store directly is not stopped. On Codex, create
+that writes the store directly, or that changes what a recorded command does through the exported environment the helper
+runs it in (`PATH`, exported functions, `BASH_ENV`), is not stopped. On Codex, create
 it with `reviewer-response --runtime codex
 --transcript <controller rollout> --thread-id <CODEX_THREAD_ID> --agent <task name> --output <new path>` instead of
 retyping the answer; its `RESPONSE_REVIEWER_FAILED` is a `REVIEWER_FAILED` outcome. Do not trim,

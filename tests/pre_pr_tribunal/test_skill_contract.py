@@ -467,6 +467,42 @@ def test_skill_binds_claude_reviewer_b_executions_to_helper_captures():
     assert "For reviewer B on Claude, also pass `submit-report` `--captures <store>`" in readme
 
 
+def test_skill_bounds_the_capture_environment_and_keeps_tracked_capture_stores():
+    """The capture boundary names the helper's environment; each Claude B store is tracked and kept."""
+    skill = text("SKILL.md")
+    steps = numbered_steps(skill)
+    assert "record its exact path with B's view in `CREATED_VIEWS`" in steps[5]
+    assert "Keep every capture store, owner-only, until the system cleans its temporary directory" in steps[5]
+    for reason in (
+        "the controller never deletes recursively",
+        "the evidence for diagnosing an `EXECUTION_UNATTESTED` rejection",
+        "at most 512 records of at most 16 MiB each",
+    ):
+        assert reason in steps[5]
+    assert (
+        "or one that runs the helper with an exported environment, such as `PATH`, an exported function or "
+        "`BASH_ENV`, that changes what a recorded command does, because a record does not bind the environment"
+    ) in steps[6]
+    recovery = skill.split("## Pending-round report recovery", 1)[1].split("\n## ", 1)[0]
+    assert "A resumed Claude B keeps the capture store recorded with that view." in recovery
+    assert "for a Claude reviewer B, naming the capture store recorded with its view" in recovery
+    schema = " ".join(text("references/report-schema.md").split())
+    assert (
+        "not a same-user process that writes the store directly or that changes what a recorded command does "
+        "through the exported environment the helper runs it in"
+    ) in schema
+    readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
+    assert (
+        "or that changes what a recorded command does through the exported environment the helper runs it in "
+        "(`PATH`, exported functions, `BASH_ENV`), is not stopped"
+    ) in readme
+    reviewer_b = " ".join(text("references/reviewer-b.md").split())
+    assert (
+        "The helper runs it with `/bin/bash -c` in the exported environment it inherits, so a function or alias "
+        "that exists only in your Bash tool's shell, such as a `grep` wrapper, does not apply there"
+    ) in reviewer_b
+
+
 def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate():
     skill = text("SKILL.md")
     for stage in (
