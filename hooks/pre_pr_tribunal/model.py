@@ -1511,11 +1511,23 @@ def validate_reviewer_report_semantics(
         raise SchemaError("REFUTED_CLAIM_REQUIRES_BLOCKER")
 
 
-def validate_submission_admission(report: ReviewerReport) -> None:
+@dataclass(frozen=True)
+class ReviewerTranscript:
+    """A reviewer's own transcript: its reply bytes and the digests its tool calls printed."""
+
+    reply: bytes
+    printed_digests: frozenset[str]
+
+
+def validate_submission_admission(
+    report: ReviewerReport, *, printed_digests: frozenset[str] | None = None,
+) -> None:
     """Admission rules for a fresh submission only.
 
     Sealed reports are re-parsed on every verdict read, so these rules never run
     there: a report sealed before them stays readable without a contract bump.
+    With `printed_digests`, a fresh execution cites only a digest the reviewer's
+    own tool calls printed; a bundle execution is authenticated by its bundle.
     """
     if not isinstance(report, ReviewerReport):
         raise SchemaError("REPORT_SCHEMA_INVALID")
@@ -1524,9 +1536,15 @@ def validate_submission_admission(report: ReviewerReport) -> None:
             UNVERIFIED_REASON_PREFIXES
         ):
             raise SchemaError("UNVERIFIED_REASON_INVALID")
-    for item in report.executions:
+    for index, item in enumerate(report.executions):
         if len(set(item.capture_sha256)) == 1:
             raise SchemaError("CAPTURE_SHA256_PLACEHOLDER")
+        if (
+            printed_digests is not None
+            and item.evidence_ref is None
+            and item.capture_sha256 not in printed_digests
+        ):
+            raise SchemaError("EXECUTION_UNATTESTED", path=f"executions[{index}].capture_sha256")
 
 
 def _blocker_identity(value: object) -> tuple[str, int, Reviewer]:

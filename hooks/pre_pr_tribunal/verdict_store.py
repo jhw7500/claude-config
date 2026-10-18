@@ -982,11 +982,36 @@ def _record_failure_locked(
     return slot
 
 
+def _printed_digests(
+    pending: Verdict, reviewer: Reviewer, raw: bytes, transcript: m.ReviewerTranscript | None,
+) -> frozenset[str] | None:
+    """Return the digests a Claude-round Reviewer B's own tool calls printed, or None where unchecked.
+
+    Codex reviewers' tool calls are in their own rollouts, which are not read yet.
+    """
+    checked = reviewer is Reviewer.B and pending.producer_runtime == "claude"
+    if transcript is None:
+        if checked:
+            raise SchemaError("SUBMISSION_TRANSCRIPT_REQUIRED")
+        return None
+    if not checked:
+        raise SchemaError("SUBMISSION_TRANSCRIPT_UNEXPECTED")
+    # The digests attest only the reply they were read with.
+    if transcript.reply != raw:
+        raise SchemaError("SUBMISSION_TRANSCRIPT_MISMATCH")
+    return transcript.printed_digests
+
+
 def submit_reviewer_report(
     cwd: Path, *, reviewer: Reviewer, raw: bytes, now: Callable[[], str] = utc_now,
+    transcript: m.ReviewerTranscript | None = None,
 ) -> ReportReceipt:
     """Validate exact bytes, publish the canonical report, and seal one current schema-3 slot."""
-    if not isinstance(reviewer, Reviewer) or not isinstance(raw, bytes):
+    if (
+        not isinstance(reviewer, Reviewer)
+        or not isinstance(raw, bytes)
+        or not (transcript is None or isinstance(transcript, m.ReviewerTranscript))
+    ):
         raise SchemaError("REPORT_SCHEMA_INVALID")
     root = repository_root(cwd)
     preflight_review_directory(root)
@@ -1025,6 +1050,7 @@ def submit_reviewer_report(
             else:
                 if len(raw) > MAX_ATTEMPT_RAW_BYTES:
                     raise SchemaError("REPORT_TOO_LARGE")
+                printed = _printed_digests(pending, reviewer, raw, transcript)
                 try:
                     parsed = m.parse_reviewer_report(
                         raw, expected_reviewer=reviewer, expected_round=pending.round,
@@ -1036,7 +1062,7 @@ def submit_reviewer_report(
                     authenticate_report(root, pending, parsed)
                     _validate_unexecutable_claims(root, pending, snapshot, parsed)
                     m.validate_reviewer_report_semantics(parsed)
-                    m.validate_submission_admission(parsed)
+                    m.validate_submission_admission(parsed, printed_digests=printed)
                 except SchemaError as error:
                     error.from_submission = True
                     if error.code in REPORT_RETRYABLE_CODES:

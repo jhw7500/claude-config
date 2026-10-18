@@ -430,6 +430,32 @@ def test_skill_recovery_takes_reviewer_bytes_with_reviewer_response():
     assert bullet.index("reviewer-response") < bullet.index("submit-report --reviewer X")
 
 
+def test_skill_binds_claude_reviewer_b_executions_to_its_own_tool_output():
+    """A fresh B digest counts only where the reviewer's own tool call printed it."""
+    skill = text("SKILL.md")
+    step = numbered_steps(skill)[6]
+    assert "On Claude, for reviewer B also pass `--transcript` and `--agent`" in step
+    assert step.index("submit-report --reviewer X") < step.index("for reviewer B also pass")
+    for code in (
+        "SUBMISSION_TRANSCRIPT_MISMATCH", "EXECUTION_UNATTESTED",
+        "SUBMISSION_TRANSCRIPT_REQUIRED", "SUBMISSION_TRANSCRIPT_UNEXPECTED",
+    ):
+        assert f"`{code}`" in step
+    assert "an integrity stop for that role" in step
+    assert "Codex rounds do not yet check fresh B executions" in step
+    assert "`CAPTURE_SHA256_PLACEHOLDER`, and `EXECUTION_UNATTESTED`" in skill
+    recovery = skill.split("## Pending-round report recovery", 1)[1].split("\n## ", 1)[0]
+    assert "with step 6's `--transcript` and `--agent` for a Claude reviewer B" in recovery
+    reviewer_b = " ".join(text("references/reviewer-b.md").split())
+    assert "only a digest that one of your own tool calls printed" in reviewer_b
+    assert "Keep the whole output of the call that prints the digest under 2 KiB" in reviewer_b
+    schema = " ".join(text("references/report-schema.md").split())
+    assert "The last three are submission admission rules" in schema
+    assert "own tool calls whose input does not contain it" in schema
+    readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
+    assert "For reviewer B on Claude, also pass `submit-report` the same" in readme
+
+
 def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate():
     skill = text("SKILL.md")
     for stage in (

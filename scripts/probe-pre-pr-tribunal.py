@@ -1457,6 +1457,54 @@ _REPORT_RETRYABLE_CODES = frozenset((
 ))
 
 
+@contextmanager
+def _claude_reviewer_transcript(raw: bytes):
+    """Yield submit arguments naming a synthetic Claude transcript that printed every cited digest.
+
+    The installed runtime accepts a Claude-round Reviewer B report only with the
+    transcript it came from, so the probe writes the one an honest reviewer leaves.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ProbeFailure("SETUP_FAILED") from None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    executions = value.get("executions") if isinstance(value, dict) else None
+    printed = "\n".join(
+        item["capture_sha256"] for item in executions
+        if isinstance(item, dict) and isinstance(item.get("capture_sha256"), str)
+    ) if isinstance(executions, list) else ""
+    agent = "probe-reviewer-b"
+    records = (
+        {"type": "user", "agentId": agent, "message": {"role": "user", "content": "review"}},
+        {"type": "assistant", "agentId": agent, "message": {
+            "id": "m1", "role": "assistant", "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                         "input": {"command": "sha256sum capture"}}],
+        }},
+        {"type": "user", "agentId": agent, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": printed},
+        ]}},
+        {"type": "assistant", "agentId": agent, "message": {
+            "id": "m2", "role": "assistant", "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": text}],
+        }},
+    )
+    directory = tempfile.mkdtemp(prefix="probe-transcript-")
+    try:
+        path = Path(directory) / "transcript.jsonl"
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        yield ("--transcript", str(path), "--agent", agent)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 def _create_pass_verdict(
     cli: Path,
     repo: Path,
@@ -1575,9 +1623,14 @@ def _create_pass_verdict(
                 raw = report_factory(reviewer, attempt, snapshot)
                 if not isinstance(raw, bytes):
                     raise ProbeFailure("SETUP_FAILED")
-                receipt = measured("report_store", reviewer, local_attempt, lambda: _tribunal_cli(
-                    cli, repo, home, "submit-report", "--reviewer", reviewer, raw=raw,
-                ))
+                with ExitStack() as stack:
+                    transcript = (
+                        stack.enter_context(_claude_reviewer_transcript(raw))
+                        if runtime == "claude" and reviewer == "B" else ()
+                    )
+                    receipt = measured("report_store", reviewer, local_attempt, lambda: _tribunal_cli(
+                        cli, repo, home, "submit-report", "--reviewer", reviewer, *transcript, raw=raw,
+                    ))
                 if receipt.get("raw_sha256") != hashlib.sha256(raw).hexdigest():
                     raise ProbeFailure("REPORT_BYTES_MISMATCH")
                 submitted_receipts[reviewer] = receipt

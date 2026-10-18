@@ -23,6 +23,7 @@ from pre_pr_tribunal.model import (
     ReportReceipt,
     Reviewer,
     ReviewerSlot,
+    ReviewerTranscript,
     SchemaError,
     parse_decisions,
     parse_reviewer_report,
@@ -160,10 +161,18 @@ def report_paths(repo, snapshot, *, round_number=1, overrides=None):
         value = report(snapshot, reviewer, round_number=round_number)
         value.update(overrides.get(reviewer, {}))
         path = repo / f".review/inbox/round-{round_number}/{reviewer}.json"
-        if read_verdict(repo).schema == 1:
-            store_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=json.dumps(value).encode())
+        raw = json.dumps(value).encode()
+        verdict = read_verdict(repo)
+        if verdict.schema == 1:
+            store_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=raw)
         else:
-            submit_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=json.dumps(value).encode(), now=NOW)
+            # A Claude-round Reviewer B names the transcript whose tool calls printed its digests.
+            transcript = ReviewerTranscript(raw, frozenset(
+                item["capture_sha256"] for item in value["executions"]
+            )) if reviewer == "B" and verdict.producer_runtime == "claude" else None
+            submit_reviewer_report(
+                repo, reviewer=Reviewer(reviewer), raw=raw, now=NOW, transcript=transcript,
+            )
         result[reviewer] = path
     return result
 

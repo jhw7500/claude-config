@@ -21,6 +21,7 @@ if __package__ in {None, ""}:
         MIXED_SLOT_VERDICT_SCHEMAS,
         VERDICT_SCHEMA_VERSION,
         Reviewer,
+        ReviewerTranscript,
         TribunalError,
         validate_report_bytes,
     )
@@ -58,6 +59,7 @@ else:
         MIXED_SLOT_VERDICT_SCHEMAS,
         VERDICT_SCHEMA_VERSION,
         Reviewer,
+        ReviewerTranscript,
         TribunalError,
         validate_report_bytes,
     )
@@ -183,6 +185,9 @@ def _parser() -> argparse.ArgumentParser:
     # command at parse time, before stdin is read and the report is stored.
     submit.add_argument("--run-id")
     submit.add_argument("--attempt")
+    # Reviewer B in a Claude round names the transcript its reply came from.
+    submit.add_argument("--transcript", type=Path)
+    submit.add_argument("--agent")
     response = commands.add_parser("reviewer-response", add_help=False)
     response.add_argument("--runtime", required=True, choices=("claude", "codex"))
     response.add_argument("--transcript", required=True, type=Path)
@@ -304,7 +309,9 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
     return verdict, projection
 
 
-def _submit_with_telemetry(cwd, arguments, raw, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns):
+def _submit_with_telemetry(
+    cwd, arguments, raw, *, transcript=None, wall_clock=utc_now, monotonic_ns=time.monotonic_ns,
+):
     """Own the report_store span when the caller supplies its run and request ordinal."""
     reviewer = Reviewer(arguments.reviewer)
     run_id, attempt = arguments.run_id, arguments.attempt
@@ -323,7 +330,7 @@ def _submit_with_telemetry(cwd, arguments, raw, *, wall_clock=utc_now, monotonic
     # The review lock is exclusive and non-reentrant, so every telemetry call
     # sits strictly before or after the primary transaction, never around it.
     try:
-        receipt = submit_reviewer_report(cwd, reviewer=reviewer, raw=raw)
+        receipt = submit_reviewer_report(cwd, reviewer=reviewer, raw=raw, transcript=transcript)
     except Exception as primary_error:
         try:
             if span is not None:
@@ -641,6 +648,53 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
         return texts[0].encode("utf-8")
     except UnicodeEncodeError:
         raise TribunalError("RESPONSE_INVALID") from None
+
+
+_PRINTED_DIGEST = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
+
+
+def _claude_transcript(transcript: Path, agent: str) -> ReviewerTranscript:
+    """Return a Claude subagent's reply and every digest its own tool results show.
+
+    A digest counts only where the tool call that produced the result does not
+    itself contain it, so typing a value into `echo` does not attest it. Every
+    request counts: a retried reply may cite a digest computed before the retry.
+    """
+
+    reply = _claude_reply(transcript, agent)
+    calls = {}
+    results = []
+    for record in _transcript_records(transcript):
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if record.get("type") == "assistant" and block.get("type") == "tool_use":
+                if isinstance(block.get("id"), str):
+                    calls[block["id"]] = json.dumps(block.get("input"), ensure_ascii=False)
+            elif record.get("type") == "user" and block.get("type") == "tool_result":
+                results.append((block.get("tool_use_id"), block.get("content")))
+    printed = set()
+    for call_id, content in results:
+        call = calls.get(call_id) if isinstance(call_id, str) else None
+        if call is None:
+            continue
+        if isinstance(content, str):
+            texts = [content]
+        elif isinstance(content, list):
+            texts = [
+                item["text"] for item in content
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+            ]
+        else:
+            texts = []
+        printed.update(
+            digest for value in texts for digest in _PRINTED_DIGEST.findall(value) if digest not in call
+        )
+    return ReviewerTranscript(reply=reply, printed_digests=frozenset(printed))
 
 
 _CODEX_THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -1165,10 +1219,17 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 else reviewer_context_envelope(verdict, reviewer)
             )
         elif arguments.command == "submit-report":
+            if (arguments.transcript is None) != (arguments.agent is None):
+                parser.error("--transcript")
+            raw = _report_stdin()
             receipt = _submit_with_telemetry(
                 cwd,
                 arguments,
-                _report_stdin(),
+                raw,
+                transcript=(
+                    None if arguments.transcript is None
+                    else _claude_transcript(arguments.transcript, arguments.agent)
+                ),
                 wall_clock=wall_clock,
                 monotonic_ns=monotonic_ns,
             )
