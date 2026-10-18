@@ -1,11 +1,13 @@
-"""In a Claude round, Reviewer B's fresh executions cite only digests its own tool calls printed."""
+"""In a Claude round, Reviewer B's fresh executions cite only digests its own tool calls computed."""
 
 import hashlib
 import json
+import re
+from pathlib import Path
 
 import pytest
 
-from pre_pr_tribunal.model import Reviewer, ReviewerTranscript, SchemaError
+from pre_pr_tribunal.model import MAX_REPORT_BYTES, Reviewer, ReviewerTranscript, SchemaError
 from pre_pr_tribunal.verdict_store import begin_round, read_verdict, submit_reviewer_report
 from tests.pre_pr_tribunal.test_evidence_lifecycle import bundle, reused
 from tests.pre_pr_tribunal.test_model_store import NOW, execution, report, run_cli_bytes
@@ -14,6 +16,7 @@ from tests.pre_pr_tribunal.test_reviewer_response import (
 )
 
 PRINTED = hashlib.sha256(b"1 passed").hexdigest()
+ROLE_PROMPT = Path(__file__).resolve().parents[2] / "skills/pre-pr-tribunal/references/reviewer-b.md"
 
 
 def bash(tool_id, command):
@@ -42,7 +45,7 @@ def b_report(snapshot, digest=PRINTED, command="python3 -m pytest -q", evidence=
 
 def reviewer_transcript(tmp_path, reply, *, printed=PRINTED, command=None):
     """A reviewer that ran one command whose output shows `printed`, then replied."""
-    run = command or "python3 -m pytest -q > out 2>&1; echo rc=$?; sha256sum out"
+    run = command or 'T=$(mktemp -d); python3 -m pytest -q > "$T/out" 2>&1; echo rc=$?; sha256sum "$T/out"'
     return write_transcript(tmp_path / f"agent-{AGENT}.jsonl", [
         prompt("review"),
         assistant("m1", [bash("t1", run)], "tool_use"),
@@ -95,13 +98,28 @@ def test_a_digest_no_tool_call_printed_is_rejected_for_retry(git_repo, tmp_path,
     assert not (git_repo / ".review/inbox/round-1/B.json").exists()
 
 
+@pytest.mark.parametrize("command", (
+    'T=$(mktemp -d); python3 -m pytest -q > "$T/out"; sha256sum "$T/out"',
+    'T=$(mktemp -d); python3 -m pytest -q > "$T/out"; shasum -a 256 "$T/out"',
+    "python3 -c 'import hashlib,subprocess; print(hashlib.sha256(subprocess.run([\"true\"]).args[0].encode()).hexdigest())'",
+    'T=$(mktemp -d); python3 -m pytest -q > "$T/out"; openssl dgst -sha256 "$T/out"',
+), ids=("sha256sum", "shasum", "hashlib", "openssl"))
+def test_each_documented_sha256_command_form_attests(git_repo, tmp_path, command):
+    pending = claude_round(git_repo)
+    reply = b_report(pending.snapshot)
+
+    submitted = submit(git_repo, reply.encode(), reviewer_transcript(tmp_path, reply, command=command))
+
+    assert submitted.returncode == 0, submitted.stderr
+
+
 def test_a_digest_printed_before_a_format_retry_still_attests(git_repo, tmp_path):
     # The retried reply reuses a digest the reviewer computed before the follow-up.
     pending = claude_round(git_repo)
     reply = b_report(pending.snapshot)
     transcript = write_transcript(tmp_path / f"agent-{AGENT}.jsonl", [
         prompt("review"),
-        assistant("m1", [bash("t1", "python3 -m pytest -q > out; sha256sum out")], "tool_use"),
+        assistant("m1", [bash("t1", 'T=$(mktemp -d); python3 -m pytest -q > "$T/out"; sha256sum "$T/out"')], "tool_use"),
         result("t1", [{"type": "text", "text": f"{PRINTED}  out"}]),
         assistant("m2", [text("not json")], "end_turn"),
         follow_up("retry with the format fixed"),
@@ -114,9 +132,11 @@ def test_a_digest_printed_before_a_format_retry_still_attests(git_repo, tmp_path
 
 
 @pytest.mark.parametrize(("command", "output"), (
-    (f"echo {PRINTED}", f"{PRINTED}\n"),
-    ("sha512sum out", f"{PRINTED}{'a' * 64}  out\n"),
-), ids=("the-call-contains-it", "inside-a-longer-hex-run"))
+    (f"echo {PRINTED}; sha256sum out", f"{PRINTED}\n"),
+    ("sha256sum out; sha512sum out", f"{PRINTED}{'a' * 64}  out\n"),
+    # A command that only shows a file prints a digest it did not compute.
+    ("cat skills/pre-pr-tribunal/references/reviewer-b.md", f'"capture_sha256": "{PRINTED}",\n'),
+), ids=("the-call-contains-it", "inside-a-longer-hex-run", "a-call-that-computes-nothing"))
 def test_output_that_does_not_show_a_computed_digest_does_not_attest(git_repo, tmp_path, command, output):
     pending = claude_round(git_repo)
     reply = b_report(pending.snapshot)
@@ -130,6 +150,57 @@ def test_output_that_does_not_show_a_computed_digest_does_not_attest(git_repo, t
     submitted = submit(git_repo, reply.encode(), transcript)
 
     assert submitted.stderr.splitlines()[0] == b"PRE_PR_TRIBUNAL:EXECUTION_UNATTESTED"
+
+
+def test_the_role_prompt_example_digest_read_from_its_file_does_not_attest(git_repo, tmp_path):
+    # Reviewer B reads its role prompt, whose example execution carries a real digest.
+    role_prompt = ROLE_PROMPT.read_text(encoding="utf-8")
+    example = re.search(r'"capture_sha256": "([0-9a-f]{64})"', role_prompt).group(1)
+    pending = claude_round(git_repo)
+    reply = b_report(pending.snapshot, digest=example)
+    transcript = write_transcript(tmp_path / f"agent-{AGENT}.jsonl", [
+        prompt("review"),
+        assistant("m1", [{"type": "tool_use", "id": "t1", "name": "Read",
+                          "input": {"file_path": str(ROLE_PROMPT)}}], "tool_use"),
+        result("t1", role_prompt),
+        assistant("m2", [text(reply)], "end_turn"),
+    ])
+
+    submitted = submit(git_repo, reply.encode(), transcript)
+
+    assert submitted.stderr.splitlines()[0] == b"PRE_PR_TRIBUNAL:EXECUTION_UNATTESTED"
+
+
+def test_recomputing_a_digest_the_request_showed_attests(git_repo, tmp_path):
+    # Reviewer B may recompute a value it was given, such as the snapshot diff digest.
+    pending = claude_round(git_repo)
+    reply = b_report(pending.snapshot)
+    transcript = write_transcript(tmp_path / f"agent-{AGENT}.jsonl", [
+        prompt(f"review; the expected digest is {PRINTED}"),
+        assistant("m1", [bash("t1", "git diff --binary master..HEAD | sha256sum")], "tool_use"),
+        result("t1", f"{PRINTED}  -\n"),
+        assistant("m2", [text(reply)], "end_turn"),
+    ])
+
+    submitted = submit(git_repo, reply.encode(), transcript)
+
+    assert submitted.returncode == 0, submitted.stderr
+
+
+def test_an_oversized_claude_b_reply_takes_the_format_retry_path(git_repo, tmp_path):
+    # The CLI reads at most one byte past the limit, so the bound bytes cannot equal the reply.
+    pending = claude_round(git_repo)
+    value = json.loads(b_report(pending.snapshot))
+    value["claims"][0]["statement"] = "x" * 1024
+    value["claims"] = [{**value["claims"][0], "id": f"B-R1-C{index:03d}"} for index in range(1, 129)]
+    reply = json.dumps(value)
+    assert len(reply.encode()) > MAX_REPORT_BYTES
+
+    submitted = submit(git_repo, reply.encode(), reviewer_transcript(tmp_path, reply))
+
+    assert submitted.stderr.splitlines()[0] == b"PRE_PR_TRIBUNAL:REPORT_TOO_LARGE"
+    slot = read_verdict(git_repo).reviewers["B"]
+    assert slot.status == "pending" and slot.attempt_count == 1 and slot.last_error == "REPORT_TOO_LARGE"
 
 
 def test_a_claude_reviewer_b_submission_requires_its_transcript(git_repo):

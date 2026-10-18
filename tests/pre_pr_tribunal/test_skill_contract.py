@@ -447,11 +447,15 @@ def test_skill_binds_claude_reviewer_b_executions_to_its_own_tool_output():
     recovery = skill.split("## Pending-round report recovery", 1)[1].split("\n## ", 1)[0]
     assert "with step 6's `--transcript` and `--agent` for a Claude reviewer B" in recovery
     reviewer_b = " ".join(text("references/reviewer-b.md").split())
-    assert "only a digest that one of your own tool calls printed" in reviewer_b
-    assert "Keep the whole output of the call that prints the digest under 2 KiB" in reviewer_b
+    assert "only a digest that one of your own shell commands computed and printed" in reviewer_b
+    assert "read from a file such as this prompt's example" in reviewer_b
+    assert "Keep the whole output of that command under 2 KiB" in reviewer_b
+    # Reviewer B is read-only: the recipe writes only outside its view.
+    assert "only into a new `mktemp -d` directory outside your view, never inside the view" in reviewer_b
+    assert "own commands that computes SHA-256 (`sha256sum`" in step
     schema = " ".join(text("references/report-schema.md").split())
     assert "The last three are submission admission rules" in schema
-    assert "own tool calls whose input does not contain it" in schema
+    assert "own commands that computes SHA-256 and does not itself contain it" in schema
     readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
     assert "For reviewer B on Claude, also pass `submit-report` the same" in readme
 

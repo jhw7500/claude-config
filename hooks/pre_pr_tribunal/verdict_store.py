@@ -996,6 +996,10 @@ def _printed_digests(
         return None
     if not checked:
         raise SchemaError("SUBMISSION_TRANSCRIPT_UNEXPECTED")
+    # The CLI reads one byte past the limit, so an oversized reply cannot match;
+    # it never seals, and parsing rejects it for a format retry.
+    if len(raw) > m.MAX_REPORT_BYTES:
+        return transcript.printed_digests
     # The digests attest only the reply they were read with.
     if transcript.reply != raw:
         raise SchemaError("SUBMISSION_TRANSCRIPT_MISMATCH")

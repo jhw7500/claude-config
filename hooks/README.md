@@ -203,8 +203,8 @@ On Claude, create that file with `reviewer-response --runtime claude --transcrip
 --output <new path>` instead of copying the completion notification, which escapes text for display; its
 `RESPONSE_PENDING` means the reply is not recorded yet. For reviewer B on Claude, also pass `submit-report` the same
 `--transcript <Agent transcript> --agent <agentId>`: it refuses bytes that are not that reply, and it accepts a fresh B
-execution only when its `capture_sha256` was printed by one of the reviewer's own tool calls (`EXECUTION_UNATTESTED`
-otherwise). On Codex, create it with `reviewer-response --runtime codex
+execution only when its `capture_sha256` was printed by one of the reviewer's own commands that computes SHA-256
+(`EXECUTION_UNATTESTED` otherwise). On Codex, create it with `reviewer-response --runtime codex
 --transcript <controller rollout> --thread-id <CODEX_THREAD_ID> --agent <task name> --output <new path>` instead of
 retyping the answer; its `RESPONSE_REVIEWER_FAILED` is a `REVIEWER_FAILED` outcome. Do not trim,
 parse-and-re-emit, reserialize, repair, or silently truncate them. The CLI's bounded read of maximum report size plus

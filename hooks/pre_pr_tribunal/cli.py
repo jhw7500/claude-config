@@ -651,14 +651,18 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
 
 
 _PRINTED_DIGEST = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
+_SHA256_COMMAND = re.compile(
+    r"sha256sum|shasum\s+(?:-a\s*|--algorithm[=\s]\s*)256|hashlib\.sha256|openssl\s+(?:dgst\s+-sha256|sha256)\b"
+)
 
 
 def _claude_transcript(transcript: Path, agent: str) -> ReviewerTranscript:
-    """Return a Claude subagent's reply and every digest its own tool results show.
+    """Return a Claude subagent's reply and every digest its own tool calls computed.
 
-    A digest counts only where the tool call that produced the result does not
-    itself contain it, so typing a value into `echo` does not attest it. Every
-    request counts: a retried reply may cite a digest computed before the retry.
+    A digest counts only in the result of a call whose `command` computes
+    SHA-256 and does not itself contain the digest: a value read from a file,
+    such as the role prompt's example, or typed into `echo` does not attest it.
+    Every request counts: a retried reply may cite a digest computed before the retry.
     """
 
     reply = _claude_reply(transcript, agent)
@@ -673,7 +677,12 @@ def _claude_transcript(transcript: Path, agent: str) -> ReviewerTranscript:
             if not isinstance(block, dict):
                 continue
             if record.get("type") == "assistant" and block.get("type") == "tool_use":
-                if isinstance(block.get("id"), str):
+                command = block.get("input", {}).get("command") if isinstance(block.get("input"), dict) else None
+                if (
+                    isinstance(block.get("id"), str)
+                    and isinstance(command, str)
+                    and _SHA256_COMMAND.search(command) is not None
+                ):
                     calls[block["id"]] = json.dumps(block.get("input"), ensure_ascii=False)
             elif record.get("type") == "user" and block.get("type") == "tool_result":
                 results.append((block.get("tool_use_id"), block.get("content")))
