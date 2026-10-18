@@ -1511,11 +1511,70 @@ def validate_reviewer_report_semantics(
         raise SchemaError("REFUTED_CLAIM_REQUIRES_BLOCKER")
 
 
-def validate_submission_admission(report: ReviewerReport) -> None:
+@dataclass(frozen=True)
+class CaptureRecord:
+    """One command the installed `capture-run` helper ran and recorded."""
+
+    command: str
+    head: str | None
+    exit_code: int
+    capture_sha256: str
+    stdout: str
+    stderr: str
+    complete: bool
+
+
+def report_command(command: str) -> str:
+    """Validate a command exactly as a report execution's `command` field is validated."""
+    return _command(command)
+
+
+def citable_excerpt(text: str, limit: int) -> str:
+    """Return the longest leading slice of `text`, at most `limit` characters, a report excerpt accepts."""
+    candidate = text[:limit]
+    for index, character in enumerate(candidate):
+        if unicodedata.category(character) in {"Cc", "Cs"} and character not in _EXCERPT_CONTROLS:
+            candidate = candidate[:index]
+            break
+    while candidate:
+        try:
+            return _execution_excerpt(candidate)
+        except SchemaError:
+            candidate = candidate[: len(candidate) // 2]
+    return ""
+
+
+def _unattested_field(item: Execution, captures: tuple[CaptureRecord, ...]) -> str | None:
+    """Return the first execution field no recorded capture supports, or None."""
+    matching = [record for record in captures if record.capture_sha256 == item.capture_sha256]
+    for field, supported in (
+        ("capture_sha256", lambda record: True),
+        ("command", lambda record: record.command == item.command),
+        ("exit_code", lambda record: record.exit_code == item.exit_code),
+        ("stdout_excerpt", lambda record: item.stdout_excerpt in record.stdout),
+        ("stderr_excerpt", lambda record: item.stderr_excerpt in record.stderr),
+        # `truncated` is false only when the excerpts are the whole recorded output.
+        ("truncated", lambda record: item.truncated == (
+            not record.complete
+            or item.stdout_excerpt != record.stdout
+            or item.stderr_excerpt != record.stderr
+        )),
+    ):
+        matching = [record for record in matching if supported(record)]
+        if not matching:
+            return field
+    return None
+
+
+def validate_submission_admission(
+    report: ReviewerReport, *, captures: tuple[CaptureRecord, ...] | None = None,
+) -> None:
     """Admission rules for a fresh submission only.
 
     Sealed reports are re-parsed on every verdict read, so these rules never run
     there: a report sealed before them stays readable without a contract bump.
+    With `captures`, each fresh execution must match one recorded capture; a
+    bundle execution is authenticated by its bundle.
     """
     if not isinstance(report, ReviewerReport):
         raise SchemaError("REPORT_SCHEMA_INVALID")
@@ -1524,9 +1583,13 @@ def validate_submission_admission(report: ReviewerReport) -> None:
             UNVERIFIED_REASON_PREFIXES
         ):
             raise SchemaError("UNVERIFIED_REASON_INVALID")
-    for item in report.executions:
+    for index, item in enumerate(report.executions):
         if len(set(item.capture_sha256)) == 1:
             raise SchemaError("CAPTURE_SHA256_PLACEHOLDER")
+        if captures is not None and item.evidence_ref is None:
+            field = _unattested_field(item, captures)
+            if field is not None:
+                raise SchemaError("EXECUTION_UNATTESTED", path=f"executions[{index}].{field}")
 
 
 def _blocker_identity(value: object) -> tuple[str, int, Reviewer]:

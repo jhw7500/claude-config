@@ -9,9 +9,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import ctypes
 import re
+import secrets
+import signal
 import stat
+import subprocess
 import sys
+import tempfile
 import time
 
 if __package__ in {None, ""}:
@@ -21,6 +26,9 @@ if __package__ in {None, ""}:
         MIXED_SLOT_VERDICT_SCHEMAS,
         VERDICT_SCHEMA_VERSION,
         Reviewer,
+        CaptureRecord,
+        citable_excerpt,
+        report_command,
         TribunalError,
         validate_report_bytes,
     )
@@ -58,6 +66,9 @@ else:
         MIXED_SLOT_VERDICT_SCHEMAS,
         VERDICT_SCHEMA_VERSION,
         Reviewer,
+        CaptureRecord,
+        citable_excerpt,
+        report_command,
         TribunalError,
         validate_report_bytes,
     )
@@ -183,6 +194,13 @@ def _parser() -> argparse.ArgumentParser:
     # command at parse time, before stdin is read and the report is stored.
     submit.add_argument("--run-id")
     submit.add_argument("--attempt")
+    # Reviewer B in a Claude round names the store its capture-run helper wrote.
+    submit.add_argument("--captures", type=Path)
+    capture = commands.add_parser("capture-run", add_help=False)
+    capture.add_argument("--store", required=True, type=Path)
+    capture.add_argument("--cwd", required=True, type=Path)
+    capture.add_argument("--command", required=True, dest="shell_command")
+    capture.add_argument("--timeout", type=int, default=100)
     response = commands.add_parser("reviewer-response", add_help=False)
     response.add_argument("--runtime", required=True, choices=("claude", "codex"))
     response.add_argument("--transcript", required=True, type=Path)
@@ -304,7 +322,9 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
     return verdict, projection
 
 
-def _submit_with_telemetry(cwd, arguments, raw, *, wall_clock=utc_now, monotonic_ns=time.monotonic_ns):
+def _submit_with_telemetry(
+    cwd, arguments, raw, *, captures=None, wall_clock=utc_now, monotonic_ns=time.monotonic_ns,
+):
     """Own the report_store span when the caller supplies its run and request ordinal."""
     reviewer = Reviewer(arguments.reviewer)
     run_id, attempt = arguments.run_id, arguments.attempt
@@ -323,7 +343,7 @@ def _submit_with_telemetry(cwd, arguments, raw, *, wall_clock=utc_now, monotonic
     # The review lock is exclusive and non-reentrant, so every telemetry call
     # sits strictly before or after the primary transaction, never around it.
     try:
-        receipt = submit_reviewer_report(cwd, reviewer=reviewer, raw=raw)
+        receipt = submit_reviewer_report(cwd, reviewer=reviewer, raw=raw, captures=captures)
     except Exception as primary_error:
         try:
             if span is not None:
@@ -641,6 +661,237 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
         return texts[0].encode("utf-8")
     except UnicodeEncodeError:
         raise TribunalError("RESPONSE_INVALID") from None
+
+
+_CAPTURE_RECORD = re.compile(r"capture-[0-9a-f]{32}\.json")
+_CAPTURE_STREAM_BYTES = 1024 * 1024
+# The helper kills a command soon after its captured output passes this.
+_CAPTURE_OUTPUT_BYTES = 64 * 1024 * 1024
+_PR_SET_CHILD_SUBREAPER = 36
+# JSON escapes a control byte as six characters, so two capped streams fit with room.
+_CAPTURE_RECORD_BYTES = 16 * 1024 * 1024
+_CAPTURE_TIMEOUT_SECONDS = 480
+_CAPTURE_RECORDS = 512
+_CAPTURE_EXCERPT_CHARACTERS = 2000
+_CAPTURE_COMMAND_BYTES = 4096
+
+
+def _capture_store(store: Path) -> int:
+    """Open a current-user, owner-only capture directory without following a link."""
+
+    if not store.is_absolute():
+        raise TribunalError("CAPTURE_STORE_UNSAFE")
+    try:
+        descriptor = os.open(store, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise TribunalError("CAPTURE_STORE_UNSAFE") from None
+    info = os.fstat(descriptor)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        os.close(descriptor)
+        raise TribunalError("CAPTURE_STORE_UNSAFE")
+    return descriptor
+
+
+def _capture_head(cwd: Path) -> str | None:
+    result = subprocess.run(
+        ["/usr/bin/git", "-C", str(cwd), "rev-parse", "--verify", "HEAD^{commit}"],
+        stdin=subprocess.DEVNULL, capture_output=True, check=False,
+    )
+    head = result.stdout.decode("ascii", "replace").strip()
+    return head if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else None
+
+
+def _become_subreaper() -> None:
+    """Adopt the command's orphans so this helper can reap them; a no-op where unsupported."""
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _reap_children() -> None:
+    """Reap every exited child, waiting briefly for killed ones to finish dying."""
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.01)
+
+
+def _kill_session(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _read_capture(handle, digest) -> tuple[bytes, int]:
+    """Feed a whole captured stream to `digest`; return its first bytes and its size."""
+    handle.seek(0)
+    head, size = bytearray(), 0
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+        size += len(chunk)
+        if len(head) < _CAPTURE_STREAM_BYTES:
+            head += chunk[: _CAPTURE_STREAM_BYTES - len(head)]
+    return bytes(head), size
+
+
+def _capture_run(store: Path, cwd: Path, command: str, *, timeout: int) -> dict[str, object]:
+    """Run one reviewer command, record its full capture digest in the store, and return what to cite.
+
+    The digest is SHA-256 of all stdout bytes followed by all stderr bytes. The
+    command runs in its own session with no stdin and output to files; when bash
+    exits, its timeout passes, or the helper is signalled, the session is killed.
+    """
+
+    try:
+        report_command(command)
+    except TribunalError:
+        raise TribunalError("CAPTURE_COMMAND_INVALID") from None
+    if not cwd.is_absolute() or not 1 <= timeout <= _CAPTURE_TIMEOUT_SECONDS:
+        raise TribunalError("CAPTURE_COMMAND_INVALID")
+    if not store.is_absolute():
+        raise TribunalError("CAPTURE_COMMAND_INVALID")
+    descriptor = _capture_store(store)
+    try:
+        if sum(1 for name in os.listdir(descriptor) if _CAPTURE_RECORD.fullmatch(name)) >= _CAPTURE_RECORDS:
+            raise TribunalError("CAPTURE_STORE_UNSAFE")
+        try:
+            directory = cwd.resolve(strict=True)
+        except OSError:
+            raise TribunalError("CAPTURE_COMMAND_INVALID") from None
+        if not directory.is_dir():
+            raise TribunalError("CAPTURE_COMMAND_INVALID")
+        head = _capture_head(directory)
+        with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
+            _become_subreaper()
+            process = subprocess.Popen(
+                ["/bin/bash", "-c", command], cwd=directory, stdin=subprocess.DEVNULL,
+                stdout=out_file, stderr=err_file, start_new_session=True,
+            )
+
+            def stop(signum, frame):
+                _kill_session(process)
+                raise SystemExit(128 + signum)
+
+            previous = {
+                number: signal.signal(number, stop)
+                for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+            }
+            timed_out = limited = False
+            deadline = time.monotonic() + timeout
+            try:
+                # Only the captured streams are bounded; files the command writes are not.
+                while process.poll() is None:
+                    written = os.fstat(out_file.fileno()).st_size + os.fstat(err_file.fileno()).st_size
+                    if written > _CAPTURE_OUTPUT_BYTES:
+                        limited = True
+                        break
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        break
+                    time.sleep(0.02)
+            finally:
+                # Background children the command left behind die with its session.
+                _kill_session(process)
+                process.wait()
+                _reap_children()
+                for number, handler in previous.items():
+                    signal.signal(number, handler)
+            exit_code = 124 if timed_out else process.returncode
+            digest = hashlib.sha256()
+            stdout, stdout_bytes = _read_capture(out_file, digest)
+            stderr, stderr_bytes = _read_capture(err_file, digest)
+        stdout_text = stdout.decode("utf-8", "replace")
+        stderr_text = stderr.decode("utf-8", "replace")
+        # The record holds the whole captured output only when nothing was cut.
+        complete = not limited and stdout_bytes == len(stdout) and stderr_bytes == len(stderr)
+        record = json.dumps({
+            "schema": 1, "helper": str(Path(__file__).resolve()), "command": command,
+            "cwd": str(directory), "head": head, "exit_code": exit_code, "timed_out": timed_out,
+            "capture_sha256": digest.hexdigest(), "stdout_bytes": stdout_bytes,
+            "stderr_bytes": stderr_bytes, "output_limited": limited, "complete": complete,
+            "stdout": stdout_text, "stderr": stderr_text,
+        }, ensure_ascii=False).encode("utf-8")
+        if len(record) > _CAPTURE_RECORD_BYTES:
+            raise TribunalError("CAPTURE_COMMAND_INVALID")
+        target = os.open(
+            f"capture-{secrets.token_hex(16)}.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=descriptor,
+        )
+        with os.fdopen(target, "wb") as handle:
+            handle.write(record)
+    finally:
+        os.close(descriptor)
+    stdout_excerpt = citable_excerpt(stdout_text, _CAPTURE_EXCERPT_CHARACTERS)
+    stderr_excerpt = citable_excerpt(stderr_text, _CAPTURE_EXCERPT_CHARACTERS)
+    return {
+        "command": command,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "capture_sha256": digest.hexdigest(),
+        "stdout_excerpt": stdout_excerpt,
+        "stderr_excerpt": stderr_excerpt,
+        "truncated": not complete or stdout_excerpt != stdout_text or stderr_excerpt != stderr_text,
+    }
+
+
+def _capture_records(store: Path) -> tuple[CaptureRecord, ...]:
+    """Return the captures this installed helper recorded in the store.
+
+    A file that is not an owner-only regular record written by this same helper
+    attests nothing and is skipped.
+    """
+
+    helper = str(Path(__file__).resolve())
+    descriptor = _capture_store(store)
+    records = []
+    try:
+        names = sorted(name for name in os.listdir(descriptor) if _CAPTURE_RECORD.fullmatch(name))
+        if len(names) > _CAPTURE_RECORDS:
+            raise TribunalError("CAPTURE_STORE_UNSAFE")
+        for name in names:
+            try:
+                target = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+            except OSError:
+                continue
+            with os.fdopen(target, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_size > _CAPTURE_RECORD_BYTES
+                ):
+                    continue
+                try:
+                    value = json.loads(handle.read(_CAPTURE_RECORD_BYTES + 1).decode("utf-8"))
+                except (ValueError, RecursionError):
+                    continue
+            if not isinstance(value, dict) or value.get("schema") != 1 or value.get("helper") != helper:
+                continue
+            command, head, exit_code = value.get("command"), value.get("head"), value.get("exit_code")
+            digest, stdout, stderr = value.get("capture_sha256"), value.get("stdout"), value.get("stderr")
+            complete = value.get("complete")
+            if (
+                isinstance(command, str)
+                and (head is None or isinstance(head, str))
+                and isinstance(exit_code, int) and not isinstance(exit_code, bool)
+                and isinstance(digest, str)
+                and isinstance(stdout, str)
+                and isinstance(stderr, str)
+                and isinstance(complete, bool)
+            ):
+                records.append(CaptureRecord(command, head, exit_code, digest, stdout, stderr, complete))
+    finally:
+        os.close(descriptor)
+    return tuple(records)
 
 
 _CODEX_THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -1164,11 +1415,17 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 if verdict.schema == 1
                 else reviewer_context_envelope(verdict, reviewer)
             )
+        elif arguments.command == "capture-run":
+            payload = _capture_run(
+                arguments.store, arguments.cwd, arguments.shell_command, timeout=arguments.timeout,
+            )
         elif arguments.command == "submit-report":
+            raw = _report_stdin()
             receipt = _submit_with_telemetry(
                 cwd,
                 arguments,
-                _report_stdin(),
+                raw,
+                captures=None if arguments.captures is None else _capture_records(arguments.captures),
                 wall_clock=wall_clock,
                 monotonic_ns=monotonic_ns,
             )

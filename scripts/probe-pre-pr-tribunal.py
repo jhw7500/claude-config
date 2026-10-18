@@ -1420,7 +1420,7 @@ def _synthetic_report_bytes(
         report.update({
             "executions": [{
                 "id": "B-R1-E999",
-                "command": "python3 -c print-ok",
+                "command": "printf '1 passed'",
                 "exit_code": 0,
                 "stdout_excerpt": stdout,
                 "stderr_excerpt": "",
@@ -1455,6 +1455,24 @@ _REPORT_RETRYABLE_CODES = frozenset((
     "REPORT_SCHEMA_INVALID", "REPORT_SNAPSHOT_MISMATCH", "REPORT_TOO_LARGE",
     "TEXT_INVALID", "TEXT_TOO_LARGE",
 ))
+
+
+@contextmanager
+def _claude_reviewer_captures(cli: Path, repo: Path, home: Path):
+    """Yield submit arguments naming a capture store the installed helper filled.
+
+    The installed runtime accepts a Claude-round Reviewer B report only when each
+    fresh execution matches a capture, so the probe runs the synthetic report's
+    command through the helper as an honest reviewer would.
+    """
+    directory = tempfile.mkdtemp(prefix="probe-captures-")
+    try:
+        os.chmod(directory, 0o700)
+        _tribunal_cli(cli, repo, home, "capture-run", "--store", directory, "--cwd", str(repo),
+                      "--command", "printf '1 passed'")
+        yield ("--captures", directory)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def _create_pass_verdict(
@@ -1575,9 +1593,14 @@ def _create_pass_verdict(
                 raw = report_factory(reviewer, attempt, snapshot)
                 if not isinstance(raw, bytes):
                     raise ProbeFailure("SETUP_FAILED")
-                receipt = measured("report_store", reviewer, local_attempt, lambda: _tribunal_cli(
-                    cli, repo, home, "submit-report", "--reviewer", reviewer, raw=raw,
-                ))
+                with ExitStack() as stack:
+                    transcript = (
+                        stack.enter_context(_claude_reviewer_captures(cli, repo, home))
+                        if runtime == "claude" and reviewer == "B" else ()
+                    )
+                    receipt = measured("report_store", reviewer, local_attempt, lambda: _tribunal_cli(
+                        cli, repo, home, "submit-report", "--reviewer", reviewer, *transcript, raw=raw,
+                    ))
                 if receipt.get("raw_sha256") != hashlib.sha256(raw).hexdigest():
                     raise ProbeFailure("REPORT_BYTES_MISMATCH")
                 submitted_receipts[reviewer] = receipt

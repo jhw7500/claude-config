@@ -5,8 +5,10 @@ import json
 import os
 from pathlib import Path
 import stat
+import shutil
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -153,6 +155,20 @@ def authorize_next_begin(repo, *, runtime="codex", round_number=1, decisions_pat
     )
 
 
+def _helper_captures(repo, value):
+    """Record each execution's command with the capture helper, as an honest Reviewer B would."""
+    from pre_pr_tribunal import cli
+
+    store = Path(tempfile.mkdtemp())
+    try:
+        for item in value["executions"]:
+            item["command"] = "printf '1 passed'"
+            cli._capture_run(store, repo, item["command"], timeout=30)
+        return cli._capture_records(store)
+    finally:
+        shutil.rmtree(store, ignore_errors=True)
+
+
 def report_paths(repo, snapshot, *, round_number=1, overrides=None):
     overrides = overrides or {}
     result = {}
@@ -160,10 +176,18 @@ def report_paths(repo, snapshot, *, round_number=1, overrides=None):
         value = report(snapshot, reviewer, round_number=round_number)
         value.update(overrides.get(reviewer, {}))
         path = repo / f".review/inbox/round-{round_number}/{reviewer}.json"
-        if read_verdict(repo).schema == 1:
-            store_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=json.dumps(value).encode())
+        verdict = read_verdict(repo)
+        captures = None
+        if verdict.schema != 1 and reviewer == "B" and verdict.producer_runtime == "claude":
+            # A Claude-round Reviewer B runs each command through the installed capture helper.
+            captures = _helper_captures(repo, value)
+        raw = json.dumps(value).encode()
+        if verdict.schema == 1:
+            store_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=raw)
         else:
-            submit_reviewer_report(repo, reviewer=Reviewer(reviewer), raw=json.dumps(value).encode(), now=NOW)
+            submit_reviewer_report(
+                repo, reviewer=Reviewer(reviewer), raw=raw, now=NOW, captures=captures,
+            )
         result[reviewer] = path
     return result
 

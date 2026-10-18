@@ -982,11 +982,33 @@ def _record_failure_locked(
     return slot
 
 
+def _bound_captures(
+    pending: Verdict, reviewer: Reviewer, captures: tuple[m.CaptureRecord, ...] | None,
+) -> tuple[m.CaptureRecord, ...] | None:
+    """Return a Claude-round Reviewer B's captures of the bound HEAD, or None where unchecked.
+
+    Codex reviewers do not run the capture helper yet.
+    """
+    checked = reviewer is Reviewer.B and pending.producer_runtime == "claude"
+    if captures is None:
+        if checked:
+            raise SchemaError("SUBMISSION_CAPTURES_REQUIRED")
+        return None
+    if not checked:
+        raise SchemaError("SUBMISSION_CAPTURES_UNEXPECTED")
+    return tuple(record for record in captures if record.head == pending.head_sha)
+
+
 def submit_reviewer_report(
     cwd: Path, *, reviewer: Reviewer, raw: bytes, now: Callable[[], str] = utc_now,
+    captures: tuple[m.CaptureRecord, ...] | None = None,
 ) -> ReportReceipt:
     """Validate exact bytes, publish the canonical report, and seal one current schema-3 slot."""
-    if not isinstance(reviewer, Reviewer) or not isinstance(raw, bytes):
+    if (
+        not isinstance(reviewer, Reviewer)
+        or not isinstance(raw, bytes)
+        or not (captures is None or all(isinstance(record, m.CaptureRecord) for record in captures))
+    ):
         raise SchemaError("REPORT_SCHEMA_INVALID")
     root = repository_root(cwd)
     preflight_review_directory(root)
@@ -1025,6 +1047,7 @@ def submit_reviewer_report(
             else:
                 if len(raw) > MAX_ATTEMPT_RAW_BYTES:
                     raise SchemaError("REPORT_TOO_LARGE")
+                bound = _bound_captures(pending, reviewer, captures)
                 try:
                     parsed = m.parse_reviewer_report(
                         raw, expected_reviewer=reviewer, expected_round=pending.round,
@@ -1036,7 +1059,7 @@ def submit_reviewer_report(
                     authenticate_report(root, pending, parsed)
                     _validate_unexecutable_claims(root, pending, snapshot, parsed)
                     m.validate_reviewer_report_semantics(parsed)
-                    m.validate_submission_admission(parsed)
+                    m.validate_submission_admission(parsed, captures=bound)
                 except SchemaError as error:
                     error.from_submission = True
                     if error.code in REPORT_RETRYABLE_CODES:

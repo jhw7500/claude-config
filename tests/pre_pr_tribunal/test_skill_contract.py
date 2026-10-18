@@ -430,6 +430,43 @@ def test_skill_recovery_takes_reviewer_bytes_with_reviewer_response():
     assert bullet.index("reviewer-response") < bullet.index("submit-report --reviewer X")
 
 
+def test_skill_binds_claude_reviewer_b_executions_to_helper_captures():
+    """A fresh Claude-round B execution counts only when the installed helper recorded it."""
+    skill = text("SKILL.md")
+    steps = numbered_steps(skill)
+    assert "before dispatching Reviewer B, create its capture store with `mktemp -d` outside `VIEW_ROOT`" in steps[5]
+    assert "a fresh replacement B gets a fresh store, and a same-handle retry keeps its store" in steps[5]
+    step = steps[6]
+    assert "On Claude, for reviewer B also pass `--captures` with that B's capture store" in step
+    assert step.index("submit-report --reviewer X") < step.index("also pass `--captures`")
+    for code in (
+        "EXECUTION_UNATTESTED", "CAPTURE_STORE_UNSAFE",
+        "SUBMISSION_CAPTURES_REQUIRED", "SUBMISSION_CAPTURES_UNEXPECTED",
+    ):
+        assert f"`{code}`" in step
+    assert "Codex reviewers do not run the helper yet" in step
+    assert "do not move the installed runtime across a pending Claude round" in step
+    assert "`CAPTURE_SHA256_PLACEHOLDER`, and `EXECUTION_UNATTESTED`" in skill
+    recovery = skill.split("## Pending-round report recovery", 1)[1].split("\n## ", 1)[0]
+    assert "with step 6's `--captures` for a Claude reviewer B" in recovery
+    reviewer_b = " ".join(text("references/reviewer-b.md").split())
+    assert f"{CLI} capture-run --store '<capture store>' --cwd '<your view>' --command '<command>'" in reviewer_b
+    assert "at most 480; keep your Bash tool timeout longer" in reviewer_b
+    assert "the printed excerpts are leading slices a report accepts" in reviewer_b
+    assert "Set `truncated` to false only when your excerpts are the whole recorded output" in reviewer_b
+    assert "soon after its captured output passes 64 MiB" in reviewer_b
+    assert "with `truncated` true unless they are the whole recorded output" in step
+    assert "it cannot stop a same-user process that writes a record into the store directly" in step
+    assert "Copy `command`, `exit_code` and `capture_sha256` unchanged" in reviewer_b
+    assert "such as this prompt's example, matches nothing" in reviewer_b
+    assert "Keep `--cwd` your view; to work elsewhere, such as a merge-base copy, put `cd` inside the command" in reviewer_b
+    schema = " ".join(text("references/report-schema.md").split())
+    assert "The last three are submission admission rules" in schema
+    assert "must match one capture the installed `capture-run` helper recorded for the bound HEAD" in schema
+    readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
+    assert "For reviewer B on Claude, also pass `submit-report` `--captures <store>`" in readme
+
+
 def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate():
     skill = text("SKILL.md")
     for stage in (
