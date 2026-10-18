@@ -9,8 +9,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import ctypes
 import re
-import resource
 import secrets
 import signal
 import stat
@@ -665,8 +665,9 @@ def _claude_reply(transcript: Path, agent: str) -> bytes:
 
 _CAPTURE_RECORD = re.compile(r"capture-[0-9a-f]{32}\.json")
 _CAPTURE_STREAM_BYTES = 1024 * 1024
-# A command that writes more output than this is stopped by SIGXFSZ.
+# The helper kills a command soon after its captured output passes this.
 _CAPTURE_OUTPUT_BYTES = 64 * 1024 * 1024
+_PR_SET_CHILD_SUBREAPER = 36
 # JSON escapes a control byte as six characters, so two capped streams fit with room.
 _CAPTURE_RECORD_BYTES = 16 * 1024 * 1024
 _CAPTURE_TIMEOUT_SECONDS = 480
@@ -700,8 +701,26 @@ def _capture_head(cwd: Path) -> str | None:
     return head if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", head) else None
 
 
-def _limit_capture_output() -> None:
-    resource.setrlimit(resource.RLIMIT_FSIZE, (_CAPTURE_OUTPUT_BYTES, _CAPTURE_OUTPUT_BYTES))
+def _become_subreaper() -> None:
+    """Adopt the command's orphans so this helper can reap them; a no-op where unsupported."""
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _reap_children() -> None:
+    """Reap every exited child, waiting briefly for killed ones to finish dying."""
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.01)
 
 
 def _kill_session(process: subprocess.Popen) -> None:
@@ -751,10 +770,10 @@ def _capture_run(store: Path, cwd: Path, command: str, *, timeout: int) -> dict[
             raise TribunalError("CAPTURE_COMMAND_INVALID")
         head = _capture_head(directory)
         with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
+            _become_subreaper()
             process = subprocess.Popen(
                 ["/bin/bash", "-c", command], cwd=directory, stdin=subprocess.DEVNULL,
                 stdout=out_file, stderr=err_file, start_new_session=True,
-                preexec_fn=_limit_capture_output,
             )
 
             def stop(signum, frame):
@@ -765,16 +784,24 @@ def _capture_run(store: Path, cwd: Path, command: str, *, timeout: int) -> dict[
                 number: signal.signal(number, stop)
                 for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
             }
-            timed_out = False
+            timed_out = limited = False
+            deadline = time.monotonic() + timeout
             try:
-                try:
-                    process.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
+                # Only the captured streams are bounded; files the command writes are not.
+                while process.poll() is None:
+                    written = os.fstat(out_file.fileno()).st_size + os.fstat(err_file.fileno()).st_size
+                    if written > _CAPTURE_OUTPUT_BYTES:
+                        limited = True
+                        break
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        break
+                    time.sleep(0.02)
             finally:
                 # Background children the command left behind die with its session.
                 _kill_session(process)
                 process.wait()
+                _reap_children()
                 for number, handler in previous.items():
                     signal.signal(number, handler)
             exit_code = 124 if timed_out else process.returncode
@@ -783,11 +810,14 @@ def _capture_run(store: Path, cwd: Path, command: str, *, timeout: int) -> dict[
             stderr, stderr_bytes = _read_capture(err_file, digest)
         stdout_text = stdout.decode("utf-8", "replace")
         stderr_text = stderr.decode("utf-8", "replace")
+        # The record holds the whole captured output only when nothing was cut.
+        complete = not limited and stdout_bytes == len(stdout) and stderr_bytes == len(stderr)
         record = json.dumps({
             "schema": 1, "helper": str(Path(__file__).resolve()), "command": command,
             "cwd": str(directory), "head": head, "exit_code": exit_code, "timed_out": timed_out,
             "capture_sha256": digest.hexdigest(), "stdout_bytes": stdout_bytes,
-            "stderr_bytes": stderr_bytes, "stdout": stdout_text, "stderr": stderr_text,
+            "stderr_bytes": stderr_bytes, "output_limited": limited, "complete": complete,
+            "stdout": stdout_text, "stderr": stderr_text,
         }, ensure_ascii=False).encode("utf-8")
         if len(record) > _CAPTURE_RECORD_BYTES:
             raise TribunalError("CAPTURE_COMMAND_INVALID")
@@ -808,10 +838,7 @@ def _capture_run(store: Path, cwd: Path, command: str, *, timeout: int) -> dict[
         "capture_sha256": digest.hexdigest(),
         "stdout_excerpt": stdout_excerpt,
         "stderr_excerpt": stderr_excerpt,
-        "truncated": (
-            stdout_excerpt != stdout_text or stderr_excerpt != stderr_text
-            or stdout_bytes > len(stdout) or stderr_bytes > len(stderr)
-        ),
+        "truncated": not complete or stdout_excerpt != stdout_text or stderr_excerpt != stderr_text,
     }
 
 
@@ -851,6 +878,7 @@ def _capture_records(store: Path) -> tuple[CaptureRecord, ...]:
                 continue
             command, head, exit_code = value.get("command"), value.get("head"), value.get("exit_code")
             digest, stdout, stderr = value.get("capture_sha256"), value.get("stdout"), value.get("stderr")
+            complete = value.get("complete")
             if (
                 isinstance(command, str)
                 and (head is None or isinstance(head, str))
@@ -858,8 +886,9 @@ def _capture_records(store: Path) -> tuple[CaptureRecord, ...]:
                 and isinstance(digest, str)
                 and isinstance(stdout, str)
                 and isinstance(stderr, str)
+                and isinstance(complete, bool)
             ):
-                records.append(CaptureRecord(command, head, exit_code, digest, stdout, stderr))
+                records.append(CaptureRecord(command, head, exit_code, digest, stdout, stderr, complete))
     finally:
         os.close(descriptor)
     return tuple(records)

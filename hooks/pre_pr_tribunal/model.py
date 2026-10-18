@@ -1521,6 +1521,7 @@ class CaptureRecord:
     capture_sha256: str
     stdout: str
     stderr: str
+    complete: bool
 
 
 def report_command(command: str) -> str:
@@ -1552,6 +1553,12 @@ def _unattested_field(item: Execution, captures: tuple[CaptureRecord, ...]) -> s
         ("exit_code", lambda record: record.exit_code == item.exit_code),
         ("stdout_excerpt", lambda record: item.stdout_excerpt in record.stdout),
         ("stderr_excerpt", lambda record: item.stderr_excerpt in record.stderr),
+        # `truncated` is false only when the excerpts are the whole recorded output.
+        ("truncated", lambda record: item.truncated == (
+            not record.complete
+            or item.stdout_excerpt != record.stdout
+            or item.stderr_excerpt != record.stderr
+        )),
     ):
         matching = [record for record in matching if supported(record)]
         if not matching:

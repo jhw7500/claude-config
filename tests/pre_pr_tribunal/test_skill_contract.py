@@ -452,7 +452,10 @@ def test_skill_binds_claude_reviewer_b_executions_to_helper_captures():
     reviewer_b = " ".join(text("references/reviewer-b.md").split())
     assert f"{CLI} capture-run --store '<capture store>' --cwd '<your view>' --command '<command>'" in reviewer_b
     assert "at most 480; keep your Bash tool timeout longer" in reviewer_b
-    assert "the printed excerpts are the longest leading slices a report accepts" in reviewer_b
+    assert "the printed excerpts are leading slices a report accepts" in reviewer_b
+    assert "Set `truncated` to false only when your excerpts are the whole recorded output" in reviewer_b
+    assert "soon after its captured output passes 64 MiB" in reviewer_b
+    assert "with `truncated` true unless they are the whole recorded output" in step
     assert "it cannot stop a same-user process that writes a record into the store directly" in step
     assert "Copy `command`, `exit_code` and `capture_sha256` unchanged" in reviewer_b
     assert "such as this prompt's example, matches nothing" in reviewer_b

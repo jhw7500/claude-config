@@ -155,16 +155,18 @@ def test_a_capture_outside_the_bound_snapshot_does_not_attest(git_repo, tmp_path
     assert_unattested(git_repo, submitted, "capture_sha256")
 
 
-@pytest.mark.parametrize("change", ("another-helper", "shared-mode"))
+@pytest.mark.parametrize("change", ("another-helper", "shared-mode", "no-completeness"))
 def test_a_record_the_installed_helper_did_not_leave_does_not_attest(git_repo, tmp_path, change):
     # The candidate source's own cli.py, run from a reviewer view, is not the installed helper.
     pending = claude_round(git_repo)
     store = capture_store(tmp_path)
     item = execution_from(capture(git_repo, store, "printf '1 passed'"))
     (record,) = store.iterdir()
+    value = json.loads(record.read_text(encoding="utf-8"))
     if change == "another-helper":
-        value = json.loads(record.read_text(encoding="utf-8"))
         record.write_text(json.dumps({**value, "helper": str(tmp_path / "view/hooks/pre_pr_tribunal/cli.py")}))
+    elif change == "no-completeness":
+        record.write_text(json.dumps({key: entry for key, entry in value.items() if key != "complete"}))
     else:
         record.chmod(0o644)
 
@@ -248,13 +250,64 @@ def test_a_signal_to_the_helper_kills_the_command_session(git_repo, tmp_path):
     assert helper.returncode != 0
 
 
-def test_the_helper_stops_unbounded_output_at_its_limit(git_repo, tmp_path):
+def test_the_helper_stops_unbounded_output_soon_after_its_limit(git_repo, tmp_path):
     store = capture_store(tmp_path)
+    started = time.monotonic()
 
-    capture(git_repo, store, f"head -c {OUTPUT_LIMIT + 4096} /dev/zero")
+    captured = capture(git_repo, store, "yes", timeout=60)
 
+    assert time.monotonic() - started < 30
     (record,) = store.iterdir()
-    assert json.loads(record.read_text(encoding="utf-8"))["stdout_bytes"] <= OUTPUT_LIMIT
+    assert OUTPUT_LIMIT < json.loads(record.read_text(encoding="utf-8"))["stdout_bytes"] < 4 * OUTPUT_LIMIT
+    assert (captured["timed_out"], captured["truncated"]) == (False, True)
+
+
+def test_the_helper_does_not_limit_files_the_command_writes(git_repo, tmp_path):
+    # Only the captured streams are bounded; a large artifact the command builds is not.
+    store = capture_store(tmp_path)
+    artifact = tmp_path / "artifact"
+
+    captured = capture(git_repo, store, f"python3 -c 'open(\"{artifact}\", \"wb\").truncate({OUTPUT_LIMIT + 4096})'")
+
+    assert captured["exit_code"] == 0, captured["stderr_excerpt"]
+    assert artifact.stat().st_size == OUTPUT_LIMIT + 4096
+
+
+def test_the_helper_reaps_the_background_children_it_kills(git_repo, tmp_path):
+    # Under a subreaper that never reaps, as in a container whose PID 1 does not,
+    # a killed orphan stays a zombie unless the helper reaps it itself.
+    store = capture_store(tmp_path)
+    pidfile = tmp_path / "child"
+    cli_path = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
+    wrapper = (
+        "import ctypes, json, subprocess, sys\n"
+        "ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)\n"
+        f"subprocess.run([sys.executable, {str(cli_path)!r}, 'capture-run', '--store', {str(store)!r},"
+        f" '--cwd', {str(git_repo)!r}, '--command', 'sleep 30 & echo $! > {pidfile}; exit 0'],"
+        " capture_output=True, check=True)\n"
+        f"pid = int(open({str(pidfile)!r}).read())\n"
+        "try:\n"
+        "    state = open(f'/proc/{pid}/stat').read().rsplit(')', 1)[1].split()[0]\n"
+        "except FileNotFoundError:\n"
+        "    state = 'gone'\n"
+        "print(state)\n"
+    )
+
+    result = subprocess.run([sys.executable, "-c", wrapper], capture_output=True, text=True, timeout=60)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "gone"
+
+
+def test_a_report_that_hides_omitted_output_does_not_attest(git_repo, tmp_path):
+    pending = claude_round(git_repo)
+    store = capture_store(tmp_path)
+    item = {**execution_from(capture(git_repo, store, "printf '1 passed'")), "stdout_excerpt": ""}
+    assert item["truncated"] is False
+
+    submitted = submit(git_repo, b_report(pending.snapshot, item).encode(), store)
+
+    assert_unattested(git_repo, submitted, "truncated")
 
 
 def test_a_printed_excerpt_is_the_longest_slice_a_report_accepts(git_repo, tmp_path):
@@ -367,7 +420,7 @@ def test_an_unattested_fresh_execution_beside_a_bundle_one_is_still_rejected(git
     raw = json.dumps(value).encode()
     unrelated = CaptureRecord(
         command="true", head=pending.head_sha, exit_code=0,
-        capture_sha256=hashlib.sha256(b"").hexdigest(), stdout="", stderr="",
+        capture_sha256=hashlib.sha256(b"").hexdigest(), stdout="", stderr="", complete=True,
     )
 
     with pytest.raises(SchemaError, match="^EXECUTION_UNATTESTED$") as raised:
