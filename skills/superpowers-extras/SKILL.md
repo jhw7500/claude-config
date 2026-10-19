@@ -20,7 +20,8 @@ observations #7–#15, #17, #20, #21, #28–#30, #35–#37, #39, staged 2026-09-
 and revised 2026-09-10. Staging is not evidence of live installation.
 Base skills are from the `superpowers` plugin (v6.3.0). The
 subagent-driven-development section comes from claude-config issue #205
-(2026-10-13) and quotes plugin v7.0.0.
+(2026-10-13) and quotes plugin v7.0.0. The deltas added for claude-config
+issue #215 (2026-10-19) were written against plugin v7.0.0.
 
 These deltas are maintained **locally only** — they are not contributed
 upstream, by decision. This skill is the canonical home for them: when a
@@ -157,6 +158,17 @@ easy and plausible-sounding regression. More generally, before asserting
 anything by containment, establish that the compared values are not prefixes or
 suffixes of one another.
 
+**Split an invariant's tests by the argument's three states.** For a rule such
+as "this optional add-on never disturbs the main operation", test the argument
+(1) absent, (2) present and valid, and (3) present but invalid — empty string,
+wrong type, out of range. Invariants break most often in the third state, and
+the absent case never reaches it. Check separately whether a layer that runs
+*before* the main code (an argument parser's type conversion, schema
+validation, a decorator) rejects the invalid value first: that layer turns a
+fail-open add-on into one that stops the main operation. If a contract says to
+always pass the argument while another passage says the value can be missing,
+that combination is a third-state test case.
+
 ---
 
 ## superpowers:verification-before-completion
@@ -241,6 +253,14 @@ Ask before reporting it:
   the system persists output (logs, build artifacts, check-run output, API,
   attachments) before promoting "I did not find it" to "it does not exist" — a
   wrong absence claim also spawns work to fix a defect that isn't there.
+- **A path-scoped predicate answers only for the exact path you gave it.**
+  `git check-ignore`, `git check-attr`, permission checks and path-matching
+  linters report on their argument, not on what lies beneath it. A negative
+  answer for an ancestor directory is not a negative answer for its contents:
+  a rule in a nested `.gitignore` can ignore every file below while the
+  ancestor itself is reported as not ignored. Query the exact path you are
+  about to rely on; when a directory's contents are the subject, enumerate the
+  concrete paths (the tool's `--stdin` form takes a list where it has one).
 - **Multi-consumer artifacts** (specs, schemas, config, interface definitions)
   verify against the STRICTEST consumer. A lenient parser hides defects while
   passing them: passes accumulate, confidence grows, and the gap grows with it.
@@ -341,6 +361,15 @@ stable name at the point of use. Relatedly, pin environment-dependent branches
 configuration for the duration of the test rather than letting the environment
 choose.
 
+**A failure that appears beside a change is attributed by a matrix, not by one
+re-run.** "My change broke it" and "it was already broken" are both confident
+answers a single re-run can produce. Vary two axes independently — source
+version (original / changed) and scope (the single test / its file / the whole
+suite) — and repeat the cell that failed at least once. First, because it is
+the cheapest check, look for any call path from the changed code to the failing
+test at all. Record which cells you ran; a cell that was never run is evidence
+for neither answer.
+
 ### Adds to Key Patterns — the instrument is your own tooling
 
 **Your control path must not run over the system under test.** When verifying a
@@ -417,6 +446,15 @@ Two rules make this safe:
 - Capture logs defensively — `LC_ALL=C grep -a` — because a capture that turns
   out not to be valid text reads as an empty arm, which reads as success.
 
+**A verification you have launched is not one you have read.** Before writing a
+figure or claim into an issue, PR, commit message or document, ask whether a
+check of that same claim is still running — a background agent, a CI job, a
+re-measurement. If one is, hold the artifact until its result is in. If you
+cannot hold it, leave the claim out or mark it as still being reproduced, and
+come back to settle it when the result arrives. The launched check feels like
+confirmation, but until it finishes the claim is exactly as unverified as one
+nobody checked.
+
 This is the persistence half of the same rule that keeps unverified inferences
 out of commit messages, docs and issues: once a claim is in a durable artifact
 its provenance is laundered, and later readers will not re-derive it.
@@ -442,6 +480,7 @@ its provenance is laundered, and later readers will not re-derive it.
 - Citing a CI job as evidence without checking whether its steps executed
 - Reading a mutation result before asserting the mutation was actually injected — and injected at the intended site
 - Writing a verification claim into a commit message, comment or document in the same step that produces the evidence
+- Publishing a figure while the check that verifies it is still running
 - Filling a timestamp or a `since` baseline from an estimate of elapsed time
 - Treating "the test passed on the first run" as "already implemented" without measuring the precondition
 
@@ -491,6 +530,17 @@ retract.
   evidence of causation" under verification-before-completion. A diagnosis built
   on an uncontrolled confirmation reads as solid, gets written into a fix, and
   is only contradicted much later.
+- Before discarding evidence as a tooling error ("that reading can't be right,
+  the parser must be off"), measure it again with a second, independent method.
+  Until that re-measurement contradicts it, keep it as a live hypothesis, not
+  noise: surprising evidence is more often a lead than a bug in the probe.
+- When reproducing why a gate or controller blocked something, run its exact
+  recipe — the argv and environment the controller itself builds, read from its
+  source — not a similar-looking command. A near-copy can land on the right
+  cause by luck and still mislead the re-check after a fix, because it exercises
+  a different mechanism. A harness that calls the controller's functions
+  directly should start by reading and meeting their preconditions, not by
+  discovering them one rejection at a time.
 
 ### Adds to Phase 1 — evidence in multi-component systems
 
@@ -521,6 +571,7 @@ investigation early. Ask first whether a single cause produces all of them.
 - "Two things broke at once, so there are two bugs"
 - "That service is running, so it isn't the problem"
 - "I ran the command and the value is what I wanted, so the command works"
+- "That reading can't be right — it must be a parsing error"
 
 ### Adds to Rationalizations
 
@@ -534,6 +585,26 @@ investigation early. Ask first whether a single cause produces all of them.
 ---
 
 ## superpowers:requesting-code-review
+
+### Adds to How to Request — enumerate the prose's mechanism claims
+
+Reviewers verify what they are asked to verify. When a diff adds documentation
+or guidance prose, pull out each mechanism claim it makes — how a file is
+deployed (link or copy), the order steps run in, what an external tool or a
+gate does or rejects — and list each one in the reviewer prompt as an item to
+confirm or refute against the code or by running it. An enumerated claim gets
+checked against its primary source; an unenumerated one passes on how
+plausible the sentence sounds, and a code-focused review then approves a
+factual error.
+
+- When a rule transcribes a contract's exception forms (sentinels, escapes,
+  allowed values), take the whole set from the spec's table or the validator's
+  constants, not from an example — and enumerate that claim too.
+- A safety-net sentence ("re-validate afterwards") is itself a claim to
+  enumerate: it hides any violation its validator cannot catch.
+- When the same policy text is copied into two consumers, ask for an
+  equivalence assertion with host-specific tokens neutralised, plus a mutation
+  experiment showing the assertion fails when one copy drifts.
 
 ### Adds to reading the response
 
