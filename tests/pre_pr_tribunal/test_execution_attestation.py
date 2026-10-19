@@ -321,22 +321,24 @@ def test_a_printed_excerpt_is_a_leading_slice_a_report_accepts(git_repo, tmp_pat
     assert submitted.returncode == 0, submitted.stderr
 
 
-def test_the_tail_idiom_keeps_the_end_and_the_command_status(git_repo, tmp_path):
+def test_the_tail_idiom_keeps_the_end_and_the_command_status(git_repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     store = capture_store(tmp_path)
-    setup = "python3 -c $'print(\".\" * 3000)'"
-    check = "python3 -c $'print(\"1 failed\")\\nraise SystemExit(1)'"
-    keep = '; exit "${PIPESTATUS[0]}"'
 
-    lost = capture(git_repo, store, f"{{ {setup} && {check}; }} 2>&1 | tail -n 1")
-    ungrouped = capture(git_repo, store, f"{setup} && {check} 2>&1 | tail -n 1{keep}")
-    inner = capture(git_repo, store, f"{{ false | true; }} 2>&1 | tail -n 1{keep}")
-    pipefail = capture(git_repo, store, "set -o pipefail; { false | true; } 2>&1 | tail -n 1")
-    kept = capture(git_repo, store, f"{{ {setup} && {check}; }} 2>&1 | tail -n 1{keep}")
+    def tail_of(command, **options):
+        idiom = f'D=$(mktemp -d) && {{ {command}; }} >"$D/out" 2>&1; s=$?; tail -n 1 "$D/out"; exit "$s"'
+        return capture(git_repo, store, idiom, **options)
 
-    assert (lost["exit_code"], lost["stdout_excerpt"]) == (0, "1 failed\n")
-    assert ungrouped["truncated"] is True and "1 failed" not in ungrouped["stdout_excerpt"]
-    assert (inner["exit_code"], pipefail["exit_code"]) == (0, 1)
-    assert (kept["exit_code"], kept["stdout_excerpt"], kept["truncated"]) == (1, "1 failed\n", False)
+    failed = tail_of("python3 -c $'print(\".\" * 3000)' && python3 -c $'print(\"1 failed\")\\nraise SystemExit(1)'")
+    inner = tail_of("false | true")
+    early = tail_of("seq 1 1000000 | head -n 1")
+    background = tail_of("sleep 30 & echo done", timeout=10)
+    piped = capture(git_repo, store, "{ sleep 30 & echo done; } 2>&1 | tail -n 1", timeout=2)
+
+    assert (failed["exit_code"], failed["stdout_excerpt"], failed["truncated"]) == (1, "1 failed\n", False)
+    assert (inner["exit_code"], early["exit_code"], early["stdout_excerpt"]) == (0, 0, "1\n")
+    assert (background["exit_code"], background["timed_out"], background["stdout_excerpt"]) == (0, False, "done\n")
+    assert piped["timed_out"] is True
 
 
 def test_a_large_honest_capture_still_attests(git_repo, tmp_path):

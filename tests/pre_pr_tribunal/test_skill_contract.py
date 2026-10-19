@@ -537,11 +537,12 @@ def test_reviewer_b_quotes_the_end_of_a_long_output_without_hiding_its_exit_stat
     reviewer_b = " ".join(text("references/reviewer-b.md").split())
     assert (
         "They show only the start of a long output; to quote its end, such as a test summary, put the end into the "
-        "command: `{ <command>; } 2>&1 | tail -n <N>; exit \"${PIPESTATUS[0]}\"` records only the last lines of "
-        "the whole command, so you can cite them whole, and exits with the command's own status. Keep the braces, "
-        "because without them a command list such as `setup && test` pipes only its last command into `tail`. "
-        "Keep the final `exit`, because the pipeline alone reports `tail`'s status; do not use `set -o pipefail` "
-        "for this, because it also changes the status of pipelines inside `<command>`, such as `false | true`."
+        "command: `D=$(mktemp -d) && { <command>; } >\"$D/out\" 2>&1; s=$?; tail -n <N> \"$D/out\"; exit \"$s\"` "
+        "records only the last lines of the whole command, so you can cite them whole, and exits with the command's "
+        "own status. It writes the output to a file in a new `mktemp -d` directory outside your view instead of "
+        "piping it into `tail`, so a command list such as `setup && test`, a pipeline inside `<command>` such as "
+        "`false | true`, or a background process `<command>` leaves running neither changes that status nor keeps "
+        "the helper waiting."
     ) in reviewer_b
 
 
