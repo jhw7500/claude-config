@@ -138,6 +138,33 @@ def test_identity_rejects_start_ticks_changed_during_read(fake_proc, monkeypatch
     assert tree.identity(321) is None
 
 
+@pytest.mark.parametrize("observe", (False, True), ids=("identity", "observe_identity"))
+def test_a_scheduler_state_change_during_read_keeps_the_identity(fake_proc, monkeypatch, observe):
+    # A process that alternates between running and sleeping changes its stat state between the two reads.
+    tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
+    expected = tree.identity(321)
+    assert expected is not None
+    original_read = tree._read_text
+    stat_reads = 0
+
+    def read_text(path):
+        nonlocal stat_reads
+        text = original_read(path)
+        if path == fake_proc.root / "321" / "stat":
+            stat_reads += 1
+            if stat_reads == 1:
+                fake_proc.write_state(321, "R")
+        return text
+
+    monkeypatch.setattr(tree, "_read_text", read_text)
+    if observe:
+        observation = tree.observe_identity(321)
+        assert (observation.kind, observation.identity) == ("live", expected)
+    else:
+        assert tree.identity(321) == expected
+    assert stat_reads == 2
+
+
 def test_ancestor_chain_stops_at_missing_parent(fake_proc):
     tree = procfs.LinuxProcfs(fake_proc.root, fake_proc.boot_id_path)
     chain = tree.ancestor_chain(321)
