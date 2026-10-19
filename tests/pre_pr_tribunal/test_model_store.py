@@ -32,6 +32,7 @@ from pre_pr_tribunal.model import (
     validate_reviewer_b_budget,
     validate_report_bytes,
     validate_submission_admission,
+    _IGNORABLE_NON_FORMAT,
 )
 from pre_pr_tribunal.verdict_store import (
     _read_sealed_report,
@@ -1676,6 +1677,17 @@ def test_default_ignorable_characters_cannot_split_a_secret_or_home_path_marker(
             expected_round=1,
             snapshot=snapshot,
         )
+
+
+def test_the_model_ignorable_table_matches_the_independent_copy():
+    # The split tests above use only range ends, so a gap inside a range is caught here.
+    expected = {point for start, end in _NON_FORMAT_IGNORABLE_RANGES for point in range(start, end + 1)}
+    matched = {
+        point
+        for point in range(0x110000)
+        if not 0xD800 <= point <= 0xDFFF and _IGNORABLE_NON_FORMAT.fullmatch(chr(point))
+    }
+    assert matched == expected
 
 
 @pytest.mark.parametrize(
