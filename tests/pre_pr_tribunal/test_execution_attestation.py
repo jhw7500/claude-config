@@ -349,7 +349,8 @@ def test_a_tail_is_empty_when_it_adds_nothing_or_the_stream_is_not_recorded_whol
     ("ok\n-----BEGIN PRIVATE KEY-----\n" + "QUJD\n" * 5 + "-----END PRIVATE KEY-----\n", 60, ""),
     ("progress\r50%\rdone\nsummary\n", 100, "summary\n"),
     ("fine\nghp_" + "A" * 36 + "\n", 30, ""),
-), ids=("mid-line-home-path", "private-key", "carriage-return", "mid-token"))
+    ("match:\n-----BEGIN OPENSSH PRIVATE KEY-----\n" + "QUJDREVGR0hJSktMTU5P\n" * 6, 2000, ""),
+), ids=("mid-line-home-path", "private-key", "carriage-return", "mid-token", "key-without-end"))
 def test_a_tail_excerpt_starts_at_a_line_so_no_secret_check_loses_its_prefix(text, limit, expected):
     assert tribunal_cli.citable_tail_excerpt(text, limit) == expected
 

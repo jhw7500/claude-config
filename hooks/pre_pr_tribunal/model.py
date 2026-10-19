@@ -1547,10 +1547,13 @@ def citable_excerpt(text: str, limit: int) -> str:
 def citable_tail_excerpt(text: str, limit: int) -> str:
     """Return the end of `text` from a line start, at most `limit` characters, that a report excerpt accepts.
 
-    A slice that started mid-line could carry the body of a home path, token or key without the prefix the
-    excerpt checks look for, so the slice always starts after a newline, drops leading lines until the checks
-    accept it, and is refused while it names a private key, whose marker line may lie before the slice.
+    A slice that started mid-line could carry the body of a home path or token without the prefix the excerpt
+    checks look for, so the slice always starts after a newline and drops leading lines until the checks accept
+    it. A key spans lines: its BEGIN marker can lie before the slice and no END line need follow, so a text that
+    names a private key anywhere gives no tail at all.
     """
+    if "PRIVATE KEY" in text:
+        return ""
     offset = max(len(text) - limit, 0)
     for index in range(len(text) - 1, offset - 1, -1):
         if unicodedata.category(text[index]) in {"Cc", "Cs"} and text[index] not in _EXCERPT_CONTROLS:
@@ -1558,12 +1561,10 @@ def citable_tail_excerpt(text: str, limit: int) -> str:
             break
     while offset < len(text):
         if offset == 0 or text[offset - 1] == "\n":
-            candidate = text[offset:]
-            if "PRIVATE KEY" not in candidate:
-                try:
-                    return _execution_excerpt(candidate)
-                except SchemaError:
-                    pass
+            try:
+                return _execution_excerpt(text[offset:])
+            except SchemaError:
+                pass
         newline = text.find("\n", offset)
         if newline < 0:
             return ""
