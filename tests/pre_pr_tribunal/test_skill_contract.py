@@ -537,8 +537,10 @@ def test_reviewer_b_quotes_the_end_of_a_long_output_without_hiding_its_exit_stat
     reviewer_b = " ".join(text("references/reviewer-b.md").split())
     assert (
         "They show only the start of a long output; to quote its end, such as a test summary, put the end into the "
-        "command: `set -o pipefail; <command> 2>&1 | tail -n <N>` records only those last lines, so you can cite them "
-        "whole, and `set -o pipefail` keeps the command's own exit status, which a bare `| tail` replaces with `tail`'s."
+        "command: `set -o pipefail; { <command>; } 2>&1 | tail -n <N>` records only the last lines of the whole "
+        "command, so you can cite them whole. Keep the braces, because without them a command list such as "
+        "`setup && test` pipes only its last command into `tail`, and keep `set -o pipefail`, which keeps the "
+        "command's own exit status where a bare `| tail` reports `tail`'s."
     ) in reviewer_b
 
 

@@ -323,12 +323,15 @@ def test_a_printed_excerpt_is_a_leading_slice_a_report_accepts(git_repo, tmp_pat
 
 def test_pipefail_keeps_the_exit_status_when_the_command_records_only_its_end(git_repo, tmp_path):
     store = capture_store(tmp_path)
-    program = "python3 -c $'print(\".\" * 3000)\\nprint(\"1 failed\")\\nraise SystemExit(1)' 2>&1 | tail -n 1"
+    setup = "python3 -c $'print(\".\" * 3000)'"
+    check = "python3 -c $'print(\"1 failed\")\\nraise SystemExit(1)'"
 
-    bare = capture(git_repo, store, program)
-    kept = capture(git_repo, store, f"set -o pipefail; {program}")
+    bare = capture(git_repo, store, f"{{ {setup} && {check}; }} 2>&1 | tail -n 1")
+    ungrouped = capture(git_repo, store, f"set -o pipefail; {setup} && {check} 2>&1 | tail -n 1")
+    kept = capture(git_repo, store, f"set -o pipefail; {{ {setup} && {check}; }} 2>&1 | tail -n 1")
 
     assert (bare["exit_code"], bare["stdout_excerpt"]) == (0, "1 failed\n")
+    assert ungrouped["truncated"] is True and "1 failed" not in ungrouped["stdout_excerpt"]
     assert (kept["exit_code"], kept["stdout_excerpt"], kept["truncated"]) == (1, "1 failed\n", False)
 
 
