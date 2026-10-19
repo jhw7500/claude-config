@@ -382,6 +382,22 @@ def test_a_leading_excerpt_stops_before_a_split_key_marker(marker):
     assert "QUJD" not in tribunal_cli.citable_excerpt(text, 2000)
 
 
+@pytest.mark.parametrize(
+    "character",
+    ("️", "͏", "ㅤ", "ﾠ"),
+    ids=("variation-selector-16", "combining-grapheme-joiner", "hangul-filler", "halfwidth-hangul-filler"),
+)
+def test_a_default_ignorable_character_cannot_split_a_key_marker_in_either_excerpt(character):
+    text = f"match:\n-----BEGIN OPENSSH PRIV{character}ATE KEY-----\n" + "QUJDREVGR0hJSktMTU5P\n" * 6
+    assert tribunal_cli.citable_tail_excerpt(text, 2000) == ""
+    assert "QUJD" not in tribunal_cli.citable_excerpt(text, 2000)
+
+
+def test_a_tail_excerpt_keeps_text_with_an_emoji_variation_selector():
+    text = "collected 3 items\n✔️ 3 passed\n"
+    assert tribunal_cli.citable_tail_excerpt(text, 100) == text
+
+
 def test_a_large_honest_capture_still_attests(git_repo, tmp_path):
     # A megabyte of NUL bytes per stream serializes to six times its size in the record.
     pending = claude_round(git_repo)

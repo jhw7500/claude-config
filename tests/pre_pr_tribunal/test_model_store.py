@@ -32,6 +32,7 @@ from pre_pr_tribunal.model import (
     validate_reviewer_b_budget,
     validate_report_bytes,
     validate_submission_admission,
+    _IGNORABLE_NON_FORMAT,
 )
 from pre_pr_tribunal.verdict_store import (
     _read_sealed_report,
@@ -1632,6 +1633,69 @@ def test_invisible_characters_cannot_split_a_secret_or_home_path_marker(snapshot
     ids=("byte-order-mark", "zero-width-joiner", "no-break-space"),
 )
 def test_format_and_compatibility_characters_without_a_marker_stay_accepted(snapshot, value):
+    item = execution()
+    item["stdout_excerpt"] = value
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+    assert parsed.executions[0].stdout_excerpt == value
+
+
+# Default_Ignorable_Code_Point ranges that are not format (Cf) characters, copied from Unicode 18.0.0
+# DerivedCoreProperties.txt independently of the table in model.py, so a wrong entry there fails here.
+_NON_FORMAT_IGNORABLE_RANGES = (
+    (0x034F, 0x034F), (0x115F, 0x1160), (0x17B4, 0x17B5), (0x180B, 0x180D), (0x180F, 0x180F),
+    (0x2065, 0x2065), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8),
+    (0xE0000, 0xE0000), (0xE0002, 0xE001F), (0xE0080, 0xE00FF), (0xE0100, 0xE01EF), (0xE01F0, 0xE0FFF),
+)
+_NON_FORMAT_IGNORABLE = tuple(
+    dict.fromkeys(point for start, end in _NON_FORMAT_IGNORABLE_RANGES for point in (start, end))
+)
+
+
+@pytest.mark.parametrize("point", _NON_FORMAT_IGNORABLE, ids=lambda point: f"U+{point:04X}")
+@pytest.mark.parametrize(
+    ("field", "template"),
+    [
+        ("stdout_excerpt", "-----BEGIN OPENSSH PRIV{}ATE KEY-----\nQUJDREVG\n"),
+        ("command", "cat /ho{}me/alice/private"),
+    ],
+    ids=("key-excerpt", "home-command"),
+)
+def test_default_ignorable_characters_cannot_split_a_secret_or_home_path_marker(
+    snapshot, field, template, point
+):
+    item = execution()
+    item[field] = template.format(chr(point))
+    with pytest.raises(SchemaError, match="EVIDENCE_SECRET_DETECTED"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+def test_the_model_ignorable_table_matches_the_independent_copy():
+    # The split tests above use only range ends, so a gap inside a range is caught here.
+    expected = {point for start, end in _NON_FORMAT_IGNORABLE_RANGES for point in range(start, end + 1)}
+    matched = {
+        point
+        for point in range(0x110000)
+        if not 0xD800 <= point <= 0xDFFF and _IGNORABLE_NON_FORMAT.fullmatch(chr(point))
+    }
+    assert matched == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["✔️ 3 passed\n", "이름ㅤ확인\n", "ﾠ정렬 표\n"],
+    ids=("emoji-variation-selector", "hangul-filler", "halfwidth-hangul-filler"),
+)
+def test_default_ignorable_characters_without_a_marker_stay_accepted(snapshot, value):
     item = execution()
     item["stdout_excerpt"] = value
     parsed = parse_reviewer_report(

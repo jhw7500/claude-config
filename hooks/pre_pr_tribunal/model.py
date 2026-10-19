@@ -65,6 +65,17 @@ _SECRET = re.compile(
     r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8}|AKIA[A-Z0-9]{12}"
 )
 _HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>]+")
+# Default_Ignorable_Code_Point ranges that are not format (Cf) characters, from Unicode 18.0.0
+# DerivedCoreProperties.txt; the Unicode 13.0.0 table of Python 3.10 lacks only U+180F. Format characters are
+# dropped by category, so they are not listed.
+_IGNORABLE_NON_FORMAT_RANGES = (
+    (0x034F, 0x034F), (0x115F, 0x1160), (0x17B4, 0x17B5), (0x180B, 0x180D), (0x180F, 0x180F),
+    (0x2065, 0x2065), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8),
+    (0xE0000, 0xE0000), (0xE0002, 0xE001F), (0xE0080, 0xE00FF), (0xE0100, 0xE01EF), (0xE01F0, 0xE0FFF),
+)
+_IGNORABLE_NON_FORMAT = re.compile(
+    "[" + "".join(f"\\U{start:08X}-\\U{end:08X}" for start, end in _IGNORABLE_NON_FORMAT_RANGES) + "]"
+)
 _HTTP_URL_START = re.compile(r"https?://", re.IGNORECASE)
 _SHELL_CONTROL = frozenset(";|&()<>`")
 _EXCERPT_CONTROLS = frozenset(("\n", "\t"))
@@ -1031,11 +1042,16 @@ def _contains_home_path(text: str) -> bool:
 def _detection_forms(text: str) -> tuple[str, str]:
     """Return `text` and the form the secret and home-path checks must also see.
 
-    A format character such as a zero-width space, or a compatibility form such as a no-break space, can split a
-    marker without changing what a reader sees, so the second form drops format characters and applies NFKC.
+    A format character such as a zero-width space, another default-ignorable character such as a variation selector
+    or a Hangul filler, or a compatibility form such as a no-break space, can split a marker without changing what a
+    reader sees, so the second form drops format and default-ignorable characters and applies NFKC. The text itself
+    is kept, so output that uses those characters, such as an emoji presentation selector, is still accepted.
     """
     visible = unicodedata.normalize(
-        "NFKC", "".join(character for character in text if unicodedata.category(character) != "Cf")
+        "NFKC",
+        _IGNORABLE_NON_FORMAT.sub(
+            "", "".join(character for character in text if unicodedata.category(character) != "Cf")
+        ),
     )
     return text, visible
 
@@ -1571,7 +1587,8 @@ def citable_tail_excerpt(text: str, limit: int) -> str:
     a backspace or a zero-width space, can split that name without showing it, so a text that holds one gives no
     tail either. A detected secret can have an undetected pair on a later line, such as an access key id followed
     by its secret key, so a text with any detected secret gives no tail. Both checks see the detection forms, so a
-    compatibility character such as a no-break space cannot split the name either.
+    compatibility or default-ignorable character such as a no-break space or a variation selector cannot split the
+    name either.
     """
     if any("PRIVATE KEY" in form or _SECRET.search(form) for form in _detection_forms(text)) or any(
         unicodedata.category(character) in {"Cc", "Cf", "Cs"} and character not in _EXCERPT_CONTROLS
