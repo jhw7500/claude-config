@@ -536,10 +536,12 @@ Tribunal을 실행한다면 policy-preview 뒤 활성 reviewer·intensity/mode·
    1회, `iterative`는 최대 3회라는 결과를 먼저 설명한다. 필요한 숫자는 기존 CLI 호환 값으로만 제시한다.
 
 6. **PASS 뒤의 비차단 지적은 모아서 한 번에 고친다.** PASS에는 decision 경로가 없으므로, PASS 뒤에
-   고치는 커밋마다 새 lifecycle이 `base..HEAD` 전체를 다시 심사한다. advisory finding, PR 리뷰어
+   고친 커밋을 다시 심사하면 새 lifecycle이 `base..HEAD` 전체를 다시 본다. advisory finding, PR 리뷰어
    지적, 직접 찾은 결함을 하나씩 고쳐 올리면 그 수만큼 전패널 리뷰가 반복된다. 그러니 고칠지 판단할
-   지적을 먼저 다 모으고(PR을 이미 열었다면 PR 리뷰 결과까지), 한 번에 고친 뒤 lifecycle 한 번으로
-   재심사한다. 리뷰 강도를 낮추는 것으로 이 비용을 대신 줄이지 않는다 — `single`도 리뷰어 집합은
+   지적을 먼저 다 모으고(PR을 이미 열었다면 PR 리뷰 결과까지), 한 번에 고친다. 재심사를 하더라도
+   lifecycle 한 번이다. 같은 branch가 이미 두 번 PASS했거나 그 횟수를 확인할 수 없으면, 그 재심사도
+   권장 선택지로 두지 않고 누적 PASS 횟수와 리뷰 시간을 보이며 사용자에게 묻는다(`pre-pr-tribunal`
+   스킬 8번). 리뷰 강도를 낮추는 것으로 이 비용을 대신 줄이지 않는다 — `single`도 리뷰어 집합은
    같고, `off`는 심사를 생략하는 것이다.
 
 7. **같은 브랜치에서 FAIL이 이어지면 재심사를 제안하기 전에 범위부터 다시 본다.** FAIL 뒤의
