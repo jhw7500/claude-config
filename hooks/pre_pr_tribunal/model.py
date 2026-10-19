@@ -1552,9 +1552,10 @@ def citable_tail_excerpt(text: str, limit: int) -> str:
     it. A key spans lines: its BEGIN marker can lie before the slice and no END line need follow, so a text that
     names a private key anywhere gives no tail at all. A control or format character, such as an escape sequence,
     a backspace or a zero-width space, can split that name without showing it, so a text that holds one gives no
-    tail either.
+    tail either. A detected secret can have an undetected pair on a later line, such as an access key id followed
+    by its secret key, so a text with any detected secret gives no tail.
     """
-    if "PRIVATE KEY" in text or any(
+    if "PRIVATE KEY" in text or _SECRET.search(text) or any(
         unicodedata.category(character) in {"Cc", "Cf", "Cs"} and character not in _EXCERPT_CONTROLS
         for character in text
     ):

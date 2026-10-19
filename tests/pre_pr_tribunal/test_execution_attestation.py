@@ -358,9 +358,16 @@ def test_a_tail_is_empty_when_it_adds_nothing_or_the_stream_is_not_recorded_whol
     ("match:\n-----BEGIN OPENSSH \x1b[31mPRIVATE\x1b(B\x1b[m KEY-----\n" + "QUJDREVGR0hJSktMTU5P\n" * 6, 2000, ""),
     ("match:\n-----BEGIN OPENSSH " + "".join(c + "\b" + c for c in "PRIVATE KEY") + "-----\n" + "QUJD\n" * 6, 2000, ""),
     ("match:\n-----BEGIN OPENSSH PRIVATE​ KEY-----\n" + "QUJDREVGR0hJSktMTU5P\n" * 6, 2000, ""),
+    (
+        "[default]\naws_access_key_id = AKI" + "A" + "B" * 16 + "\naws_secret_access_key = " + "s3cr3t" * 7 + "\n",
+        2000,
+        "",
+    ),
+    ("> Authorization: Bearer " + "t0k3n" * 4 + "\n> Cookie: session=" + "c00k1e" * 4 + "\n", 2000, ""),
 ), ids=(
     "mid-line-home-path", "private-key", "carriage-return", "mid-token", "key-without-end", "coloured-key-marker",
-    "reset-escape-key-marker", "overstruck-key-marker", "zero-width-key-marker",
+    "reset-escape-key-marker", "overstruck-key-marker", "zero-width-key-marker", "secret-key-after-key-id",
+    "cookie-after-bearer",
 ))
 def test_a_tail_excerpt_starts_at_a_line_so_no_secret_check_loses_its_prefix(text, limit, expected):
     assert tribunal_cli.citable_tail_excerpt(text, limit) == expected
