@@ -1458,11 +1458,11 @@ _REPORT_RETRYABLE_CODES = frozenset((
 
 
 @contextmanager
-def _claude_reviewer_captures(cli: Path, repo: Path, home: Path):
+def _reviewer_captures(cli: Path, repo: Path, home: Path):
     """Yield submit arguments naming a capture store the installed helper filled.
 
-    The installed runtime accepts a Claude-round Reviewer B report only when each
-    fresh execution matches a capture, so the probe runs the synthetic report's
+    The installed runtime accepts a Reviewer B report only when each fresh
+    execution matches a capture, so the probe runs the synthetic report's
     command through the helper as an honest reviewer would.
     """
     directory = tempfile.mkdtemp(prefix="probe-captures-")
@@ -1595,8 +1595,8 @@ def _create_pass_verdict(
                     raise ProbeFailure("SETUP_FAILED")
                 with ExitStack() as stack:
                     transcript = (
-                        stack.enter_context(_claude_reviewer_captures(cli, repo, home))
-                        if runtime == "claude" and reviewer == "B" else ()
+                        stack.enter_context(_reviewer_captures(cli, repo, home))
+                        if reviewer == "B" else ()
                     )
                     receipt = measured("report_store", reviewer, local_attempt, lambda: _tribunal_cli(
                         cli, repo, home, "submit-report", "--reviewer", reviewer, *transcript, raw=raw,

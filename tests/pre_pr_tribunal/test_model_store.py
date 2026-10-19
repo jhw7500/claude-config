@@ -59,7 +59,7 @@ def snapshot(git_repo):
     return capture_snapshot(git_repo, "master", now=NOW)
 
 
-def execution(identifier="A-R1-E001", *, command="python3 -m pytest -q"):
+def execution(identifier="A-R1-E001", *, command="printf '1 passed'"):
     stdout = "1 passed"
     return {
         "id": identifier,
@@ -169,6 +169,46 @@ def _helper_captures(repo, value):
         shutil.rmtree(store, ignore_errors=True)
 
 
+def honest_capture_store(repo, raw, *, helper=None):
+    """Fill a capture store as an honest Reviewer B does: run each fresh execution's command through the helper.
+
+    `helper` names another `cli.py`, such as an installed copy, whose own `capture-run` writes the records it reads.
+    """
+    from pre_pr_tribunal import cli
+    from pre_pr_tribunal.model import TribunalError
+
+    store = Path(tempfile.mkdtemp(dir=repo.parent))
+    try:
+        executions = json.loads(raw).get("executions", [])
+    except (TypeError, ValueError, AttributeError):
+        executions = []
+    for item in executions if isinstance(executions, list) else []:
+        if not (isinstance(item, dict) and "evidence_ref" not in item and isinstance(item.get("command"), str)):
+            continue
+        if helper is not None:
+            subprocess.run([sys.executable, str(helper), "capture-run", "--store", str(store), "--cwd", str(repo),
+                            "--command", item["command"]], capture_output=True, check=False)
+            continue
+        try:
+            cli._capture_run(store, repo, item["command"], timeout=30)
+        except TribunalError:
+            continue  # The helper refuses a command no report can carry, so nothing attests it.
+    return store
+
+
+def honest_captures(repo, raw):
+    from pre_pr_tribunal import cli
+
+    return cli._capture_records(honest_capture_store(repo, raw))
+
+
+def capture_arguments(repo, reviewer, raw, *, helper=None):
+    """The `submit-report` arguments a CLI submission adds: Reviewer B names its capture store."""
+    if reviewer != "B":
+        return ()
+    return ("--captures", str(honest_capture_store(repo, raw, helper=helper)))
+
+
 def report_paths(repo, snapshot, *, round_number=1, overrides=None):
     overrides = overrides or {}
     result = {}
@@ -178,8 +218,8 @@ def report_paths(repo, snapshot, *, round_number=1, overrides=None):
         path = repo / f".review/inbox/round-{round_number}/{reviewer}.json"
         verdict = read_verdict(repo)
         captures = None
-        if verdict.schema != 1 and reviewer == "B" and verdict.producer_runtime == "claude":
-            # A Claude-round Reviewer B runs each command through the installed capture helper.
+        if verdict.schema != 1 and reviewer == "B":
+            # Reviewer B runs each command through the installed capture helper.
             captures = _helper_captures(repo, value)
         raw = json.dumps(value).encode()
         if verdict.schema == 1:
@@ -695,6 +735,9 @@ def write_current_pending(git_repo):
 
 def submit_reviewer_report(*args, **kwargs):
     from pre_pr_tribunal.verdict_store import submit_reviewer_report as submit
+    if kwargs.get("reviewer") is Reviewer.B and "captures" not in kwargs:
+        # Reviewer B submits with the captures the helper recorded for its commands.
+        kwargs["captures"] = honest_captures(args[0] if args else kwargs["cwd"], kwargs["raw"])
     return submit(*args, **kwargs)
 
 
@@ -3523,7 +3566,7 @@ def test_cli_later_round_context_omits_own_decision_executions(git_repo):
         }
     ]
     assert "executions" not in json.dumps(payload["own_decisions"])
-    assert "python3 -m pytest -q" not in json.dumps(payload)
+    assert execution()["command"] not in json.dumps(payload)
     assert "1 passed" not in json.dumps(payload)
 
 
@@ -4088,7 +4131,8 @@ def test_cli_submit_parser_failure_updates_only_requested_slot(git_repo):
     before = read_verdict(git_repo)
 
     failed = run_cli_bytes(
-        git_repo, "submit-report", "--reviewer", "B", input=b'{"schema":1'
+        git_repo, "submit-report", "--reviewer", "B", *capture_arguments(git_repo, "B", b""),
+        input=b'{"schema":1',
     )
 
     assert (failed.returncode, failed.stdout, failed.stderr) == (
@@ -4249,7 +4293,8 @@ def test_cli_finalize_without_paths_authenticates_all_sealed_reports(git_repo):
             report(pending.snapshot, reviewer), separators=(",", ":")
         ).encode()
         assert run_cli_bytes(
-            git_repo, "submit-report", "--reviewer", reviewer, input=raw
+            git_repo, "submit-report", "--reviewer", reviewer,
+            *capture_arguments(git_repo, reviewer, raw), input=raw,
         ).returncode == 0
 
     finalized = run_cli_bytes(git_repo, "finalize")
@@ -4448,7 +4493,9 @@ def test_cli_submit_retryable_rejection_names_reviewer_and_field_path(
     pending = read_verdict(git_repo)
     raw = json.dumps(build(pending.snapshot), separators=(",", ":")).encode()
 
-    failed = run_cli_bytes(git_repo, "submit-report", "--reviewer", reviewer, input=raw)
+    failed = run_cli_bytes(
+        git_repo, "submit-report", "--reviewer", reviewer, *capture_arguments(git_repo, reviewer, raw), input=raw,
+    )
 
     assert (failed.returncode, failed.stdout) == (1, b"")
     assert failed.stderr == (

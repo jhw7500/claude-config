@@ -1145,10 +1145,7 @@ def test_installed_resume_measures_b_only_after_a_and_c_seal(tmp_path, runtime):
         module._tribunal_cli(cli, repo, home, "submit-report", "--reviewer", role, raw=raw)
         saved[role] = raw
     for _ in range(3):
-        captures = (
-            module._claude_reviewer_captures(cli, repo, home) if runtime == "claude" else nullcontext(())
-        )
-        with captures as arguments, pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
+        with module._reviewer_captures(cli, repo, home) as arguments, pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
             module._tribunal_cli(cli, repo, home, "submit-report", "--reviewer", "B", *arguments, raw=b"{")
     module._tribunal_cli(cli, repo, home, "telemetry-close", "--run-id", begun["telemetry"]["run_id"],
                         "--outcome", "failure", "--reason-code", "JSON_INVALID")
@@ -1190,10 +1187,7 @@ def test_installed_full_panel_and_selective_recovery_comparison(tmp_path, runtim
     for role in "AC":
         raw = module._synthetic_report_bytes(role, 1, begun["snapshot"])
         module._tribunal_cli(cli, selective_repo, home, "submit-report", "--reviewer", role, raw=raw)
-    captures = (
-        module._claude_reviewer_captures(cli, selective_repo, home) if runtime == "claude" else nullcontext(())
-    )
-    with captures as arguments, pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
+    with module._reviewer_captures(cli, selective_repo, home) as arguments, pytest.raises(module.ProbeFailure, match="^JSON_INVALID$"):
         module._tribunal_cli(cli, selective_repo, home, "submit-report", "--reviewer", "B", *arguments, raw=b"{")
     module._tribunal_cli(cli, selective_repo, home, "telemetry-close", "--run-id", begun["telemetry"]["run_id"],
                         "--outcome", "failure", "--reason-code", "JSON_INVALID")
@@ -1267,9 +1261,11 @@ def test_installed_capacity_recovery_preserves_receipts_and_runs_only_pending(
             }]
         # Non-canonical whitespace catches accidental parse/re-emit on reuse.
         raw = (json.dumps(report, indent=2) + "\n \n").encode()
-        receipt = module._tribunal_cli(
-            cli, repo, home, "submit-report", "--reviewer", role, raw=raw,
-        )
+        captures = module._reviewer_captures(cli, repo, home) if role == "B" else nullcontext(())
+        with captures as arguments:
+            receipt = module._tribunal_cli(
+                cli, repo, home, "submit-report", "--reviewer", role, *arguments, raw=raw,
+            )
         assert receipt["raw_sha256"] == hashlib.sha256(raw).hexdigest()
         sealed[role] = (raw, receipt)
 

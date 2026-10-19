@@ -10,6 +10,7 @@ import pytest
 
 from pre_pr_tribunal import cli, telemetry
 from pre_pr_tribunal.model import TribunalError
+from tests.pre_pr_tribunal.test_model_store import capture_arguments
 
 
 BEGIN = ("begin", "--base", "master", "--runtime", "codex", "--round", "1")
@@ -27,7 +28,7 @@ def report(begun, reviewer):
         value.update({
             "executions": [{
                 "id": "B-R1-E999",
-                "command": "python3 -c print-ok",
+                "command": "printf '1 passed'",
                 "exit_code": 0,
                 "stdout_excerpt": stdout,
                 "stderr_excerpt": "",
@@ -142,10 +143,12 @@ def test_supplied_run_and_attempt_record_one_span_outside_the_store_lock(
 ):
     """The store lock is non-reentrant: nesting costs the span, then the submission."""
     run_id = begun["telemetry"]["run_id"]
+    raw = report(begun, "B")
     code, out, err = command(
         monkeypatch, capsys, git_repo,
-        ("submit-report", "--reviewer", "B", "--run-id", run_id, "--attempt", "2"),
-        raw=report(begun, "B"), second=5,
+        ("submit-report", "--reviewer", "B", "--run-id", run_id, "--attempt", "2",
+         *capture_arguments(git_repo, "B", raw)),
+        raw=raw, second=5,
     )
     assert (code, err) == (0, "")
     assert json.loads(out)["state"] == "sealed"

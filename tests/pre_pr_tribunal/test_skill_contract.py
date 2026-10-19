@@ -430,28 +430,31 @@ def test_skill_recovery_takes_reviewer_bytes_with_reviewer_response():
     assert bullet.index("reviewer-response") < bullet.index("submit-report --reviewer X")
 
 
-def test_skill_binds_claude_reviewer_b_executions_to_helper_captures():
-    """A fresh Claude-round B execution counts only when the installed helper recorded it."""
+def test_skill_binds_reviewer_b_executions_to_helper_captures():
+    """A fresh B execution counts only when the installed helper recorded it, on either runtime."""
     skill = text("SKILL.md")
     steps = numbered_steps(skill)
-    assert "before dispatching Reviewer B, create its capture store with `mktemp -d` outside `VIEW_ROOT`" in steps[5]
+    assert (
+        "On either runtime, before dispatching Reviewer B, create its capture store with `mktemp -d` outside "
+        "`VIEW_ROOT`"
+    ) in steps[5]
     assert "a fresh replacement B gets a fresh store, and a same-handle retry keeps its store" in steps[5]
     step = steps[6]
-    assert "On Claude, for reviewer B also pass `--captures` with that B's capture store" in step
+    assert "For reviewer B also pass `--captures` with that B's capture store" in step
     assert step.index("submit-report --reviewer X") < step.index("also pass `--captures`")
     for code in (
         "EXECUTION_UNATTESTED", "CAPTURE_STORE_UNSAFE",
         "SUBMISSION_CAPTURES_REQUIRED", "SUBMISSION_CAPTURES_UNEXPECTED",
     ):
         assert f"`{code}`" in step
-    assert "Codex reviewers do not run the helper yet" in step
-    assert "do not move the installed runtime across a pending Claude round" in step
+    assert "Never pass it for another role." in step
+    assert "do not move the installed runtime while a round is pending in any repository on either runtime" in step
     assert "`CAPTURE_SHA256_PLACEHOLDER`, and `EXECUTION_UNATTESTED`" in skill
     recovery = skill.split("## Pending-round report recovery", 1)[1].split("\n## ", 1)[0]
-    assert "with step 6's `--captures` for a Claude reviewer B" in recovery
+    assert "with step 6's `--captures` for reviewer B" in recovery
     reviewer_b = " ".join(text("references/reviewer-b.md").split())
     assert f"{CLI} capture-run --store '<capture store>' --cwd '<your view>' --command '<command>'" in reviewer_b
-    assert "at most 480; keep your Bash tool timeout longer" in reviewer_b
+    assert "at most 480; keep your shell tool's timeout longer" in reviewer_b
     assert "the printed excerpts are leading slices a report accepts" in reviewer_b
     assert "Set `truncated` to false only when your excerpts are the whole recorded output" in reviewer_b
     assert "soon after its captured output passes 64 MiB" in reviewer_b
@@ -464,11 +467,37 @@ def test_skill_binds_claude_reviewer_b_executions_to_helper_captures():
     assert "The last three are submission admission rules" in schema
     assert "must match one capture the installed `capture-run` helper recorded for the bound HEAD" in schema
     readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
-    assert "For reviewer B on Claude, also pass `submit-report` `--captures <store>`" in readme
+    assert "On either runtime, for reviewer B also pass `submit-report` `--captures <store>`" in readme
+
+
+def test_codex_reviewer_b_runs_the_capture_helper_like_a_claude_one():
+    """No Codex exception remains, B gets no role that competes with the helper, and B reads its line whole."""
+    skill = text("SKILL.md")
+    for retired in (
+        "Codex reviewers do not run the helper yet", "pending Claude round", "On Claude, for reviewer B",
+        "Claude reviewer B", "resumed Claude B", "On Claude, before dispatching Reviewer B",
+    ):
+        assert retired not in skill
+    codex = numbered_steps(skill)[5].split("On Codex use native `collaboration.spawn_agent` calls", 1)[1]
+    assert (
+        "Spawn Reviewer B with no agent role, so no host-local role instruction, such as one that forbids "
+        "writing files, competes with the capture record the helper writes for it."
+    ) in codex
+    reviewer_b = " ".join(text("references/reviewer-b.md").split())
+    assert "In a Claude round" not in reviewer_b and "Bash tool" not in reviewer_b
+    assert (
+        "Read that line whole: when your shell tool takes an output limit, such as `max_output_tokens`, set it "
+        "high enough for the line, and when the shown output marks part of it as cut, run the helper again with a "
+        "higher limit instead of copying cut text."
+    ) in reviewer_b
+    schema = " ".join(text("references/report-schema.md").split())
+    assert "in a Claude round" not in schema
+    readme = " ".join((REPOSITORY_ROOT / "hooks" / "README.md").read_text(encoding="utf-8").split())
+    assert "For reviewer B on Claude" not in readme
 
 
 def test_skill_bounds_the_capture_environment_and_keeps_tracked_capture_stores():
-    """The capture boundary names the helper's environment; each Claude B store is tracked and kept."""
+    """The capture boundary names the helper's environment; each B store is tracked and kept."""
     skill = text("SKILL.md")
     steps = numbered_steps(skill)
     assert "record its exact path with B's view in `CREATED_VIEWS`" in steps[5]
@@ -484,8 +513,8 @@ def test_skill_bounds_the_capture_environment_and_keeps_tracked_capture_stores()
         "`BASH_ENV`, that changes what a recorded command does, because a record does not bind the environment"
     ) in steps[6]
     recovery = skill.split("## Pending-round report recovery", 1)[1].split("\n## ", 1)[0]
-    assert "A resumed Claude B keeps the capture store recorded with that view." in recovery
-    assert "for a Claude reviewer B, naming the capture store recorded with its view" in recovery
+    assert "A resumed B keeps the capture store recorded with that view." in recovery
+    assert "for reviewer B, naming the capture store recorded with its view" in recovery
     schema = " ".join(text("references/report-schema.md").split())
     assert (
         "not a same-user process that writes the store directly or that changes what a recorded command does "
@@ -499,7 +528,7 @@ def test_skill_bounds_the_capture_environment_and_keeps_tracked_capture_stores()
     reviewer_b = " ".join(text("references/reviewer-b.md").split())
     assert (
         "The helper runs it with `/bin/bash -c` in the exported environment it inherits, so a function or alias "
-        "that exists only in your Bash tool's shell, such as a `grep` wrapper, does not apply there"
+        "that exists only in your shell tool's own shell, such as a `grep` wrapper, does not apply there"
     ) in reviewer_b
 
 

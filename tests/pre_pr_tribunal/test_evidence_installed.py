@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+from tests.pre_pr_tribunal.test_model_store import capture_arguments
+
 REPO = Path(__file__).resolve().parents[2]
 
 
@@ -87,7 +89,8 @@ def test_disposable_installed_cli_reuse_lifecycle_and_sealed_mutation(git_repo, 
                 },
             })
         raw = json.dumps(value, indent=2).encode()
-        cli('submit-report', '--reviewer', role, raw=raw)
+        cli('submit-report', '--reviewer', role, *capture_arguments(git_repo, role, raw, helper=package / 'cli.py'),
+            raw=raw)
         path = git_repo / f'.review/inbox/round-1/{role}.json'
         assert path.read_bytes() == raw
         assert path.stat().st_uid == os.geteuid() and stat.S_ISREG(path.lstat().st_mode)

@@ -201,7 +201,7 @@ explicitly enforce and verify current-user ownership, regular non-symlink type, 
 of ambient `umask`, then pipe those same bytes directly to `submit-report --reviewer A|B|C --run-id "$RUN_ID" --attempt "$ATTEMPT"`.
 On Claude, create that file with `reviewer-response --runtime claude --transcript <Agent transcript> --agent <agentId>
 --output <new path>` instead of copying the completion notification, which escapes text for display; its
-`RESPONSE_PENDING` means the reply is not recorded yet. For reviewer B on Claude, also pass `submit-report`
+`RESPONSE_PENDING` means the reply is not recorded yet. On either runtime, for reviewer B also pass `submit-report`
 `--captures <store>`, the owner-only directory the controller gave that B: it accepts a fresh B execution only when the
 installed `capture-run` helper recorded a matching capture there (`EXECUTION_UNATTESTED` otherwise). A same-user process
 that writes the store directly, or that changes what a recorded command does through the exported environment the helper

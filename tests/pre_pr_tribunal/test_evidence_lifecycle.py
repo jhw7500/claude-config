@@ -15,9 +15,10 @@ from pre_pr_tribunal.model import (
     TribunalError,
 )
 from pre_pr_tribunal.review_context import reviewer_context_envelope
-from pre_pr_tribunal.verdict_store import (begin_round, submit_reviewer_report,
+from pre_pr_tribunal.verdict_store import (begin_round,
     finalize_round, read_verdict, require_current_in_progress,
     validate_stored_reviewer_report)
+from tests.pre_pr_tribunal.test_model_store import capture_arguments, submit_reviewer_report
 
 
 def bundle(repo):
@@ -53,7 +54,7 @@ def raw_report(verdict, reviewer, execution=None):
         if execution is None:
             execution = {
                 'id': f'B-R{verdict.round}-E999',
-                'command': 'python3 -c print-ok',
+                'command': "printf '1 passed'",
                 'exit_code': 0,
                 'stdout_excerpt': '1 passed',
                 'stderr_excerpt': '',
@@ -484,7 +485,7 @@ def test_cli_pinned_detached_projection_and_native_submit(git_repo, tmp_path, in
     assert verified.returncode == 0, verified.stdout
     fields = json.loads(verified.stdout)['executions'][0]['execution']
     raw = raw_report(verdict, 'B', {'id': 'B-R1-E001', **fields})
-    result = run('submit-report', '--reviewer', 'B', raw=raw)
+    result = run('submit-report', '--reviewer', 'B', *capture_arguments(git_repo, 'B', raw, helper=cli), raw=raw)
     assert result.returncode == 0, result.stderr
     assert (git_repo / '.review/inbox/round-1/B.json').read_bytes() == raw
 

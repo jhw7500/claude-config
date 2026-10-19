@@ -24,8 +24,8 @@ from pre_pr_tribunal import round_grant
 from pre_pr_tribunal.verdict_store import (
     begin_round,
     finalize_round,
-    submit_reviewer_report,
 )
+from tests.pre_pr_tribunal.test_model_store import submit_reviewer_report
 
 
 def NOW():
@@ -127,7 +127,7 @@ def _execution(identifier):
     stdout = "ok"
     return {
         "id": identifier,
-        "command": "python3 -m pytest -q",
+        "command": "printf ok",
         "exit_code": 0,
         "stdout_excerpt": stdout,
         "stderr_excerpt": "",
@@ -741,6 +741,7 @@ def test_high_risk_budget_keeps_independent_refuted_blockers(tmp_path):
         finding_id = f"B-R1-{index:03d}"
         evidence = _execution(execution_id)
         evidence.update(
+            command="printf refuted; exit 1",
             exit_code=1,
             stdout_excerpt="refuted",
             capture_sha256=hashlib.sha256(b"refuted").hexdigest(),
