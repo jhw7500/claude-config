@@ -365,10 +365,13 @@ choose.
 re-run.** "My change broke it" and "it was already broken" are both confident
 answers a single re-run can produce. Vary two axes independently — source
 version (original / changed) and scope (the single test / its file / the whole
-suite) — and repeat the cell that failed at least once. First, because it is
-the cheapest check, look for any call path from the changed code to the failing
-test at all. Record which cells you ran; a cell that was never run is evidence
-for neither answer.
+suite). First, because it is the cheapest check, look for any call path from
+the changed code to the failing test at all. Read the failing cell's output
+before running anything again; unless it already shows a deterministic cause,
+repeat that cell once. That repeat is a measurement — it is how you establish
+whether the failure is deterministic — not the retry that systematic-debugging's
+"Before re-running a failed job or command" rule forbids. Record which cells
+you ran; a cell that was never run is evidence for neither answer.
 
 ### Adds to Key Patterns — the instrument is your own tooling
 
