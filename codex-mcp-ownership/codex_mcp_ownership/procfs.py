@@ -62,6 +62,20 @@ def parse_stat(raw: str) -> ProcStat:
         raise ProcfsFormatError("non-integer proc stat field") from error
 
 
+def _same_process(before: ProcStat, after: ProcStat) -> bool:
+    """Return whether two reads of one stat file describe the same process.
+
+    The scheduler state changes between the reads of a process that alternates between running and sleeping, so it
+    is not compared; a reused pid still differs in start_ticks.
+    """
+    return (before.pid, before.ppid, before.pgid, before.start_ticks) == (
+        after.pid,
+        after.ppid,
+        after.pgid,
+        after.start_ticks,
+    )
+
+
 class LinuxProcfs:
     def __init__(
         self,
@@ -104,7 +118,7 @@ class LinuxProcfs:
             return None
         except OSError:
             return None
-        if before != after or before.pid != pid or after.pid != pid:
+        if not _same_process(before, after) or before.pid != pid or after.pid != pid:
             return None
         return ProcessIdentity(
             boot_id=boot_id,
@@ -144,7 +158,7 @@ class LinuxProcfs:
             return IdentityObservation("missing", None)
         except (OSError, ProcfsFormatError):
             return IdentityObservation("unavailable", None)
-        if before != after or before.pid != pid or after.pid != pid:
+        if not _same_process(before, after) or before.pid != pid or after.pid != pid:
             return IdentityObservation("unavailable", None)
         return IdentityObservation(
             "live",
