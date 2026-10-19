@@ -1172,6 +1172,23 @@ def test_installed_resume_measures_b_only_after_a_and_c_seal(tmp_path, runtime):
         assert (repo / f".review/inbox/round-1/{role}.json").read_bytes() == raw
 
 
+def test_probe_repo_disables_detached_auto_maintenance(tmp_path):
+    # The full-panel comparison copies this repository; auto maintenance would race the copy.
+    module = _load_probe_module()
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    repo = tmp_path / "repo"
+    module._create_probe_repo(repo, home)
+    for key, expected in (("maintenance.auto", "false"), ("gc.auto", "0")):
+        value = subprocess.run(
+            ["/usr/bin/git", "-C", str(repo), "config", "--get", key],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert value == expected
+
+
 @pytest.mark.parametrize("runtime", ("claude", "codex"))
 def test_installed_full_panel_and_selective_recovery_comparison(tmp_path, runtime):
     """Same snapshot and synchronous fixture, not a native latency/speedup claim.

@@ -1282,6 +1282,9 @@ def _git(
 def _create_probe_repo(repo: Path, home: Path) -> None:
     repo.mkdir(mode=0o700)
     _git(repo, home, "init", "-q", "-b", "feature")
+    # The probe tests copy this repository; detached auto maintenance would race the copy.
+    _git(repo, home, "config", "maintenance.auto", "false")
+    _git(repo, home, "config", "gc.auto", "0")
     _git(
         repo,
         home,
