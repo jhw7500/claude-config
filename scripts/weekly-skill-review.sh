@@ -36,6 +36,16 @@ for skill_dir in "$HOME/.claude/plugins/cache" "$HOME/.claude/commands/jhw"; do
         ADD_DIRS+=(--add-dir "$(readlink -f "$skill_dir")")
     fi
 done
+# 초안의 기준은 ~/.claude/skills 링크가 가리키는 live 실체다(핀 worktree처럼 이 저장소 밖일 수 있다).
+# 목록만 프롬프트에 넘긴다. --add-dir는 acceptEdits에서 자동 편집 경로가 되므로, 바깥 실체를 넘기면
+# 이 무인 세션이 그 live 파일(예: tribunal 리뷰어 지침)을 고칠 수 있다. 읽지 못하는 스킬은 보류로 보고된다.
+LIVE_SKILLS=""
+if [ -d "$HOME/.claude/skills" ]; then
+    for link in "$HOME/.claude/skills"/*; do
+        [ -e "$link" ] || continue
+        LIVE_SKILLS+="$(basename "$link") -> $(readlink -f "$link")"$'\n'
+    done
+fi
 
 if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 2000000 ]; then
     mv -f "$LOG" "$LOG.1"
@@ -50,6 +60,8 @@ PROMPT="task-observer 스킬의 정기 리뷰를 실행해라.
 ${INVENTORY}
 이번 산출물 경로: ${OUTPUT}
 이전 pending 보고서 및 번들: ${REVIEW_ROOT}
+live 스킬 설치본(초안의 기준, ~/.claude/skills 링크의 실체):
+${LIVE_SKILLS}
 다중 소스 모드의 원본 보존 규칙을 따른다. 로그·archive·last-review-date.txt는
 수정하지 않는다. 각 출처 경로와 관찰 번호를 묶어서 식별한다(번호만으로 합치지 않는다).
 검토 결과·누락 사유·검토 시각은 이번 경로의 REVIEW.md에 기록한다.
@@ -61,6 +73,12 @@ ${INVENTORY}
 - live 스킬 파일(플러그인 캐시 포함)은 절대 수정하지 않는다. staged 사본만 만든다.
 - 작업 큐는 '### Observation N:' 헤더 열거에서 만든다(Status grep 만으로 만들지 않는다).
 - 기존 pending 보고서와 현재 live 파일을 대조해 유효한 초안을 중복 생성하지 않는다.
+- 초안의 기준(base)은 위 live 설치본 파일이다. 이전 pending 번들의 사본은 기준으로 쓰지 않고,
+  그 번들이 어떤 델타를 넣으려 했는지 확인하는 목록으로만 쓴다.
+- live 설치본을 읽을 수 없으면 그 스킬은 스테이징하지 말고 보류로 보고한다. 다른 체크아웃의
+  같은 이름 파일을 대리 원본으로 쓰지 않는다.
+- 초안을 만든 뒤 live 기준과 비교한다. 관찰과 무관한 줄을 지우는 초안은 스테이징하지 않는다.
+  스킬마다 기준 경로와 지운 줄·더한 줄 수를 REVIEW.md에 기록한다.
 - 초안은 STAGED(설치 대기)이며 ACTIONED가 아니다. 실제 설치 수는 0으로 보고한다.
 - 모든 소스의 헤더 수와 분류 수를 대조한다. 읽기 실패는 빈 큐로 간주하지 않는다.
 - 끝나면 소스별 검토/건너뜀 상태와 STAGED·설치·미해결 수를 REVIEW.md에 기록한다.
