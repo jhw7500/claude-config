@@ -541,8 +541,9 @@ Tribunal을 실행한다면 policy-preview 뒤 활성 reviewer·intensity/mode·
    지적을 먼저 다 모으고(PR을 이미 열었다면 PR 리뷰 결과까지), 한 번에 고친다. 재심사를 하더라도
    lifecycle 한 번이다. 같은 branch가 이미 두 번 PASS했거나 그 횟수를 확인할 수 없으면, 그 재심사도
    권장 선택지로 두지 않고 누적 PASS 횟수와 리뷰 시간을 보이며 사용자에게 묻는다(`pre-pr-tribunal`
-   스킬 8번). 리뷰 강도를 낮추는 것으로 이 비용을 대신 줄이지 않는다 — `single`도 리뷰어 집합은
-   같고, `off`는 심사를 생략하는 것이다.
+   스킬 8번). PR이 아직 없으면 고친 커밋이 PASS를 stale로 만들어 PR 생성에 새 PASS가 필요하다.
+   그래서 PASS HEAD에서 PR을 먼저 만들고, 수정은 열린 PR에 push한다. 리뷰 강도를 낮추는 것으로
+   이 비용을 대신 줄이지 않는다 — `single`도 리뷰어 집합은 같고, `off`는 심사를 생략하는 것이다.
 
 7. **같은 브랜치에서 FAIL이 이어지면 재심사를 제안하기 전에 범위부터 다시 본다.** FAIL 뒤의
    재심사도 다음 라운드든 새 lifecycle이든 `base..HEAD` 전체를 다시 심사한다(1번). blocker를 하나
