@@ -68,7 +68,6 @@ _HOME_PATH = re.compile(r"/(?:home|Users)/[^/\s?#'\"<>]+")
 _HTTP_URL_START = re.compile(r"https?://", re.IGNORECASE)
 _SHELL_CONTROL = frozenset(";|&()<>`")
 _EXCERPT_CONTROLS = frozenset(("\n", "\t"))
-_TERMINAL_ESCAPE = re.compile(r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 _MAX_SHELL_NESTING = 64
 
 
@@ -1551,21 +1550,16 @@ def citable_tail_excerpt(text: str, limit: int) -> str:
     A slice that started mid-line could carry the body of a home path or token without the prefix the excerpt
     checks look for, so the slice always starts after a newline and drops leading lines until the checks accept
     it. A key spans lines: its BEGIN marker can lie before the slice and no END line need follow, so a text that
-    names a private key anywhere gives no tail at all, even when terminal colour codes split the marker.
+    names a private key anywhere gives no tail at all. A control or format character, such as an escape sequence,
+    a backspace or a zero-width space, can split that name without showing it, so a text that holds one gives no
+    tail either.
     """
-    visible = _TERMINAL_ESCAPE.sub("", text)
-    visible = "".join(
-        character
-        for character in visible
-        if character in _EXCERPT_CONTROLS or unicodedata.category(character) not in {"Cc", "Cs"}
-    )
-    if "PRIVATE KEY" in visible:
+    if "PRIVATE KEY" in text or any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs"} and character not in _EXCERPT_CONTROLS
+        for character in text
+    ):
         return ""
     offset = max(len(text) - limit, 0)
-    for index in range(len(text) - 1, offset - 1, -1):
-        if unicodedata.category(text[index]) in {"Cc", "Cs"} and text[index] not in _EXCERPT_CONTROLS:
-            offset = index + 1
-            break
     while offset < len(text):
         if offset == 0 or text[offset - 1] == "\n":
             try:
