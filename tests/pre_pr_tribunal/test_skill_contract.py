@@ -151,6 +151,31 @@ def test_pass_places_pr_appendix_inside_impact_and_risks_field():
     assert "if that fails, do not create a PR" in step
 
 
+def test_pass_recommends_pushing_and_bounds_re_review_of_advisory_fixes():
+    step = numbered_steps(text("SKILL.md"))[8]
+    assert "recommend pushing with any `pr_appendix` findings left as advisories in the PR body" in step
+    assert "only as one fix of every collected advisory and PR review finding" in step
+    assert "how many PASS lifecycles this branch has already run and their review time" in step
+    assert "Once the branch has passed twice, never mark a re-review of such a fix as the recommended option" in step
+    assert "If you cannot establish that count, show it as unknown and treat the branch as having passed twice" in step
+    assert "If no PR exists yet, a fix commit makes this PASS stale" in step
+    assert "prefer creating the PR at the PASS HEAD first, then pushing the fix to the open PR" in step
+    assert step.index("validate the edited body again before PR creation") < step.index(
+        "recommend pushing with any `pr_appendix` findings"
+    ) < step.index("If it is FAIL")
+
+
+def test_global_guidance_bounds_the_post_pass_re_review_the_same_way():
+    guidance = (REPOSITORY_ROOT / "claude-md" / "global-guidance.md").read_text(encoding="utf-8")
+    rule = guidance[guidance.index("6. **PASS 뒤의 비차단 지적은 모아서 한 번에 고친다.**"):]
+    rule = rule[:rule.index("\n7. ")]
+    assert "한 번에 고친 뒤 lifecycle 한 번으로\n   재심사한다" not in rule
+    assert "같은 branch가 이미 두 번 PASS했거나 그 횟수를 확인할 수 없으면" in rule
+    assert "권장 선택지로 두지 않고 누적 PASS 횟수와 리뷰 시간을 보이며 사용자에게 묻는다" in rule
+    assert "PR이 아직 없으면 고친 커밋이 PASS를 stale로 만들어 PR 생성에 새 PASS가 필요하다" in rule
+    assert "PASS HEAD에서 PR을 먼저 만들고, 수정은 열린 PR에 push한다" in rule
+
+
 def test_skill_limits_terminal_user_override_to_exact_one_shot_contract():
     skill = text("SKILL.md")
     assert "ROUND_LIMIT_EXHAUSTED" in skill
