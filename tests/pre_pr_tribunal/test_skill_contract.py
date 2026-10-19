@@ -532,6 +532,16 @@ def test_skill_bounds_the_capture_environment_and_keeps_tracked_capture_stores()
     ) in reviewer_b
 
 
+def test_reviewer_b_quotes_the_end_of_a_long_output_without_hiding_its_exit_status():
+    """B can cite a long output's end through the helper, and a bare tail cannot turn a failure into success."""
+    reviewer_b = " ".join(text("references/reviewer-b.md").split())
+    assert (
+        "They show only the start of a long output; to quote its end, such as a test summary, put the end into the "
+        "command: `set -o pipefail; <command> 2>&1 | tail -n <N>` records only those last lines, so you can cite them "
+        "whole, and `set -o pipefail` keeps the command's own exit status, which a bare `| tail` replaces with `tail`'s."
+    ) in reviewer_b
+
+
 def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate():
     skill = text("SKILL.md")
     for stage in (

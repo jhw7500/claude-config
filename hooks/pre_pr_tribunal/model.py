@@ -1530,7 +1530,7 @@ def report_command(command: str) -> str:
 
 
 def citable_excerpt(text: str, limit: int) -> str:
-    """Return the longest leading slice of `text`, at most `limit` characters, a report excerpt accepts."""
+    """Return a leading slice of `text`, at most `limit` characters, a report excerpt accepts (not always the longest)."""
     candidate = text[:limit]
     for index, character in enumerate(candidate):
         if unicodedata.category(character) in {"Cc", "Cs"} and character not in _EXCERPT_CONTROLS:

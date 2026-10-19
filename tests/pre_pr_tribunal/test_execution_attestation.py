@@ -310,7 +310,7 @@ def test_a_report_that_hides_omitted_output_does_not_attest(git_repo, tmp_path):
     assert_unattested(git_repo, submitted, "truncated")
 
 
-def test_a_printed_excerpt_is_the_longest_slice_a_report_accepts(git_repo, tmp_path):
+def test_a_printed_excerpt_is_a_leading_slice_a_report_accepts(git_repo, tmp_path):
     pending = claude_round(git_repo)
     store = capture_store(tmp_path)
     captured = capture(git_repo, store, r"printf 'ok\r\nmore'")
@@ -319,6 +319,17 @@ def test_a_printed_excerpt_is_the_longest_slice_a_report_accepts(git_repo, tmp_p
     submitted = submit(git_repo, b_report(pending.snapshot, execution_from(captured)).encode(), store)
 
     assert submitted.returncode == 0, submitted.stderr
+
+
+def test_pipefail_keeps_the_exit_status_when_the_command_records_only_its_end(git_repo, tmp_path):
+    store = capture_store(tmp_path)
+    program = "python3 -c $'print(\".\" * 3000)\\nprint(\"1 failed\")\\nraise SystemExit(1)' 2>&1 | tail -n 1"
+
+    bare = capture(git_repo, store, program)
+    kept = capture(git_repo, store, f"set -o pipefail; {program}")
+
+    assert (bare["exit_code"], bare["stdout_excerpt"]) == (0, "1 failed\n")
+    assert (kept["exit_code"], kept["stdout_excerpt"], kept["truncated"]) == (1, "1 failed\n", False)
 
 
 def test_a_large_honest_capture_still_attests(git_repo, tmp_path):
