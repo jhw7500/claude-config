@@ -1028,6 +1028,23 @@ def _contains_home_path(text: str) -> bool:
     return False
 
 
+def _detection_forms(text: str) -> tuple[str, str]:
+    """Return `text` and the form the secret and home-path checks must also see.
+
+    A format character such as a zero-width space, or a compatibility form such as a no-break space, can split a
+    marker without changing what a reader sees, so the second form drops format characters and applies NFKC.
+    """
+    visible = unicodedata.normalize(
+        "NFKC", "".join(character for character in text if unicodedata.category(character) != "Cf")
+    )
+    return text, visible
+
+
+def _has_secret_or_home_path(text: str) -> bool:
+    """Return whether `text` holds a detected secret or an absolute home path in either detection form."""
+    return any(_SECRET.search(form) or _contains_home_path(form) for form in _detection_forms(text))
+
+
 def _execution_excerpt(value: object) -> str:
     if not isinstance(value, str):
         raise SchemaError("TEXT_INVALID")
@@ -1043,14 +1060,14 @@ def _execution_excerpt(value: object) -> str:
         for character in value
     ):
         raise SchemaError("TEXT_INVALID")
-    if _SECRET.search(value) or _contains_home_path(value):
+    if _has_secret_or_home_path(value):
         raise SchemaError("EVIDENCE_SECRET_DETECTED")
     return value
 
 
 def _command(value: object) -> str:
     text = _text(value, MAX_COMMAND_TEXT_BYTES)
-    if _SECRET.search(text) or _contains_home_path(text):
+    if _has_secret_or_home_path(text):
         raise SchemaError("EVIDENCE_SECRET_DETECTED")
     return text
 
@@ -1553,9 +1570,10 @@ def citable_tail_excerpt(text: str, limit: int) -> str:
     names a private key anywhere gives no tail at all. A control or format character, such as an escape sequence,
     a backspace or a zero-width space, can split that name without showing it, so a text that holds one gives no
     tail either. A detected secret can have an undetected pair on a later line, such as an access key id followed
-    by its secret key, so a text with any detected secret gives no tail.
+    by its secret key, so a text with any detected secret gives no tail. Both checks see the detection forms, so a
+    compatibility character such as a no-break space cannot split the name either.
     """
-    if "PRIVATE KEY" in text or _SECRET.search(text) or any(
+    if any("PRIVATE KEY" in form or _SECRET.search(form) for form in _detection_forms(text)) or any(
         unicodedata.category(character) in {"Cc", "Cf", "Cs"} and character not in _EXCERPT_CONTROLS
         for character in text
     ):

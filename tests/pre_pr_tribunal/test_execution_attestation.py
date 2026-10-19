@@ -364,13 +364,22 @@ def test_a_tail_is_empty_when_it_adds_nothing_or_the_stream_is_not_recorded_whol
         "",
     ),
     ("> Authorization: Bearer " + "t0k3n" * 4 + "\n> Cookie: session=" + "c00k1e" * 4 + "\n", 2000, ""),
+    ("match:\n-----BEGIN OPENSSH PRIVATE KEY-----\n" + "QUJDREVGR0hJSktMTU5P\n" * 6, 2000, ""),
 ), ids=(
     "mid-line-home-path", "private-key", "carriage-return", "mid-token", "key-without-end", "coloured-key-marker",
     "reset-escape-key-marker", "overstruck-key-marker", "zero-width-key-marker", "secret-key-after-key-id",
-    "cookie-after-bearer",
+    "cookie-after-bearer", "no-break-space-key-marker",
 ))
 def test_a_tail_excerpt_starts_at_a_line_so_no_secret_check_loses_its_prefix(text, limit, expected):
     assert tribunal_cli.citable_tail_excerpt(text, limit) == expected
+
+
+@pytest.mark.parametrize("marker", (
+    "PRIVATE​ KEY", "PRIV‍ATE KEY", "PRI­VATE KEY", "PRIVATE KEY",
+), ids=("zero-width-space", "zero-width-joiner", "soft-hyphen", "no-break-space"))
+def test_a_leading_excerpt_stops_before_a_split_key_marker(marker):
+    text = f"-----BEGIN OPENSSH {marker}-----\n" + "QUJDREVGR0hJSktMTU5P\n" * 3
+    assert "QUJD" not in tribunal_cli.citable_excerpt(text, 2000)
 
 
 def test_a_large_honest_capture_still_attests(git_repo, tmp_path):
