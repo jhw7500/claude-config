@@ -19,6 +19,8 @@ SHARED_RULES = (
     "`<PR>`의 생성 명령(`--repo`·변수 인자 포함)은 실행하지 않는다.",
     "PR 본문은 `<PR>`의 작성·검증 단계를 통과한 파일을 그대로 넘긴다.",
     "일반 git 명령을 추가로 차단하거나 Tribunal 재심사를 호출하지 않는다.",
+    "커밋 제목의 결과문과 필드 내용은 한국어로 쓰고,",
+    "작성 스킬을 거치지 않은 커밋에도 적용한다.",
 )
 
 
@@ -170,3 +172,13 @@ def test_install_rejects_bad_managed_blocks_without_writing_agents(home, run_ins
     assert message in result.stderr
     assert agents.read_bytes() == seed.encode("utf-8")
     assert not (codex / "hooks.json").exists()
+
+
+def test_change_evidence_block_upgrades_previous_text(installer):
+    current = installer.change_evidence_policy_block()
+    previous = "".join(line for line in current.splitlines(keepends=True) if "한국어로 쓰고" not in line)
+    assert previous != current
+    old = installer.merge_change_evidence_block("keep-before\n", previous)
+    upgraded = installer.merge_change_evidence_block(old, current)
+    assert upgraded == installer.merge_change_evidence_block("keep-before\n", current)
+    assert upgraded.count(installer.CHANGE_EVIDENCE_START) == 1
