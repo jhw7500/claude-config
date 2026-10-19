@@ -2,10 +2,10 @@ import json
 
 from pre_pr_tribunal import telemetry
 from pre_pr_tribunal.model import Reviewer
-from pre_pr_tribunal.verdict_store import submit_reviewer_report, finalize_round
+from pre_pr_tribunal.verdict_store import finalize_round
 from tests.pre_pr_tribunal.test_evidence_lifecycle import bundle, begin, reused, raw_report
 from tests.pre_pr_tribunal.test_evidence_runtime import node_repo
-from tests.pre_pr_tribunal.test_model_store import finding
+from tests.pre_pr_tribunal.test_model_store import finding, submit_reviewer_report
 
 
 def observed_run(repo, verdict):

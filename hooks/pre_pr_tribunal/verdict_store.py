@@ -985,11 +985,8 @@ def _record_failure_locked(
 def _bound_captures(
     pending: Verdict, reviewer: Reviewer, captures: tuple[m.CaptureRecord, ...] | None,
 ) -> tuple[m.CaptureRecord, ...] | None:
-    """Return a Claude-round Reviewer B's captures of the bound HEAD, or None where unchecked.
-
-    Codex reviewers do not run the capture helper yet.
-    """
-    checked = reviewer is Reviewer.B and pending.producer_runtime == "claude"
+    """Return Reviewer B's captures of the bound HEAD, or None for a role that is unchecked."""
+    checked = reviewer is Reviewer.B
     if captures is None:
         if checked:
             raise SchemaError("SUBMISSION_CAPTURES_REQUIRED")

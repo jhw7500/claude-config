@@ -194,7 +194,7 @@ def _parser() -> argparse.ArgumentParser:
     # command at parse time, before stdin is read and the report is stored.
     submit.add_argument("--run-id")
     submit.add_argument("--attempt")
-    # Reviewer B in a Claude round names the store its capture-run helper wrote.
+    # Reviewer B names the store its capture-run helper wrote.
     submit.add_argument("--captures", type=Path)
     capture = commands.add_parser("capture-run", add_help=False)
     capture.add_argument("--store", required=True, type=Path)

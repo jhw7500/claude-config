@@ -22,6 +22,7 @@ from pre_pr_tribunal.telemetry import (
     summarize_run,
 )
 from pre_pr_tribunal import telemetry as telemetry_module
+from tests.pre_pr_tribunal.test_model_store import capture_arguments
 
 
 def NOW():
@@ -48,7 +49,7 @@ def complete_report(reviewer, snapshot, *, findings=()):
         value.update({
             "executions": [{
                 "id": "B-R1-E999",
-                "command": "python3 -c print-ok",
+                "command": "printf '1 passed'",
                 "exit_code": 0,
                 "stdout_excerpt": stdout,
                 "stderr_excerpt": "",
@@ -329,7 +330,8 @@ def test_cli_early_detection_includes_rejected_v2_submission(
         raw = json.dumps(report)
     store = call(("telemetry-start", "--run-id", run_id, "--stage", "report_store",
                   "--reviewer", reviewer, "--attempt", "1"), 9)["span_id"]
-    rejected = run_cli(git_repo, "submit-report", "--reviewer", reviewer, input=raw)
+    rejected = run_cli(git_repo, "submit-report", "--reviewer", reviewer,
+                       *capture_arguments(git_repo, reviewer, raw), input=raw)
     assert (rejected.returncode, rejected.stdout, rejected.stderr) == (
         1, "", f"PRE_PR_TRIBUNAL:{reason}\n",
     )
@@ -460,7 +462,8 @@ def test_telemetry_cannot_alter_tribunal_result(git_repo, tmp_path, monkeypatch,
             if invalid_report and reviewer == "A":
                 raw = "{"
             submitted = command(
-                repo, ("submit-report", "--reviewer", reviewer), raw.encode()
+                repo, ("submit-report", "--reviewer", reviewer, *capture_arguments(repo, reviewer, raw)),
+                raw.encode(),
             )
             if submitted[0] != 0:
                 validation_results.append(

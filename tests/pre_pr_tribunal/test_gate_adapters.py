@@ -20,7 +20,8 @@ from pre_pr_tribunal import (
 )
 from pre_pr_tribunal.gate import GateCode, evaluate_gate
 from pre_pr_tribunal.model import VERDICT_SCHEMA_VERSION, Reviewer, SchemaError
-from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict, submit_reviewer_report
+from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict
+from tests.pre_pr_tribunal.test_model_store import submit_reviewer_report
 
 
 PACKAGE = Path(__file__).resolve().parents[2] / "hooks" / "pre_pr_tribunal"
@@ -52,7 +53,7 @@ def _execution(identifier: str) -> dict[str, object]:
     stdout = "1 passed"
     return {
         "id": identifier,
-        "command": "python3 -m pytest -q",
+        "command": "printf '1 passed'",
         "exit_code": 0,
         "stdout_excerpt": stdout,
         "stderr_excerpt": "",
@@ -130,7 +131,7 @@ def _reports(
             value.update({
                 "executions": [{
                     "id": f"B-R{round_number}-E999",
-                    "command": "python3 -c print-ok",
+                    "command": "printf '1 passed'",
                     "exit_code": 0,
                     "stdout_excerpt": stdout,
                     "stderr_excerpt": "",

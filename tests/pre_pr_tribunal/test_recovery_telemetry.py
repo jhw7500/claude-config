@@ -12,6 +12,7 @@ import pytest
 from pre_pr_tribunal import cli, telemetry
 from pre_pr_tribunal.git_state import capture_snapshot
 from pre_pr_tribunal.model import Reviewer, SchemaError
+from tests.pre_pr_tribunal.test_model_store import capture_arguments
 
 
 CLI = Path(__file__).resolve().parents[2] / "hooks/pre_pr_tribunal/cli.py"
@@ -20,6 +21,8 @@ LIFECYCLE = "1" * 32
 
 
 def invoke(repo, *args, raw=None):
+    if args[:3] == ("submit-report", "--reviewer", "B"):
+        args = (*args, *capture_arguments(repo, "B", raw))
     return subprocess.run([sys.executable, str(CLI), *args], cwd=repo,
                           input=raw, capture_output=True, check=False)
 
@@ -54,7 +57,7 @@ def report(begun, reviewer):
         value.update({
             "executions": [{
                 "id": "B-R1-E999",
-                "command": "python3 -c print-ok",
+                "command": "printf '1 passed'",
                 "exit_code": 0,
                 "stdout_excerpt": stdout,
                 "stderr_excerpt": "",

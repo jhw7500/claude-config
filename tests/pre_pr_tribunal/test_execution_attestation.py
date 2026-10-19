@@ -1,4 +1,4 @@
-"""In a Claude round, each fresh Reviewer B execution must match a capture the installed helper recorded."""
+"""In every round, each fresh Reviewer B execution must match a capture the installed helper recorded."""
 
 import hashlib
 import json
@@ -362,8 +362,9 @@ def test_an_empty_capture_store_argument_is_unsafe(git_repo, tmp_path):
     assert submitted.stderr == b"PRE_PR_TRIBUNAL:CAPTURE_STORE_UNSAFE\n"
 
 
-def test_a_claude_reviewer_b_submission_requires_its_capture_store(git_repo, tmp_path):
-    pending = claude_round(git_repo)
+@pytest.mark.parametrize("runtime", ("claude", "codex"))
+def test_a_reviewer_b_submission_requires_its_capture_store(git_repo, tmp_path, runtime):
+    pending = begin_round(git_repo, base="master", runtime=runtime, round_number=1, now=NOW)
     item = execution_from(capture(git_repo, capture_store(tmp_path), "printf '1 passed'"))
 
     submitted = submit(git_repo, b_report(pending.snapshot, item).encode())
@@ -373,26 +374,29 @@ def test_a_claude_reviewer_b_submission_requires_its_capture_store(git_repo, tmp
     assert slot.status == "pending" and slot.attempt_count == 0
 
 
-@pytest.mark.parametrize(("runtime", "reviewer"), (("codex", "B"), ("claude", "A")))
-def test_a_capture_store_is_refused_where_no_check_uses_it(git_repo, tmp_path, runtime, reviewer):
+@pytest.mark.parametrize("runtime", ("claude", "codex"))
+def test_a_capture_store_is_refused_where_no_check_uses_it(git_repo, tmp_path, runtime):
     pending = begin_round(git_repo, base="master", runtime=runtime, round_number=1, now=NOW)
     store = capture_store(tmp_path)
-    item = execution_from(capture(git_repo, store, "printf '1 passed'"))
-    raw = b_report(pending.snapshot, item) if reviewer == "B" else json.dumps(report(pending.snapshot, "A"))
+    capture(git_repo, store, "printf '1 passed'")
+    raw = json.dumps(report(pending.snapshot, "A"))
 
-    submitted = submit(git_repo, raw.encode(), store, reviewer=reviewer)
+    submitted = submit(git_repo, raw.encode(), store, reviewer="A")
 
     assert submitted.stderr == b"PRE_PR_TRIBUNAL:SUBMISSION_CAPTURES_UNEXPECTED\n"
 
 
-def test_a_codex_round_keeps_unchecked_fresh_executions(git_repo):
-    # Codex reviewers do not run the helper yet; their fresh digests stay unauthenticated.
+def test_a_codex_round_attests_fresh_executions_like_a_claude_round(git_repo, tmp_path):
     pending = begin_round(git_repo, base="master", runtime="codex", round_number=1, now=NOW)
-    item = {**execution("B-R1-E001"), "capture_sha256": PLAUSIBLE}
+    store = capture_store(tmp_path)
+    honest = execution_from(capture(git_repo, store, "printf '1 passed'"))
+    typed = {**execution("B-R1-E001"), "capture_sha256": PLAUSIBLE}
 
-    submitted = submit(git_repo, b_report(pending.snapshot, item).encode())
+    assert_unattested(git_repo, submit(git_repo, b_report(pending.snapshot, typed).encode(), store), "capture_sha256")
+    submitted = submit(git_repo, b_report(pending.snapshot, honest).encode(), store)
 
     assert submitted.returncode == 0, submitted.stderr
+    assert read_verdict(git_repo).reviewers["B"].status == "sealed"
 
 
 def test_a_bundle_execution_is_authenticated_by_its_bundle_not_a_capture(git_repo):
