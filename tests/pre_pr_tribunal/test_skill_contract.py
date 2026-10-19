@@ -151,6 +151,17 @@ def test_pass_places_pr_appendix_inside_impact_and_risks_field():
     assert "if that fails, do not create a PR" in step
 
 
+def test_pass_recommends_pushing_and_bounds_re_review_of_advisory_fixes():
+    step = numbered_steps(text("SKILL.md"))[8]
+    assert "recommend pushing with any `pr_appendix` findings left as advisories in the PR body" in step
+    assert "only as one fix of every collected advisory and PR review finding" in step
+    assert "how many PASS lifecycles this branch has already run and their review time" in step
+    assert "Once the branch has passed twice, never mark a re-review of such a fix as the recommended option" in step
+    assert step.index("validate the edited body again before PR creation") < step.index(
+        "recommend pushing with any `pr_appendix` findings"
+    ) < step.index("If it is FAIL")
+
+
 def test_skill_limits_terminal_user_override_to_exact_one_shot_contract():
     skill = text("SKILL.md")
     assert "ROUND_LIMIT_EXHAUSTED" in skill
