@@ -1600,6 +1600,50 @@ def test_assignment_and_punctuation_embedded_home_paths_are_rejected(
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("stdout_excerpt", "-----BEGIN OPENSSH PRIVATE​ KEY-----\nQUJDREVG\n"),
+        ("stdout_excerpt", "-----BEGIN OPENSSH PRIV‍ATE KEY-----\nQUJDREVG\n"),
+        ("stderr_excerpt", "-----BEGIN OPENSSH PRI­VATE KEY-----\nQUJDREVG\n"),
+        ("stdout_excerpt", "-----BEGIN OPENSSH PRIVATE KEY-----\nQUJDREVG\n"),
+        ("stdout_excerpt", "cwd=/ho​me/alice/private"),
+        ("command", "cat /ho​me/alice/private"),
+    ],
+    ids=(
+        "zero-width-space", "zero-width-joiner", "soft-hyphen", "no-break-space",
+        "split-home-excerpt", "split-home-command",
+    ),
+)
+def test_invisible_characters_cannot_split_a_secret_or_home_path_marker(snapshot, field, value):
+    item = execution()
+    item[field] = value
+    with pytest.raises(SchemaError, match="EVIDENCE_SECRET_DETECTED"):
+        parse_reviewer_report(
+            json.dumps(report(snapshot, "A", executions=[item])).encode(),
+            expected_reviewer=Reviewer.A,
+            expected_round=1,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["﻿collected 3 items\n", "joiner a‍b stays\n", "no break space\n"],
+    ids=("byte-order-mark", "zero-width-joiner", "no-break-space"),
+)
+def test_format_and_compatibility_characters_without_a_marker_stay_accepted(snapshot, value):
+    item = execution()
+    item["stdout_excerpt"] = value
+    parsed = parse_reviewer_report(
+        json.dumps(report(snapshot, "A", executions=[item])).encode(),
+        expected_reviewer=Reviewer.A,
+        expected_round=1,
+        snapshot=snapshot,
+    )
+    assert parsed.executions[0].stdout_excerpt == value
+
+
+@pytest.mark.parametrize(
     "value",
     [
         "https://example.com/home/alice/private",

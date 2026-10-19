@@ -63,7 +63,7 @@ def _safe_text(value, maximum=4096):
 
 
 def _sensitive(value):
-    if model._SECRET.search(value) or model._contains_home_path(value):
+    if model._has_secret_or_home_path(value):
         raise SchemaError('EVIDENCE_SECRET_DETECTED')
 
 

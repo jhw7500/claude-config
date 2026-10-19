@@ -14,7 +14,7 @@ from types import MappingProxyType
 from .git_state import DIFF_RECIPE_VERSION
 from .model import (
     REPORT_TEXT_CONTRACT_VERSION, Reviewer, SchemaError, Snapshot, TribunalError,
-    _contains_home_path, _head_ref, _load_json, _SECRET, _text,
+    _has_secret_or_home_path, _head_ref, _load_json, _text,
 )
 from .review_store import (
     atomic_replace_bytes, locked_review, read_named_file, repository_root,
@@ -214,7 +214,7 @@ def _timestamp(value: object) -> str:
 def _safe_text(value: object, maximum: int) -> str:
     try:
         text = _text(value, maximum)
-        _require(not _SECRET.search(text) and not _contains_home_path(text))
+        _require(not _has_secret_or_home_path(text))
         return text
     except SchemaError:
         raise SchemaError(_INVALID) from None
