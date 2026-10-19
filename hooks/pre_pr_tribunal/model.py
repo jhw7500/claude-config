@@ -1544,6 +1544,33 @@ def citable_excerpt(text: str, limit: int) -> str:
     return ""
 
 
+def citable_tail_excerpt(text: str, limit: int) -> str:
+    """Return the end of `text` from a line start, at most `limit` characters, that a report excerpt accepts.
+
+    A slice that started mid-line could carry the body of a home path, token or key without the prefix the
+    excerpt checks look for, so the slice always starts after a newline, drops leading lines until the checks
+    accept it, and is refused while it names a private key, whose marker line may lie before the slice.
+    """
+    offset = max(len(text) - limit, 0)
+    for index in range(len(text) - 1, offset - 1, -1):
+        if unicodedata.category(text[index]) in {"Cc", "Cs"} and text[index] not in _EXCERPT_CONTROLS:
+            offset = index + 1
+            break
+    while offset < len(text):
+        if offset == 0 or text[offset - 1] == "\n":
+            candidate = text[offset:]
+            if "PRIVATE KEY" not in candidate:
+                try:
+                    return _execution_excerpt(candidate)
+                except SchemaError:
+                    pass
+        newline = text.find("\n", offset)
+        if newline < 0:
+            return ""
+        offset = newline + 1
+    return ""
+
+
 def _unattested_field(item: Execution, captures: tuple[CaptureRecord, ...]) -> str | None:
     """Return the first execution field no recorded capture supports, or None."""
     matching = [record for record in captures if record.capture_sha256 == item.capture_sha256]
