@@ -321,17 +321,21 @@ def test_a_printed_excerpt_is_a_leading_slice_a_report_accepts(git_repo, tmp_pat
     assert submitted.returncode == 0, submitted.stderr
 
 
-def test_pipefail_keeps_the_exit_status_when_the_command_records_only_its_end(git_repo, tmp_path):
+def test_the_tail_idiom_keeps_the_end_and_the_command_status(git_repo, tmp_path):
     store = capture_store(tmp_path)
     setup = "python3 -c $'print(\".\" * 3000)'"
     check = "python3 -c $'print(\"1 failed\")\\nraise SystemExit(1)'"
+    keep = '; exit "${PIPESTATUS[0]}"'
 
-    bare = capture(git_repo, store, f"{{ {setup} && {check}; }} 2>&1 | tail -n 1")
-    ungrouped = capture(git_repo, store, f"set -o pipefail; {setup} && {check} 2>&1 | tail -n 1")
-    kept = capture(git_repo, store, f"set -o pipefail; {{ {setup} && {check}; }} 2>&1 | tail -n 1")
+    lost = capture(git_repo, store, f"{{ {setup} && {check}; }} 2>&1 | tail -n 1")
+    ungrouped = capture(git_repo, store, f"{setup} && {check} 2>&1 | tail -n 1{keep}")
+    inner = capture(git_repo, store, f"{{ false | true; }} 2>&1 | tail -n 1{keep}")
+    pipefail = capture(git_repo, store, "set -o pipefail; { false | true; } 2>&1 | tail -n 1")
+    kept = capture(git_repo, store, f"{{ {setup} && {check}; }} 2>&1 | tail -n 1{keep}")
 
-    assert (bare["exit_code"], bare["stdout_excerpt"]) == (0, "1 failed\n")
+    assert (lost["exit_code"], lost["stdout_excerpt"]) == (0, "1 failed\n")
     assert ungrouped["truncated"] is True and "1 failed" not in ungrouped["stdout_excerpt"]
+    assert (inner["exit_code"], pipefail["exit_code"]) == (0, 1)
     assert (kept["exit_code"], kept["stdout_excerpt"], kept["truncated"]) == (1, "1 failed\n", False)
 
 
