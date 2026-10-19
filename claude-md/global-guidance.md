@@ -41,6 +41,7 @@
 
 - [Change Evidence Contract v1 정본](https://github.com/jhw7500/automation/blob/0d97a63891ba4473a3a189eae643f8059b76eb56/docs/change-evidence-contract-v1.md)을 참조하고, Claude에서는 `/jhw:commit`(직접/PR용 커밋) 또는 `/jhw:pr`(PR 본문 작성·검증)를 참조한다. 이미 해당 작성 스킬을 적용했다면 중복 호출하지 않는다.
 - 커밋 메시지 또는 PR 본문에 변경 이유·실제 검증·확인된 참조가 빠졌다면 실행 전에 누락을 알리고 정본 스킬로 보완한다. 검증하지 않은 결과나 Issue/PR 관계를 만들지 않는다. 스킬이 설치되지 않았다면 배포 누락을 알리고 계약을 충족한 척하지 않는다.
+- origin이 `github.com/jhw7500/*`인 저장소의 커밋은 제목의 결과문과 필드 내용을 한국어로 쓰고, `type(scope)`·필드 제목·트레일러·명령·경로·식별자·오류 코드와 도구가 읽는 고정 문구(`Not run:`, `Closes #N` 같은 닫기 키워드, `review-fix round N`)는 원문 그대로 둔다. 작성 스킬을 거치지 않은 커밋에도 적용하며, 그 밖의 저장소는 그 저장소의 언어 관례를 따른다.
 - 이 지침은 안내 전용이며 Issue·PR·commit을 자동 생성하지 않는다. Task 선택은 task-nudge, PR 생성 허가는 pre-PR Tribunal가 담당한다. PR은 pre-PR Tribunal의 canonical command로만 생성하고, `/jhw:pr`의 생성 명령(`--repo`·변수 인자 포함)은 실행하지 않는다. PR 본문은 `/jhw:pr`의 작성·검증 단계를 통과한 파일을 그대로 넘긴다. 일반 git 명령을 추가로 차단하거나 Tribunal 재심사를 호출하지 않는다.
 
 ---

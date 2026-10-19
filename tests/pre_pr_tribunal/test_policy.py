@@ -1956,3 +1956,12 @@ def test_revoke_without_a_grant_is_a_no_op_and_rejects_value_flags(
     assert main(["intensity-grant", "--base", "master", "--runtime", "codex",
                  "--relayed", "--reason", "no value"]) == 1
     assert capsys.readouterr().err == "PRE_PR_TRIBUNAL:GRANT_INVALID\n"
+
+
+def test_review_fix_commit_instruction_uses_change_evidence_format():
+    skill = (
+        Path(__file__).resolve().parents[2] / "skills/pre-pr-tribunal/SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "Create one `review-fix round N` commit" not in skill
+    assert "use the Change Evidence commit format with a conventional `type(scope):` title" in skill
+    assert "record `review-fix round N` and the addressed finding IDs in its `Why` field" in skill
