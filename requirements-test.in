@@ -1,4 +1,5 @@
 packaging==26.3
 pytest==9.1.1
+pytest-xdist==3.8.0
 PyYAML==6.0.3
 slack-bolt==1.30.0

@@ -68,6 +68,18 @@ def complete_report(reviewer, snapshot, *, findings=()):
     return value
 
 
+def test_git_repo_fixture_disables_detached_auto_maintenance(git_repo):
+    # The copytree tests below race .git/objects/maintenance.lock when auto maintenance runs.
+    for key, expected in (("maintenance.auto", "false"), ("gc.auto", "0")):
+        value = subprocess.run(
+            ["/usr/bin/git", "-C", str(git_repo), "config", "--get", key],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert value == expected
+
+
 @pytest.mark.parametrize("telemetry_state", ("successful", "substituted", "missing", "corrupt"))
 def test_legacy_telemetry_cannot_authorize_current_report_bytes(git_repo, telemetry_state):
     from pre_pr_tribunal.verdict_store import (

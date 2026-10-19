@@ -33,4 +33,4 @@ jobs:
       - name: Run pytest
         run: |
           unset LD_LIBRARY_PATH
-          python -m pytest -q
+          python -m pytest -q -n auto

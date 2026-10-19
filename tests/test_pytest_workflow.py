@@ -13,6 +13,7 @@ DIRECT_REQUIREMENTS_PATH = ROOT / "requirements-test.in"
 LOCK_PATH = ROOT / "requirements-test.lock"
 RUNTIME_REQUIREMENTS_PATH = ROOT / "slack-bridge" / "requirements.txt"
 SHA256_HASH_OPTION = re.compile(r"\s+--hash=sha256:([0-9a-f]{64})")
+PYTEST_COMMAND = ["python", "-m", "pytest", "-q", "-n", "auto"]
 
 
 def _load_requirements(path):
@@ -93,7 +94,7 @@ def test_pytest_workflow_installs_bubblewrap_before_running_tests():
     pytest_step_index = next(
         index
         for index, step in enumerate(steps)
-        if ["python", "-m", "pytest", "-q"] in _commands(step)
+        if PYTEST_COMMAND in _commands(step)
     )
     installers = [
         (index, step, command)
@@ -116,13 +117,13 @@ def test_pytest_workflow_unsets_setup_python_loader_override():
     test_steps = [
         step
         for step in steps
-        if ["python", "-m", "pytest", "-q"] in _commands(step)
+        if PYTEST_COMMAND in _commands(step)
     ]
 
     assert len(test_steps) == 1
     assert _commands(test_steps[0]) == [
         ["unset", "LD_LIBRARY_PATH"],
-        ["python", "-m", "pytest", "-q"],
+        PYTEST_COMMAND,
     ]
 
 
@@ -181,11 +182,11 @@ def test_pytest_workflow_is_an_unfiltered_reproducible_required_gate():
     assert len(test_steps) == 1
     test_step, test_command = test_steps[0]
     _assert_unconditional_required_gate(test_step, "pytest step")
-    assert test_command == ["python", "-m", "pytest", "-q"]
+    assert test_command == PYTEST_COMMAND
 
     direct_requirements = _load_requirements(DIRECT_REQUIREMENTS_PATH)
     runtime_requirements = _load_requirements(RUNTIME_REQUIREMENTS_PATH)
-    required_names = {"packaging", "pytest", "pyyaml", *runtime_requirements}
+    required_names = {"packaging", "pytest", "pytest-xdist", "pyyaml", *runtime_requirements}
     assert direct_requirements.keys() == required_names
     for requirement in direct_requirements.values():
         _exact_pin(requirement)
@@ -196,11 +197,13 @@ def test_pytest_workflow_is_an_unfiltered_reproducible_required_gate():
     locked_requirements = _load_hashed_lock(LOCK_PATH)
     expected_lock_names = {
         "exceptiongroup",
+        "execnet",
         "iniconfig",
         "packaging",
         "pluggy",
         "pygments",
         "pytest",
+        "pytest-xdist",
         "pyyaml",
         "slack-bolt",
         "slack-sdk",

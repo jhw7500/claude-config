@@ -50,6 +50,14 @@ def git_repo(tmp_path):
         check=True,
         env=env,
     )
+    # Tests copy this repository with shutil.copytree; git's detached auto maintenance
+    # would otherwise create and remove .git/objects/maintenance.lock during the copy.
+    for key, value in (("maintenance.auto", "false"), ("gc.auto", "0")):
+        subprocess.run(
+            ["/usr/bin/git", "-C", str(repo), "config", key, value],
+            check=True,
+            env=env,
+        )
     subprocess.run(
         ["/usr/bin/git", "-C", str(repo), "config", "user.name", "Test"],
         check=True,
