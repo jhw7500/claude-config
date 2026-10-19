@@ -532,6 +532,27 @@ def test_skill_bounds_the_capture_environment_and_keeps_tracked_capture_stores()
     ) in reviewer_b
 
 
+def test_reviewer_b_quotes_the_end_of_a_long_output_from_the_helper():
+    """B cites a long output's end from the helper's tail excerpt, not from a shell wrapper it composes."""
+    reviewer_b = " ".join(text("references/reviewer-b.md").split())
+    assert (
+        "prints `command`, `exit_code`, `timed_out`, `capture_sha256`, `stdout_excerpt`, `stderr_excerpt`, "
+        "`truncated`, `stdout_tail_excerpt` and `stderr_tail_excerpt` as one JSON line"
+    ) in reviewer_b
+    assert (
+        "They show only the start of a long output. To quote its end, such as a test summary, use "
+        "`stdout_tail_excerpt` or `stderr_tail_excerpt`: the last lines of that stream, starting at a line, which "
+        "the helper prints only when it recorded the whole stream and its end differs from the whole, and leaves "
+        "empty otherwise; for output over 1 MiB a stream is not recorded whole, so choose a quieter command, such "
+        "as a test runner's quiet mode. Put a tail value in the execution's `stdout_excerpt` or `stderr_excerpt` "
+        "and set `truncated` to true. An execution has only its seven fields, so never copy `timed_out` or a "
+        "`*_tail_excerpt` key into it; to cite both the start and the end of one output, report two executions "
+        "with different `id`s that copy the same `command`, `exit_code` and `capture_sha256`."
+    ) in reviewer_b
+    for wrapper in ("| tail -n", "mktemp -d) &&", "PIPESTATUS", "set -o pipefail"):
+        assert wrapper not in reviewer_b
+
+
 def test_skill_records_every_required_telemetry_stage_without_making_it_a_gate():
     skill = text("SKILL.md")
     for stage in (

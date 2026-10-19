@@ -310,7 +310,7 @@ def test_a_report_that_hides_omitted_output_does_not_attest(git_repo, tmp_path):
     assert_unattested(git_repo, submitted, "truncated")
 
 
-def test_a_printed_excerpt_is_the_longest_slice_a_report_accepts(git_repo, tmp_path):
+def test_a_printed_excerpt_is_a_leading_slice_a_report_accepts(git_repo, tmp_path):
     pending = claude_round(git_repo)
     store = capture_store(tmp_path)
     captured = capture(git_repo, store, r"printf 'ok\r\nmore'")
@@ -319,6 +319,58 @@ def test_a_printed_excerpt_is_the_longest_slice_a_report_accepts(git_repo, tmp_p
     submitted = submit(git_repo, b_report(pending.snapshot, execution_from(captured)).encode(), store)
 
     assert submitted.returncode == 0, submitted.stderr
+
+
+def test_the_helper_prints_the_end_of_a_whole_stream_and_the_end_attests(git_repo, tmp_path):
+    pending = claude_round(git_repo)
+    store = capture_store(tmp_path)
+    captured = capture(git_repo, store, "python3 -c $'print(\".\" * 3000)\\nprint(\"1 failed\")\\nraise SystemExit(1)'")
+    assert (captured["stdout_excerpt"], captured["stdout_tail_excerpt"]) == ("." * 2000, "1 failed\n")
+    item = {**execution_from(captured), "stdout_excerpt": captured["stdout_tail_excerpt"], "truncated": True}
+
+    submitted = submit(git_repo, b_report(pending.snapshot, item).encode(), store)
+
+    assert submitted.returncode == 0, submitted.stderr
+    assert read_verdict(git_repo).reviewers["B"].status == "sealed"
+
+
+def test_a_tail_is_empty_when_it_adds_nothing_or_the_stream_is_not_recorded_whole(git_repo, tmp_path):
+    store = capture_store(tmp_path)
+
+    short = capture(git_repo, store, "printf 'ok\\n'")
+    large = capture(git_repo, store, "python3 -c $'print(\"x\" * 1100000)\\nprint(\"end\")'")
+
+    assert (short["stdout_tail_excerpt"], short["stderr_tail_excerpt"]) == ("", "")
+    assert (large["truncated"], large["stdout_tail_excerpt"]) == (True, "")
+
+
+@pytest.mark.parametrize(("text", "limit", "expected"), (
+    ("x" * 30 + "\n/home/user/notes\nend\n", 20, "end\n"),
+    ("ok\n-----BEGIN PRIVATE KEY-----\n" + "QUJD\n" * 5 + "-----END PRIVATE KEY-----\n", 60, ""),
+    ("progress\r50%\rdone\nsummary\n", 100, ""),
+    ("fine\nghp_" + "A" * 36 + "\n", 30, ""),
+    ("match:\n-----BEGIN OPENSSH PRIVATE KEY-----\n" + "QUJDREVGR0hJSktMTU5P\n" * 6, 2000, ""),
+    (
+        "match:\n-----BEGIN OPENSSH PRIVATE \x1b[01;31m\x1b[KKEY\x1b[m\x1b[K-----\n" + "QUJDREVGR0hJSktMTU5P\n" * 6,
+        2000,
+        "",
+    ),
+    ("match:\n-----BEGIN OPENSSH \x1b[31mPRIVATE\x1b(B\x1b[m KEY-----\n" + "QUJDREVGR0hJSktMTU5P\n" * 6, 2000, ""),
+    ("match:\n-----BEGIN OPENSSH " + "".join(c + "\b" + c for c in "PRIVATE KEY") + "-----\n" + "QUJD\n" * 6, 2000, ""),
+    ("match:\n-----BEGIN OPENSSH PRIVATE​ KEY-----\n" + "QUJDREVGR0hJSktMTU5P\n" * 6, 2000, ""),
+    (
+        "[default]\naws_access_key_id = AKI" + "A" + "B" * 16 + "\naws_secret_access_key = " + "s3cr3t" * 7 + "\n",
+        2000,
+        "",
+    ),
+    ("> Authorization: Bearer " + "t0k3n" * 4 + "\n> Cookie: session=" + "c00k1e" * 4 + "\n", 2000, ""),
+), ids=(
+    "mid-line-home-path", "private-key", "carriage-return", "mid-token", "key-without-end", "coloured-key-marker",
+    "reset-escape-key-marker", "overstruck-key-marker", "zero-width-key-marker", "secret-key-after-key-id",
+    "cookie-after-bearer",
+))
+def test_a_tail_excerpt_starts_at_a_line_so_no_secret_check_loses_its_prefix(text, limit, expected):
+    assert tribunal_cli.citable_tail_excerpt(text, limit) == expected
 
 
 def test_a_large_honest_capture_still_attests(git_repo, tmp_path):

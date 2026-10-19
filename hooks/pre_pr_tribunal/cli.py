@@ -28,6 +28,7 @@ if __package__ in {None, ""}:
         Reviewer,
         CaptureRecord,
         citable_excerpt,
+        citable_tail_excerpt,
         report_command,
         TribunalError,
         validate_report_bytes,
@@ -68,6 +69,7 @@ else:
         Reviewer,
         CaptureRecord,
         citable_excerpt,
+        citable_tail_excerpt,
         report_command,
         TribunalError,
         validate_report_bytes,
@@ -831,6 +833,12 @@ def _capture_run(store: Path, cwd: Path, command: str, *, timeout: int) -> dict[
         os.close(descriptor)
     stdout_excerpt = citable_excerpt(stdout_text, _CAPTURE_EXCERPT_CHARACTERS)
     stderr_excerpt = citable_excerpt(stderr_text, _CAPTURE_EXCERPT_CHARACTERS)
+
+    def tail(text: str, whole: bool) -> str:
+        # Only a stream recorded whole holds its end; an end that is the whole stream adds nothing.
+        excerpt = citable_tail_excerpt(text, _CAPTURE_EXCERPT_CHARACTERS) if whole and not limited else ""
+        return "" if excerpt == text else excerpt
+
     return {
         "command": command,
         "exit_code": exit_code,
@@ -839,6 +847,8 @@ def _capture_run(store: Path, cwd: Path, command: str, *, timeout: int) -> dict[
         "stdout_excerpt": stdout_excerpt,
         "stderr_excerpt": stderr_excerpt,
         "truncated": not complete or stdout_excerpt != stdout_text or stderr_excerpt != stderr_text,
+        "stdout_tail_excerpt": tail(stdout_text, stdout_bytes == len(stdout)),
+        "stderr_tail_excerpt": tail(stderr_text, stderr_bytes == len(stderr)),
     }
 
 

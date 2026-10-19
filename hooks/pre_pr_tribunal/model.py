@@ -1530,7 +1530,7 @@ def report_command(command: str) -> str:
 
 
 def citable_excerpt(text: str, limit: int) -> str:
-    """Return the longest leading slice of `text`, at most `limit` characters, a report excerpt accepts."""
+    """Return a leading slice of `text`, at most `limit` characters, a report excerpt accepts (not always the longest)."""
     candidate = text[:limit]
     for index, character in enumerate(candidate):
         if unicodedata.category(character) in {"Cc", "Cs"} and character not in _EXCERPT_CONTROLS:
@@ -1541,6 +1541,36 @@ def citable_excerpt(text: str, limit: int) -> str:
             return _execution_excerpt(candidate)
         except SchemaError:
             candidate = candidate[: len(candidate) // 2]
+    return ""
+
+
+def citable_tail_excerpt(text: str, limit: int) -> str:
+    """Return the end of `text` from a line start, at most `limit` characters, that a report excerpt accepts.
+
+    A slice that started mid-line could carry the body of a home path or token without the prefix the excerpt
+    checks look for, so the slice always starts after a newline and drops leading lines until the checks accept
+    it. A key spans lines: its BEGIN marker can lie before the slice and no END line need follow, so a text that
+    names a private key anywhere gives no tail at all. A control or format character, such as an escape sequence,
+    a backspace or a zero-width space, can split that name without showing it, so a text that holds one gives no
+    tail either. A detected secret can have an undetected pair on a later line, such as an access key id followed
+    by its secret key, so a text with any detected secret gives no tail.
+    """
+    if "PRIVATE KEY" in text or _SECRET.search(text) or any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs"} and character not in _EXCERPT_CONTROLS
+        for character in text
+    ):
+        return ""
+    offset = max(len(text) - limit, 0)
+    while offset < len(text):
+        if offset == 0 or text[offset - 1] == "\n":
+            try:
+                return _execution_excerpt(text[offset:])
+            except SchemaError:
+                pass
+        newline = text.find("\n", offset)
+        if newline < 0:
+            return ""
+        offset = newline + 1
     return ""
 
 
