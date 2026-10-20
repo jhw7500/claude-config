@@ -144,6 +144,29 @@ def test_a_second_new_artifact_url_is_refused_so_a_retry_cannot_duplicate(tmp_pa
     assert record(entry, "published", "--url", URL).returncode == 0
 
 
+def test_an_artifact_id_with_an_underscore_is_accepted(tmp_path):
+    # A published id looked like 22 characters of base64url, whose alphabet includes "_" as well as "-".
+    url = "https://claude.ai/artifact/AKD1Fs_LE4Bh-GCWi4iC4Q"
+    _, result = export(tmp_path, "--update-url", url)
+    entry = entry_of(result)
+    assert record(entry, "publishing").returncode == 0
+    assert record(entry, "published", "--url", url).returncode == 0
+
+
+def test_the_skill_recovery_sequence_republishes_to_the_settled_url(tmp_path):
+    # The skill's "Unrecorded attempt" path: settle the URL, mark the attempt failed, publish again to that URL.
+    _, result = export(tmp_path)
+    entry = entry_of(result)
+    assert record(entry, "publishing").returncode == 0
+    assert record(entry, "published", "--url", URL).returncode == 0
+    assert record(entry, "failed", "--reason", "an earlier publish attempt was not recorded").returncode == 0
+    assert record(entry, "publishing").returncode == 0
+    assert record(entry, "published", "--url", URL, "--version", "1792459229-07d5").returncode == 0
+    assert record(entry, "verified").returncode == 0
+    data = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
+    assert (data["state"], data["url"], data["version"]) == ("verified", URL, "1792459229-07d5")
+
+
 def test_update_mode_accepts_only_its_target_url(tmp_path):
     _, result = export(tmp_path, "--update-url", URL)
     entry = entry_of(result)
