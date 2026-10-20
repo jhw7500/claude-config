@@ -1,30 +1,31 @@
-# 전역 지침 (모든 Claude Code 세션 공통)
+# Global guidance (all Claude Code sessions) — 전역 지침
 
-이 파일(`~/.claude/global-guidance.md`)은 `~/.claude/CLAUDE.md`에서 `@global-guidance.md`로 import되어 **모든 프로젝트 세션에 전역 적용**된다. 프로젝트별 지침은 각 프로젝트의 `CLAUDE.md` / `AGENTS.md`에 둔다.
+This file (`~/.claude/global-guidance.md`) is imported from `~/.claude/CLAUDE.md` via `@global-guidance.md` and **applies to every project session**. Project-specific guidance lives in each project's `CLAUDE.md` / `AGENTS.md`.
 
-> 아래 사용자 지침이 OMC 기본 동작보다 우선한다.
-> 각 절의 근거·이력·세부 값은 claude-config 저장소 `claude-md/archive/guidance-rationale.md`에 있다(세션마다 로드되지 않음).
-
----
-
-> Notion 작업 전용 지침은 `@CLAUDE-notion.md` 참조 — `/jhw:*` 스킬과 `mcp__notion__*` / `mcp__jhw-notion__*` 도구 호출 시 적용. (notion이 없는 호스트에서는 import되지 않음)
+> The user guidance below takes precedence over OMC default behavior.
+> Rationale, history and detailed values for each section live in the claude-config repo at `claude-md/archive/guidance-rationale.md` (not loaded per session).
+> This guidance is written in English only to save context tokens. **All user-facing output stays in Korean** (rule 7). Write new guidance in English. Rule 9 and the Change Evidence section stay in Korean verbatim because tests bind them to the Codex and hook copies.
 
 ---
 
-## 공통 작업 규칙 (전역)
+> Notion-specific guidance: see `@CLAUDE-notion.md` — applies to `/jhw:*` skills and `mcp__notion__*` / `mcp__jhw-notion__*` tool calls. (Not imported on hosts without Notion.)
 
-1. **절대 경로 사용** — 코드에서도, 사용자에게 파일 언급할 때도 절대 경로 사용.
-2. **독립 작업 병렬 실행** — 의존성 없는 도구 호출은 반드시 병렬 배치.
-3. **독립 검증 필수** — 구현 완료 후 자기 검증 외 독립 검증 수단 사용.
-4. **변경 범위 최소화** — 요청한 것만 수정. 주변 코드 "개선"/리팩토링/주석 추가 금지.
-5. **테스트 먼저 확인** — 수정 전 기존 테스트 실행하여 현재 상태 파악.
-6. **롤백 가능한 변경 우선** — 되돌릴 수 없는 작업(force push, drop table 등)은 사전 확인.
-7. **한국어 응답** — 모든 응답과 설명은 한국어로 작성.
-8. **Handoff 층위 분리** — 두 handoff는 산출물과 목적이 달라 함께 쓴다 (개정 2026-08-22, 구 "단일화" 규칙 폐기):
-   - **Task Handoff (정본)**: jhw-control Project Control Task(`/jhw:task`)의 작업 이관 정본 경로는 `task finish --status handoff` → 새 세션 `/jhw:task resume <tsk-id>`다. Task 상태·증거·다음 단계는 jhw-control 기록(Registry)이 정본이다. `.ai/handoff.md`는 도구가 만드는 로컬 사본이므로 직접 쓰거나 편집하지 않는다.
-   - **세션 스냅샷 (보호막)**: `session-handoff:handoff`/`resume`(repo root `HANDOFF.<세션>.md`)은 크래시·compact 대비 세션 컨텍스트 보호막이다. **Task 작업 중에도 사용한다** — auto-compact(PreCompact 훅) 시점과 긴 작업의 마일스톤에서 권장. Task 작업 중 작성 시 본문에 tsk-/clm-id를 남겨 두 기록을 연결하고, Task 세션 대화에서는 "체크포인트"로 지칭해 Task Handoff와 혼동을 막는다. 내장 `/resume`(transcript 세션 picker, `claude --resume`과 동일 역할)과 session-handoff계 `/resume`(HANDOFF 파일 기반 — 플러그인은 비활성이고 claude-config `install.sh`가 `~/.claude/commands/`에 배포)은 동명 충돌이므로, transcript 복원은 항상 셸에서 `claude --resume`/`--continue`로 부른다. `/resume <세션명>`은 이 환경에서 HANDOFF 파일 흐름으로 동작한다(2026-08-22 실측; 네임스페이스형 `/session-handoff:resume`은 미지원 — 플러그인 커맨드가 아니므로).
-     - **경고:** 세션 안에서 `/resume`을 입력해도 transcript는 복원되지 않고 HANDOFF 파일 흐름이 실행된다. transcript 복원은 반드시 셸에서 `claude --resume` 또는 `claude --continue`로 실행한다.
-   - **재개 우선순위**: Task 세션 재개는 `/jhw:task resume <tsk-id>`가 1순위다. 강제종료 등으로 task handoff가 없으면 `HANDOFF.<세션>.md`를 보조 컨텍스트로 읽되, 두 기록이 어긋나면 jhw-control 기록을 따른다.
+---
+
+## Common working rules — 공통 작업 규칙 (전역)
+
+1. **Use absolute paths** — in code and whenever mentioning files to the user.
+2. **Run independent work in parallel** — tool calls with no dependency between them must be batched in parallel.
+3. **Independent verification is mandatory (독립 검증 필수)** — after implementing, use an independent means of verification in addition to self-checking.
+4. **Minimize the change scope** — change only what was requested. No "improving", refactoring or adding comments to surrounding code.
+5. **Check tests first** — run the existing tests before modifying to learn the current state.
+6. **Prefer reversible changes** — confirm in advance before irreversible operations (force push, drop table, etc.).
+7. **Respond in Korean** — every reply, explanation, report and question to the user is written in Korean, even though this guidance is in English.
+8. **Two handoff layers (Handoff 층위 분리)** — the two handoffs differ in artifact and purpose, so both are used (revised 2026-08-22; the old "single handoff" rule is retired):
+   - **Task Handoff (canonical)**: for jhw-control Project Control Tasks (`/jhw:task`), the canonical hand-over path is `task finish --status handoff` → in a new session `/jhw:task resume <tsk-id>`. The jhw-control record (Registry) is canonical for Task state, evidence and next steps. `.ai/handoff.md` is a local copy produced by the tool; never write or edit it directly.
+   - **Session snapshot (safety net)**: `session-handoff:handoff`/`resume` (repo root `HANDOFF.<세션>.md`) protects session context against crashes and compaction. **Use it during Task work too** — recommended at auto-compact (PreCompact hook) time and at milestones of long work. When writing one during Task work, record the tsk-/clm-id in the body to link the two records, and call it a "checkpoint" (체크포인트) in Task-session conversation so it is not confused with Task Handoff. The built-in `/resume` (transcript session picker, same role as `claude --resume`) and the session-handoff `/resume` (HANDOFF-file based — the plugin is disabled and claude-config `install.sh` deploys it to `~/.claude/commands/`) collide by name, so transcript restore is always invoked from the shell with `claude --resume`/`--continue`. In this environment `/resume <세션명>` runs the HANDOFF-file flow (measured 2026-08-22; the namespaced `/session-handoff:resume` is unsupported because it is not a plugin command).
+     - **Warning:** typing `/resume` inside a session does not restore the transcript; it runs the HANDOFF-file flow. Transcript restore must be run from the shell with `claude --resume` or `claude --continue`.
+   - **Resume priority**: `/jhw:task resume <tsk-id>` comes first when resuming a Task session. If no task handoff exists (e.g. after a forced termination), read `HANDOFF.<세션>.md` as auxiliary context; if the two records disagree, follow the jhw-control record.
 9. **Task 등록 권유 (넛지)** — `[TASK-NUDGE]` 또는 Codex AGENTS fallback을 받으면, 아래 순서에서 **하나만** 추천하고 필요한 승인 또는 복구가 끝날 때까지 후속 실질 변경을 멈춘다.
    - **우선순위**: (1) 이미 결정했거나 제외 작업(조회/Q&A·단순 문서/설정·subagent/서브에이전트)이면 Task 없이 진행한다. (2) backlog는 registered/unregistered 여부와 무관하게 GitHub Issue만 별도 승인 후 제안하고 Task/Claim을 선점하지 않는다. (3) 즉시 작업의 unknown은 등록 여부를 가정하지 않고 현재 변경을 중단해 분류 복구를 알린다. (4) registered(등록) 저장소의 즉시 작업은 기존 Issue 또는 반복·다중 세션 증거가 있으면 Formal Issue Task, 현재 세션에서 끝낼 제한 작업이면 Temporary Task, 조정 비용보다 작으면 Task 없이를 추천한다. (5) unregistered(미등록) 저장소의 즉시 작업은 반복·다중 세션 증거가 있을 때만 Project/Repository 등록을 별도 승인으로 먼저 제안하고, 그렇지 않으면 Task 없이 진행한다.
    - **적용 시점**: 이 세션에서 넛지로 저장소 등록 상태를 이미 받았다면, 기존 Issue 작업의 구현을 승인받은 시점에 넛지가 첫 Edit에서 다시 걸리기를 기다리지 말고 브랜치 생성·첫 편집 전에 위 우선순위를 먼저 적용한다. 컨테이너(브랜치·worktree·Claim)를 첫 산출물보다 먼저 정해야 이관 비용이 생기지 않는다. 등록 상태를 아직 받지 못했으면 이 앞당김을 적용하지 않는다. 상태를 가정하지 않고 첫 넛지를 기다린다.
@@ -32,7 +33,7 @@
    - **승인 경계**: GitHub Issue 생성, Project/Repository 등록, Formal 또는 Temporary Task 시작은 각각 별도의 명시적 사용자 승인이 필요하며 앞 단계 승인은 다음 단계를 승인하지 않는다. 이미 Task를 시작했거나 사용자가 Task 없이를 선택한 세션에는 다시 묻지 않는다.
    - **승인된 lifecycle**: `/jhw:task` 규격을 유지하고 `"$HOME/.local/bin/jhw-control-host" preflight`가 성공한 뒤 신규 Formal/Temporary Task는 현재 checkout의 exact root와 `"$HOME/.local/bin/jhw-control-host" task start --resolve-from-checkout true`를 사용한다. 기존 Task 재개는 `"$HOME/.local/bin/jhw-control-host" task start --task <tsk-id>`를 사용하며, finish/switch는 `"$HOME/.local/bin/jhw-control-host" task finish`를 사용한다. preflight가 저장소 잠김을 보고하면 사용자 터미널에서 `"$HOME/.local/bin/jhw-control-host" unlock` 한 번만 실행한 뒤 preflight를 재시도한다.
    - **보안 경계**: Project/Repository ID를 추측하거나 portfolio pagination으로 조합하지 않는다. `PROJECT_REPOSITORY_NOT_FOUND`는 정확한 Project Record에 Repository를 등록한 뒤 재시도하고, `PROJECT_REPOSITORY_AMBIGUOUS`는 Repository 연관을 하나로 축소한 뒤 재시도한다. 어느 경우에도 Project를 임의 선택하거나 explicit mode로 자동 fallback하지 않는다. raw CLI 호출·설정 소싱·직접 자격증명 조회·daemon 교체는 금지한다.
-10. **쓰기 직전 다른 작성자 확인** — 작업본에 처음 쓰기 전에 기준선(HEAD, `git status --porcelain`, `git reflog --date=iso`의 맨 위 항목)을 기록한다. 커밋, Tribunal `begin`, push 직전에 다시 보고, 기준선 이후 내가 만들지 않은 변경이나 reflog 항목이 있거나 기준선에 이미 내 것이 아닌 미커밋 변경이 있었으면 멈추고 알린다. 같은 worktree에 살아 있는 이전 세션도 작성자다. "다른 작성자 없음"은 관측이 아니라 확보해야 하는 전제다. 이 확인은 같은 파일을 다른 세션이 함께 고친 경우까지 가려내지는 못한다.
+10. **Check for other writers right before writing** — before the first write to a working copy, record a baseline (HEAD, `git status --porcelain`, the top entry of `git reflog --date=iso`). Look again right before commit, Tribunal `begin` and push; if there are changes or reflog entries since the baseline that you did not make, or the baseline already had uncommitted changes that are not yours, stop and report. A previous session still alive in the same worktree is also a writer. "No other writer" is a premise to secure, not an observation. This check cannot detect another session editing the same files alongside you.
 
 ---
 
@@ -47,391 +48,267 @@
 
 ---
 
-## 진행상황 보고 (전역)
+## Progress reporting — 진행상황 보고 (전역)
 
-- 탐색 시작 전 1~2문장으로 무엇을 찾는지 먼저 말한다.
-- 단계 변경 시 (지금 한 일 / 핵심 사실 / 다음 할 일)을 짧게 보고한다.
-- 백그라운드 작업이 있으면 무엇이 돌고 있는지 명시한다.
-- 코드 수정 후 (무엇을 / 어느 파일 / 무엇을 검증할지)를 바로 말한다.
-- 막히면 (어디서 막혔는지 / 배제된 원인 / 다음 우회) 즉시 공유한다.
-- 도구만 연속 호출하고 침묵하지 않는다.
-
----
-
-## 정보 수집 → 조기 종료 방지 (전역)
-
-**트리거** (다음 도구 호출 직후 또는 결과 수신 직후):
-- 정보 수집·탐색 도구 일반: `WebFetch`, `WebSearch`, `query-docs`, MCP `*-fetch` / `*-search` 류
-- **`AskUserQuestion`** — 사용자 답변 수신 직후 (답변에 의존하는 action까지 같은 응답 안에서 수행)
-- 도메인별 세부는 도메인 문서 참조 (예: Notion → `@CLAUDE-notion.md`)
-
-**필수 자가 점검 (응답 종료 직전)**:
-1. 사용자 요청이 다단계인가? (저장/편집/생성/실행/적용 등 action을 포함)
-2. 이 응답에 그 action 도구 호출(MCP create/update / `Edit` / `Write` / `Bash` 등)이 **승인된 모든 항목에 대해** 포함됐는가?
-   - 항목들이 다른 parent/대상/그룹에 속하면 **그룹 수만큼** 분할 호출 필요
-3. action 호출 후 **결과 요약 텍스트 보고**가 응답 마지막에 포함됐는가?
-   - 도구 결과 JSON만으로는 부족 — 사용자가 한 눈에 볼 수 있는 표/요약 텍스트 의무
-   - URL/ID/exit code 등 핵심 정보를 1줄 이상 텍스트로 전달
-4. 위 항목 중 하나라도 빠지면 **응답 종료 금지** — 같은 응답 안에서 마저 처리.
-
-**AskUserQuestion 특칙**:
-- 답변이 단일 응답 단위로 반환되더라도, 그 답변에 의존한 action(파일 수정/삭제/이동/커밋 등)을 **같은 응답 안에서** 즉시 수행한다.
-- 다단계 답변(중간에 추가 조회 필요)이라도 마지막 action까지 같은 응답에서 마친다.
-- "답변 잘 받았습니다" 류 보고만 하고 종료하는 패턴 금지.
-
-> 위반 사례 누적(일반·외부비동기·Notion)은 `~/.claude/archive/violations.md` 참조 — 방지 규칙은 위 자가점검에 코드화되어 있음. 새 사례는 규칙 1줄만 여기에, 서사는 아카이브에 추가.
+- Before starting an exploration, say in 1–2 sentences what you are looking for.
+- On a phase change, briefly report (what was just done / key facts / what is next).
+- If background work is running, state what is running.
+- Right after modifying code, say (what / which file / what will be verified).
+- When blocked, share it immediately (where it is blocked / causes ruled out / next workaround).
+- Do not call tools back to back in silence.
 
 ---
 
-## 구현 전 접근 검증 (전역)
+## Prevent early exit after information gathering — 정보 수집 → 조기 종료 방지 (전역)
 
-**트리거**: 이슈·요청에 이미 더 단순한 방안이 적혀 있는데 다른 설계를 하려 할 때, 또는 새
-추상화·다중 파일 변경·새 상태를 도입하려 할 때.
+**Trigger** (right after the following tool calls or on receiving their results):
+- Information-gathering and exploration tools in general: `WebFetch`, `WebSearch`, `query-docs`, MCP `*-fetch` / `*-search`
+- **`AskUserQuestion`** — right after receiving the user's answer (perform the actions that depend on the answer in the same response)
+- Domain specifics are in the domain documents (e.g. Notion → `@CLAUDE-notion.md`)
 
-1. **먼저 200단어 설계 노트를 쓴다.** 세 가지만 담는다 — ① 택한 접근 ② **이슈에 이미 적힌
-   더 단순한 방안보다 나은 이유** ③ 가장 그럴듯한 실패 모드 2개.
-2. **접근 수준 피드백만 받는다.** 리뷰어(`/jhw:ship` 리뷰 라운드, `code-reviewer`, `critic`)에게
-   코드가 아니라 이 노트를 먼저 보인다. 구현 디테일은 이 단계의 대상이 아니다.
-3. **리뷰어가 원안을 선호하면 원안을 택하고 설계는 버린다.** 더 복잡한 쪽을 방어하지 않는다.
-   설계 노트는 접근을 *파는* 문서가 아니라 접근을 *시험하는* 문서다.
-4. **노트가 200단어를 넘어가면 그 자체가 신호다** — 접근이 필요 이상으로 복잡하다는 뜻이다.
-   줄여서 다시 쓰거나 더 단순한 방안으로 돌아간다.
+**Mandatory self-check (right before ending the response)**:
+1. Is the user's request multi-step? (includes actions such as save/edit/create/run/apply)
+2. Does this response include those action tool calls (MCP create/update / `Edit` / `Write` / `Bash`, etc.) **for every approved item**?
+   - If items belong to different parents/targets/groups, split the calls **once per group**
+3. After the action calls, does the end of the response include a **text summary of the results**?
+   - Tool-result JSON alone is not enough — a table/summary text the user can read at a glance is required
+   - Convey key information such as URL/ID/exit code in at least one line of text
+4. If any of the above is missing, **do not end the response** — finish it in the same response.
 
-**적용 안 함**: 단일 파일·단일 함수 수정, 이미 합의된 설계의 실행, 긴급 수정, 되돌리기 쉬운 실험.
+**AskUserQuestion special rule**:
+- Even though the answer arrives as a single response unit, perform the actions that depend on it (file edit/delete/move/commit, etc.) **in the same response** right away.
+- Even if the answer needs several steps (more lookups in between), finish through the last action in the same response.
+- Ending with only a "got your answer" (답변 잘 받았습니다) style report is forbidden.
 
----
-
-## 판단 전 1차 출처 재확인 (전역)
-
-**트리거**: 설계 노트·계획·리뷰 응답·커밋·이슈 본문에 어떤 사실을 전제로 쓰려 할 때. 특히 그 사실이
-좌표(`file:line`), 이슈·문서에 적힌 수치, 앞서 본 값에 대한 기억, 서브에이전트 보고에서 왔을 때.
-
-좌표·인용된 수치·기억·위임 보고는 **어디를 볼지 알려 주는 포인터**일 뿐, 그 자리에 무엇이 있는지를
-보증하지 않는다. 판단에 쓰기 전에 그 자리의 1차 출처를 지금 다시 읽고, 읽은 내용과 함께 적는다.
-
-1. **좌표는 내용과 함께 인용한다.** `file:line`을 적을 때 그 자리의 실제 내용 한 줄을 붙인다. 붙일 수
-   없으면 아직 열어 보지 않은 것이므로 전제로 쓰지 않는다. 서브에이전트가 준 좌표도 직접 열기 전에는
-   같다.
-2. **설계 전제는 그 동작을 강제하는 코드 지점에서 출발한다.** "시스템이 X를 한다"에 기대는 설계는
-   노트를 쓰기 전에 X를 강제하는 지점을 찾아 1번처럼 인용한다. 찾지 못했으면 검색한 범위(저장소
-   소스·설치본·설정·CI 등)를 함께 적고 X를 "강제 미확인" 전제로 표시하며, 그 위에 메커니즘을 바꾸는
-   설계를 세우지 않는다. 못 찾았다는 결과만으로 X를 관행이라고 단정하지도 않는다.
-3. **이슈·문서에 적힌 수치는 주장이다.** 설계 방향을 정하는 수치는 원자료에서 다시 계산하고, 원자료
-   경로·계산 방법·검색 범위를 함께 적는다. 다시 계산할 수 없으면 "인용(미검증)"으로 표시하고 그 위에
-   설계를 세우지 않는다.
-4. **결정을 가르는 값은 쓰는 자리에서 다시 출력한다.** floor·임계값·상한·버전 경계 같은 값은 같은
-   세션에서 이미 봤더라도 기억으로 쓰지 않는다. 기억은 흐려지는 대신 "보통 그런 값"으로 바뀌고, 그
-   값이 통념과 같은 방향일수록 다시 확인하려는 생각이 들지 않는다.
-5. **의무는 그것을 이행할 메커니즘이 오늘 만들 수 있는 범위 안에서만 지운다.** "X를 M으로 뒷받침하게
-   한다"는 규칙을 만들기 전에 M이 지금 만들 수 있는 산출물을 센다. 그 산출물이 지금 제출되는 것보다
-   빈약하면 그 규칙은 개선이 아니라 퇴행이다.
-6. **"이미 있는 부품을 조립한다"는 주장은 접합 지점에서 확인한다.** 부품이 각각 있다는 것만으로는
-   부족하다. 넣으려는 값을 그 자리의 현재 문법·스키마·허용 목록으로 한 번 그대로 써 본다. 써지지
-   않으면 조립이 아니라 확장이다.
-
-"구현 전 접근 검증"의 설계 노트에 적을 때, 이 절이 요구하는 인용·검색 범위·재계산 기록은 노트
-본문의 세 항목과 200단어에 세지 않고 노트 아래의 근거 목록에 둔다. 근거가 많아졌다는 이유로 접근을
-복잡하다고 판정하지 않는다.
-
-**적용 안 함**: 같은 응답 안에서 방금 출력한 값, 사용자가 사실을 단정하고 실행만 요청한 경우.
+> Accumulated violation cases (general, external async, Notion) are in `~/.claude/archive/violations.md` — the prevention rules are encoded in the self-check above. For a new case, add only a one-line rule here and the narrative to the archive.
 
 ---
 
-## 생성·수정 전 주변 열거 (전역)
+## Validate the approach before implementing — 구현 전 접근 검증 (전역)
 
-**트리거**: ① 새 이슈·태스크·브랜치·설계문서를 **만들려 할 때**, ② 리뷰어나 사용자가
-**시연한 결함 하나를 고치려 할 때**.
+**Trigger**: when an issue or request already describes a simpler approach and you are about to design a different one, or when introducing a new abstraction, a multi-file change or new state.
 
-1. **만들기 전에 이미 있는지 찾는다.** 이슈는 `gh issue list --search`와 키워드로 열린
-   항목을 훑는다. 같은 문제가 이미 정식화돼 있으면 새로 만들지 말고 그 위에서 시작한다.
-   기존 항목은 중복 방지 이상의 값을 준다 — 내가 비목표로 뺀 축에 대한 **반례**를 이미
-   갖고 있을 수 있다.
-2. **고치기 전에 같은 부류가 닿는 경로를 열거한다.** 리뷰어는 인스턴스 하나를 보여줄
-   뿐 경계를 알려주지 않는다. 결함 부류를 한 문장으로 쓰고, 그 부류에 도달하는 호출
-   지점을 전부 세어 각각을 확인한 뒤에 코드를 쓴다. 같은 부류의 반례가 두 번 나오면 세 번째
-   수정을 쓰기 전에 접근을 바꾼다. 남은 경로를 다 셀 수 없으면 4번대로 그 능력을 없앤다.
-3. **열거 결과를 산출물에 남긴다.** 이슈 본문·결정문에 "무엇을 찾아봤고 무엇이 있었는지"를
-   적는다. 그래야 다음 사람이 다시 열거하지 않는다.
-4. **부류를 열거할 수 없으면 방어하지 말고 제거한다.** 규칙으로 막는 쪽과 능력을 없애는
-   쪽 중, 경로를 다 셀 수 없다면 후자가 맞다.
+1. **Write a 200-word design note first.** It holds only three things — ① the chosen approach ② **why it beats the simpler approach already written in the issue** ③ the two most plausible failure modes.
+2. **Get approach-level feedback only.** Show reviewers (`/jhw:ship` review round, `code-reviewer`, `critic`) this note first, not code. Implementation details are out of scope at this stage.
+3. **If the reviewer prefers the original proposal, take it and drop the design.** Do not defend the more complex option. A design note is a document that *tests* the approach, not one that *sells* it.
+4. **A note that exceeds 200 words is itself a signal** — the approach is more complex than needed. Shorten and rewrite it, or go back to the simpler approach.
 
-**적용 안 함**: 사용자가 대상을 특정해 지시한 단건 수정, 이미 열거가 끝난 설계의 실행,
-1~2회 조회로 끝나는 확인.
+**Not applicable**: single-file or single-function changes, executing an already agreed design, emergency fixes, easily reverted experiments.
 
 ---
 
-## 인과 주장 전 반증 확인 (전역)
+## Re-check the primary source before judging — 판단 전 1차 출처 재확인 (전역)
 
-**트리거**: "원인은 X다", "X 때문이다", "X가 문제다" 류의 진단을 보고하려 할 때.
+**Trigger**: when about to write a fact as a premise into a design note, plan, review response, commit or issue body — especially when that fact came from a coordinate (`file:line`), a number quoted in an issue or document, memory of a value seen earlier, or a subagent report.
 
-**필수 자가 점검 (보고 직전)**:
-1. X를 **반증할 단일 사실**이 무엇인가? (함수 시그니처, 호출 경로, 반환값 전파,
-   릴리스/머지 상태, 설정 실제값 등)
-2. 그 사실을 **직접 확인**했는가? 로그 숫자 일치·시간 근접·정황 일치는 확인이 아니다.
-3. **이미 손에 있는 출력을 끝까지 읽었는가?** 특히 실패를 보고한 것이 내가 만든
-   도구·스크립트라면, 대상을 의심하기 전에 **그 도구가 주장한 동작을 실제로 수행했는지**
-   먼저 확인한다 (자체 출력에 "건너뜀/미실행/조기 return/관측 불가"가 찍혀 있지 않은지).
-4. 확인하지 못한 것은 **"추정"으로 표시**했는가? 확인된 사실과 섞어 쓰지 않았는가?
+Coordinates, quoted numbers, memory and delegated reports are only **pointers telling you where to look**; they do not guarantee what is there. Before using one in a judgment, re-read the primary source at that spot now and write it down together with what you read.
 
-**하나라도 아니오면 보고하지 말고 확인부터 한다.** 반증 사실 확인은 대개 grep/읽기
-1회로 끝난다 — 그 비용이 오진 보고의 비용보다 항상 싸다.
+1. **Quote coordinates together with content.** When writing `file:line`, attach one line of the actual content at that spot. If you cannot, you have not opened it yet, so do not use it as a premise. Coordinates given by a subagent are the same until you open them yourself.
+2. **Design premises start from the code location that enforces the behavior.** A design that relies on "the system does X" must, before the note is written, find the location that enforces X and quote it as in 1. If it is not found, record the search scope (repo source, installed copy, config, CI, etc.), mark X as an "enforcement unconfirmed" (강제 미확인) premise, and do not build a mechanism-changing design on it. Do not conclude that X is mere convention just because it was not found either.
+3. **Numbers written in issues and documents are claims.** Recompute direction-setting numbers from the raw data and record the raw-data path, the calculation method and the search scope. If you cannot recompute one, mark it "quoted (unverified)" (인용(미검증)) and do not build a design on it.
+4. **Re-print decision-critical values where you use them.** Values such as floors, thresholds, caps and version boundaries are never written from memory, even if you saw them earlier in the same session. Memory does not just fade; it turns into "what such values usually are", and the more the value matches conventional wisdom, the less you think to re-check it.
+5. **Impose an obligation only within what the mechanism that fulfills it can produce today.** Before making a rule "back X with M", count the artifacts M can produce now. If they are poorer than what is submitted today, the rule is a regression, not an improvement.
+6. **Verify "just assembling existing parts" at the joints.** Each part existing on its own is not enough. Write the value you intend to insert once, as-is, in the current grammar/schema/allow-list of that spot. If it cannot be written, it is an extension, not an assembly.
 
-**적용 안 함**: 사용자가 원인을 **단정**하고 그에 따른 실행만 요청한 경우, 단일 명령의
-즉시 확인 가능한 결과.
+When writing a design note for "Validate the approach before implementing", the citations, search scopes and recomputation records this section requires do not count toward the note's three items or 200 words; put them in an evidence list under the note. Do not judge the approach complex because the evidence grew.
+
+**Not applicable**: a value just printed in the same response; the user asserted the fact and only asked for execution.
 
 ---
 
-## 검증 명령 위생 (전역)
+## Enumerate the surroundings before creating or fixing — 생성·수정 전 주변 열거 (전역)
 
-**트리거**: 사실 확인 목적의 **모든** 명령·도구 호출 직전 — `grep`/`rg`/`find`/`git`/`jq`/`readelf`/스크립트 등 형태 무관.
+**Trigger**: ① when about to **create** a new issue, task, branch or design doc; ② when about to fix **one defect demonstrated** by a reviewer or the user.
 
-1. **명령에 결론을 심지 않는다.** `|| echo "없음 → X 뿐"` 형태 금지. 도구가 못 찾으면
-   셸이 **내가 미리 써넣은 가정**을 출력하고, 그것을 도구의 발견으로 되읽게 된다.
-   반증이 구조적으로 불가능한 명령이다. 중립 표기만 쓴다 — `|| echo "(no match)"`.
+1. **Before creating, look for an existing one.** For issues, scan open items with `gh issue list --search` and keywords. If the same problem is already formalized, do not create a new one; start from it. Existing items are worth more than de-duplication — they may already hold **counterexamples** on the axis you excluded as a non-goal.
+2. **Before fixing, enumerate the paths the same class can reach.** A reviewer shows one instance, not the boundary. Write the defect class in one sentence, count every call site that reaches that class, check each one, then write code. If a counterexample of the same class shows up twice, change the approach before writing a third fix. If you cannot count the remaining paths, remove the capability as in 4.
+3. **Record the enumeration in the artifact.** Write "what was searched and what was found" in the issue body or decision record so the next person does not enumerate again.
+4. **If the class cannot be enumerated, remove rather than defend.** Between blocking with a rule and removing the capability, the latter is right when you cannot count all the paths.
 
-2. **부정 주장에는 검색 범위를 붙인다.** "X가 유일하다"가 아니라 "내가 검색한 A/B에서는
-   X뿐". 전역 명제를 하려면 전역 검색을 한다(대상 디렉터리를 명시해 `grep -rn`).
-   *검색 범위 안에서의 부재*를 *존재하지 않음*으로 승격시키지 않는다.
+**Not applicable**: a single fix where the user specified the target; executing a design whose enumeration is already done; checks finished in 1–2 lookups.
 
-   **부재를 보고하기 전에 채널을 먼저 열거한다.** 요약·집계만 노출하는 시스템은 원문을
-   **별도 채널**에 보관하는 경우가 많다. CI 라면 실행 로그보다 **아티팩트 목록을 먼저**
-   본다(`gh api repos/{owner}/{repo}/actions/runs/{id}/artifacts`) — 로그는 명령 에코와
-   스크립트 소스로 오염돼 신호 대비 잡음이 최악이다. 남은 채널(아티팩트·체크런 출력·첨부·
-   API)을 열거하기 전에는 "로그에서 못 찾았다"를 "어디에도 없다"로 올리지 않는다. 잘못된
-   부재 단정은 그 자체로 틀리는 데 그치지 않고, **존재하지 않는 결함을 고치려는 후속
-   작업까지 유발한다**.
+---
 
-3. **"유일 / 전부 / 항상 / 반드시"는 정지 신호.** 그 단어를 쓰려면 exhaustive 검색 결과를
-   같이 제시할 수 있어야 한다. 못 하면 단어를 뺀다.
+## Seek the falsifier before a causal claim — 인과 주장 전 반증 확인 (전역)
 
-4. **값싼 결정적 실험을 정적 추론보다 먼저.** 추론을 시작하기 전에 "지금 돌려볼 수 있나?"를
-   묻는다. 대개 수 초다.
+**Trigger**: when about to report a diagnosis such as "the cause is X", "it is because of X" or "X is the problem" (원인은 X다 / X 때문이다 / X가 문제다).
 
-   | 질문 | 결정적 실험 |
+**Mandatory self-check (right before reporting)**:
+1. What **single fact would falsify** X? (function signature, call path, return-value propagation, release/merge state, actual config value, etc.)
+2. Did you **check that fact directly**? Matching log numbers, temporal proximity or circumstantial fit are not checks.
+3. **Did you read the output already in hand to the end?** Especially when the thing reporting failure is a tool or script you built, before suspecting the target, first check **whether the tool actually performed the action it claims** (its own output must not show "skipped / not run / early return / unobservable").
+4. Did you **mark what you could not check as an estimate** (추정)? Did you avoid mixing it with confirmed facts?
+
+**If any answer is no, do not report — check first.** Checking the falsifier usually takes one grep or read, which is always cheaper than a misdiagnosis.
+
+**Not applicable**: the user **asserted** the cause and only asked for the follow-up execution; immediately checkable results of a single command.
+
+---
+
+## Verification command hygiene — 검증 명령 위생 (전역)
+
+**Trigger**: right before **every** command or tool call made to check a fact — `grep`/`rg`/`find`/`git`/`jq`/`readelf`/scripts, whatever the form.
+
+1. **Do not plant conclusions in commands.** No `|| echo "없음 → X 뿐"` (none → only X) patterns. When the tool finds nothing, the shell prints **the assumption you wrote in advance**, and you read it back as the tool's finding. Such a command is structurally unfalsifiable. Use only neutral markers — `|| echo "(no match)"`.
+
+2. **Attach the search scope to negative claims.** Not "X is the only one" but "in A/B, which I searched, only X". For a global claim, do a global search (`grep -rn` naming the target directories). Do not promote *absence within the searched scope* to *does not exist*.
+
+   **Enumerate channels before reporting absence.** Systems that expose only summaries or aggregates often keep the raw data in a **separate channel**. For CI, look at the **artifact list first**, before the run log (`gh api repos/{owner}/{repo}/actions/runs/{id}/artifacts`) — logs are polluted by command echoes and script source and have the worst signal-to-noise. Until the remaining channels (artifacts, check-run output, attachments, API) are enumerated, do not upgrade "not found in the log" to "nowhere". A wrong absence claim is not only wrong itself; **it triggers follow-up work to fix a defect that does not exist**.
+
+3. **"only / all / always / must" (유일 / 전부 / 항상 / 반드시) are stop signs.** To use such a word you must be able to present exhaustive search results alongside it. If you cannot, drop the word.
+
+4. **Cheap deterministic experiments before static reasoning.** Before starting to reason, ask "can I just run it now?". It usually takes seconds.
+
+   | Question | Deterministic experiment |
    |---|---|
-   | 빌드 설정이 어떻게 되나 | 설정을 바꿔 실제로 재생성 (예: 커널 `olddefconfig`) |
-   | 실기가 어떤 상태인가 | 해당 장비에 직접 조회 |
-   | 바이너리 의존이 있나 | `readelf -sW ... \| awk '$7=="UND"'` |
+   | What is the build config | Change the config and actually regenerate (e.g. kernel `olddefconfig`) |
+   | What state is the device in | Query that device directly |
+   | Is there a binary dependency | `readelf -sW ... \| awk '$7=="UND"'` |
 
-5. **관측 ≠ 함의.** 단일 관측이 가설과 *양립한다*는 것과 가설을 *함의한다*는 것은 다르다.
-   그럴듯한 메커니즘 + 부합하는 관측 하나면 이야기가 매끄러워지고, 매끄러움을 증거로
-   착각하게 된다. 관측 하나로 일반 명제를 세우지 않는다.
+5. **Observation ≠ implication.** A single observation being *compatible* with a hypothesis is different from it *implying* the hypothesis. A plausible mechanism plus one matching observation makes the story smooth, and the smoothness gets mistaken for evidence. Do not build a general claim on one observation.
 
-6. **사용자 반문은 재검증 트리거.** "근거는?" / "정말?" / "확실한가?"가 오면 기존 근거를
-   다시 설명하지 말고 **처음부터 다시 확인**한다.
+6. **A user's pushback is a re-verification trigger.** When "evidence?" / "really?" / "are you sure?" (근거는? / 정말? / 확실한가?) arrives, do not re-explain the old evidence — **re-check from scratch**.
 
-7. **관측 명령을 관측 대상에 포함시키지 않는다.** `ps -eo args | grep "[x]foo"` 는 grep
-   자신만 제외할 뿐, 그 검색어를 명령줄에 담고 있는 **부모 셸(`sh -c ...`)은 제외하지
-   못한다** — SSH 로 원격 실행하면 내 명령 자체가 매치되어 개수가 부풀려진다. 프로세스
-   존재 확인은 comm(실행파일명) 기준 + 자기 PID 배제로 하고, 포트 리스너·PID 파일 같은
-   **독립 증거**를 함께 본다. 같은 이유로 `pkill -f <문자열>` 은 그 문자열이 자기 명령줄에
-   있으면 자기 셸을 죽인다(원격 일괄 정리에는 PID 파일이나 프로세스 그룹을 쓴다).
-   검색어가 자신의 명령줄에 나타나는 도구(ps/grep/pkill/history)는 자기 참조를 구조적으로
-   배제한 뒤에만 개수를 신뢰한다.
+7. **Do not include the observing command in what it observes.** `ps -eo args | grep "[x]foo"` excludes only grep itself, **not the parent shell (`sh -c ...`)** that carries the search term in its command line — when run remotely over SSH, your own command matches and inflates the count. Check process existence by comm (executable name) while excluding your own PID, and look at **independent evidence** such as port listeners or PID files as well. For the same reason, `pkill -f <문자열>` kills your own shell when the string is in its command line (use PID files or process groups for remote bulk cleanup). For tools whose search term appears in their own command line (ps/grep/pkill/history), trust counts only after structurally excluding self-reference.
 
-8. **검증 실행과 입력을 결속한다.** 기준선·완료 테스트는 의도한 절대 cwd, 명령, 실제 입력
-   (SHA만 아니라 관련 미커밋 소스·fixture·설정), 실행 환경(인터프리터 절대 경로와 버전, 의존성
-   출처, 수집된 테스트 수), 기대 범위와 실제 실행·실패·skip 수,
-   대상 종료코드, 원본 로그 위치를 남긴다. 실행 중 입력 편집은 금지하며 병렬 편집은
-   작성자가 없는 별도 고정 작업본으로 분리한다. 변경 전 기준선을 후보 코드로 대체하지
-   않는다. 전후 digest가 같아도 중간 변경·복구를 배제하지 못한다. 입력 변경이 관측된
-   실행은 기존 실패나 회귀로 귀속하지 않는다. 경로 진입 실패 시 후속 검사를 막고,
-   대상 종료코드를 출력 축약 전에 캡처한다. 명령의 exit 0이나 PASS 문자열 수만으로
-   통과를 판정하지 않는다. 검사 수가 없는 도구는 해당 도구의 실제 성공 근거를 사용한다.
-   이 절차는 공유 작업본·운영 환경 변경이나 권한 확대를 승인하지 않는다.
+8. **Bind verification runs to their inputs.** For baseline and completion tests, record the intended absolute cwd, the command, the actual inputs (not just the SHA but the relevant uncommitted source, fixtures and config), the execution environment (interpreter absolute path and version, dependency source, number of collected tests), the expected range and the actual run/fail/skip counts, the target exit code and the raw log location. Editing inputs during a run is forbidden; to keep editing in parallel, run on a separate pinned working copy that nobody writes to, and make the edits elsewhere. Do not substitute candidate code for the pre-change baseline. Identical before/after digests do not rule out an intermediate change and recovery. A run during which input changes were observed is not attributed to an existing failure or a regression. If entering the path fails, block the subsequent checks, and capture the target exit code before truncating output. Do not judge a pass by a command's exit 0 or a count of PASS strings alone. For tools without check counts, use that tool's actual success evidence. This procedure does not authorize changes to shared working copies or production environments, nor privilege escalation.
 
-**영속 산출물 전파 금지**: 위 절차로 확인되지 않은 주장은 커밋 메시지·문서·메일·이슈 등
-영속 산출물에 쓰지 않는다. 추론이면 "추정"으로 표시한다. 한번 산출물에 들어간 주장은
-출처가 세탁되어 재검토 대상에서 빠지고, 이후 같은 파일을 다시 읽어도 반증 줄을 지나치게 된다.
+**No propagation into durable artifacts**: claims not confirmed by the procedure above never go into durable artifacts such as commit messages, documents, emails or issues. Mark inferences as estimates (추정). Once a claim enters an artifact its source is laundered, it drops out of review, and later rereads of the same file skip past the falsifying line.
 
-**적용 안 함**: 사용자가 사실을 단정하고 실행만 요청한 경우, 단일 명령의 즉시 확인 가능한 결과.
+**Not applicable**: the user asserted the fact and only asked for execution; immediately checkable results of a single command.
 
 ---
 
-## 검증: 되돌리면 실패하는가 (전역)
+## Verification: does it fail when reverted — 검증: 되돌리면 실패하는가 (전역)
 
-**트리거**: 테스트·어서션·검증 스크립트를 추가하고 "검증했다 / 통과한다 / 동작을 확인했다"를
-보고하려 할 때.
+**Trigger**: when adding tests, assertions or verification scripts and about to report "verified / passes / confirmed the behavior" (검증했다 / 통과한다 / 동작을 확인했다).
 
-1. **변경 검증과 보존 검사를 구분한다.** 변경을 검출한다고 주장하는 테스트는 격리된
-   대조군의 구 동작에서 실패하고 새 동작에서 통과하는지 확인한다. 양쪽에서 통과하는
-   유효한 보존 검사는 유지하되 변경 검출 건수와 따로 보고한다. 보존 검사만으로는 새 동작을
-   입증하지 못한다. 공유·배포 작업본을 되돌리지 말고 승인된 격리 입력에서 비교한다.
-2. **exit code 는 검증이 아니다.** `EXIT=0`, "스크립트가 끝까지 돌았다", "빌드가 됐다"는
-   변경이 의도한 동작을 한다는 증거가 아니다. 어서션이 **측정값**(반환값·레지스터·카운트·
-   diff)을 보게 만든다. 게이트 스크립트는 실패해야 할 입력에 대해 실제로 실패하는지도 같이 본다.
-3. **실기·커널·설정에 대한 주장은 측정 전까지 가설이다.** 측정하지 않았으면 "추정"으로 표기한다
-   ([검증 명령 위생] 4번의 값싼 결정적 실험을 먼저 시도한다).
-4. **보고 문구는 확인한 범위까지만.** "검증됨"과 "테스트가 통과함"과 "빌드가 성공함"은 서로
-   다른 주장이다. 강한 쪽으로 올려 쓰지 않는다.
-5. **검증 도구는 "가장 잘 거부하는 것"으로 고른다.** 소비자가 여럿인 산출물(스펙·스키마·
-   설정 파일)에서 **한 소비자의 통과는 다른 소비자의 통과를 함의하지 않는다.** 관대한
-   파서는 결함을 *숨기면서 통과시키므로*, 통과가 쌓일수록 안심되지만 그 안심이 곧 검증
-   공백이다. 파일을 읽는 소비자가 몇 종류인지 먼저 세고 **가장 엄격한 소비자**를 오라클로
-   삼는다. 표준 산출물이면 전용 린터를 찾아보고(없으면 "관대한 파서로만 확인했다"는 한계를
-   명시), 참조 구현을 베낄 때는 그 구현이 **스펙의 어느 판**을 따르는지 확인한다(혼용
-   모듈에서 구식 문법을 물려받기 쉽다).
-6. **새 전역 입력을 도입하면 테스트 격리부터 깨진다 — 그 깨짐이 프로덕션 고장의 예고편이다.**
-   진입점이 argv/env/cwd 를 읽게 바꾸면 (1) 테스트 하네스가 그 상태를 명시적으로
-   set/restore 하도록 같이 고치고, (2) 유효하지 않은 값에 대한 **폴백과 경고를 같은
-   변경에서** 넣는다. 테스트가 깨졌을 때 "테스트 문제"로 분류하기 전에, 같은 입력이 런타임에
-   들어오면 무슨 일이 생기는지 먼저 묻는다 — 하네스만 고치면 그 고장 모드는 발견되지 않은 채
-   남는다.
+1. **Distinguish change verification from preservation checks.** For a test that claims to detect a change, confirm that it fails on the old behavior of an isolated control and passes on the new behavior. Valid preservation checks that pass on both sides are kept but reported separately from the change-detection count. Preservation checks alone do not prove the new behavior. Do not revert shared or deployed working copies; compare on approved isolated inputs.
+2. **An exit code is not verification.** `EXIT=0`, "the script ran to the end" or "the build succeeded" is not evidence that the change does what it should. Make assertions look at **measured values** (return values, registers, counts, diffs). For gate scripts, also check that they actually fail on inputs that should fail.
+3. **Claims about hardware, kernels or config are hypotheses until measured.** If not measured, mark them as estimates (추정) (try the cheap deterministic experiment of [Verification command hygiene] 4 first).
+4. **Word the report only up to what was checked.** "Verified", "tests pass" and "build succeeds" are different claims. Do not upgrade to a stronger one.
+5. **Choose the verification tool that "rejects best".** For artifacts with several consumers (specs, schemas, config files), **one consumer passing does not imply another passes.** A lenient parser *hides defects while passing*, so accumulated passes feel reassuring while that reassurance is exactly the verification gap. First count how many kinds of consumers read the file and use **the strictest consumer** as the oracle. For standard artifacts, look for a dedicated linter (if there is none, state the limit "checked only with a lenient parser" (관대한 파서로만 확인했다)), and when copying a reference implementation, check **which edition of the spec** it follows (mixed modules easily inherit outdated syntax).
+6. **Introducing a new global input breaks test isolation first — and that breakage previews a production failure.** When an entry point is changed to read argv/env/cwd, (1) fix the test harness to explicitly set/restore that state, and (2) add **a fallback and a warning for invalid values in the same change**. When a test breaks, before classifying it as "a test problem", first ask what happens when the same input arrives at runtime — fixing only the harness leaves that failure mode undiscovered.
 
-**적용 안 함**: 사용자가 검증 생략을 명시한 경우. 되돌리기 자체가 파괴적인 작업(마이그레이션·
-배포·실기 플래싱)이라 revert 왕복이 더 위험한 경우 — 이때는 그 사실을 1줄로 밝히고 대신
-실패 입력으로 어서션이 빨개지는지를 본다.
+**Not applicable**: the user explicitly waived verification. Cases where the revert itself is destructive (migration, deployment, flashing hardware), so a revert round trip is riskier — then state that in one line and instead check that the assertion turns red on a failing input.
 
 ---
 
-## 음성 결과 보고 전 양성 대조 (전역)
+## Positive control before reporting a negative result — 음성 결과 보고 전 양성 대조 (전역)
 
-**트리거**: 내가 만든 계측으로 얻은 **부정 결과**를 보고하려 할 때 — "재현 안 됨",
-"차이 없음", "0건", "영향 없음", "문제 없음".
+**Trigger**: when about to report a **negative result** obtained with instrumentation you built — "not reproduced", "no difference", "0 hits", "no impact", "no problem" (재현 안 됨 / 차이 없음 / 0건 / 영향 없음 / 문제 없음).
 
-1. **그 계측이 양성을 잡을 수 있는지 먼저 보인다.** 알려진 양성 입력을 하나 만들어 같은
-   스크립트가 빨개지는지 확인한다. 못 만들면 "검출 능력 미확인"이라고 **결과와 같은 줄에**
-   적는다. 양성 대조 없는 음성 결과는 발견이 아니라 침묵이다.
-2. **전제 변수를 판정값과 같은 출력에 찍는다.** 내가 바꾸려던 것이 실제로 바뀌었는지 —
-   pid, mtime, 레지스터 리드백, 설정 리드백 — 를 결과 옆에 나란히 출력한다. 전제가 안 찍힌
-   음성 결과는 "대상이 안 움직였다"와 구분되지 않는다.
-3. **개수·부재를 근거로 쓰기 전에 매처가 실제 인스턴스를 잡는지 확인한다.** `grep -c` 가 0을
-   냈다면 그 패턴이 알려진 한 건을 잡는지 먼저 본다. 어휘가 대상과 안 맞으면 0은 부재가
-   아니라 무의미다.
-4. **설명을 만들기 전에 측정을 검증한다.** 결과가 나오면 해석이 먼저 떠오르지만 그럴듯함은
-   검증의 대체물이 아니다. "이 숫자가 무의미하려면 무엇이 참이어야 하나"를 먼저 답한다.
-5. **가설에 안 맞는다는 이유로 이미 성립한 증거를 격하하지 않는다.** 통제된 조건에서 현상을
-   재현했으면 그것이 재현이다. 내가 가정한 경로에서 안 나왔다는 것은 가정을 고칠 이유이지
-   증거를 깎을 이유가 아니다.
+1. **First show that the instrumentation can catch a positive.** Make one known-positive input and confirm the same script turns red. If you cannot make one, write "detection ability unconfirmed" (검출 능력 미확인) **on the same line as the result**. A negative result without a positive control is silence, not a finding.
+2. **Print the premise variables in the same output as the verdict.** Print whether what you meant to change actually changed — pid, mtime, register readback, config readback — next to the result. A negative result without its premise printed is indistinguishable from "the target never moved".
+3. **Before using a count or an absence as evidence, confirm the matcher catches a real instance.** If `grep -c` returned 0, first check that the pattern catches one known instance. If the vocabulary does not match the target, 0 is meaningless, not absence.
+4. **Validate the measurement before building an explanation.** When a result appears, an interpretation comes to mind first, but plausibility is no substitute for verification. First answer "what would have to be true for this number to be meaningless?".
+5. **Do not downgrade already-established evidence because it does not fit the hypothesis.** If you reproduced the phenomenon under controlled conditions, that is a reproduction. Not seeing it on the path you assumed is a reason to fix the assumption, not to shave the evidence.
 
-**적용 안 함**: 단일 명령의 즉시 확인 가능한 결과, 사용자가 부재를 단정하고 실행만 요청한 경우.
+**Not applicable**: immediately checkable results of a single command; the user asserted the absence and only asked for execution.
 
-같은 계약의 정본은 `skills/superpowers-extras/SKILL.md`다. 둘이 어긋나면 그 파일을 따른다.
+The canonical version of the same contract is `skills/superpowers-extras/SKILL.md`. If the two disagree, follow that file.
 
 ---
 
-## 외부 비동기 작업 자동 알림 (필수 규칙)
+## Automatic notification for external async work — 외부 비동기 작업 자동 알림 (필수 규칙)
 
-GitHub Actions, gh workflows, 사내 CI 등 **외부 비동기 작업**은 Claude Code의 `task-notification`이 자동으로 잡지 못한다.
+**External async work** such as GitHub Actions, gh workflows and internal CI is not caught automatically by Claude Code's `task-notification`.
 
-**필수 동작**:
-사용자에게 "끝나면 알려드릴게요/보고드릴게요/모니터링할게요" 라고 약속하는 순간, 다음 중
-하나를 **반드시 실행**한다 — 약속 후 가만히 있는 것은 위반:
+**Required action**:
+The moment you promise the user "I'll let you know / report / monitor when it is done" (끝나면 알려드릴게요/보고드릴게요/모니터링할게요), you **must run** one of the following — promising and then sitting idle is a violation:
 
-1. **`gh run watch <run-id> --exit-status` 를 BG로 실행**
+1. **Run `gh run watch <run-id> --exit-status` in the background**
    ```bash
    nohup gh run watch <RUN_ID> --exit-status > /tmp/watch.log 2>&1 &
    ```
-   - 이건 내가 띄운 BG → 워크플로우 종료 시 task-notification 자동 발생
-   - notification 받은 그 턴에서 즉시 결과 확인 + 사용자에게 보고
-2. **`/schedule` 스킬로 일회성 예약** (특정 시각 또는 N분 후)
-   - 별도 Claude 세션이 예약된 시각에 자동 실행 → 결과 확인 + 알림
-3. **로컬 스크립트면 `run_in_background=true` Bash로 실행**
-   - 이건 종료 시 task-notification 자동 발생 (이미 잘 동작하는 메커니즘)
+   - This is a BG process you launched → a task-notification fires automatically when the workflow ends
+   - On the turn that receives the notification, check the result immediately and report to the user
+2. **A one-off schedule with the `/schedule` skill** (at a specific time or after N minutes)
+   - A separate Claude session runs at the scheduled time → checks the result and notifies
+3. **For local scripts, run them via Bash with `run_in_background=true`**
+   - A task-notification fires automatically on exit (a mechanism that already works well)
 
-**금지**: ScheduleWakeup만 사용하고 끝내기 — `/loop` 외부에서는 사용자 메시지에 흡수돼
-무력화됨. 신뢰할 수 없는 알림.
+**Forbidden**: using only ScheduleWakeup and stopping there — outside `/loop` it is absorbed by user messages and neutralized. It is not a reliable notification.
 
-**자가 점검 (응답 종료 직전)**:
-- "결과 알려드릴게요/모니터링할게요" 류 약속을 했나?
-- 이 응답에 위 1/2/3 중 하나의 자동화 호출이 포함됐나?
-- 약속만 하고 자동화 호출 없으면 **응답 종료 금지**.
-
----
-
-## 서브에이전트 보고 유실 방지 (필수 규칙)
-
-`Agent` 도구에 **`name`을 붙이면 메일박스 모드**로 뜬다. 이 모드는 완료 시
-`idle_notification`만 발생시키고 **에이전트의 최종 보고 텍스트를 유실**한다 —
-에이전트는 일을 정상적으로 끝낸 상태이므로 작업 실패가 아니라 전달 실패다.
-
-- **기본값: `name`을 붙이지 않는다.** 그래야 완료 알림이 최종 메시지를 담아 자동 도착한다.
-- 실행 중 `SendMessage`로 지시를 보내야 해서 `name`이 꼭 필요한 경우에만 붙이고,
-  그때는 프롬프트에 "최종 보고는 반드시 SendMessage로 main에 보내라"를 **명시**한다.
-- 결과를 받아야 하는 리뷰·검증·조사 에이전트에는 `name`을 붙이지 않는다.
-- **바이트에 결속되는 산출물은 완료 알림 본문에서 읽지 않는다.** 알림 본문은 표시용으로
-  이스케이프될 수 있어(`&gt;`, `&amp;`) 원문과 바이트가 다르다. 해시 결속·재현 가능한 제출처럼
-  바이트 동일성이 필요하면 에이전트 출력 파일(트랜스크립트)에서 최종 메시지를 추출하고, 추출 직후
-  바이트 수·digest·이스케이프 잔재를 확인한다. 알림 본문은 사람이 읽는 요약으로만 쓴다.
-- `PreToolUse` 훅 `agent-name-delivery-hook.py`가 이 조건을 자동 검사한다.
+**Self-check (right before ending the response)**:
+- Did I promise "I'll report the result / monitor it" (결과 알려드릴게요/모니터링할게요)?
+- Does this response include one of the automation calls 1/2/3 above?
+- If there is a promise without an automation call, **do not end the response**.
 
 ---
 
-## BG 완료 알림 자동 반영 (수동 호출 규칙)
+## Prevent lost subagent reports — 서브에이전트 보고 유실 방지 (필수 규칙)
 
-Claude Code가 Bash `run_in_background=true` 완료 시 전달하는
-`<task-notification>` system-reminder는 훅으로 잡을 수 없다 (transcript에
-persist되지 않음). 따라서 수신 즉시 아래 스크립트로 HUD state에 반영한다:
+Giving the `Agent` tool a **`name` launches it in mailbox mode**. That mode emits only `idle_notification` on completion and **loses the agent's final report text** — the agent finished its work normally, so this is a delivery failure, not a work failure.
+
+- **Default: do not set `name`.** Then the completion notification arrives automatically carrying the final message.
+- Set `name` only when you must send instructions mid-run via `SendMessage`, and in that case **state explicitly** in the prompt: "최종 보고는 반드시 SendMessage로 main에 보내라" (you must send the final report to main via SendMessage).
+- Do not set `name` on review, verification or research agents whose results you need.
+- **Do not read byte-bound artifacts from the completion-notification body.** The notification body may be escaped for display (`&gt;`, `&amp;`), so its bytes differ from the original. When byte identity is needed, as in hash binding or reproducible submissions, extract the final message from the agent's output file (transcript), and right after extracting it check the byte count, digest and escape residue. Use the notification body only as a human-readable summary.
+- The `PreToolUse` hook `agent-name-delivery-hook.py` checks this condition automatically.
+
+---
+
+## Reflect BG completion notifications — BG 완료 알림 자동 반영 (수동 호출 규칙)
+
+The `<task-notification>` system-reminder that Claude Code delivers when a Bash `run_in_background=true` job completes cannot be caught by hooks (it is not persisted in the transcript). So, on receipt, reflect it into the HUD state immediately with this script:
 
 ```bash
 python3 ~/.claude/scripts/bg-hud-complete.py <tool_use_id> <status>
 ```
 
-- `<tool_use_id>`: notification의 `<tool-use-id>` 값 (예: `toolu_01AF...`)
-- `<status>`: `<status>` 값 — `completed` 또는 `failed`
-- 스크립트가 현재 `.omc/state/sessions/*/hud-state.json`을 자동 탐색해 마킹.
+- `<tool_use_id>`: the notification's `<tool-use-id>` value (e.g. `toolu_01AF...`)
+- `<status>`: the `<status>` value — `completed` or `failed`
+- The script finds the current `.omc/state/sessions/*/hud-state.json` automatically and marks it.
 
-### 언제 호출?
-- `<task-notification>`을 받은 **바로 그 턴**에 호출 (별도 사용자 요청 없이).
-- 다른 작업 중이라면 병렬 Bash 호출로 처리해 본래 작업 흐름을 끊지 않는다.
+### When to call
+- On **the same turn** that receives the `<task-notification>` (without a separate user request).
+- If you are in the middle of other work, handle it with a parallel Bash call so the main flow is not interrupted.
 
-### 보고 방식
-- 성공 시 1문장 또는 현재 진행 중 응답에 자연스럽게 통합 ("BG `<id 끝 4자>` 완료 반영").
-- 실패 시 (`exit 2`) 조용히 스킵 — 이미 stale로 처리됐거나 state 갱신 전일 뿐.
+### How to report
+- On success, one sentence or folded naturally into the ongoing response ("BG `<id 끝 4자>` 완료 반영").
+- On failure (`exit 2`), skip silently — it was already handled as stale, or the state was not updated yet.
 
-### 적용 범위
-- Bash BG만 해당 (Agent BG는 SubagentStop 훅이 즉시 처리).
-- 한 notification에 여러 태그가 있으면 각각 개별 호출.
-
----
-
-## Task Observer 스킬 활성화 (전역)
-
-> 전제: `~/.claude/skills/task-observer` 설치됨 (claude-config `install.sh`가 배포).
-> 미설치 호스트에서는 이 절을 무시한다.
-
-- **작업 지향 세션 시작 시** — 도구를 사용해 산출물을 만들 세션이면 — 작업 착수 전에
-  `task-observer` 스킬을 먼저 호출한다. 세션 전반에서 스킬 개선 기회(반복 패턴, 사용자
-  교정, 워크플로우 인사이트)를 관찰 로그에 수집하기 위함이다.
-- **다른 스킬을 로드할 때** 관찰 로그(observation log)에서 그 스킬에 태깅된 OPEN 관찰을
-  확인하고, 스킬 파일이 아직 갱신되지 않았어도 해당 인사이트를 현재 작업에 적용한다.
-- 조회·Q&A만 하는 세션과 서브에이전트는 호출하지 않는다.
-- 활성화를 다른 스킬 경유로 체이닝하지 않는다 — 체인이 끊기면 관찰 활동 전체가 침묵한다.
+### Scope
+- Bash BG only (Agent BG is handled immediately by the SubagentStop hook).
+- If one notification carries several tags, call once per tag.
 
 ---
 
-## 탐색 위임 (컨텍스트 보존, 전역)
+## Activate the Task Observer skill — Task Observer 스킬 활성화 (전역)
 
-**트리거**: 조사·탐색·로그 분석이 Bash/조회 호출 **3회를 넘길 것으로 예상**되는 순간.
+> Prerequisite: `~/.claude/skills/task-observer` is installed (deployed by claude-config `install.sh`).
+> On hosts where it is not installed, ignore this section.
 
-- 본 스레드에서 직접 돌리지 말고 **서브에이전트에 위임**하고, 결론 + 근거 위치(file:line,
-  핵심 출력 1~2줄)만 회수한다. 빌드 로그·SSH 출력·grep 덤프 원문을 본 스레드에 남기지
-  않는다 (사용자가 원문을 요청한 경우는 예외).
-- 위임 시 [서브에이전트 보고 유실 방지] 규칙을 따른다 — `name` 없이 띄운다.
-- **적용 안 함**: 1~2회 호출로 끝나는 결정적 확인, 위임 왕복이 조사 자체보다 비싼 소규모
-  조회, 중간 판단이 계속 필요해 순차 의존이 강한 인터랙티브 디버깅.
-
----
-
-## HANDOFF 체크포인트 (전역)
-
-`[HANDOFF-CHECKPOINT]` 리마인더를 받거나 phase 경계(구현 완료 / 리뷰 라운드 종료 / 외부 게이트 판정
-확정 직후 / 머지 / 저장 완료)에 이르면 `~/.claude/guidance/handoff-checkpoint.md`를 읽고 그 형식대로
-repo root `HANDOFF.<세션>.md`를 갱신한다.
+- **At the start of a task-oriented session** — one that will use tools to produce deliverables — invoke the `task-observer` skill before starting the work, so that skill-improvement opportunities (repeated patterns, user corrections, workflow insights) are collected into the observation log throughout the session.
+- **When loading another skill**, check the observation log for OPEN observations tagged with that skill, and apply those insights to the current work even if the skill file has not been updated yet.
+- Do not invoke it in query/Q&A-only sessions or in subagents.
+- Do not chain the activation through another skill — if the chain breaks, all observation activity goes silent.
 
 ---
 
-## tribunal 심사 단위 축소 (전역)
+## Delegate exploration — 탐색 위임 (컨텍스트 보존, 전역)
 
-pre-pr-tribunal 게이트가 걸린 저장소에서 구현을 시작하거나, Tribunal을 실행·재심사하거나 그 판정에
-대응할 때는 `~/.claude/guidance/tribunal-review-units.md`를 먼저 읽는다. 핵심: 심사 단위를 작게 나눠
-올린다. FAIL·INCONCLUSIVE 뒤에는 결과를 보고하고 멈추며, 수정·커밋·재심사는 사용자의 새 명시 요청이
-허용한 범위에서만 한다. PASS 뒤 비차단 지적은 모아서 한 번에 고친다. 리뷰 강도 하향으로 비용을 줄이지 않는다.
+**Trigger**: the moment an investigation, exploration or log analysis is **expected to take more than 3** Bash/lookup calls.
+
+- Do not run it in the main thread; **delegate it to a subagent** and bring back only the conclusion plus evidence locations (file:line, 1–2 key output lines). Do not leave raw build logs, SSH output or grep dumps in the main thread (unless the user asked for the raw output).
+- When delegating, follow [Prevent lost subagent reports] — launch without `name`.
+- **Not applicable**: deterministic checks done in 1–2 calls; small lookups where the delegation round trip costs more than the investigation itself; strongly sequential interactive debugging that needs continuous intermediate judgment.
 
 ---
 
-## 리뷰·검증 예산 (전역)
+## HANDOFF checkpoint — HANDOFF 체크포인트 (전역)
 
-계획 실행(`superpowers:subagent-driven-development`·`superpowers:executing-plans`), 리뷰 루프, 서브에이전트
-구현을 시작할 때는 `~/.claude/guidance/review-budget.md`를 먼저 읽고, 작업 수·리뷰 횟수·수정 라운드
-상한을 1줄로 알린다. 사용자가 요청에서 범위·예산을 명시하면 그것이 우선한다.
+On receiving the `[HANDOFF-CHECKPOINT]` reminder, or on reaching a phase boundary (implementation done / review round ended / right after an external gate verdict is final / merge / save done), read `~/.claude/guidance/handoff-checkpoint.md` and update repo root `HANDOFF.<세션>.md` in that format.
+
+---
+
+## Shrink the tribunal review unit — tribunal 심사 단위 축소 (전역)
+
+When starting implementation in a repository gated by pre-pr-tribunal, or when running or re-running a Tribunal or responding to its verdict, read `~/.claude/guidance/tribunal-review-units.md` first. Core: split the review unit small. After FAIL or INCONCLUSIVE, report the result and stop; fix, commit or re-review only within the scope a new explicit user request allows. Collect non-blocking findings after a PASS and fix them at once. Do not cut cost by lowering the review intensity.
+
+---
+
+## Review and verification budget — 리뷰·검증 예산 (전역)
+
+When starting plan execution (`superpowers:subagent-driven-development`·`superpowers:executing-plans`), a review loop or subagent implementation, read `~/.claude/guidance/review-budget.md` first and announce in one line the number of tasks, the number of reviews and the fix-round cap. If the user specified scope or budget in the request, that takes precedence.
