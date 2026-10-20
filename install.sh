@@ -160,6 +160,12 @@ install_doc "$REPO_DIR/claude-md/global-guidance.md" ~/.claude/global-guidance.m
 # 심볼릭 링크로 저장소 파일을 직접 가리켜 드리프트 자체를 없앤다.
 private_dir ~/.claude/archive
 ln -sfn "$REPO_DIR/claude-md/archive/violations.md" ~/.claude/archive/violations.md
+# 상황별 지침: 전역 지침이 "언제 읽을지"만 남기고 본문은 여기서 필요할 때 읽는다. 링크라 pull 시 자동 갱신된다.
+if [ -e ~/.claude/guidance ] && [ ! -L ~/.claude/guidance ]; then
+  echo "[install] 경고: ~/.claude/guidance 가 링크가 아니라 상황별 지침 링크를 건너뜀" >&2
+else
+  ln -sfn "$REPO_DIR/claude-md/guidance" ~/.claude/guidance
+fi
 IMPORTS="@global-guidance.md"
 if grep -qi "notion" "$HOME/.claude.json" 2>/dev/null; then
   install_doc "$REPO_DIR/claude-md/CLAUDE-notion.md" ~/.claude/CLAUDE-notion.md

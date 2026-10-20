@@ -681,7 +681,7 @@ next review.
 ## superpowers:subagent-driven-development
 
 The budget rule itself lives in the global guidance
-(`~/.claude/global-guidance.md`, section "리뷰·검증 예산"); this section maps it
+(`~/.claude/guidance/review-budget.md`, summarized in `~/.claude/global-guidance.md` section "리뷰·검증 예산"); this section maps it
 onto this skill's loop. Where the two disagree, the budget rule wins. A scope or
 budget your human partner states in the request beats both.
 

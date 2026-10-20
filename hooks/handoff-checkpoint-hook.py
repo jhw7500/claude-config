@@ -37,7 +37,7 @@ REMINDER = """<system-reminder>
 - Task 세션이면 tsk-/clm-id를 본문에 남겨 두 기록을 연결한다.
 - 게이트(Tribunal·CI·리뷰 verdict) 판정 직후라면 게이트 식별자(run·round·HEAD)와
   blocker ID 목록을 남긴다.
-- 세부 규칙: ~/.claude/global-guidance.md > "HANDOFF 체크포인트 (전역)".
+- 세부 규칙: ~/.claude/guidance/handoff-checkpoint.md
 </system-reminder>"""
 
 

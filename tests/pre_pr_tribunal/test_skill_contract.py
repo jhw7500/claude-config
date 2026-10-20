@@ -166,7 +166,7 @@ def test_pass_recommends_pushing_and_bounds_re_review_of_advisory_fixes():
 
 
 def test_global_guidance_bounds_the_post_pass_re_review_the_same_way():
-    guidance = (REPOSITORY_ROOT / "claude-md" / "global-guidance.md").read_text(encoding="utf-8")
+    guidance = (REPOSITORY_ROOT / "claude-md" / "guidance" / "tribunal-review-units.md").read_text(encoding="utf-8")
     rule = guidance[guidance.index("6. **PASS 뒤의 비차단 지적은 모아서 한 번에 고친다.**"):]
     rule = rule[:rule.index("\n7. ")]
     assert "한 번에 고친 뒤 lifecycle 한 번으로\n   재심사한다" not in rule
