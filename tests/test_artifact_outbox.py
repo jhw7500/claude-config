@@ -50,6 +50,16 @@ def test_export_stages_a_private_copy_with_its_digest(tmp_path):
     assert str(entry) in json.loads(result.stdout)["next_step"]
 
 
+def test_a_long_multibyte_title_still_fits_a_filesystem_name(tmp_path):
+    # Sixty four-byte characters exceed a 255-byte name component once the timestamp is prepended.
+    _, result = export(tmp_path, title="\U00020000" * 60)
+    entry = entry_of(result)
+    data = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
+    assert len(entry.name.encode("utf-8")) <= 255
+    assert len(data["document"].encode("utf-8")) <= 255
+    assert data["title"] == "\U00020000" * 60
+
+
 def test_default_outbox_is_outside_the_repository_under_home(tmp_path):
     source = tmp_path / "doc.md"
     source.write_text("body\n", encoding="utf-8")
@@ -98,48 +108,86 @@ def test_show_detects_a_document_changed_after_export(tmp_path):
     assert shown.returncode == 3 and json.loads(shown.stdout)["digest_ok"] is False
 
 
-def test_record_moves_through_published_and_verified(tmp_path):
+def record(entry, *args):
+    return run("record", "--entry", str(entry), "--state", *args)
+
+
+def test_record_moves_through_publishing_published_and_verified(tmp_path):
     _, result = export(tmp_path)
     entry = entry_of(result)
-    assert run("record", "--entry", str(entry), "--state", "published", "--url", URL,
-               "--account", "user@example.com").returncode == 0
-    assert run("record", "--entry", str(entry), "--state", "verified", "--version", "v1").returncode == 0
+    assert record(entry, "publishing").returncode == 0
+    assert record(entry, "published", "--url", URL, "--account", "user@example.com").returncode == 0
+    assert record(entry, "verified", "--version", "v1").returncode == 0
     data = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
     assert (data["state"], data["url"], data["account"], data["version"]) == ("verified", URL, "user@example.com", "v1")
-    assert [item["state"] for item in data["history"]] == ["published", "verified"]
+    assert [item["state"] for item in data["history"]] == ["publishing", "published", "verified"]
+
+
+def test_an_unrecorded_publish_attempt_blocks_a_second_publish(tmp_path):
+    # The session published and died before recording the URL: the entry is still in publishing.
+    _, result = export(tmp_path)
+    entry = entry_of(result)
+    assert record(entry, "publishing").returncode == 0
+    blocked = record(entry, "publishing")
+    assert refused(blocked) and "earlier publish attempt was not recorded" in blocked.stderr
+    assert record(entry, "published", "--url", URL).returncode == 0
 
 
 def test_a_second_new_artifact_url_is_refused_so_a_retry_cannot_duplicate(tmp_path):
     _, result = export(tmp_path)
     entry = entry_of(result)
-    assert run("record", "--entry", str(entry), "--state", "published", "--url", URL).returncode == 0
-    assert run("record", "--entry", str(entry), "--state", "failed", "--reason", "read-back mismatch").returncode == 0
-    other = URL[:-1] + "1"
-    assert refused(run("record", "--entry", str(entry), "--state", "published", "--url", other))
-    assert run("record", "--entry", str(entry), "--state", "published", "--url", URL).returncode == 0
+    assert record(entry, "publishing").returncode == 0
+    assert record(entry, "published", "--url", URL).returncode == 0
+    assert record(entry, "failed", "--reason", "read-back mismatch").returncode == 0
+    assert record(entry, "publishing").returncode == 0
+    assert refused(record(entry, "published", "--url", URL[:-1] + "1"))
+    assert record(entry, "published", "--url", URL).returncode == 0
 
 
 def test_update_mode_accepts_only_its_target_url(tmp_path):
     _, result = export(tmp_path, "--update-url", URL)
     entry = entry_of(result)
-    assert refused(run("record", "--entry", str(entry), "--state", "published", "--url", URL[:-1] + "1"))
-    assert run("record", "--entry", str(entry), "--state", "published", "--url", URL).returncode == 0
+    assert record(entry, "publishing").returncode == 0
+    assert refused(record(entry, "published", "--url", URL[:-1] + "1"))
+    assert record(entry, "published", "--url", URL).returncode == 0
+
+
+def test_repeated_failures_keep_every_reason(tmp_path):
+    _, result = export(tmp_path)
+    entry = entry_of(result)
+    assert record(entry, "failed", "--reason", "publish tool refused").returncode == 0
+    assert record(entry, "failed", "--reason", "retry also refused").returncode == 0
+    data = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
+    assert [item.get("reason") for item in data["history"]] == ["publish tool refused", "retry also refused"]
 
 
 @pytest.mark.parametrize(
-    ("first", "second"),
+    ("steps", "refused_step"),
     [
-        (("verified",), None),
-        (("published", "--url", URL), ("verified",)),
+        ((), ("verified",)),
+        ((), ("published", "--url", URL)),
+        ((("publishing",), ("published", "--url", URL), ("verified",)), ("publishing",)),
     ],
-    ids=("verify-before-publish", "publish-after-verified"),
+    ids=("verify-before-publish", "published-without-publishing", "publish-after-verified"),
 )
-def test_record_refuses_out_of_order_states(tmp_path, first, second):
+def test_record_refuses_out_of_order_states(tmp_path, steps, refused_step):
     _, result = export(tmp_path)
     entry = entry_of(result)
-    if second is None:
-        assert refused(run("record", "--entry", str(entry), "--state", *first))
-        return
-    assert run("record", "--entry", str(entry), "--state", *first).returncode == 0
-    assert run("record", "--entry", str(entry), "--state", *second).returncode == 0
-    assert refused(run("record", "--entry", str(entry), "--state", "published", "--url", URL))
+    for step in steps:
+        assert record(entry, *step).returncode == 0
+    assert refused(record(entry, *refused_step))
+
+
+def test_filesystem_and_damaged_entry_errors_use_the_script_contract(tmp_path):
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x", encoding="utf-8")
+    source = tmp_path / "doc.md"
+    source.write_text("body\n", encoding="utf-8")
+    assert refused(run("export", "--outbox", str(blocker / "outbox"), "--title", "t", "--source", str(source)))
+    _, result = export(tmp_path)
+    entry = entry_of(result)
+    data = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
+    del data["document"]
+    (entry / "entry.json").write_text(json.dumps(data), encoding="utf-8")
+    assert refused(run("show", "--entry", str(entry)))
+    assert refused(record(entry, "failed", "--reason", "x"))

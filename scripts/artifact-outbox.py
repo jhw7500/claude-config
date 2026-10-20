@@ -18,14 +18,19 @@ import tempfile
 
 MAX_BYTES = 256 * 1024
 MAX_TITLE = 200
+MAX_SLUG_BYTES = 120
 ARTIFACT_URL = re.compile(r"https://claude\.ai/(?:code/)?artifact/[A-Za-z0-9-]+")
-# A published URL is never replaced by another, so retrying after a failure updates the same artifact.
+# publishing is recorded before the Artifact tool runs, so an entry left in publishing without a URL tells a retry
+# that an earlier attempt may have published without recording; it must look for that artifact instead of
+# publishing again. A recorded URL is never replaced by another, so a retry after a failure updates that artifact.
 TRANSITIONS = {
-    "exported": {"published", "failed"},
+    "exported": {"publishing", "failed"},
+    "publishing": {"published", "failed"},
     "published": {"verified", "failed"},
-    "failed": {"published"},
+    "failed": {"publishing", "failed"},
     "verified": set(),
 }
+REQUIRED = {"title", "document", "sha256", "mode", "target_url", "state", "url", "account", "version", "history"}
 
 
 class OutboxError(Exception):
@@ -50,7 +55,10 @@ def _url(value: str) -> str:
 
 
 def _slug(title: str) -> str:
-    slug = re.sub(r"[^\w-]+", "-", title).strip("-_")[:60].strip("-_")
+    # A name component is commonly limited to 255 bytes, and the entry name adds a timestamp and a suffix, so the
+    # slug is cut by UTF-8 bytes on a character boundary.
+    slug = re.sub(r"[^\w-]+", "-", title).strip("-_")
+    slug = slug.encode("utf-8")[:MAX_SLUG_BYTES].decode("utf-8", "ignore").strip("-_")
     return slug or "document"
 
 
@@ -75,7 +83,8 @@ def _load(entry: Path) -> dict:
         data = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise OutboxError(f"cannot read entry: {error}") from None
-    if not isinstance(data, dict) or data.get("schema") != 1 or data.get("state") not in TRANSITIONS:
+    if (not isinstance(data, dict) or data.get("schema") != 1 or data.get("state") not in TRANSITIONS
+            or not REQUIRED <= data.keys() or not isinstance(data["history"], list)):
         raise OutboxError("entry.json is not an artifact outbox entry")
     return data
 
@@ -134,6 +143,11 @@ def show(entry: Path) -> tuple[dict, bool]:
 def record(entry: Path, state: str, url: str | None, account: str | None, version: str | None,
            reason: str | None) -> dict:
     data = _load(entry)
+    if state == "publishing" and data["state"] == "publishing":
+        raise OutboxError(
+            "an earlier publish attempt was not recorded; find that artifact in your artifact list and record it "
+            "with --state published --url, or record --state failed before publishing again"
+        )
     if state not in TRANSITIONS[data["state"]]:
         raise OutboxError(f"cannot record {state} after {data['state']}")
     if state == "published":
@@ -175,7 +189,7 @@ def main(argv: list[str]) -> int:
     shown.add_argument("--entry", type=Path, required=True)
     recorded = commands.add_parser("record", help="record a publish or verification result")
     recorded.add_argument("--entry", type=Path, required=True)
-    recorded.add_argument("--state", choices=("published", "verified", "failed"), required=True)
+    recorded.add_argument("--state", choices=("publishing", "published", "verified", "failed"), required=True)
     recorded.add_argument("--url")
     recorded.add_argument("--account")
     recorded.add_argument("--version")
@@ -189,7 +203,7 @@ def main(argv: list[str]) -> int:
             code = 0 if ok else 3
         else:
             result, code = record(args.entry, args.state, args.url, args.account, args.version, args.reason), 0
-    except OutboxError as error:
+    except (OutboxError, OSError) as error:
         print(f"artifact-outbox: {error}", file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False))
