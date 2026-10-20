@@ -83,9 +83,16 @@ def _load(entry: Path) -> dict:
         data = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise OutboxError(f"cannot read entry: {error}") from None
-    if (not isinstance(data, dict) or data.get("schema") != 1 or data.get("state") not in TRANSITIONS
-            or not REQUIRED <= data.keys() or not isinstance(data["history"], list)):
+    if (not isinstance(data, dict) or data.get("schema") != 1 or not REQUIRED <= data.keys()
+            or not all(isinstance(data[key], str) for key in ("title", "document", "sha256", "state"))
+            or not all(data[key] is None or isinstance(data[key], str)
+                       for key in ("target_url", "url", "account", "version"))
+            or data["state"] not in TRANSITIONS or data["mode"] not in ("new", "update")
+            or not isinstance(data["history"], list)):
         raise OutboxError("entry.json is not an artifact outbox entry")
+    # The skill publishes <entry>/<document>, so the name must not reach outside the entry.
+    if data["document"] in ("", ".", "..") or Path(data["document"]).name != data["document"]:
+        raise OutboxError("entry.json names a document outside the entry")
     return data
 
 

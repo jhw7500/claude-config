@@ -8,9 +8,10 @@
 |---|---|
 | `skills/plugin-toggle/` | 플러그인 on/off 스킬. `enabledPlugins` 토글 + **`/reload-plugins`로 재시작 없이 즉시 적용** |
 | `skills/gstack-toggle/` | gstack 사용자 스킬(~47개) on/off 토글(디렉토리 이동 방식). 미설치 호스트선 no-op이라 안전 |
+| `skills/artifact-publish/` | `artifact-outbox.py`로 내보낸 문서를 대화형 Claude Code 세션에서 claude.ai Artifact로 발행·재확인하고 outbox 항목에 기록하는 스킬 |
 | `slack-bridge/` | Slack 비공개 채널 ↔ Claude Code 세션 헤드리스 브릿지. `setup-slack-bridge.sh`로 systemd `--user` 서비스 설치. 상세는 `slack-bridge/README.md` |
 | `shell/plug.sh` | `plug on\|off <key>` 셸 함수 (bkit/docs/pw/pyright/compound) |
-| `scripts/` | 개인 hook/toggle과 **jhw-control-host.py** secure launcher: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, apex-toggle.sh, setup-mcp.sh |
+| `scripts/` | 개인 hook/toggle과 **jhw-control-host.py** secure launcher: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, apex-toggle.sh, setup-mcp.sh, artifact-outbox.py |
 | `hooks/` | 커스텀 훅 6개: carl·notion-continuous·general-continuation·post-info·post-action·bg-task. install.sh가 env-aware **자동 배선** |
 | `commands/` | session-handoff 사용자 커맨드: `/handoff [세션명]`, `/resume [세션명]` |
 | `manifest/` | `mcp.json` — MCP 서버 정의(공개 6 + 사내 4). `setup-mcp.sh`가 사용 |
@@ -41,6 +42,7 @@ source ~/.bashrc
   - 현재 `jhw-notion` PR 작성 절차의 생성 명령은 pre-PR Tribunal 게이트의 canonical command가 아니다. `--repo`뿐 아니라 동적 `--base`와 변수 인자도 게이트가 거부하므로 `--repo`만 빼서 재시도하지 않는다. `$jhw-pr`/`/jhw:pr`는 본문 작성·검증 단계까지만 따르고, 검증을 통과한 본문 파일을 canonical command에 넘겨 PR을 별도 생성한다. 두 흐름을 그대로 이어 실행하거나 gate를 우회하지 않는다.
   - 설치기는 change-evidence 블록을 제거하지 않으며, 이전 버전의 설치기를 다시 실행해도 이 블록은 남는다. 반대로 이 설치기가 남아 있는 동안에는 블록을 손으로 지워도 다음 `./install.sh` 실행이 블록을 다시 추가한다. 따라서 철회는 `global-guidance.md`의 해당 절과 설치기의 Codex 블록 기록을 함께 되돌린 버전으로 `./install.sh`를 다시 실행한 뒤, 각 호스트의 활성 AGENTS 파일에서 `claude-config:change-evidence:START/END` 블록을 직접 지우는 순서로 한다.
   - 필드 정의·validator는 이 저장소에 복제하지 않는다. 정본 v1 좌표가 바뀌면 양쪽 지침의 링크를 명시적으로 갱신하고 `tests/task_nudge/test_change_evidence_guidance.py`를 실행한다. 이미 스킬을 적용한 작업은 반복 호출하지 않으며, 일반 git 명령을 추가로 차단하지 않는다.
+- **Artifact outbox (Codex → Claude)**: Artifact 발행은 `/login`한 대화형 Claude Code 세션에서만 된다. 그래서 Codex는 확정 문서를 `~/.claude/scripts/artifact-outbox.py export`로 저장소 밖 outbox에 내보내고, Claude Code의 `artifact-publish` 스킬이 발행·재확인·기록을 맡는다. Codex 안내는 별도 `claude-config:artifact-outbox:START/END` AGENTS 블록으로 설치기가 기록한다. 스크립트 링크와 블록 모두 `./install.sh`를 다시 실행해야 반영된다.
 - `context-bar`(statusLine 교체)는 **미포함** (현재 OMC HUD와 상호배타라 별도 결정 필요)
 
 ## pre-PR tribunal
