@@ -19,7 +19,7 @@ import tempfile
 MAX_BYTES = 256 * 1024
 MAX_TITLE = 200
 MAX_SLUG_BYTES = 120
-ARTIFACT_URL = re.compile(r"https://claude\.ai/(?:code/)?artifact/[A-Za-z0-9_-]+")
+ARTIFACT_URL = re.compile(r"https://claude\.ai/(?:code/)?artifact/[A-Za-z0-9-]+")
 # publishing is recorded before the Artifact tool runs, so an entry left in publishing without a URL tells a retry
 # that an earlier attempt may have published without recording; it must look for that artifact instead of
 # publishing again. A recorded URL is never replaced by another, so a retry after a failure updates that artifact.
