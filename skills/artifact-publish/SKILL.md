@@ -22,10 +22,11 @@ directory the user gave. If the script is missing, report that `./install.sh` ha
    user to export it again. From the output, note `title`, `document`, `mode`, `target_url`, `state` and `url`.
    - `verified`: already done. Report the URL and stop.
    - `published`: the publish was recorded but not checked. Run step 2, then continue from step 8.
-   - `publishing` with no `url`: an earlier attempt may have published without recording it. Go to
+   - `publishing`: an earlier attempt may have published without recording it. Run step 2, then go to
      [Unrecorded attempt](#unrecorded-attempt).
 2. **Check the account.** Run `claude auth status --json`. Continue only if `loggedIn` is `true` and `authMethod` is
-   `claude.ai`. Otherwise record `failed --reason "not signed in to claude.ai"` and stop. Use `email` as the account.
+   `claude.ai`. Otherwise ask the user to sign in with `/login` and stop without recording anything, so the entry
+   keeps its state for the next attempt. Use `email` as the account.
 3. **Choose the target.** If `url` is recorded, update that artifact. Otherwise, if `mode` is `update`, update
    `target_url`. Otherwise create a new artifact. For an update, read the target first with the Artifact tool
    (`action: "read"`). Continue only if the result says the user is a writer. Otherwise record
@@ -37,7 +38,10 @@ directory the user gave. If the script is missing, report that `./install.sh` ha
    Artifact tool with `file_path` set to `$ENTRY/<document>`, the entry `title`, and the target `url` for an update.
    Meet any other requirement the tool states, such as loading a skill or giving an icon, without changing the file.
 7. **Record the URL immediately.** Before anything else, run `record --entry "$ENTRY" --state published --url "<url>"`
-   with the URL from the publish result. If publishing failed, record `failed --reason "<error>"` and stop.
+   with the URL from the publish result. If the tool refused the publish before creating anything, for example by
+   rejecting the file or because the user declined it, record `failed --reason "<error>"` and stop. If the outcome is
+   unknown, such as a timeout, a dropped connection or an error that does not say nothing was created, do not record
+   `failed`: leave the entry in `publishing` and go to [Unrecorded attempt](#unrecorded-attempt).
 8. **Read it back.** Read the artifact with `action: "read"`. If the returned content equals the document byte for
    byte, record `verified`, adding `--version "<version>"` when the publish or read result names one. Otherwise
    record `failed --reason "read-back differs from the document"`.
@@ -46,8 +50,13 @@ directory the user gave. If the script is missing, report that `./install.sh` ha
 
 ## Unrecorded attempt
 
-List the user's artifacts (`action: "list"`) and look for ones with the entry title updated after the `publishing`
-time in the entry history. If exactly one matches, record `published --url "<its url>"` and continue from step 8.
+If `url` is recorded or `mode` is `update`, the earlier attempt could only have published to that one artifact
+(`url`, otherwise `target_url`). Record `published --url "<that url>"` and continue from step 8; the read-back shows
+whether that attempt landed.
+
+Otherwise list the user's artifacts (`action: "list"`) and look for ones with the entry title updated after the
+`publishing` time in the entry history. If exactly one matches, record `published --url "<its url>"` and continue
+from step 8.
 Otherwise show the user what you found and ask them to choose: record a URL they pick, or record `failed`, which allows
 a new publish that may duplicate an artifact the earlier attempt made.
 
