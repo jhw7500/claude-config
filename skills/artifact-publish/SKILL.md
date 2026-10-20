@@ -29,36 +29,65 @@ directory the user gave. If the script is missing, report that `./install.sh` ha
    keeps its state for the next attempt. Use `email` as the account.
 3. **Choose the target.** If `url` is recorded, update that artifact. Otherwise, if `mode` is `update`, update
    `target_url`. Otherwise create a new artifact. For an update, read the target first with the Artifact tool
-   (`action: "read"`). Continue only if the result says the user is a writer. Otherwise record
-   `failed --reason "no writer access to the target"` and stop.
+   (`action: "read"`). Continue only if the result says the artifact is owned by you or that you are a writer.
+   Otherwise record `failed --reason "no writer access to the target"` and stop.
 4. **Read the document.** Read the whole `$ENTRY/<document>` file before publishing it. Do not edit it.
 5. **Record the attempt before publishing.** Run `record --entry "$ENTRY" --state publishing --account "<email>"`.
    If the script refuses, follow its message and do not publish.
 6. **Publish the file as it is.** This skill asks for the Markdown file itself to be published as Markdown. Call the
    Artifact tool with `file_path` set to `$ENTRY/<document>`, the entry `title`, and the target `url` for an update.
    Meet any other requirement the tool states, such as loading a skill or giving an icon, without changing the file.
-7. **Record the URL immediately.** Before anything else, run `record --entry "$ENTRY" --state published --url "<url>"`
-   with the URL from the publish result. If the tool refused the publish before creating anything, for example by
+7. **Record the URL immediately.** Before anything else, run
+   `record --entry "$ENTRY" --state published --url "<url>" --version "<version id>"` with the URL and the version id
+   from the publish result. If the tool refused the publish before creating anything, for example by
    rejecting the file or because the user declined it, record `failed --reason "<error>"` and stop. If the outcome is
    unknown, such as a timeout, a dropped connection or an error that does not say nothing was created, do not record
    `failed`: leave the entry in `publishing` and go to [Unrecorded attempt](#unrecorded-attempt).
-8. **Read it back.** Read the artifact with `action: "read"`. If the returned content equals the document byte for
-   byte, record `verified`, adding `--version "<version>"` when the publish or read result names one. Otherwise
-   record `failed --reason "read-back differs from the document"`.
+8. **Read it back.** Read the artifact with `action: "read"`. The service keeps the page it renders from the Markdown,
+   not the Markdown itself, so the read cannot be compared with the document byte for byte. Compare the text
+   instead. The read result names the file that holds the full page.
+
+   Record `verified --version "<version id from the read>"` only if all of these hold. Otherwise record
+   `failed --reason "<the check that failed>"`.
+   - The read names the version id that the entry recorded in step 7. If the entry has no recorded `version`
+     (it was settled in [Unrecorded attempt](#unrecorded-attempt)), skip this check; the text check decides.
+   - It says the artifact is owned by you or that you are a writer.
+   - The page `<title>` is the entry's `document` name.
+   - The text of the page's `<article>` element equals the document's text, comparing with whitespace collapsed.
+     - Leave out the article's first label, `Markdown · <document>`.
+     - The page drops the Markdown markup, such as heading marks, list markers, backticks, table pipes, table
+       divider rows and code fences. Leave that markup out of the document's side too.
+     - The page escapes characters such as `"` as `&quot;`. Compare them unescaped.
+     - Every word must match, and neither side may have extra text.
+   - `show --entry "$ENTRY"` still exits 0, so the exported document has not changed since step 1.
+
+   These checks tie the page to this document's text. They do not prove the page holds the document byte for byte,
+   which the read cannot show.
 9. **Report.** Give the user the entry, the URL, the final state and, on failure, the reason. Do not republish
-   automatically.
+   automatically. Publish again only when the user asks. That request starts again from step 1, and from `failed`
+   with a recorded URL it updates that artifact.
 
 ## Unrecorded attempt
 
-If `url` is recorded or `mode` is `update`, the earlier attempt could only have published to that one artifact
-(`url`, otherwise `target_url`). Record `published --url "<that url>"` and continue from step 8; the read-back shows
-whether that attempt landed.
+First settle the one artifact the earlier attempt could have published to.
 
-Otherwise list the user's artifacts (`action: "list"`) and look for ones with the entry title updated after the
-`publishing` time in the entry history. If exactly one matches, record `published --url "<its url>"` and continue
-from step 8.
-Otherwise show the user what you found and ask them to choose: record a URL they pick, or record `failed`, which allows
-a new publish that may duplicate an artifact the earlier attempt made.
+- If `url` is recorded, it is `url`. Otherwise, if `mode` is `update`, it is `target_url`. The entry itself names
+  this artifact.
+- Otherwise, list the user's artifacts (`action: "list"`). The list shows each artifact under its page title, which
+  for a published Markdown file is the file name. So look for ones listed under the entry's `document` name and
+  updated after the `publishing` time in the entry history.
+  - A match is only a guess, so in every case show the user what you found. Tell them that the entry will be bound
+    to the artifact they settle on, and that any later publish of this entry goes to it.
+  - Then ask them to choose one of these:
+    - They can confirm one artifact as the one the earlier attempt made. Settle on it.
+    - They can pick another URL. Settle on it.
+    - They can have you record `failed`. That allows a new publish, which may duplicate an artifact the earlier
+      attempt made. Then stop.
+    - If they choose none of these, stop without recording anything.
+
+With the URL settled, record `published --url "<that url>"` and continue from step 8. The read shows whether that
+artifact already holds this document. Nothing is published again here. If step 8 records `failed`, publishing again
+needs the user's request, as step 9 says.
 
 ## Never
 

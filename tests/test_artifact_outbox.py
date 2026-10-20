@@ -144,6 +144,18 @@ def test_a_second_new_artifact_url_is_refused_so_a_retry_cannot_duplicate(tmp_pa
     assert record(entry, "published", "--url", URL).returncode == 0
 
 
+def test_the_skill_recovery_sequence_verifies_the_settled_url_without_publishing_again(tmp_path):
+    # The skill's "Unrecorded attempt" path: record the settled URL, then the version its read-back names.
+    _, result = export(tmp_path)
+    entry = entry_of(result)
+    assert record(entry, "publishing").returncode == 0
+    assert record(entry, "published", "--url", URL).returncode == 0
+    assert record(entry, "verified", "--version", "1792459229-07d5").returncode == 0
+    data = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
+    assert (data["state"], data["url"], data["version"]) == ("verified", URL, "1792459229-07d5")
+    assert [item["state"] for item in data["history"]] == ["publishing", "published", "verified"]
+
+
 def test_update_mode_accepts_only_its_target_url(tmp_path):
     _, result = export(tmp_path, "--update-url", URL)
     entry = entry_of(result)
