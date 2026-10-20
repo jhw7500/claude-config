@@ -191,3 +191,27 @@ def test_filesystem_and_damaged_entry_errors_use_the_script_contract(tmp_path):
     (entry / "entry.json").write_text(json.dumps(data), encoding="utf-8")
     assert refused(run("show", "--entry", str(entry)))
     assert refused(record(entry, "failed", "--reason", "x"))
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("document", None),
+        ("document", "../outside.md"),
+        ("sha256", None),
+        ("state", []),
+        ("mode", ["new"]),
+        ("url", 5),
+    ],
+    ids=("null-document", "document-outside-entry", "null-digest", "list-state", "list-mode", "number-url"),
+)
+def test_a_damaged_field_value_is_refused_before_it_is_used(tmp_path, key, value):
+    # The skill publishes `<entry>/<document>`, so the name must stay inside the entry.
+    _, result = export(tmp_path)
+    entry = entry_of(result)
+    (entry.parent / "outside.md").write_text("not exported\n", encoding="utf-8")
+    data = json.loads((entry / "entry.json").read_text(encoding="utf-8"))
+    data[key] = value
+    (entry / "entry.json").write_text(json.dumps(data), encoding="utf-8")
+    assert refused(run("show", "--entry", str(entry)))
+    assert refused(record(entry, "failed", "--reason", "x"))

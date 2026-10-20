@@ -40,6 +40,9 @@ CHANGE_EVIDENCE_CONTRACT = (
     "0d97a63891ba4473a3a189eae643f8059b76eb56/"
     "docs/change-evidence-contract-v1.md"
 )
+ARTIFACT_OUTBOX_START = "<!-- claude-config:artifact-outbox:START -->"
+ARTIFACT_OUTBOX_END = "<!-- claude-config:artifact-outbox:END -->"
+ARTIFACT_OUTBOX_COMMAND = "/usr/bin/python3 $HOME/.claude/scripts/artifact-outbox.py"
 CLAUDE_MATCHER = "Edit|Write|NotebookEdit"
 CLAUDE_COMMAND = "$HOME/.claude/hooks/task-nudge.sh"
 CODEX_MATCHER = "apply_patch|Edit|Write"
@@ -130,19 +133,38 @@ def merge_change_evidence_block(original: str, policy: str) -> str:
     )
 
 
-def merge_guidance_blocks(original: str) -> str:
-    """Reject overlapping managed policies before replacing either one."""
-    task_span = _managed_block_span(original, AGENTS_START, AGENTS_END, "task-nudge")
-    evidence_span = _managed_block_span(
-        original, CHANGE_EVIDENCE_START, CHANGE_EVIDENCE_END, "change-evidence"
+def merge_artifact_outbox_block(original: str, policy: str) -> str:
+    return _merge_managed_block(
+        original, policy, ARTIFACT_OUTBOX_START, ARTIFACT_OUTBOX_END,
+        "artifact-outbox",
     )
-    if task_span and evidence_span and max(task_span[0], evidence_span[0]) < min(
-        task_span[1], evidence_span[1]
-    ):
-        raise InstallError("AGENTS managed blocks overlap")
-    return merge_change_evidence_block(
-        merge_agents_block(original, agents_policy_block()),
-        change_evidence_policy_block(),
+
+
+def merge_guidance_blocks(original: str) -> str:
+    """Reject overlapping managed policies before replacing any of them."""
+    spans = [
+        span
+        for span in (
+            _managed_block_span(original, AGENTS_START, AGENTS_END, "task-nudge"),
+            _managed_block_span(
+                original, CHANGE_EVIDENCE_START, CHANGE_EVIDENCE_END, "change-evidence"
+            ),
+            _managed_block_span(
+                original, ARTIFACT_OUTBOX_START, ARTIFACT_OUTBOX_END, "artifact-outbox"
+            ),
+        )
+        if span
+    ]
+    for index, first in enumerate(spans):
+        for second in spans[index + 1:]:
+            if max(first[0], second[0]) < min(first[1], second[1]):
+                raise InstallError("AGENTS managed blocks overlap")
+    return merge_artifact_outbox_block(
+        merge_change_evidence_block(
+            merge_agents_block(original, agents_policy_block()),
+            change_evidence_policy_block(),
+        ),
+        artifact_outbox_policy_block(),
     )
 
 
@@ -189,6 +211,20 @@ def change_evidence_policy_block() -> str:
         "`$jhw-pr`의 생성 명령(`--repo`·변수 인자 포함)은 실행하지 않는다. "
         "PR 본문은 `$jhw-pr`의 작성·검증 단계를 통과한 파일을 그대로 넘긴다. "
         "일반 git 명령을 추가로 차단하거나 Tribunal 재심사를 호출하지 않는다.\n"
+    )
+
+
+def artifact_outbox_policy_block() -> str:
+    """Point Codex at the outbox; only an interactive Claude Code session can publish."""
+    return (
+        "사용자가 확정한 문서를 claude.ai 계정의 Artifact로 저장해 달라고 할 때만 적용한다. "
+        "Codex는 Artifact를 직접 발행할 수 없다. `/login`한 대화형 Claude Code 세션만 발행할 수 있다.\n"
+        "\n"
+        f"- 문서를 `{ARTIFACT_OUTBOX_COMMAND} export --title '<제목>' --source <파일>`로 내보낸다. "
+        "기존 Artifact를 갱신하는 요청이면 `--update-url <claude.ai artifact URL>`을 더한다.\n"
+        "- 출력의 `entry`와 `next_step`을 사용자에게 그대로 전한다. 발행과 확인은 그 안내대로 "
+        "Claude Code의 `artifact-publish` skill이 한다. Codex 쪽에서 저장이나 발행이 끝났다고 말하지 않는다.\n"
+        "- 스크립트가 없거나 거부하면 그 메시지를 전하고, 다른 경로로 발행을 시도하지 않는다.\n"
     )
 
 
