@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -22,8 +23,11 @@ def _get(value: dict, snake: str, camel: str) -> object:
     return value.get(snake, value.get(camel))
 
 
-def decode_request(raw: bytes, *, runtime: str) -> Optional[tuple[Path, str]]:
-    """(cwd, command) for a shell tool call, else None (the gate does not apply)."""
+def decode_request(raw: bytes, *, runtime: str) -> Optional[tuple[Optional[Path], str]]:
+    """(commit directory, command) for a shell tool call, else None (the gate does not apply).
+
+    For Codex, an absolute ``tool_input.workdir`` is the commit directory; a present but
+    unusable ``workdir`` yields ``(None, command)`` meaning "do not judge"."""
     try:
         value = json.loads(raw)
     except (ValueError, RecursionError):
@@ -41,6 +45,11 @@ def decode_request(raw: bytes, *, runtime: str) -> Optional[tuple[Path, str]]:
     command = tool_input.get("command", tool_input.get("cmd"))
     if not isinstance(command, str):
         return None
+    if runtime == "codex" and "workdir" in tool_input:
+        workdir = tool_input["workdir"]
+        if isinstance(workdir, str) and workdir and os.path.isabs(workdir):
+            return Path(workdir), command
+        return None, command
     return Path(cwd), command
 
 
@@ -63,6 +72,10 @@ def adapter_main(runtime: str) -> int:
         if request is None:
             return 0
         cwd, command = request
+        if cwd is None:
+            if "commit" in command:
+                gate._warn("Codex workdir가 절대경로가 아니어서 검사하지 않았다")
+            return 0
         decision = gate.evaluate(
             command, cwd=cwd, runtime=runtime, home=gate.default_home(), now=time.time()
         )
