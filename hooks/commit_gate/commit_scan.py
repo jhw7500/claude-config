@@ -24,8 +24,15 @@ failed ``cd`` does not stop the next command. Paths containing a ``..``
 component, ``cd -P/-L`` and ``-c core.worktree/core.bare/include*`` are
 ``unknown``. ``-c alias.*`` makes the whole git command ``unknown``; aliases
 defined in git *config files* are out of scope here (the CI audit still sees
-such commits). ``effective_message`` gives the bytes git records after its
-message cleanup.
+such commits). ``-c``/``--config-env`` keys ``commit.cleanup``,
+``core.commentChar``, ``core.commentString`` and ``commit.template`` make the
+command ``unknown``. The same keys set in git CONFIG FILES are not visible to
+this static scanner: the gate must read ``commit.cleanup``/``core.commentChar``
+from the commit directory before calling ``effective_message``.
+``--fixup``/``--squash`` together with ``-m``/``-F`` is ``unknown`` (git prepends
+an autosquash line). ``effective_message`` gives the bytes git records after its
+message cleanup; pass ``from_literal=True`` for ``-m`` text, to which git
+appends a final newline before cleanup.
 """
 
 from __future__ import annotations
@@ -94,6 +101,11 @@ _LONG_IGNORED_FLAG = frozenset({
 _LONG_IGNORED_ARG = frozenset({"author", "date"})
 _SHORT_FLAGS = frozenset("aqvnoi")
 _CONFIG_REDIRECT = ("core.worktree", "core.bare")
+# config keys that change the recorded message bytes
+_CONFIG_MESSAGE = frozenset({
+    "commit.cleanup", "core.commentchar", "core.commentstring", "commit.template",
+})
+_DELIM_LINE = re.compile(r"\n([A-Za-z_]\w*)(?=\n)")
 
 
 class _Unsupported(Exception):
@@ -164,12 +176,17 @@ def _extract_heredocs(command: str) -> tuple[str, dict[str, str]]:
     placeholders: dict[str, str] = {}
     out: list[str] = []
     pos = 0
-    lines: dict[str, list[int]] = {}  # delimiter -> offsets of "\nD\n" lines
+    lines: dict[str, list[int]] = {}  # ident -> offsets of "\nIDENT\n" lines (one pass)
+    scanned = False
     while True:
         m = _HEREDOC_HEADER.search(command, pos)
         if m is None:
             break
         delim = m.group("delim")
+        if not scanned:
+            scanned = True
+            for f in _DELIM_LINE.finditer(command):
+                lines.setdefault(f.group(1), []).append(f.start())
         end = _heredoc_end(command, m, delim, lines)
         if end is None:
             out.append(command[pos:m.end()])
@@ -190,12 +207,8 @@ def _extract_heredocs(command: str) -> tuple[str, dict[str, str]]:
 def _heredoc_end(command: str, m: "re.Match[str]", delim: str,
                  lines: dict[str, list[int]]) -> Optional[tuple[int, int]]:
     positions = lines.get(delim)
-    if positions is None:  # one linear pass per delimiter, then bisect
-        positions = [
-            f.start() for f in re.finditer(
-                r"(?=\n" + re.escape(delim) + r"\n)", command)
-        ]
-        lines[delim] = positions
+    if not positions:
+        return None
     idx = bisect_left(positions, m.end() - 1)  # newline that ends the header line
     if idx >= len(positions):
         return None
@@ -482,7 +495,7 @@ def _handle_git(words: list[_Word], state: dict, placeholders: dict[str, str],
                 key = words[i + 1].text.partition("=")[0].lower()
                 if key.startswith("alias."):
                     alias = True
-                elif (key in _CONFIG_REDIRECT
+                elif (key in _CONFIG_REDIRECT or key in _CONFIG_MESSAGE
                       or key.startswith(("include.", "includeif."))):
                     clean = False
             i += 2
@@ -619,6 +632,8 @@ def _classify(
         return unknown("option is missing its argument")
     if files and messages:
         return unknown("both file and message given")
+    if fixup and (files or messages):
+        return unknown("--fixup/--squash with a message source adds an autosquash line")
     if files:
         value = files[0]
         if (len(files) != 1 or not _literal(value) or value == "-"
@@ -636,7 +651,7 @@ def _classify(
         parts = [placeholders.get(m, m) for m in messages]
         if any(_PLACEHOLDER_PREFIX in p and p not in placeholders.values() for p in parts):
             return unknown("message is not a statically known string")
-        return make("literal", "message option", text="\n\n".join(parts))
+        return make("literal", "message option", text=_join_messages(parts))
     if amend and no_edit:
         return make("auto", "amend without editing")
     if no_edit and _in_progress_operation(directory):
@@ -644,12 +659,28 @@ def _classify(
     return unknown("no message option")
 
 
-def effective_message(raw: str, cleanup: str) -> Optional[str]:
+def _join_messages(parts: list[str]) -> str:
+    """git's `-m` accumulation without the final newline: a blank line between
+    values, each value ended with a newline first (strbuf_complete_line)."""
+    acc = ""
+    for part in parts:
+        if acc:
+            acc += ("" if acc.endswith("\n") else "\n") + "\n"
+        acc += part
+    return acc
+
+
+def effective_message(raw: str, cleanup: str, *, from_literal: bool = False) -> Optional[str]:
     """The bytes git records for `raw` under `--cleanup=<cleanup>` (no editor).
+
+    ``from_literal`` marks text built from ``-m``: git ends it with a newline
+    before cleanup. File text (default) is used as read.
 
     ``None`` when the result depends on ``core.commentChar`` or the mode is
     unknown, so the caller must treat the message as unknown.
     """
+    if from_literal and raw and not raw.endswith("\n"):
+        raw += "\n"
     if cleanup == "verbatim":
         return raw
     if cleanup not in ("default", "whitespace"):

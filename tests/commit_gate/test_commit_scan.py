@@ -269,7 +269,7 @@ def test_fixup_and_squash_consume_their_argument():
     _only_unknown("git commit --fixup amend:HEAD")
     _only_unknown("git commit --fixup=reword:HEAD")
     # `HEAD` is the fixup target, not a message file or message
-    assert one("git commit --fixup HEAD -F m.md").source == "file"
+    _only_unknown("git commit --fixup HEAD -F m.md")  # autosquash line is prepended
 
 
 def test_unrecognised_wrapper_with_commit_is_reported_unknown():
@@ -448,3 +448,90 @@ def test_heredoc_search_is_linear_on_adversarial_shape():
 ])
 def test_loose_fallback_counts_commit_after_quoted_option_values(command):
     _only_unknown(command)
+
+
+@pytest.mark.parametrize("command", [
+    "git -c commit.cleanup=verbatim commit -m 'a  '",
+    "git -c core.commentChar=';' commit -m x",
+    "git -c CORE.COMMENTSTRING=// commit -m x",
+    "git -c commit.template=t.txt commit -m x",
+    "git --config-env=commit.cleanup=CLEAN commit -m x",
+    "git --config-env core.commentChar=CC commit -m x",
+])
+def test_message_changing_config_overrides_are_unknown(command):
+    _only_unknown(command)
+
+
+def test_unrelated_config_override_stays_literal():
+    assert one("git -c user.name=x commit -m 'feat: t'").source == "literal"
+
+
+@pytest.mark.parametrize("command", [
+    "git commit --squash HEAD -F msg",
+    "git commit --fixup HEAD -m x",
+    "git commit --fixup=HEAD --message=x",
+    "git commit --squash=HEAD -m x",
+    "git commit -m x --fixup HEAD",
+])
+def test_autosquash_with_message_source_is_unknown(command):
+    _only_unknown(command)
+
+
+def test_autosquash_alone_stays_auto():
+    assert one("git commit --fixup HEAD").source == "auto"
+    assert one("git commit --squash=HEAD").source == "auto"
+
+
+def test_heredoc_search_is_linear_for_many_distinct_delimiters():
+    cmd = "".join(f"git commit -m \"$(cat <<'D{i}'\n" for i in range(5000))
+    assert len(cmd) < 200_000
+    start = time.monotonic()
+    result = scan_commits(cmd, cwd=CWD)
+    assert time.monotonic() - start < 1.0
+    assert isinstance(result.invocations, tuple)
+
+
+def test_heredoc_with_many_distinct_delimiters_still_extracts():
+    cmd = "".join(f"git commit -m \"$(cat <<'D{i}'\nm{i}\nD{i}\n)\"\n" for i in range(50))
+    result = scan_commits(cmd, cwd=CWD)
+    assert [i.message_text for i in result.invocations] == [f"m{i}" for i in range(50)]
+
+
+_GIT = "/usr/bin/git"
+
+
+def _recorded(args, cwd, env):
+    subprocess.run([_GIT, "commit", "-q", "--allow-empty", *args], cwd=cwd, env=env, check=True)
+    out = subprocess.run([_GIT, "cat-file", "commit", "HEAD"], cwd=cwd, env=env,
+                         check=True, capture_output=True).stdout.decode()
+    return out.split("\n\n", 1)[1]
+
+
+@pytest.mark.skipif(not os.path.exists(_GIT), reason="needs /usr/bin/git")
+@pytest.mark.parametrize("command,flags,expect", [
+    ("git commit --cleanup=verbatim -m a", ["--cleanup=verbatim", "-m", "a"], "a\n"),
+    ("git commit --cleanup=verbatim -m a -m b",
+     ["--cleanup=verbatim", "-m", "a", "-m", "b"], "a\n\nb\n"),
+    ("git commit -m a", ["-m", "a"], "a\n"),
+    ("git commit --cleanup=verbatim -m 'a\n' -m b",
+     ["--cleanup=verbatim", "-m", "a\n", "-m", "b"], "a\n\nb\n"),
+])
+def test_effective_message_literal_matches_real_git(tmp_path, command, flags, expect):
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run([_GIT, "init", "-q", str(tmp_path)], check=True, env=env)
+    inv = one(command)
+    got = effective_message(inv.message_text, inv.cleanup, from_literal=True)
+    assert got == expect
+    assert got == _recorded(flags, tmp_path, env)
+
+
+def test_effective_message_literal_appends_newline_only_when_needed():
+    assert effective_message("a", "verbatim", from_literal=True) == "a\n"
+    assert effective_message("a\n", "verbatim", from_literal=True) == "a\n"
+    assert effective_message("", "verbatim", from_literal=True) == ""
+    assert effective_message("a", "default", from_literal=True) == "a\n"
+    # file bytes are kept as git reads them (measured: verbatim file without
+    # trailing newline is recorded unchanged)
+    assert effective_message("nofinal", "verbatim") == "nofinal"
