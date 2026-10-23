@@ -115,6 +115,35 @@ def test_env_prefix_and_wrappers():
     assert one("/usr/bin/git commit -F m.md").source == "file"
 
 
+def test_rtk_prefix_is_judged_like_git():
+    plain = one('git commit -m "a" -m "b"')
+    for cmd in ('rtk git commit -m "a" -m "b"', 'rtk proxy git commit -m "a" -m "b"'):
+        inv = one(cmd)
+        assert (inv.source, inv.message_text, inv.directory) == (
+            plain.source, plain.message_text, plain.directory), cmd
+        assert inv.source == "literal"
+    inv = one("rtk proxy git commit -F msg.md")
+    assert inv.source == "file"
+    assert inv.message_path == CWD / "msg.md"
+
+
+def test_rtk_prefix_resolves_directory_and_chains():
+    assert one("rtk git -C sub commit -m x").directory == CWD / "sub"
+    assert one("cd sub && rtk git commit -m x").directory == CWD / "sub"
+    result = scan_commits("rtk git status && rtk git commit -m x", cwd=CWD)
+    assert [i.source for i in result.invocations] == ["literal"]
+
+
+def test_rtk_unmodelled_forms_stay_unknown_or_empty():
+    for cmd in ("rtk -v git commit -m x", "rtk proxy -x git commit -m x",
+                "rtk git -C $X commit -m x"):
+        assert one(cmd).source == "unknown", cmd
+    # a dynamic command word hides `git`; plain `$G commit` is likewise not counted
+    for cmd in ("rtk $G commit -m x", "$G commit -m x", "rtk ls -la", "rtk git status",
+                "rtk", "rtk proxy"):
+        assert scan_commits(cmd, cwd=CWD).invocations == (), cmd
+
+
 def test_nested_shell_commit_is_unknown():
     inv = one('bash -c "git commit -F m.md"')
     assert inv.source == "unknown"
