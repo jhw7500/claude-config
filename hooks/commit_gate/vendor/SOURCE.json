@@ -1,0 +1,9 @@
+{
+  "automation_commit": "0c1e9b3930569f38344dfa1b3c4103a248401ef3",
+  "rules_version": "1",
+  "files": {
+    "validate_change_evidence.py": "43ee3633f5dd2c1febd39635c815d678c5b1cc8c7be4bc9f09c47d7defc7460a",
+    "commit_title_rules.py": "24f4109e84fd8ba58b206bddfb8e3463193adaf2a6f98b04b71a29d6faf2e2ef",
+    "check_commit_message.py": "48d8462963c93111979667fbc4fbbfe65355f2355f9acdcc0484da7a61d0dfcc"
+  }
+}
