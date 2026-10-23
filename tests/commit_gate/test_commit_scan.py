@@ -110,7 +110,8 @@ def test_auto_sources(tmp_path):
 
 def test_env_prefix_and_wrappers():
     assert one("GIT_AUTHOR_NAME=x env git commit -F m.md").source == "file"
-    assert one("env -i A=b command git commit -F m.md").source == "file"
+    # env with options and the `command` wrapper are outside the allowlist
+    assert one("env -i A=b command git commit -F m.md").source == "unknown"
     assert one("/usr/bin/git commit -F m.md").source == "file"
 
 
@@ -140,3 +141,164 @@ def test_never_raises_on_malformed_or_huge_input():
     huge = "git status; " * 100000
     assert scan_commits(huge, cwd=CWD).invocations == ()
     assert scan_commits(huge + "git commit -F m.md", cwd=CWD).invocations[0].source == "unknown"
+
+
+# ---- Run 2 fix wave: allowlist grammar regression tests ----------------------
+
+import time  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+def _only_unknown(command, cwd=CWD):
+    inv = one(command, cwd=cwd)
+    assert inv.source == "unknown", (command, inv)
+    return inv
+
+
+def test_line_continuation_between_message_options():
+    inv = one('git commit -m "feat: t" \\\n  -m "body"')
+    assert (inv.source, inv.message_text) == ("literal", "feat: t\n\nbody")
+    cmd = ('git commit -m "feat: t" \\\n  -m "$(cat <<\'EOF\'\nbody line\nEOF\n)"')
+    inv = one(cmd)
+    assert (inv.source, inv.message_text) == ("literal", "feat: t\n\nbody line")
+    inv = one("git commit \\\n --cleanup=verbatim \\\n --file /tmp/m.md")
+    assert (inv.source, inv.message_path) == ("file", Path("/tmp/m.md"))
+
+
+def test_line_continuation_quote_semantics():
+    assert one("git commit -m 'a \\\nb'").message_text == "a \\\nb"
+    assert one('git commit -m "a \\\nb"').message_text == "a b"
+
+
+@pytest.mark.parametrize("body_and_tail", [
+    "feat: x\nEOF\necho injected\nEOF\n)\"",   # delimiter line inside the body
+    "feat: x\nEOF)\"",                          # closing paren glued to delimiter
+    "feat: x\nEOF  \n)\"",                      # delimiter with trailing blanks
+    "feat: x\nEOF\n)\"suffix",                  # text glued after the closing quote
+])
+def test_noncanonical_quoted_heredoc_is_unknown(body_and_tail):
+    inv = _only_unknown(f"git commit -m \"$(cat <<'EOF'\n{body_and_tail}")
+    assert inv.message_text is None
+
+
+def test_heredoc_dash_and_unquoted_delimiter_are_unknown():
+    _only_unknown("git commit -m \"$(cat <<-'EOF'\n\tfeat: x\n\tEOF\n)\"")
+    _only_unknown("git commit -m \"$(cat <<EOF\nfeat: x\nEOF\n)\"")
+
+
+def test_canonical_heredoc_followed_by_separator_stays_literal():
+    cmd = "git commit -m \"$(cat <<'EOF'\nfeat: x\nEOF\n)\"\ngit status"
+    assert one(cmd).message_text == "feat: x"
+
+
+@pytest.mark.parametrize("command", [
+    "{ cd /x; git commit -F m.md; }",
+    "if true; then cd /x; fi; git commit -F m.md",
+    "pushd /x && git commit -F m.md",
+    "env -C /x git commit -F m.md",
+    "env --chdir=/x git commit -F m.md",
+    "GIT_DIR=/x/.git git commit -F m.md",
+    "GIT_WORK_TREE=/x git commit -F m.md",
+    "GIT_INDEX_FILE=/x/i git commit -F m.md",
+    "env GIT_DIR=/x/.git git commit -F m.md",
+    "export GIT_DIR=/x/.git && git commit -F m.md",
+    "git status || git commit -F m.md",
+    "git add . & git commit -F m.md",
+    "cat m.md | git commit -F m.md",
+    "(cd /x && git commit -F m.md)",
+    "git commit -F m.md > out.txt",
+    "git commit -F m.md 2>&1",
+    "echo hi # note\ngit commit -m wip",
+    "git commit -m wip # trailing",
+    "tee m.md && git commit -F m.md",
+    "cd ~ && git commit -F m.md",
+    "cd /x/* && git commit -F m.md",
+    "git checkout b && git commit -F m.md",
+])
+def test_constructs_outside_the_grammar_make_commits_unknown(command):
+    result = scan_commits(command, cwd=CWD)
+    assert result.invocations, command
+    assert all(i.source == "unknown" for i in result.invocations), (command, result)
+    assert all(i.directory == CWD for i in result.invocations), (command, result)
+
+
+def test_message_file_written_in_same_command_is_unknown():
+    _only_unknown("printf 'feat: x\\n' > m.md && git commit -F m.md")
+    _only_unknown("printf 'feat: x\\n' | tee m.md && git commit -F m.md")
+    inv = one("git add . && git commit -F m.md")
+    assert (inv.source, inv.message_path) == ("file", CWD / "m.md")
+    assert one("git status && git diff --stat && git commit -F m.md").source == "file"
+    assert one("true && git commit -F m.md").source == "file"
+
+
+@pytest.mark.parametrize("flag", [
+    "-F ~/m.md", "-F /tmp/m*.md", "-F <(printf x)", "-F /dev/stdin", "-F /proc/self/fd/0",
+    "-F /tmp/{a,b}.md", "-F ''", "--file=", "-F",
+])
+def test_unsafe_message_file_values_are_unknown(flag):
+    _only_unknown(f"git commit {flag}")
+    if "<" not in flag:
+        _only_unknown(f"cat m.md | git commit {flag}")
+
+
+def test_empty_attached_long_option_does_not_consume_next_argument():
+    _only_unknown("git commit --file= -m x")
+    _only_unknown("git commit --message= -F m.md")
+    inv = one("git commit --message=")
+    assert (inv.source, inv.message_text) == ("literal", "")
+
+
+def test_hash_inside_word_or_quotes_is_not_a_comment():
+    assert one('git commit -m "a # b"').message_text == "a # b"
+    assert one("git commit -m a#b").message_text == "a#b"
+
+
+def test_assignment_and_env_wrapper_allowlist():
+    assert one("GIT_AUTHOR_NAME=x GIT_COMMITTER_DATE=y git commit -F m.md").source == "file"
+    assert one("env GIT_AUTHOR_EMAIL=a@b git commit -F m.md").source == "file"
+    _only_unknown("env -i git commit -F m.md")
+    _only_unknown("FOO=bar git commit -F m.md")
+    _only_unknown("env FOO=bar git commit -F m.md")
+
+
+def test_fixup_and_squash_consume_their_argument():
+    assert one("git commit --fixup HEAD").source == "auto"
+    assert one("git commit --fixup=HEAD~1").source == "auto"
+    assert one("git commit --squash HEAD").source == "auto"
+    _only_unknown("git commit --fixup amend:HEAD")
+    _only_unknown("git commit --fixup=reword:HEAD")
+    # `HEAD` is the fixup target, not a message file or message
+    assert one("git commit --fixup HEAD -F m.md").source == "file"
+
+
+def test_unrecognised_wrapper_with_commit_is_reported_unknown():
+    for cmd in ("timeout 30 git commit -F m.md", "sudo git commit -F m.md",
+                "nice -n 5 git commit -F m.md", "command git commit -F m.md",
+                "env -i A=b command git commit -F m.md"):
+        inv = _only_unknown(cmd)
+        assert inv.directory == CWD
+
+
+def test_adversarial_input_is_fast_and_never_raises():
+    cases = [
+        "git " + "-C " * 17000 + "x",
+        "git commit -m \"$(cat <<'EOF'\n" * 2000,
+        "git " + "-c a=b " * 7000 + "commit -F m.md",
+        "(" * 5000 + "git commit -F m.md" + ")" * 5000,
+        "'" * 50000,
+        "git commit " + "-m x " * 12000,
+        "\\\n" * 25000 + "git commit -F m.md",
+        "x" * 190000 + "\ngit commit -F m.md",
+        "cd a && " * 8000 + "git commit -F m.md",
+    ]
+    for case in cases:
+        start = time.monotonic()
+        result = scan_commits(case, cwd=CWD)
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, (case[:40], elapsed)
+        assert isinstance(result.invocations, tuple)
+    deep = scan_commits("git " + "-C x " * 10000 + "commit -F m.md", cwd=CWD)
+    assert [i.source for i in deep.invocations] == ["unknown"]
+    chain = scan_commits("cd a && " * 8000 + "git commit -F m.md", cwd=CWD)
+    assert [i.source for i in chain.invocations] == ["unknown"]
