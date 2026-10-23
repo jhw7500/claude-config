@@ -41,7 +41,8 @@ source ~/.bashrc
   - `install.sh`는 Claude 지침을 먼저 복사한 뒤 task-nudge 설치기로 Codex AGENTS 블록을 기록한다. 설치기가 실패하면(관리 마커 중첩·누락 포함) Claude 지침만 갱신된 채 중단될 수 있으므로 양쪽 활성화가 동기화됐다고 간주하지 말고, 오류를 고친 뒤 재실행하여 두 지침을 확인한다.
   - 현재 `jhw-notion` PR 작성 절차의 생성 명령은 pre-PR Tribunal 게이트의 canonical command가 아니다. `--repo`뿐 아니라 동적 `--base`와 변수 인자도 게이트가 거부하므로 `--repo`만 빼서 재시도하지 않는다. `$jhw-pr`/`/jhw:pr`는 본문 작성·검증 단계까지만 따르고, 검증을 통과한 본문 파일을 canonical command에 넘겨 PR을 별도 생성한다. 두 흐름을 그대로 이어 실행하거나 gate를 우회하지 않는다.
   - 설치기는 change-evidence 블록을 제거하지 않으며, 이전 버전의 설치기를 다시 실행해도 이 블록은 남는다. 반대로 이 설치기가 남아 있는 동안에는 블록을 손으로 지워도 다음 `./install.sh` 실행이 블록을 다시 추가한다. 따라서 철회는 `global-guidance.md`의 해당 절과 설치기의 Codex 블록 기록을 함께 되돌린 버전으로 `./install.sh`를 다시 실행한 뒤, 각 호스트의 활성 AGENTS 파일에서 `claude-config:change-evidence:START/END` 블록을 직접 지우는 순서로 한다.
-  - 필드 정의·validator는 이 저장소에 복제하지 않는다. 정본 v1 좌표가 바뀌면 양쪽 지침의 링크를 명시적으로 갱신하고 `tests/task_nudge/test_change_evidence_guidance.py`를 실행한다. 이미 스킬을 적용한 작업은 반복 호출하지 않으며, 일반 git 명령을 추가로 차단하지 않는다.
+  - 커밋 시점 게이트(`install.sh`가 설치)는 jhw7500 저장소의 커밋 메시지가 Change Evidence 형식을 어기면 막고, 사용자 승인 뒤 커밋 한 건만 통과시킨다. automation validator·규칙의 바이트 동일 사본을 `hooks/commit_gate/vendor/`에 두고 `SOURCE.json`으로 고정해 실행한다. 다른 git 명령은 막지 않고 Tribunal도 호출하지 않는다. 정본 v1 좌표가 바뀌면 양쪽 지침의 링크를 명시적으로 갱신하고 `tests/task_nudge/test_change_evidence_guidance.py`를 실행한다. 이미 스킬을 적용한 작업은 반복 호출하지 않는다.
+  - 알려진 한계: Codex에서 `rtk` 접두 명령(`rtk git commit …`, `rtk proxy …`)과 `exec_command`의 `workdir`는 아직 해석하지 않아 이런 커밋은 경고만 하고 통과한다. fleet CI 커밋 감사는 이를 여전히 보고한다. 실제 Codex 훅 payload를 확인한 뒤 다루기로 미뤘다.
 - **Artifact outbox (Codex → Claude)**: Artifact 발행은 `/login`한 대화형 Claude Code 세션에서만 된다. 그래서 Codex는 확정 문서를 `~/.claude/scripts/artifact-outbox.py export`로 저장소 밖 outbox에 내보내고, Claude Code의 `artifact-publish` 스킬이 발행·재확인·기록을 맡는다. Codex 안내는 별도 `claude-config:artifact-outbox:START/END` AGENTS 블록으로 설치기가 기록한다. 스크립트 링크와 블록 모두 `./install.sh`를 다시 실행해야 반영된다.
 - `context-bar`(statusLine 교체)는 **미포함** (현재 OMC HUD와 상호배타라 별도 결정 필요)
 

@@ -161,8 +161,42 @@ def test_comment_char_config_is_unknown(repo, home, capsys):
 
 
 def test_fast_path_skips_scanning(repo, home, monkeypatch):
-    monkeypatch.setattr(gate.commit_scan, "scan_commits", lambda *a, **k: 1 / 0)
+    calls = []
+
+    def spy(*a, **k):
+        calls.append(a)
+        raise AssertionError("scan_commits must not run without 'commit'")
+
+    monkeypatch.setattr(gate.commit_scan, "scan_commits", spy)
     assert ev("ls -la", repo, home).allow
+    assert calls == []
+    # positive control: a commit command does reach the scanner
+    ev('git commit -m "bad"', repo, home)
+    assert len(calls) == 1
+
+
+def test_printed_grant_command_quotes_arguments(tmp_path, home):
+    import shlex
+    spaced = tmp_path / "my repo"
+    spaced.mkdir()
+    for cmd in (["init", "-q"], ["config", "user.email", "a@b.c"], ["config", "user.name", "t"],
+                ["remote", "add", "origin", "https://github.com/jhw7500/x.git"],
+                ["commit", "-q", "--allow-empty", "-m", "init"]):
+        subprocess.run(["git", "-C", str(spaced), *cmd], check=True, capture_output=True)
+    d = ev('git commit -m "bad"', spaced, home)
+    assert not d.allow
+    line = next(l for l in d.reason.splitlines() if "cli.py grant" in l)
+    cmd = line[line.index("/usr/bin/python3"):]
+    argv = shlex.split(cmd)
+    assert argv[argv.index("--repo") + 1] == str(spaced.resolve())
+    assert argv[argv.index("--message-sha256") + 1] == sha_of_reason(d.reason)
+
+
+def test_specific_hints_for_common_codes():
+    for code in ("commit-title-separator", "commit-title-too-long", "unexpected-preamble",
+                 "empty-field", "bullet-required", "reference-required"):
+        assert code in gate._HINTS
+    assert "/jhw:commit" in gate._FALLBACK_HINT
 
 
 def test_vendor_mismatch_allows_with_warning(repo, home, tmp_path, monkeypatch, capsys):

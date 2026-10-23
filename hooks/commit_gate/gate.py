@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,9 +38,14 @@ _HINTS = {
     "title-header-trim": "제목 앞뒤 공백을 뺀다",
     "commit-title-too-long": "제목을 72자 이하로 줄인다",
     "unexpected-preamble": "제목과 첫 필드 제목 사이에는 빈 줄만 둔다",
+    "commit-title-separator": "제목 한 줄 뒤에 빈 줄을 두고 계약 필드 5개(Contract version, Why, Changes, Validation, References)를 쓴다",
+    "empty-field": "비어 있는 필드에 내용을 채운다",
+    "bullet-required": "해당 필드를 `- ` bullet로 쓴다",
     "version-mismatch": "Contract version 값을 v1로 쓴다",
     "reference-required": "References에 확인한 이슈·문서 URL을 bullet로 쓴다",
 }
+
+_FALLBACK_HINT = "커밋 템플릿(examples/change-evidence/commit-message.md) 또는 `/jhw:commit`으로 정본 계약(change-evidence-contract-v1)에 맞춘다"
 
 
 @dataclass(frozen=True)
@@ -171,6 +177,14 @@ def _peek(home: Path, binding: dict, now: float) -> bool:
         return False
 
 
+def _cli_arg() -> str:
+    # keep $HOME expandable while quoting the rest of the path
+    prefix = "$HOME/"
+    if INSTALLED_CLI.startswith(prefix):
+        return '"$HOME"/' + shlex.quote(INSTALLED_CLI[len(prefix):])
+    return shlex.quote(INSTALLED_CLI)
+
+
 def _deny_reason(violations: list[_Violation], source: dict) -> str:
     lines = [
         "[COMMIT-GATE:RULE_VIOLATION] 커밋 메시지가 Change Evidence 규칙을 어겼다. "
@@ -179,13 +193,14 @@ def _deny_reason(violations: list[_Violation], source: dict) -> str:
     for v in violations:
         lines.append(f"- 위반 커밋 (repo {v.binding['repo_root']}, message sha256 {v.sha256})")
         for code in dict.fromkeys(v.codes):
-            lines.append(f"  - {code}: {_HINTS.get(code, '정본 계약(change-evidence-contract-v1)을 확인한다')}")
+            lines.append(f"  - {code}: {_HINTS.get(code, _FALLBACK_HINT)}")
     first = violations[0]
     lines.append(
         "메시지를 고쳐 다시 커밋하는 것이 기본이다. 규칙을 어긴 채 커밋하려면 사용자에게 묻고, "
         "승인받은 경우에만 다음을 실행한 뒤 같은 커밋을 다시 실행한다 (승인은 1회·10분): "
-        f"/usr/bin/python3 {INSTALLED_CLI} grant --runtime {first.binding['runtime']} "
-        f"--repo {first.binding['repo_root']} --message-sha256 {first.sha256} "
+        f"/usr/bin/python3 {_cli_arg()} grant --runtime {shlex.quote(str(first.binding['runtime']))} "
+        f"--repo {shlex.quote(str(first.binding['repo_root']))} "
+        f"--message-sha256 {shlex.quote(first.sha256)} "
         '--reason "<사용자의 답>" --relayed'
     )
     return "\n".join(lines)
