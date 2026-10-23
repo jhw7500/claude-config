@@ -8,30 +8,18 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 try:  # package import (hooks on sys.path) and direct script run
-    from . import grant
+    from . import grant, repo
 except ImportError:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from commit_gate import grant
+    from commit_gate import grant, repo
 
 _MAX_MESSAGE_BYTES = 1024 * 1024
-
-
-def _git(repo: Path, *args: str) -> Optional[str]:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo), *args],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -59,13 +47,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _repo_root(path: Path) -> Optional[Path]:
-    top = _git(path, "rev-parse", "--show-toplevel")
-    return Path(top) if top else None
-
-
 def _grant(args: argparse.Namespace, home: Path) -> int:
-    root = _repo_root(args.repo)
+    root = repo.repo_root(args.repo)
     if root is None:
         print("error: --repo is not a git repository", file=sys.stderr)
         return 2
@@ -86,7 +69,7 @@ def _grant(args: argparse.Namespace, home: Path) -> int:
             print("error: --message-sha256 must be 64 lowercase hex characters",
                   file=sys.stderr)
             return 2
-    head = _git(root, "rev-parse", "--verify", "-q", "HEAD")
+    head = repo.head(root)
     binding = grant.make_binding(
         repo_root=root, head=head, message_sha256=digest, runtime=args.runtime
     )
@@ -115,7 +98,7 @@ def _grant(args: argparse.Namespace, home: Path) -> int:
 
 
 def _revoke(args: argparse.Namespace, home: Path) -> int:
-    root = _repo_root(args.repo) or args.repo
+    root = repo.repo_root(args.repo) or args.repo
     removed, skipped = grant.revoke_repo_report(home, repo_root=root)
     print(f"revoked {removed} approval(s), skipped {skipped} unreadable")
     return 0
