@@ -210,7 +210,8 @@ def change_evidence_policy_block() -> str:
         "PR은 pre-PR Tribunal의 canonical command로만 생성하고, "
         "`$jhw-pr`의 생성 명령(`--repo`·변수 인자 포함)은 실행하지 않는다. "
         "PR 본문은 `$jhw-pr`의 작성·검증 단계를 통과한 파일을 그대로 넘긴다. "
-        "일반 git 명령을 추가로 차단하거나 Tribunal 재심사를 호출하지 않는다.\n"
+        "jhw7500 저장소의 커밋 형식 위반은 커밋 시점 게이트가 막고, 사용자가 승인하면 그 커밋 1건만 통과한다. "
+        "그 밖의 git 명령을 차단하거나 Tribunal 재심사를 호출하지 않는다.\n"
     )
 
 
