@@ -92,3 +92,51 @@ def test_claude_ignores_workdir(repo, repo_factory, tmp_path, home):
     r = run("claude_hook.py", _with_workdir(payload("Bash", repo, BAD), str(other)), home)
     assert r.returncode == 0
     assert json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+RTK_VALID = """feat(x): 결과를 말하는 제목
+
+ ### Contract version
+
+v1
+
+ ### Why
+
+이유다.
+
+ ### Changes
+
+- 변경한다.
+
+ ### Validation
+
+- 실행한 명령과 결과.
+
+ ### References
+
+- https://github.com/jhw7500/automation/issues/237
+"""
+
+
+@pytest.mark.parametrize("prefix", ["rtk ", "rtk proxy "])
+def test_rtk_prefixed_violation_denied_for_claude_and_codex(repo, tmp_path, home, prefix):
+    cmd = prefix + BAD
+    r = run("claude_hook.py", payload("Bash", repo, cmd), home)
+    assert r.returncode == 0
+    assert json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    r = run("codex_hook.py", _with_workdir(payload("exec_command", plain, cmd), str(repo)), home)
+    assert r.returncode == 0
+    out = json.loads(r.stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+    assert "heading-contract" in out["permissionDecisionReason"]
+
+
+def test_rtk_prefixed_valid_message_allowed(repo, tmp_path, home):
+    f = tmp_path / "msg.txt"
+    f.write_text(RTK_VALID, encoding="utf-8")
+    cmd = f"rtk git commit --cleanup=verbatim -F {f}"
+    for name, tool in (("claude_hook.py", "Bash"), ("codex_hook.py", "exec_command")):
+        r = run(name, payload(tool, repo, cmd), home)
+        assert (r.returncode, r.stdout) == (0, ""), name

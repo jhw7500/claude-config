@@ -454,8 +454,21 @@ def _handle(words: list[_Word], cwd: Path, state: dict, placeholders: dict[str, 
         pass
     elif name == "git":
         _handle_git(rest, state, placeholders, out)
+    elif name == "rtk" and (git_words := _rtk_git_words(rest)) is not None:
+        _handle_git(git_words, state, placeholders, out)
     else:
         other("git commit inside a command the scanner does not model", rest[1:])
+
+
+def _rtk_git_words(rest: list[_Word]) -> list[_Word] | None:
+    """Words starting at `git` for `rtk git …` / `rtk proxy git …`, else None."""
+    k = 1
+    if k < len(rest) and rest[k].text == "proxy" and not rest[k].dyn and not rest[k].quoted:
+        k += 1
+    if (k < len(rest) and os.path.basename(rest[k].text) == "git"
+            and not rest[k].dyn and not rest[k].text.startswith("-")):
+        return rest[k:]
+    return None
 
 
 def _apply_cd(args: list[_Word], state: dict) -> None:
