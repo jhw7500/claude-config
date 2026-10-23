@@ -28,7 +28,7 @@ MAX_GRANT_BYTES = 16 * 1024
 MAX_REASON_CHARS = 512
 UNBORN = "UNBORN"
 _SCHEMA = 1
-_RUNTIMES = frozenset(("claude", "codex"))
+RUNTIMES = frozenset(("claude", "codex"))
 _CHANNELS = frozenset(("tty", "relayed"))
 _BINDING_KEYS = frozenset(("repo_root", "head", "message_sha256", "runtime"))
 _HEX = frozenset("0123456789abcdef")
@@ -38,7 +38,7 @@ def state_dir(home: Path) -> Path:
     return Path(home) / ".local" / "state" / "claude-config" / "commit-gate"
 
 
-def _is_hex(value: object, lengths: tuple[int, ...]) -> bool:
+def is_hex(value: object, lengths: tuple[int, ...]) -> bool:
     return (
         isinstance(value, str)
         and len(value) in lengths
@@ -63,9 +63,9 @@ def _valid_binding(binding: object) -> bool:
         and set(binding) == _BINDING_KEYS
         and isinstance(binding["repo_root"], str)
         and bool(binding["repo_root"])
-        and (binding["head"] == UNBORN or _is_hex(binding["head"], (40, 64)))
-        and _is_hex(binding["message_sha256"], (64,))
-        and binding["runtime"] in _RUNTIMES
+        and (binding["head"] == UNBORN or is_hex(binding["head"], (40, 64)))
+        and is_hex(binding["message_sha256"], (64,))
+        and binding["runtime"] in RUNTIMES
     )
 
 
@@ -241,7 +241,7 @@ def revoke_repo(home: Path, *, repo_root: Path) -> int:
     try:
         with _locked_dir(home, create=False) as dir_fd:
             for name in os.listdir(dir_fd):
-                if not _is_hex(name, (64,)):
+                if not is_hex(name, (64,)):
                     continue
                 try:
                     payload = _parse(_read_grant(dir_fd, name), name)

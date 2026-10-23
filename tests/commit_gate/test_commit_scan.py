@@ -7,7 +7,7 @@ HOOKS = Path(__file__).resolve().parents[2] / "hooks"
 if str(HOOKS) not in sys.path:
     sys.path.insert(0, str(HOOKS))
 
-from commit_gate.commit_scan import scan_commits  # noqa: E402
+from commit_gate.commit_scan import effective_message, scan_commits  # noqa: E402
 
 CWD = Path("/work/repo")
 
@@ -75,7 +75,7 @@ def test_editor_is_unknown():
 def test_cd_and_dash_c_resolve_commit_directory():
     assert one("cd /x && git commit -F m.md").directory == Path("/x")
     assert one("git -C /x -C y commit -F m.md").directory == Path("/x/y")
-    assert one("cd sub; git -c a=b commit -F m.md").directory == CWD / "sub"
+    assert one("cd sub && git -c a=b commit -F m.md").directory == CWD / "sub"
 
 
 def test_multiple_commits_in_one_command():
@@ -302,3 +302,149 @@ def test_adversarial_input_is_fast_and_never_raises():
     assert [i.source for i in deep.invocations] == ["unknown"]
     chain = scan_commits("cd a && " * 8000 + "git commit -F m.md", cwd=CWD)
     assert [i.source for i in chain.invocations] == ["unknown"]
+
+
+# ---- PR #255 fix wave ---------------------------------------------------------
+
+@pytest.mark.parametrize("command", [
+    "git commit -s -F m.md", "git commit --signoff -F m.md",
+    "git commit --trailer 'A: b' -F m.md", "git commit --allow-empty-message -F m.md",
+    "git commit --dry-run -F m.md", "git commit --short -F m.md",
+    "git commit --branch -F m.md", "git commit --porcelain -F m.md",
+    "git commit --long -F m.md", "git commit -z -F m.md", "git commit --null -F m.md",
+    "git commit -uno -F m.md", "git commit --untracked-files=no -F m.md",
+    "git commit --pathspec-from-file=p -F m.md", "git commit --no-message -F m.md",
+    "git commit --no-file -F m.md", "git commit --no-verify=1 -F m.md",
+    "git commit --mes=x", "git commit --edi -F m.md", "git commit --fil=m.md",
+    "git commit --no-signoff -F m.md", "git commit -ax -F m.md", "git commit -sF m.md",
+    "git commit -",
+])
+def test_unlisted_commit_options_are_unknown(command):
+    _only_unknown(command)
+
+
+@pytest.mark.parametrize("command", [
+    "git commit -a -q -v -n -F m.md", "git commit --all --quiet --verbose -F m.md",
+    "git commit --verify --allow-empty --no-post-rewrite -F m.md",
+    "git commit -S -F m.md", "git commit -SABCD -F m.md", "git commit --gpg-sign=K -F m.md",
+    "git commit --gpg-sign -F m.md", "git commit --no-gpg-sign -F m.md",
+    "git commit --author 'A <a@b>' -F m.md", "git commit --author='A <a@b>' -F m.md",
+    "git commit --date 2020-01-01 -F m.md", "git commit --date=now -F m.md",
+    "git commit --reset-author -F m.md", "git commit -o -F m.md f", "git commit -i -F m.md f",
+    "git commit --only --include --status --no-status -F m.md", "git commit -F m.md -- f g",
+    "git commit -aF m.md", "git commit -qaF m.md", "git commit -F m.md a b",
+])
+def test_listed_commit_options_stay_determinate(command):
+    assert one(command).source == "file", command
+
+
+def test_common_legitimate_forms_stay_determinate():
+    assert one("git commit -F m.md").source == "file"
+    assert one("git add . && git commit -F m.md").source == "file"
+    cmd = "git add -A && git commit -m \"$(cat <<'EOF'\nfeat: x\n\nbody\nEOF\n)\""
+    assert one(cmd).message_text == "feat: x\n\nbody"
+    assert one("cd /repo && git commit -m x").directory == Path("/repo")
+    inv = one("git -C /repo commit -m a -m b")
+    assert (inv.directory, inv.message_text) == (Path("/repo"), "a\n\nb")
+    assert one('git commit -am "x"').message_text == "x"
+
+
+def test_cleanup_field_and_effective_message():
+    assert one("git commit -m x").cleanup == "default"
+    assert one("git commit --cleanup=verbatim -m x").cleanup == "verbatim"
+    assert one("git commit --cleanup whitespace -F m.md").cleanup == "whitespace"
+    assert one("git commit --cleanup=strip -m x").cleanup == "strip"
+    _only_unknown("git commit --cleanup=bogus -m x")
+    _only_unknown("git commit --cleanup -m")
+    inv = one("git commit -m '' -m 'feat(x): t'")
+    assert effective_message(inv.message_text, inv.cleanup) == "feat(x): t\n"
+    inv = one("git commit -m 'feat: x  '")
+    assert effective_message(inv.message_text, inv.cleanup) == "feat: x\n"
+    inv = one("git commit --cleanup=verbatim -m 'a  '")
+    assert effective_message(inv.message_text, inv.cleanup) == "a  "
+    inv = one("git commit --cleanup=strip -m 'a'")
+    assert effective_message(inv.message_text, inv.cleanup) is None
+    assert effective_message("a", "scissors") is None
+    _only_unknown("git commit --cleanup=verbatim -m '' -m 'feat: t'")
+
+
+def test_effective_message_stripspace_rules():
+    f = lambda raw: effective_message(raw, "whitespace")
+    assert f("\n\n a \t\n\n\n\nb\n\n\n") == " a\n\nb\n"
+    assert f("y \x0b\n") == "y \x0b\n"   # git keeps \v and \f (measured)
+    assert f("") == "" and f("\n \n") == ""
+    assert effective_message("x\n\n", "default") == "x\n"
+    assert effective_message("x\n\n", "verbatim") == "x\n\n"
+    assert f("a\u00a0") == "a\u00a0\n"   # only space, tab, CR, LF are stripped
+
+
+@pytest.mark.parametrize("command", [
+    "cd /x; git commit -F m.md", "cd /x\ngit commit -F m.md",
+    "cd /x && git status; git commit -F m.md",
+    "git add . && cd /x\ngit commit -m y",
+])
+def test_cd_before_unconditional_separator_makes_later_commits_unknown(command):
+    result = scan_commits(command, cwd=CWD)
+    assert result.invocations and all(i.source == "unknown" for i in result.invocations)
+    assert all(i.directory == CWD for i in result.invocations)
+    assert one("cd /x && git commit -F m.md").source == "file"
+
+
+@pytest.mark.parametrize("command", [
+    "cd .. && git commit -F m.md", "cd a/../b && git commit -F m.md",
+    "git -C ../x commit -F m.md", "git -C a/.. commit -F m.md",
+    "git commit -F ../m.md", "git commit -F a/../m.md", "git commit --file=../m.md",
+    "cd -P /x && git commit -F m.md", "cd -L /x && git commit -F m.md",
+    "git -c core.worktree=/x commit -F m.md", "git -c core.bare=true commit -F m.md",
+    "git -c include.path=x commit -F m.md", "git -c includeIf.gitdir:/a.path=x commit -F m.md",
+    "git -c CORE.WorkTree=/x commit -F m.md",
+])
+def test_dotdot_physical_paths_and_config_redirects_are_unknown(command):
+    _only_unknown(command)
+
+
+def test_dotdot_lookalikes_stay_determinate():
+    assert one("git commit -F ..m.md").source == "file"
+    assert one("cd /x/... && git commit -F m.md").directory == Path("/x/...")
+
+
+@pytest.mark.parametrize("command", [
+    "git -c alias.ci=commit ci -F m.md", "git -c alias.commit='commit -s' commit -F m.md",
+    "git -c ALIAS.x=y status && git commit -F m.md",
+    "git -c alias.st=status st", "git --config-env=alias.ci=V ci -m x",
+])
+def test_command_line_aliases_yield_unknown(command):
+    result = scan_commits(command, cwd=CWD)
+    assert result.invocations, command
+    assert all(i.source == "unknown" for i in result.invocations), command
+
+
+@pytest.mark.parametrize("command", [
+    "git diff --output=m.md && git commit -F m.md",
+    "git diff --output m.md && git commit -F m.md",
+    "git diff --stat --outp=m.md && git commit -F m.md",
+    "git add --pathspec-from-file=p && git commit -F m.md",
+    "git rm --pathspec-from-file p && git commit -F m.md",
+])
+def test_writers_before_commit_make_it_unknown(command):
+    _only_unknown(command)
+    assert one("git diff --stat && git add -A && git rm f && git commit -F m.md").source == "file"
+
+
+def test_heredoc_search_is_linear_on_adversarial_shape():
+    opener = "git commit -m \"$(cat <<'EOF'\n"
+    cmd = opener * 3000 + "EOFX\n" * 3000 + "EOF\n"
+    assert len(cmd) < 200_000
+    start = time.monotonic()
+    result = scan_commits(cmd, cwd=CWD)
+    assert time.monotonic() - start < 1.0
+    assert isinstance(result.invocations, tuple)
+
+
+@pytest.mark.parametrize("command", [
+    'git -C "my dir" commit -m x | cat',
+    'git -c user.name="A B" commit -m x | cat',
+    'git -C "a;b" commit -m x | cat',
+])
+def test_loose_fallback_counts_commit_after_quoted_option_values(command):
+    _only_unknown(command)

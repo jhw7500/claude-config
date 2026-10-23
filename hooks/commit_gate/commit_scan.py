@@ -16,14 +16,24 @@ Grammar that can yield a determinate result:
   ``GIT_AUTHOR_*``/``GIT_COMMITTER_*`` assignments or a bare ``env`` of those;
 * message sources: ``-F/--file``, ``-m/--message`` and the canonical quoted
   heredoc ``-m "$(cat <<'D' ... D\n)"``.
+
+Commit options are an exact-spelling allowlist (no abbreviations). A ``cd``
+only keeps a determinate directory when it is joined to the commit by ``&&``;
+after ``cd X;`` or ``cd X`` + newline the commit is ``unknown`` because a
+failed ``cd`` does not stop the next command. Paths containing a ``..``
+component, ``cd -P/-L`` and ``-c core.worktree/core.bare/include*`` are
+``unknown``. ``-c alias.*`` makes the whole git command ``unknown``; aliases
+defined in git *config files* are out of scope here (the CI audit still sees
+such commits). ``effective_message`` gives the bytes git records after its
+message cleanup.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import shlex
 import subprocess
+from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -38,6 +48,7 @@ class CommitInvocation:
     message_path: Optional[Path]
     message_text: Optional[str]
     reason: str
+    cleanup: str = "default"
 
 
 @dataclass(frozen=True)
@@ -72,13 +83,17 @@ _GIT_GLOBAL_WITH_ARG = frozenset({
 _PATH_BAD = frozenset("$~*?[{}`")
 _AUTO_FILES = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")
 
-# commit options that take a separate/attached argument
-_SHORT_WITH_ARG = frozenset("mFCct")
-_SHORT_OPTIONAL_ARG = frozenset("uS")
-_LONG_WITH_ARG = frozenset({
-    "file", "message", "template", "reuse-message", "reedit-message", "fixup",
-    "squash", "author", "date", "trailer", "pathspec-from-file", "cleanup",
+_CLEANUP_MODES = frozenset({"default", "verbatim", "whitespace", "strip", "scissors"})
+_WS = " \t\r\n"  # git's isspace (measured: \v and \f are kept)
+# commit options with no effect on the recorded message (exact spellings only)
+_LONG_IGNORED_FLAG = frozenset({
+    "all", "quiet", "verbose", "no-verify", "verify", "allow-empty",
+    "no-post-rewrite", "no-gpg-sign", "reset-author", "only", "include",
+    "status", "no-status",
 })
+_LONG_IGNORED_ARG = frozenset({"author", "date"})
+_SHORT_FLAGS = frozenset("aqvnoi")
+_CONFIG_REDIRECT = ("core.worktree", "core.bare")
 
 
 class _Unsupported(Exception):
@@ -99,20 +114,20 @@ def _unknown(directory: Path, reason: str) -> CommitInvocation:
 # ---- loose detection (no grammar; only counts `git ... commit`) -------------
 
 def _count_loose(text: str) -> int:
-    """Count `git [options] commit` sequences in a flat word list (linear)."""
-    toks = [t.strip("\"'") for t in _LOOSE_SPLIT.split(text)]
+    """Over-approximate the number of commits: a `git` word later followed by
+    the word `commit` (quoted option values and separators are ignored)."""
     count = 0
-    i = 0
-    n = len(toks)
-    while i < n:
-        if toks[i] and os.path.basename(toks[i]) == "git":
-            j = i + 1
-            while j < n and toks[j].startswith("-") and len(toks[j]) > 1:
-                j += 2 if toks[j] in ("-C", "-c") or toks[j] in _GIT_GLOBAL_WITH_ARG else 1
-            if j < n and toks[j] == "commit":
+    seen_git = False
+    for tok in _LOOSE_SPLIT.split(text):
+        tok = tok.strip("\"'")
+        if not tok:
+            continue
+        if tok == "commit":
+            if seen_git:
                 count += 1
-                i = j
-        i += 1
+                seen_git = False
+        elif os.path.basename(tok) == "git":
+            seen_git = True
     return count
 
 
@@ -149,13 +164,13 @@ def _extract_heredocs(command: str) -> tuple[str, dict[str, str]]:
     placeholders: dict[str, str] = {}
     out: list[str] = []
     pos = 0
-    missing: set[str] = set()
+    lines: dict[str, list[int]] = {}  # delimiter -> offsets of "\nD\n" lines
     while True:
         m = _HEREDOC_HEADER.search(command, pos)
         if m is None:
             break
         delim = m.group("delim")
-        end = _heredoc_end(command, m, delim, missing)
+        end = _heredoc_end(command, m, delim, lines)
         if end is None:
             out.append(command[pos:m.end()])
             pos = m.end()
@@ -173,30 +188,26 @@ def _extract_heredocs(command: str) -> tuple[str, dict[str, str]]:
 
 
 def _heredoc_end(command: str, m: "re.Match[str]", delim: str,
-                 missing: set[str]) -> Optional[tuple[int, int]]:
-    if delim in missing:
+                 lines: dict[str, list[int]]) -> Optional[tuple[int, int]]:
+    positions = lines.get(delim)
+    if positions is None:  # one linear pass per delimiter, then bisect
+        positions = [
+            f.start() for f in re.finditer(
+                r"(?=\n" + re.escape(delim) + r"\n)", command)
+        ]
+        lines[delim] = positions
+    idx = bisect_left(positions, m.end() - 1)  # newline that ends the header line
+    if idx >= len(positions):
         return None
-    needle = "\n" + delim
-    k = m.end() - 1  # the newline that ends the header line
-    while True:
-        k = command.find(needle, k)
-        if k < 0:
-            missing.add(delim)
-            return None
-        e = k + len(needle)
-        if e < len(command) and command[e] == "\n":
-            break
-        if e >= len(command):
-            return None
-        k = e - 1 if e - 1 > k else k + 1
-    # `k` is the newline before the first exact delimiter line; `e` the newline after
+    k = positions[idx]
+    e = k + 1 + len(delim)  # the newline after the delimiter line
     tail = e + 1
     if command[tail:tail + 2] != ')"':
         return None
     after = tail + 2
     if after < len(command) and command[after] not in " \t\r\n;&|":
         return None
-    return k if k >= m.end() else m.end(), after
+    return (k if k >= m.end() else m.end()), after
 
 
 def _join_continuations(text: str) -> str:
@@ -333,15 +344,24 @@ def _lex_word(text: str, i: int) -> tuple[_Word, int]:
     return _Word("".join(buf), dyn, quoted), i
 
 
-def _split_commands(items: list[object]) -> list[list[_Word]]:
-    commands: list[list[_Word]] = [[]]
+def _split_commands(items: list[object]) -> list[tuple[bool, list[_Word]]]:
+    """Return (unconditional, words): True when `;` or a newline precedes it."""
+    commands: list[tuple[bool, list[_Word]]] = []
+    current: list[_Word] = []
+    unconditional = False
     for item in items:
         if isinstance(item, str):
-            commands.append([])
+            if current:
+                commands.append((unconditional, current))
+                current = []
+                unconditional = False
+            if item != "&&":
+                unconditional = True
         else:
-            commands[-1].append(item)  # type: ignore[arg-type]
-    commands = [c for c in commands if c]
-    for words in commands:
+            current.append(item)
+    if current:
+        commands.append((unconditional, current))
+    for _, words in commands:
         head_seen = False
         for word in words:
             if not word.quoted and word.text in ("{", "}", "!"):
@@ -367,13 +387,16 @@ def _scan(command: str, cwd: Path) -> ScanResult:
 
     invocations: list[CommitInvocation] = []
     state = {"directory": cwd, "cwd": cwd, "poisoned": False}
-    for words in commands:
+    for unconditional, words in commands:
+        if unconditional and state["directory"] != cwd:
+            state["poisoned"] = True  # a failed `cd` would not stop this command
         _handle(words, cwd, state, placeholders, invocations)
     return ScanResult(tuple(invocations))
 
 
 def _literal(path: str) -> bool:
-    return bool(path) and not any(c in _PATH_BAD for c in path)
+    return (bool(path) and not any(c in _PATH_BAD for c in path)
+            and ".." not in path.split("/"))
 
 
 def _handle(words: list[_Word], cwd: Path, state: dict, placeholders: dict[str, str],
@@ -419,8 +442,9 @@ def _handle(words: list[_Word], cwd: Path, state: dict, placeholders: dict[str, 
 
 
 def _apply_cd(args: list[_Word], state: dict) -> None:
-    args = [a for a in args if a.text not in ("-L", "-P", "--") or a.quoted]
-    if len(args) != 1 or args[0].dyn or not _literal(args[0].text) or args[0].text == "-":
+    args = [a for a in args if a.text != "--" or a.quoted]
+    if (len(args) != 1 or args[0].dyn or not _literal(args[0].text)
+            or args[0].text.startswith("-")):
         state["poisoned"] = True
         return
     if state["poisoned"]:
@@ -436,6 +460,7 @@ def _handle_git(words: list[_Word], state: dict, placeholders: dict[str, str],
                 out: list[CommitInvocation]) -> None:
     base: Path = state["directory"]
     clean = True
+    alias = False
     dash_c = 0
     i = 1
     while i < len(words):
@@ -451,11 +476,23 @@ def _handle_git(words: list[_Word], state: dict, placeholders: dict[str, str],
                 base = Path(joined if len(joined) <= _MAX_PATH else str(base))
             i += 2
         elif text == "-c":
-            clean = clean and i + 1 < len(words) and not words[i + 1].dyn
+            if i + 1 >= len(words) or words[i + 1].dyn:
+                clean = False
+            else:
+                key = words[i + 1].text.partition("=")[0].lower()
+                if key.startswith("alias."):
+                    alias = True
+                elif (key in _CONFIG_REDIRECT
+                      or key.startswith(("include.", "includeif."))):
+                    clean = False
             i += 2
-        elif text in _GIT_GLOBAL_WITH_ARG:
+        elif text in _GIT_GLOBAL_WITH_ARG or text.startswith("--config-env="):
             clean = False
-            i += 2
+            value = text.partition("=")[2] or (
+                words[i + 1].text if i + 1 < len(words) else "")
+            if text.startswith("--config-env") and "alias." in value.lower():
+                alias = True
+            i += 1 if "=" in text else 2
         elif text.startswith("-"):
             clean = False
             i += 1
@@ -465,8 +502,14 @@ def _handle_git(words: list[_Word], state: dict, placeholders: dict[str, str],
         state["poisoned"] = True
         return
     sub = words[i].text
+    if alias:
+        out.append(_unknown(state["cwd"] if state["poisoned"] else base,
+                            "git alias given on the command line"))
+        state["poisoned"] = True
+        return
     if sub != "commit":
-        if sub not in _BEFORE_COMMIT_GIT or not clean or words[i].dyn:
+        if (sub not in _BEFORE_COMMIT_GIT or not clean or words[i].dyn
+                or _writes_files(sub, words[i + 1:])):
             state["poisoned"] = True
         return
     if state["poisoned"]:
@@ -477,6 +520,20 @@ def _handle_git(words: list[_Word], state: dict, placeholders: dict[str, str],
         out.append(_unknown(base, "unsupported git option or commit directory"))
         return
     out.append(_classify(words[i + 1:], base, placeholders))
+
+
+def _writes_files(sub: str, args: list[_Word]) -> bool:
+    """`git diff --output` writes a file; `--pathspec-from-file` reads one."""
+    for a in args:
+        name = a.text.partition("=")[0]
+        if not name.startswith("--") or len(name) < 3:
+            continue
+        if sub == "diff" and ("--output".startswith(name) or name.startswith("--output")):
+            return True
+        if sub != "diff" and ("--pathspec-from-file".startswith(name)
+                              or name.startswith("--pathspec")):
+            return True
+    return False
 
 
 def _classify(
@@ -490,7 +547,8 @@ def _classify(
     texts = [a.text for a in args]
     messages: list[str] = []
     files: list[str] = []
-    fixup = amend = no_edit = editorish = False
+    fixup = amend = no_edit = False
+    cleanup = "default"
     missing = False
     j = 0
 
@@ -512,52 +570,53 @@ def _classify(
             name, eq, value = arg[2:].partition("=")
             attached = value if eq else None
             if name in ("fixup", "squash"):
-                val = take(attached)
-                if val.startswith(("amend:", "reword:")):
-                    editorish = True
+                if take(attached).startswith(("amend:", "reword:")):
+                    return unknown("editor, template or reused message")
                 fixup = True
-            elif name in _LONG_WITH_ARG:
-                val = take(attached)
-                if name == "message":
-                    messages.append(val)
-                elif name == "file":
-                    files.append(val)
-                elif name in ("template", "reuse-message", "reedit-message"):
-                    editorish = True
-            elif name == "edit":
-                editorish = True
-            elif name == "no-edit":
+            elif name == "message":
+                messages.append(take(attached))
+            elif name == "file":
+                files.append(take(attached))
+            elif name == "cleanup":
+                cleanup = take(attached)
+                if cleanup not in _CLEANUP_MODES:
+                    return unknown("unknown --cleanup mode")
+            elif name in _LONG_IGNORED_ARG:
+                take(attached)
+            elif name == "gpg-sign":
+                pass
+            elif name in _LONG_IGNORED_FLAG and not eq:
+                pass
+            elif name == "no-edit" and not eq:
                 no_edit = True
-            elif name == "amend":
+            elif name == "amend" and not eq:
                 amend = True
+            else:
+                return unknown(f"commit option --{name} is outside the allowlist")
+        elif arg.startswith("-S"):
+            pass
         elif arg.startswith("-") and len(arg) > 1:
             k = 1
             while k < len(arg):
                 ch = arg[k]
-                if ch in _SHORT_WITH_ARG:
+                if ch in _SHORT_FLAGS:
+                    k += 1
+                    continue
+                if ch in "mF":
                     val = take(arg[k + 1:] or None)
-                    if ch == "m":
-                        messages.append(val)
-                    elif ch == "F":
-                        files.append(val)
-                    else:
-                        editorish = True
+                    (messages if ch == "m" else files).append(val)
                     break
-                if ch in _SHORT_OPTIONAL_ARG:
-                    break
-                if ch == "e":
-                    editorish = True
-                k += 1
+                return unknown(f"commit option -{ch} is outside the allowlist")
+        elif arg == "-":
+            return unknown("unrecognised commit argument")
         j += 1
 
     def make(source: MessageSource, reason: str, path: Optional[Path] = None,
              text: Optional[str] = None) -> CommitInvocation:
-        return CommitInvocation(directory, source, path, text, reason)
+        return CommitInvocation(directory, source, path, text, reason, cleanup)
 
     if missing:
         return unknown("option is missing its argument")
-    if editorish:
-        return unknown("editor, template or reused message")
     if files and messages:
         return unknown("both file and message given")
     if files:
@@ -572,6 +631,8 @@ def _classify(
     if fixup:
         return make("auto", "fixup or squash commit")
     if messages:
+        if cleanup == "verbatim" and any(m == "" for m in messages):
+            return unknown("empty -m with --cleanup=verbatim is not modelled")
         parts = [placeholders.get(m, m) for m in messages]
         if any(_PLACEHOLDER_PREFIX in p and p not in placeholders.values() for p in parts):
             return unknown("message is not a statically known string")
@@ -581,6 +642,30 @@ def _classify(
     if no_edit and _in_progress_operation(directory):
         return make("auto", "merge, cherry-pick or revert in progress")
     return unknown("no message option")
+
+
+def effective_message(raw: str, cleanup: str) -> Optional[str]:
+    """The bytes git records for `raw` under `--cleanup=<cleanup>` (no editor).
+
+    ``None`` when the result depends on ``core.commentChar`` or the mode is
+    unknown, so the caller must treat the message as unknown.
+    """
+    if cleanup == "verbatim":
+        return raw
+    if cleanup not in ("default", "whitespace"):
+        return None
+    out: list[str] = []
+    blank = False
+    for line in raw.split("\n"):
+        line = line.rstrip(_WS)
+        if not line:
+            blank = bool(out)
+            continue
+        if blank:
+            out.append("")
+            blank = False
+        out.append(line)
+    return "\n".join(out) + "\n" if out else ""
 
 
 def _in_progress_operation(directory: Path) -> bool:

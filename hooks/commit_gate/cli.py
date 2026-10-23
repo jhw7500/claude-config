@@ -46,7 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--home", type=Path, default=None, help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
     g = sub.add_parser("grant", help="approve exactly one commit (valid 10 minutes)")
-    g.add_argument("--runtime", choices=sorted(grant._RUNTIMES), required=True)
+    g.add_argument("--runtime", choices=sorted(grant.RUNTIMES), required=True)
     g.add_argument("--repo", type=Path, required=True)
     source = g.add_mutually_exclusive_group(required=True)
     source.add_argument("--message-file", type=Path)
@@ -82,7 +82,7 @@ def _grant(args: argparse.Namespace, home: Path) -> int:
         digest = hashlib.sha256(data).hexdigest()
     else:
         digest = args.message_sha256
-        if not grant._is_hex(digest, (64,)):
+        if not grant.is_hex(digest, (64,)):
             print("error: --message-sha256 must be 64 lowercase hex characters",
                   file=sys.stderr)
             return 2
