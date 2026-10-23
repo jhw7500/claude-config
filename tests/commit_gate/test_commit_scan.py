@@ -535,3 +535,27 @@ def test_effective_message_literal_appends_newline_only_when_needed():
     # file bytes are kept as git reads them (measured: verbatim file without
     # trailing newline is recorded unchanged)
     assert effective_message("nofinal", "verbatim") == "nofinal"
+
+
+def test_control_character_command_is_unknown():
+    inv = one('git commit --cleanup=verbatim -m "title"\r')
+    assert inv.source == "unknown"
+    assert "control character" in inv.reason
+    inv = one('git commit -m "a\x01b"')
+    assert inv.source == "unknown"
+    assert "control character" in inv.reason
+    inv = one('git commit -m "a\x7fb"')
+    assert inv.source == "unknown"
+
+
+def test_control_character_without_commit_has_no_invocation():
+    assert scan_commits("git status\r", cwd=CWD).invocations == ()
+
+
+def test_newline_and_tab_stay_determinate():
+    heredoc = (
+        "git commit --cleanup=verbatim -m \"$(cat <<'EOF'\n"
+        "feat: x\n\nbody\tTabbed\nEOF\n)\""
+    )
+    assert one(heredoc).source == "literal"
+    assert one('git commit --cleanup=verbatim -m "a\tb"').source == "literal"

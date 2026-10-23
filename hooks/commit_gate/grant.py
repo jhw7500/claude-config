@@ -65,6 +65,7 @@ def _valid_binding(binding: object) -> bool:
         and bool(binding["repo_root"])
         and (binding["head"] == UNBORN or is_hex(binding["head"], (40, 64)))
         and is_hex(binding["message_sha256"], (64,))
+        and isinstance(binding["runtime"], str)
         and binding["runtime"] in RUNTIMES
     )
 
@@ -143,7 +144,8 @@ def _parse(raw: bytes, name: str) -> Optional[dict]:
         payload.get("schema") != _SCHEMA
         or not _valid_binding(payload.get("binding"))
         or binding_name(payload["binding"]) != name
-        or payload.get("channel") not in _CHANNELS
+        or not isinstance(payload.get("channel"), str)
+        or payload["channel"] not in _CHANNELS
         or not isinstance(payload.get("reason"), str)
         or len(payload["reason"]) > MAX_REASON_CHARS
         or isinstance(created, bool)
@@ -236,8 +238,17 @@ def consume_grant(home: Path, *, binding: dict[str, str], now: float) -> bool:
 
 def revoke_repo(home: Path, *, repo_root: Path) -> int:
     """Delete every readable grant bound to ``repo_root``; return the count."""
+    return revoke_repo_report(home, repo_root=repo_root)[0]
+
+
+def revoke_repo_report(home: Path, *, repo_root: Path) -> tuple[int, int]:
+    """Like ``revoke_repo`` but returns ``(removed, skipped)``.
+
+    A grant file that cannot be read or parsed is skipped, never fatal.
+    """
     root = os.path.realpath(repo_root)
     removed = 0
+    skipped = 0
     try:
         with _locked_dir(home, create=False) as dir_fd:
             for name in os.listdir(dir_fd):
@@ -248,8 +259,10 @@ def revoke_repo(home: Path, *, repo_root: Path) -> int:
                     if payload is not None and payload["binding"]["repo_root"] == root:
                         _unlink(dir_fd, name)
                         removed += 1
-                except OSError:
-                    continue
+                    elif payload is None:
+                        skipped += 1
+                except Exception:  # noqa: BLE001 - one bad file must not stop revocation
+                    skipped += 1
     except FileNotFoundError:
-        return 0
-    return removed
+        return 0, 0
+    return removed, skipped

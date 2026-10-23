@@ -276,3 +276,48 @@ def test_cli_rejects_bad_hash_and_non_repo(tmp_path):
         "--home", str(home), "grant", "--runtime", "claude", "--repo", str(tmp_path),
         "--message-sha256", "xyz", "--reason", "ok", "--relayed",
     ]) != 0
+
+
+def _write_raw_grant(home, b, **over):
+    payload = {
+        "schema": 1, "binding": b, "reason": "r", "channel": "relayed",
+        "created_at": NOW,
+    }
+    payload.update(over)
+    d = grant.state_dir(home)
+    d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o700)
+    path = d / grant.binding_name(b)
+    path.write_text(json.dumps(payload))
+    path.chmod(0o600)
+    return path
+
+
+def test_unhashable_channel_or_runtime_fails_closed(tmp_path):
+    b = binding()
+    _write_raw_grant(tmp_path, b, channel=[])
+    assert grant.consume_grant(tmp_path, binding=b, now=NOW + 1) is False
+    bad = dict(b, runtime={})
+    _write_raw_grant(tmp_path, bad)
+    assert grant.consume_grant(tmp_path, binding=binding(), now=NOW + 1) is False
+
+
+def test_revoke_skips_malformed_grants_and_removes_valid(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    root = Path(os.path.realpath(repo))
+    good = grant.make_binding(repo_root=root, head="", message_sha256=MSG, runtime="claude")
+    bad1 = grant.make_binding(repo_root=root, head="", message_sha256="b" * 64, runtime="codex")
+    bad2 = grant.make_binding(repo_root=root, head="", message_sha256="c" * 64, runtime="codex")
+    grant.record_grant(tmp_path, binding=good, reason="r", channel="tty", now=NOW)
+    p1 = _write_raw_grant(tmp_path, bad1, channel=[])
+    p2 = _write_raw_grant(tmp_path, dict(bad2, runtime={}))
+    assert cli.main(["--home", str(tmp_path), "revoke", "--repo", str(repo)]) == 0
+    out = capsys.readouterr().out
+    assert "revoked 1" in out
+    assert not (grant.state_dir(tmp_path) / grant.binding_name(good)).exists()
+    assert p1.exists()
+    assert grant.revoke_repo(tmp_path, repo_root=root) == 0
+    assert p2.exists()
+    assert "skipped 2" in out

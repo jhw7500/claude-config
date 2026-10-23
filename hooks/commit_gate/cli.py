@@ -116,7 +116,8 @@ def _grant(args: argparse.Namespace, home: Path) -> int:
 
 def _revoke(args: argparse.Namespace, home: Path) -> int:
     root = _repo_root(args.repo) or args.repo
-    print(f"revoked {grant.revoke_repo(home, repo_root=root)} approval(s)")
+    removed, skipped = grant.revoke_repo_report(home, repo_root=root)
+    print(f"revoked {removed} approval(s), skipped {skipped} unreadable")
     return 0
 
 

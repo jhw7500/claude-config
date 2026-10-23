@@ -73,6 +73,8 @@ _HEREDOC_HEADER = re.compile(
 )
 _PLACEHOLDER_PREFIX = "__COMMITGATE_HEREDOC_"
 _ASSIGNMENT = re.compile(r"^([A-Za-z_]\w*)=")
+# Anything but \n and \t: bash keeps e.g. CR inside a word, this scanner would not.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _LOOSE_SPLIT = re.compile(r"[\s;&|()`<>]+")
 _ALLOWED_ENV = frozenset({
     "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
@@ -154,6 +156,8 @@ def scan_commits(command: str, *, cwd: Path) -> ScanResult:
             return ScanResult(())
         if len(command) > _MAX_SCAN_CHARS:
             return _loose_result(command, cwd, "command too long to analyse")
+        if _CONTROL_CHARS.search(command):
+            return _loose_result(command, cwd, "control character in command")
         return _scan(command, cwd)
     except Exception:  # never raise on arbitrary input
         try:
