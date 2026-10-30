@@ -306,25 +306,27 @@ def ensure_manual_allowed_locked(review_fd: int) -> None:
         raise m.SchemaError("AUTO_RUN_ID_REQUIRED")
 
 
-def _archive_round_directory(review_fd: int, run_id: str, round_number: int) -> int:
+def _archive_round_directory(
+    review_fd: int, run_id: str, round_number: int, *, create: bool = True,
+) -> int:
     archive_fd = run_fd = -1
     try:
         archive_fd = open_directory(
             review_fd,
             "auto-run-archive",
-            create=True,
+            create=create,
             code="AUTO_RUN_ARCHIVE_UNSAFE",
         )
         run_fd = open_directory(
             archive_fd,
             run_id,
-            create=True,
+            create=create,
             code="AUTO_RUN_ARCHIVE_UNSAFE",
         )
         return open_directory(
             run_fd,
             f"round-{round_number}",
-            create=True,
+            create=create,
             code="AUTO_RUN_ARCHIVE_UNSAFE",
         )
     finally:
@@ -357,6 +359,59 @@ def _archive_create(directory: int, name: str, raw: bytes, maximum: int) -> str:
     if existing != raw:
         raise m.SchemaError("AUTO_RUN_ARCHIVE_EXISTS")
     return hashlib.sha256(existing).hexdigest()
+
+
+def _validate_run_archives_locked(
+    review_fd: int, run: dict[str, object], *, reviewers: Sequence[str],
+) -> None:
+    """Authenticate the retained history and the current round's decision input."""
+    expected_reviewers = list(reviewers)
+    if (
+        any(reviewer not in {"A", "B", "C"} for reviewer in expected_reviewers)
+        or len(set(expected_reviewers)) != len(expected_reviewers)
+        or run["binding"].get("active_reviewers") != expected_reviewers
+    ):
+        raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+    current = run.get("current")
+    records = list(run["rounds"])
+    if current is not None:
+        records.append(current)
+    expected: dict[int, dict[str, tuple[str, int]]] = {}
+    for number, record in enumerate(records, 1):
+        if record.get("round") != number or number > MAX_ROUNDS:
+            raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+        if record is not current:
+            reports = record.get("report_sha256")
+            if (
+                not isinstance(reports, dict)
+                or set(reports) != set(expected_reviewers)
+                or record.get("verdict_archive_sha256") != record.get("verdict_sha256")
+            ):
+                raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+            files = expected.setdefault(number, {})
+            files["verdict.json"] = (record.get("verdict_sha256"), m.MAX_VERDICT_BYTES)
+            for reviewer in expected_reviewers:
+                files[f"{reviewer}.json"] = (reports[reviewer], m.MAX_REPORT_BYTES)
+        if number > 1:
+            digest = record.get("decisions_archive_sha256")
+            if digest != record.get("decisions_sha256"):
+                raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+            expected.setdefault(number - 1, {})["decisions.json"] = (digest, m.MAX_REPORT_BYTES)
+    for number, files in expected.items():
+        archive_fd = _archive_round_directory(review_fd, run["id"], number, create=False)
+        try:
+            for name, (digest, maximum) in files.items():
+                if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+                    raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+                raw = read_named_file(
+                    archive_fd, name, maximum=maximum,
+                    missing="AUTO_RUN_ARCHIVE_UNSAFE", unsafe="AUTO_RUN_ARCHIVE_UNSAFE",
+                    exact_mode=0o600,
+                )
+                if hashlib.sha256(raw).hexdigest() != digest:
+                    raise m.SchemaError("AUTO_RUN_ARCHIVE_UNSAFE")
+        finally:
+            os.close(archive_fd)
 
 
 def _find(store: dict[str, object], auto_run_id: str) -> dict[str, object]:
@@ -795,24 +850,12 @@ def finalize_locked(
             or record.get("verdict_sha256") != hashlib.sha256(_verdict_raw(verdict)).hexdigest()
         ):
             raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
-        archive_fd = _archive_round_directory(review_fd, run["id"], verdict.round)
-        try:
-            hashes = {"verdict": record["verdict_sha256"], **record["report_sha256"]}
-            for name, digest in hashes.items():
-                raw = read_named_file(
-                    archive_fd, f"{name}.json",
-                    maximum=m.MAX_VERDICT_BYTES if name == "verdict" else m.MAX_REPORT_BYTES,
-                    missing="AUTO_RUN_ARCHIVE_UNSAFE", unsafe="AUTO_RUN_ARCHIVE_UNSAFE",
-                    exact_mode=0o600,
-                )
-                if hashlib.sha256(raw).hexdigest() != digest:
-                    raise m.SchemaError("AUTO_RUN_ARCHIVE_UNSAFE")
-        finally:
-            os.close(archive_fd)
+        _validate_run_archives_locked(review_fd, run, reviewers=verdict.policy.active_reviewers)
         if run["status"] == "stopped":
             _remove_active_locked(review_fd, run["id"])
         elif _active_locked(review_fd) != run["id"]:
             raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+        _validate_run_archives_locked(review_fd, run, reviewers=verdict.policy.active_reviewers)
         return
     if not matches:
         if _active_locked(review_fd) is not None:
@@ -829,6 +872,7 @@ def finalize_locked(
     current = run["current"]
     if current.get("round") != verdict.round or verdict.gate.status is m.GateStatus.IN_PROGRESS:
         raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+    _validate_run_archives_locked(review_fd, run, reviewers=verdict.policy.active_reviewers)
     raw = _verdict_raw(verdict)
     report_bytes: dict[str, bytes] = {}
     inbox_fd = open_directory(
@@ -914,3 +958,5 @@ def finalize_locked(
     _write_store_locked(review_fd, store)
     if run["status"] == "stopped":
         _remove_active_locked(review_fd, run["id"])
+    # The caller publishes the canonical verdict only after this final read.
+    _validate_run_archives_locked(review_fd, run, reviewers=verdict.policy.active_reviewers)

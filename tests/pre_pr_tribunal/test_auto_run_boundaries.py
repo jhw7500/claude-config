@@ -3,11 +3,12 @@
 from dataclasses import replace
 import hashlib
 import json
+import os
 import subprocess
 
 import pytest
 
-from pre_pr_tribunal import auto_run, verdict_store
+from pre_pr_tribunal import auto_run, review_store, verdict_store
 from pre_pr_tribunal.gate import evaluate_gate
 from pre_pr_tribunal.model import SchemaError, TribunalError
 from pre_pr_tribunal.verdict_store import begin_round, finalize_round, read_verdict
@@ -316,3 +317,199 @@ def test_decision_archive_after_store_failure_is_authenticated_on_retry(
         assert len(state["rounds"]) == 1
         assert state["current"]["round"] == 2
         assert archive.read_bytes() == decisions.read_bytes()
+
+
+def _next_auto_round(repo, grant, round_number):
+    fix = _commit(repo, f"fix for round {round_number}")
+    prior_round = round_number - 1
+    decisions = write_json(
+        repo / f".review/inbox/round-{prior_round}/decisions.json",
+        [{
+            "id": f"D-R{prior_round}-A-001",
+            "finding_ref": {
+                "round": prior_round, "id": f"A-R{prior_round}-001", "reviewer": "A",
+            },
+            "disposition": "fixed", "rationale": "Covered by a new regression test.",
+            "executions": [execution(f"D-R{prior_round}-E001")],
+        }],
+    )
+    return begin_round(
+        repo, base="master", runtime="codex", round_number=round_number,
+        decisions_path=decisions, auto_run_id=grant["id"], expected_head=fix,
+        fix_commits=(fix,), now=NOW,
+    )
+
+
+@pytest.mark.parametrize("ledger_committed", (False, True))
+@pytest.mark.parametrize("damage", ("missing", "changed", "public", "symlink", "directory", "owner", "parent"))
+def test_terminal_publication_authenticates_decision_archive(
+    git_repo, monkeypatch, ledger_committed, damage,
+):
+    grant = _grant(git_repo)
+    first = _begin(git_repo, grant)
+    _submit_round(git_repo, first.snapshot, round_number=1, fail=True)
+    second = _next_auto_round(git_repo, grant, 2)
+    if ledger_committed:
+        original = verdict_store._atomic_write
+
+        def fail_terminal(fd, verdict):
+            if verdict.round == 2 and verdict.gate.status.value != "in_progress":
+                raise SchemaError("INJECTED_WRITE_FAILURE")
+            return original(fd, verdict)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(verdict_store, "_atomic_write", fail_terminal)
+            with pytest.raises(SchemaError, match="^INJECTED_WRITE_FAILURE$"):
+                _submit_round(git_repo, second.snapshot, round_number=2, fail=False)
+    archive = git_repo / f".review/auto-run-archive/{grant['id']}/round-1/decisions.json"
+    original_bytes = archive.read_bytes()
+    before = (git_repo / ".review/auto-runs.json").read_bytes()
+    with monkeypatch.context() as patch:
+        if damage == "missing":
+            archive.unlink()
+        elif damage == "changed":
+            archive.write_bytes(b"[]")
+        elif damage == "public":
+            archive.chmod(0o644)
+        elif damage == "symlink":
+            archive.unlink()
+            archive.symlink_to(git_repo / ".review/inbox/round-1/decisions.json")
+        elif damage == "directory":
+            archive.unlink()
+            archive.mkdir(mode=0o700)
+        elif damage == "parent":
+            archive.parent.rename(archive.parent.with_name("retained-round-1"))
+        else:
+            target = archive.stat()
+            original_fstat = os.fstat
+
+            def different_owner(fd):
+                info = original_fstat(fd)
+                if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
+                    fields = list(info)
+                    fields[4] = info.st_uid + 1
+                    return os.stat_result(fields)
+                return info
+
+            patch.setattr(review_store.os, "fstat", different_owner)
+        with pytest.raises(SchemaError, match="^AUTO_RUN_ARCHIVE_UNSAFE$"):
+            if ledger_committed:
+                finalize_round(git_repo, now=NOW)
+            else:
+                _submit_round(git_repo, second.snapshot, round_number=2, fail=False)
+        assert read_verdict(git_repo).gate.status.value == "in_progress"
+        assert evaluate_gate(git_repo, COMMAND, runtime="codex").block
+        assert (git_repo / ".review/auto-runs.json").read_bytes() == before
+        if damage == "parent":
+            assert not archive.parent.exists()
+    # Exact evidence restoration allows the same pending lifecycle to finish.
+    if damage == "parent":
+        archive.parent.with_name("retained-round-1").rename(archive.parent)
+    elif damage in {"missing", "changed", "public"}:
+        archive.write_bytes(original_bytes)
+        archive.chmod(0o600)
+    elif damage == "symlink":
+        archive.unlink()
+        archive.write_bytes(original_bytes)
+        archive.chmod(0o600)
+    elif damage == "directory":
+        archive.rmdir()
+        archive.write_bytes(original_bytes)
+        archive.chmod(0o600)
+    assert finalize_round(git_repo, now=NOW).gate.status.value == "pass"
+    assert len(auto_run.status(git_repo)["rounds"]) == 2
+
+
+@pytest.mark.parametrize("archive_name", ("decisions", "verdict", "A"))
+def test_third_round_revalidates_earlier_round_evidence(git_repo, archive_name):
+    grant = _grant(git_repo)
+    first = _begin(git_repo, grant)
+    _submit_round(git_repo, first.snapshot, round_number=1, fail=True)
+    second = _next_auto_round(git_repo, grant, 2)
+    _submit_round(git_repo, second.snapshot, round_number=2, fail=True)
+    third = _next_auto_round(git_repo, grant, 3)
+    archive = git_repo / f".review/auto-run-archive/{grant['id']}/round-1/{archive_name}.json"
+    archive.write_bytes(b"[]")
+    with pytest.raises(SchemaError, match="^AUTO_RUN_ARCHIVE_UNSAFE$"):
+        _submit_round(git_repo, third.snapshot, round_number=3, fail=False)
+    assert read_verdict(git_repo).gate.status.value == "in_progress"
+    assert evaluate_gate(git_repo, COMMAND, runtime="codex").block
+    assert len(auto_run.status(git_repo)["rounds"]) == 2
+
+
+@pytest.mark.parametrize("ledger_committed", (False, True))
+def test_final_archive_check_follows_store_and_marker_writes(
+    git_repo, monkeypatch, ledger_committed,
+):
+    grant = _grant(git_repo)
+    first = _begin(git_repo, grant)
+    _submit_round(git_repo, first.snapshot, round_number=1, fail=True)
+    second = _next_auto_round(git_repo, grant, 2)
+    if ledger_committed:
+        original_write = verdict_store._atomic_write
+
+        def fail_terminal(fd, verdict):
+            if verdict.round == 2 and verdict.gate.status.value == "pass":
+                raise SchemaError("INJECTED_WRITE_FAILURE")
+            return original_write(fd, verdict)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(verdict_store, "_atomic_write", fail_terminal)
+            with pytest.raises(SchemaError, match="^INJECTED_WRITE_FAILURE$"):
+                _submit_round(git_repo, second.snapshot, round_number=2, fail=False)
+    archive = git_repo / f".review/auto-run-archive/{grant['id']}/round-1/decisions.json"
+    original_remove = auto_run._remove_active_locked
+
+    def remove_then_damage(fd, run_id):
+        original_remove(fd, run_id)
+        archive.write_bytes(b"[]")
+
+    monkeypatch.setattr(auto_run, "_remove_active_locked", remove_then_damage)
+    with pytest.raises(SchemaError, match="^AUTO_RUN_ARCHIVE_UNSAFE$"):
+        if ledger_committed:
+            finalize_round(git_repo, now=NOW)
+        else:
+            _submit_round(git_repo, second.snapshot, round_number=2, fail=False)
+    assert read_verdict(git_repo).gate.status.value == "in_progress"
+    assert evaluate_gate(git_repo, COMMAND, runtime="codex").block
+
+
+@pytest.mark.parametrize("tampering", ("traversal", "subset", "duplicate", "unexpected"))
+def test_archive_reviewers_must_match_bound_verdict_policy(git_repo, monkeypatch, tampering):
+    grant = _grant(git_repo)
+    pending = _begin(git_repo, grant)
+    original = verdict_store._atomic_write
+
+    def fail_terminal(fd, verdict):
+        if verdict.gate.status.value == "pass":
+            raise SchemaError("INJECTED_WRITE_FAILURE")
+        return original(fd, verdict)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(verdict_store, "_atomic_write", fail_terminal)
+        with pytest.raises(SchemaError, match="^INJECTED_WRITE_FAILURE$"):
+            _submit_round(git_repo, pending.snapshot, round_number=1, fail=False)
+    path = git_repo / ".review/auto-runs.json"
+    store = json.loads(path.read_bytes())
+    run = store["runs"][0]
+    archive = git_repo / f".review/auto-run-archive/{grant['id']}/round-1/A.json"
+    if tampering == "duplicate":
+        run["binding"]["active_reviewers"].append("A")
+    elif tampering == "subset":
+        run["binding"]["active_reviewers"].remove("A")
+        del run["rounds"][0]["report_sha256"]["A"]
+        archive.unlink()
+    else:
+        key = "../../../inbox/round-1/A" if tampering == "traversal" else "Z"
+        run["binding"]["active_reviewers"][0] = key
+        hashes = run["rounds"][0]["report_sha256"]
+        hashes[key] = hashes.pop("A")
+        if tampering == "traversal":
+            archive.unlink()
+        else:
+            archive.rename(archive.with_name("Z.json"))
+    path.write_text(json.dumps(store))
+    with pytest.raises(SchemaError, match="^AUTO_RUN_STATE_INCONSISTENT$"):
+        finalize_round(git_repo, now=NOW)
+    assert read_verdict(git_repo).gate.status.value == "in_progress"
+    assert evaluate_gate(git_repo, COMMAND, runtime="codex").block
