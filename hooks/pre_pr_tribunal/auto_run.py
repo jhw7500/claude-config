@@ -853,9 +853,12 @@ def finalize_locked(
         _validate_run_archives_locked(review_fd, run, reviewers=verdict.policy.active_reviewers)
         if run["status"] == "stopped":
             _remove_active_locked(review_fd, run["id"])
+            # Reopen every archive after the marker write before publication.
+            _validate_run_archives_locked(
+                review_fd, run, reviewers=verdict.policy.active_reviewers
+            )
         elif _active_locked(review_fd) != run["id"]:
             raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
-        _validate_run_archives_locked(review_fd, run, reviewers=verdict.policy.active_reviewers)
         return
     if not matches:
         if _active_locked(review_fd) is not None:

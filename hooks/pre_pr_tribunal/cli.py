@@ -1427,6 +1427,9 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
             if not arguments.relayed:
                 if not sys.stdin.isatty():
                     raise TribunalError("AUTO_RUN_TTY_REQUIRED")
+                confirmation = arguments.choice
+                if confirmation not in auto_run._CHOICES:
+                    raise TribunalError("AUTO_RUN_CONSENT_REQUIRED")
                 binding = auto_run.preview(
                     cwd,
                     base=arguments.base,
@@ -1456,10 +1459,10 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                     "  estimated elapsed time/cost: unknown; includes up to three reviews plus validation\n"
                     "  stop on PASS, inconclusive/unverified evidence, provider failure/quota, pending/integrity errors, scope drift, cancel/revocation, or round 3\n"
                     "  this grants no PR creation or merge authority\n"
-                    "Type '100 자동' to authorize this bounded run: "
+                    f"Type {json.dumps(confirmation, ensure_ascii=False)} to authorize this bounded run: "
                 )
                 sys.stderr.flush()
-                if sys.stdin.readline().strip() != "100 자동":
+                if sys.stdin.readline().strip() != confirmation:
                     raise TribunalError("AUTO_RUN_CONFIRMATION_MISMATCH")
             payload = auto_run.record_grant(
                 cwd,
