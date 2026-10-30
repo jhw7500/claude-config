@@ -37,14 +37,31 @@ for skill_dir in "$HOME/.claude/plugins/cache" "$HOME/.claude/commands/jhw"; do
     fi
 done
 # 초안의 기준은 ~/.claude/skills 링크가 가리키는 live 실체다(핀 worktree처럼 이 저장소 밖일 수 있다).
-# 목록만 프롬프트에 넘긴다. --add-dir는 acceptEdits에서 자동 편집 경로가 되므로, 바깥 실체를 넘기면
-# 이 무인 세션이 그 live 파일(예: tribunal 리뷰어 지침)을 고칠 수 있다. 읽지 못하는 스킬은 보류로 보고된다.
+# --add-dir는 acceptEdits에서 자동 편집 경로가 되므로 바깥 live 실체에는 Read 규칙만 추가한다.
+# 기존 settings 파일은 그대로 사용해 상대 경로 규칙의 기준도 유지한다. 읽지 못하는 스킬은 보류로 보고된다.
 LIVE_SKILLS=""
+LIVE_READ_RULES=()
 if [ -d "$HOME/.claude/skills" ]; then
     for link in "$HOME/.claude/skills"/*; do
         [ -e "$link" ] || continue
-        LIVE_SKILLS+="$(basename "$link") -> $(readlink -f "$link")"$'\n'
+        # NUL 구분으로 읽어 실제 경로 끝의 개행을 다른 경로로 바꾸지 않는다.
+        if ! IFS= read -r -d '' live_root < <(readlink -fz -- "$link"); then
+            LIVE_SKILLS+="$(basename "$link") -> unresolved (hold: live target resolution failed)"$'\n'
+            continue
+        fi
+        LIVE_SKILLS+="$(basename "$link") -> ${live_root}"$'\n'
+        [ -d "$live_root" ] && [ -f "$live_root/SKILL.md" ] || continue
+        # 권한 패턴을 넓히거나 CLI에서 다르게 해석될 수 있는 경로에는 추가 권한을 주지 않는다.
+        case "$live_root" in
+            /|*'*'*|*'?'*|*'['*|*']'*|*"\\"*|*'"'*|*"'"*|*','*|\
+            *[[:cntrl:]]*|*[[:space:]]) continue ;;
+        esac
+        LIVE_READ_RULES+=("Read(/${live_root})" "Read(/${live_root}/**)")
     done
+fi
+LIVE_READ_ARGS=()
+if ((${#LIVE_READ_RULES[@]})); then
+    LIVE_READ_ARGS=(--allowedTools "${LIVE_READ_RULES[@]}")
 fi
 
 if [ -f "$LOG" ] && [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 2000000 ]; then
@@ -98,6 +115,7 @@ ${LIVE_SKILLS}
         "${ADD_DIRS[@]}" \
         --permission-mode acceptEdits \
         --settings "$SCRIPT_DIR/weekly-skill-review-settings.json" \
+        "${LIVE_READ_ARGS[@]}" \
         < /dev/null 2>&1
     REVIEW_EXIT=$?
     echo "exit=$REVIEW_EXIT"
