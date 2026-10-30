@@ -238,6 +238,40 @@ def test_interrupted_finalize_never_exposes_pass_and_can_retry(
     assert not (git_repo / ".review/auto-run-active.json").exists()
 
 
+@pytest.mark.parametrize("reviewer", ("A", "B"))
+def test_finalize_reauthenticates_report_bytes_before_archiving(
+    git_repo, monkeypatch, reviewer,
+):
+    grant = _grant(git_repo)
+    pending = _begin(git_repo, grant)
+    report_path = git_repo / f".review/inbox/round-1/{reviewer}.json"
+    original_finalize = auto_run.finalize_locked
+    original_raw = None
+
+    def tamper_after_report_authentication(*args, **kwargs):
+        nonlocal original_raw
+        original_raw = report_path.read_bytes()
+        report_path.write_bytes(original_raw + b"\n")
+        return original_finalize(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(auto_run, "finalize_locked", tamper_after_report_authentication)
+        with pytest.raises(SchemaError, match="^REPORT_BYTES_MISMATCH$"):
+            _submit_round(git_repo, pending.snapshot, round_number=1, fail=False)
+
+    assert original_raw is not None
+    assert read_verdict(git_repo).gate.status.value == "in_progress"
+    assert auto_run.status(git_repo, auto_run_id=grant["id"])["rounds"] == []
+    assert not (
+        git_repo / f".review/auto-run-archive/{grant['id']}/round-1"
+    ).exists()
+
+    report_path.write_bytes(original_raw)
+    assert finalize_round(git_repo, now=NOW).gate.status.value == "pass"
+    completed = auto_run.status(git_repo, auto_run_id=grant["id"])
+    assert len(completed["rounds"]) == 1
+
+
 @pytest.mark.parametrize("name", ("verdict", "A"))
 def test_completed_ledger_retry_rejects_changed_archive(git_repo, monkeypatch, name):
     grant = _grant(git_repo)

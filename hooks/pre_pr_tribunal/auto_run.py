@@ -890,11 +890,19 @@ def finalize_locked(
         os.close(inbox_fd)
     try:
         for reviewer in verdict.policy.active_reviewers:
-            report_bytes[reviewer] = read_named_file(
+            report_raw = read_named_file(
                 source_fd, f"{reviewer}.json", maximum=m.MAX_REPORT_BYTES,
                 missing="AUTO_RUN_ARCHIVE_UNSAFE", unsafe="AUTO_RUN_ARCHIVE_UNSAFE",
                 exact_mode=0o600,
             )
+            slot = verdict.reviewers.get(reviewer)
+            if (
+                slot is None
+                or slot.receipt is None
+                or hashlib.sha256(report_raw).hexdigest() != slot.receipt.raw_sha256
+            ):
+                raise m.SchemaError("REPORT_BYTES_MISMATCH")
+            report_bytes[reviewer] = report_raw
     finally:
         os.close(source_fd)
     completed_at = now()
