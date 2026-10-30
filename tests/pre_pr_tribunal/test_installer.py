@@ -29,6 +29,7 @@ CODEX_PROMPT_COMMAND = (
 PACKAGE_NAMES = (
     "__init__.py",
     "attempt_store.py",
+    "auto_run.py",
     "claude_hook.py",
     "cli.py",
     "codex_hook.py",
@@ -193,6 +194,7 @@ def test_build_plan_installs_one_shared_package_two_hooks_and_two_skill_links(in
     "relative",
     [
         Path("SKILL.md"),
+        Path("references/auto-run.md"),
         Path("references/reviewer-a.md"),
         Path("references/reviewer-b.md"),
         Path("references/reviewer-c.md"),

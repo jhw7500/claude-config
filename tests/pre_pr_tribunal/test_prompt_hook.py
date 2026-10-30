@@ -44,6 +44,10 @@ def test_natural_and_explicit_requests_get_distinct_one_round_guidance(runtime):
         assert "최대 1라운드" in message
         assert "FAIL/INCONCLUSIVE" in message
         assert "새 명시적 사용자 요청" in message
+        assert "100 자동" in message
+        assert "auto-run-grant" in message
+        assert "최초 심사 포함 최대 3라운드" in message
+        assert "숫자 100" in message
 
 
 @pytest.mark.parametrize(
@@ -207,3 +211,17 @@ def test_prior_keep_going_request_does_not_override_fail_stop():
     assert "[CONTINUOUS-EXEC]" in result.stdout
     assert "한 요청당 한 결정 라운드" in result.stdout
     assert "자동 수정·커밋·재심사는 하지 않는다" in result.stdout
+    assert "100 자동" in result.stdout
+    assert "auto-run-grant" in result.stdout
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+@pytest.mark.parametrize("answer", ["100", "100 자동", "진행"])
+def test_selection_answer_alone_does_not_grant_or_route_a_review(runtime, answer, tmp_path):
+    result = subprocess.run(
+        [sys.executable, str(HOOK), runtime],
+        input=json.dumps({"prompt": answer}, ensure_ascii=False),
+        text=True, capture_output=True, check=True, cwd=tmp_path,
+    )
+    assert result.stdout == ""
+    assert not (tmp_path / ".review").exists()

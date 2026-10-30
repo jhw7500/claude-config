@@ -88,14 +88,23 @@ fi
 설치기는 두 runtime에 advisory `UserPromptSubmit` hook도 추가한다. 자연어 심사 동작 요청과
 명시적 `$pre-pr-tribunal`/`/pre-pr-tribunal` 호출을 구분해 안내하지만, 훅 메시지는 사용자
 요청의 암호학적 증명이나 CLI 재실행 권한이 아니다. 자연어 요청은 일반 코드 리뷰와 Tribunal의
-범위를 먼저 구분한다. 어느 경로든 Tribunal을 택하면 한 사용자 요청에 결정 라운드 최대 1회,
+범위를 먼저 구분한다. 어느 경로든 Tribunal을 택하면 기본은 한 사용자 요청에 결정 라운드 최대 1회,
 실행 전 reviewer·intensity/mode·예상 소요·중단 조건 안내, FAIL/INCONCLUSIVE 뒤 즉시 중단이
 기본이다. 수정과 재심사는 결과를 본 뒤의 새 명시적 사용자 요청이 필요하다. `iterative`는
 라이프사이클 전체에서 최대 3라운드를 허용하는 정책 모드이지 한 요청에서 자동으로 3회 실행하는
-허가가 아니다. 종료된 판정 뒤의 새 `begin`은 CLI에서도 별도 일회성 `re-review-grant`를 요구한다.
+허가가 아니다. 기본 모드의 종료된 판정 뒤 새 `begin`은 CLI에서도 별도 일회성 `re-review-grant`를 요구한다.
 새 스냅샷과 이전 verdict에 결합된 `re-review-preview`를 사용자에게 보여 준 뒤 명시적 답을
 받아 기록하며, 이전 intensity 승인이나 일반적인 계속 진행 지시는 이 grant를 대체하지 못한다.
 relayed grant는 에이전트가 사용자의 답을 기록했다는 증명이지 인간 존재의 암호학적 인증은 아니다.
+강도 선택에서 사용자가 별도로 **100 자동**을 선택하면, 새 실행의 시작 스냅샷·저장소/작업 경로·
+브랜치·base·runtime·policy·reviewer와 최대 3라운드에 결합된 `auto-run-grant`를 기록한다.
+숫자 `100`이나 일반적인 "진행" 답변은 이 동의를 만들지 않는다. `auto-run-preview` → 동의 기록 →
+`begin --auto-run <id> --expected-head <sha>` 경로에서만 승인 범위의 FAIL 후속 라운드를 자동 진행한다.
+수정 커밋은 `--fix-commit <sha>`로 전부 선언하고 각 전환의 이전 verdict·새 HEAD/diff·결정을 검증한다.
+`auto-run-status`는 라운드 이력과 종료 사유를 보존하고, `auto-run-stop`은 계속 실행할 권한을 철회한다.
+PASS·INCONCLUSIVE·미검증 증거·quota/실행 실패·무결성 오류·상한 소진·취소에서 멈추며,
+기존 pending을 승격하거나 라운드 예산을 초기화하지 않는다. CLI는 검사를 맡고, 실제 수정·검증·
+커밋·리뷰어 실행은 스킬 컨트롤러가 수행한다. 상세 절차는 `skills/pre-pr-tribunal/references/auto-run.md`다.
 중간 수정에는 타깃 테스트를 쓰고 전체 테스트는 최종 검증에서 최대 1회 실행한다.
 긴 단계에서는 상태·누적 시간을 60초 이내 간격으로 보고하고, 취소 후에는 신규 작업을 시작하지
 않으며 이미 시작한 reviewer와 증거는 안전하게 보존한다.

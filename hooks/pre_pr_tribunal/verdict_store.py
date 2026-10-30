@@ -1347,9 +1347,17 @@ def begin_round(
     intensity_values: Sequence[str] | None = None,
     intensity_requester: str | Sequence[str] | None = None,
     intensity_reason: str | Sequence[str] | None = None,
+    auto_run_id: str | None = None,
+    expected_head: str | None = None,
+    fix_commits: Sequence[str] = (),
     now: Callable[[], str] = utc_now,
     token_hex: Callable[[int], str] = secrets.token_hex,
 ) -> Verdict:
+    if auto_run_id is None:
+        if expected_head is not None or fix_commits:
+            raise SchemaError("AUTO_RUN_ID_REQUIRED")
+    elif expected_head is None:
+        raise SchemaError("AUTO_RUN_EXPECTED_HEAD_REQUIRED")
     if (
         not isinstance(round_number, int)
         or isinstance(round_number, bool)
@@ -1375,6 +1383,10 @@ def begin_round(
                 raise
             stored_raw = None
         stored = _parse_verdict(stored_raw) if stored_raw is not None else None
+        if auto_run_id is None:
+            from .auto_run import ensure_manual_allowed_locked
+
+            ensure_manual_allowed_locked(review_fd)
         if stored is not None and stored.gate.status is GateStatus.IN_PROGRESS:
             raise SchemaError("ROUND_TRANSITION_INVALID")
         snapshot = capture_snapshot(root, base, now=now)
@@ -1425,11 +1437,27 @@ def begin_round(
         else:
             from .intensity_grant import matching_grant_request
 
-            request = parse_intensity_request(
-                intensity_values,
-                requester=intensity_requester,
-                reason=intensity_reason,
-            )
+            if auto_run_id is not None:
+                if (
+                    intensity_values
+                    or intensity_requester is not None
+                    or intensity_reason is not None
+                ):
+                    raise SchemaError("INTENSITY_NOT_ALLOWED")
+                from .auto_run import initial_request_locked
+
+                request = initial_request_locked(
+                    review_fd,
+                    auto_run_id=auto_run_id,
+                    snapshot=snapshot,
+                    runtime=runtime,
+                )
+            else:
+                request = parse_intensity_request(
+                    intensity_values,
+                    requester=intensity_requester,
+                    reason=intensity_reason,
+                )
             grant_request = matching_grant_request(
                 review_fd,
                 snapshot,
@@ -1438,7 +1466,7 @@ def begin_round(
                     request=parse_intensity_request(None, requester=None, reason=None),
                 ),
             )
-            if grant_request is not None:
+            if grant_request is not None and auto_run_id is None:
                 if (
                     intensity_values
                     or intensity_requester is not None
@@ -1481,6 +1509,7 @@ def begin_round(
             initial_paths = tuple(snapshot.initial_paths)
             decisions: tuple[Decision, ...] = ()
             decisions_sha256 = None
+            decisions_raw = None
             history: tuple[RoundSummary, ...] = ()
         else:
             if (
@@ -1509,6 +1538,7 @@ def begin_round(
             )
             decisions = m.parse_decisions(raw, prior_blockers=_blockers(previous))
             decisions_sha256 = hashlib.sha256(raw).hexdigest()
+            decisions_raw = raw
             if (
                 any(item.disposition == "fixed" for item in decisions)
                 and snapshot.head_sha == previous.head_sha
@@ -1536,7 +1566,24 @@ def begin_round(
                 evidence_binding=evidence_binding,
                 evidence_fallback_reason=evidence_fallback_reason,
             )
-        if stored is not None:
+        if auto_run_id is not None:
+            from .auto_run import reserve_begin_locked
+
+            reserve_begin_locked(
+                root,
+                review_fd,
+                auto_run_id=auto_run_id,
+                expected_head=expected_head,
+                fix_commits=fix_commits,
+                prior=stored,
+                prior_raw=stored_raw,
+                pending=pending,
+                decisions=decisions,
+                decisions_raw=decisions_raw,
+                decisions_sha256=decisions_sha256,
+                now=now,
+            )
+        if stored is not None and auto_run_id is None:
             if stored_raw is None:
                 raise SchemaError("VERDICT_INVALID")
             from .round_grant import consume_matching_grant_locked
@@ -1779,6 +1826,14 @@ def finalize_round(
             pending, gate=GateSummary(status, len(blockers)), created_at=snapshot.created_at
         )
         _atomic_write(review_fd, final)
+        from .auto_run import finalize_locked
+
+        finalize_locked(
+            review_fd,
+            verdict=final,
+            continuation_allowed=not has_unverified,
+            now=now,
+        )
         return final
 
 
