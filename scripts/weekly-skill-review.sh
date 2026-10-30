@@ -5,6 +5,7 @@
 # 다른 세션이 쓰는 로그를 이동하지 않는다. 심링크 별칭은 실체 경로로 중복 제거한다.
 # 결과는 skill-updates/ 에 staged 로만 남는다 — 사용자가 설치하기 전까지 live 아님.
 set -u
+export LC_ALL=C.UTF-8
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 # 워크스페이스는 인자로 받는다. 이 저장소는 공개돼 있어 개인 경로를 파일에 두지 않는다
@@ -70,6 +71,7 @@ if [ -d "$HOME/.claude/skills" ]; then
             path_parentheses="${path_parentheses//\(\)/}"
         done
         [ -z "$path_parentheses" ] || continue
+        # Claude 권한에서 //는 파일시스템 절대 경로를 나타내므로 /를 하나 더 붙인다.
         LIVE_READ_RULES+=("Read(/${live_root})" "Read(/${live_root}/**)")
     done
 fi

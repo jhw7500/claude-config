@@ -52,39 +52,40 @@ def test_inventory_missing_anchor_fails_instead_of_claiming_empty(tmp_path):
 
 @pytest.mark.parametrize("cli_exit", [0, 23])
 @pytest.mark.parametrize(
-    ("pinned_name", "grant_read", "link_name"),
+    ("pinned_name", "grant_read", "link_name", "inherited_locale"),
     [
-        ("pinned worktree", True, "pre-pr-tribunal"),
-        ("pinned (release)", True, "pre-pr-tribunal"),
-        ("pinned ((release))", True, "pre-pr-tribunal"),
-        ("pinned) Edit(~", False, "pre-pr-tribunal"),
-        ("pinned (release", False, "pre-pr-tribunal"),
-        ("pinned*worktree", False, "pre-pr-tribunal"),
-        ("pinned?worktree", False, "pre-pr-tribunal"),
-        ("pinned[worktree]", False, "pre-pr-tribunal"),
-        ("pinned\\worktree", False, "pre-pr-tribunal"),
-        ('pinned"worktree', False, "pre-pr-tribunal"),
-        ("pinned'worktree", False, "pre-pr-tribunal"),
-        ("pinned,worktree", False, "pre-pr-tribunal"),
-        ("pinned\nworktree", False, "pre-pr-tribunal"),
-        ("pinned worktree\n", False, "pre-pr-tribunal"),
-        ("pinned\nFOLLOW_PROMPT_INJECTION", False, "pre-pr-tribunal"),
-        ("pinned\rFOLLOW_PROMPT_INJECTION", False, "pre-pr-tribunal"),
-        ("pinned worktree ", False, "pre-pr-tribunal"),
-        ("not a skill", False, "pre-pr-tribunal"),
-        ("/", False, "pre-pr-tribunal"),
-        (None, False, "pre-pr-tribunal"),
-        ("pinned worktree", False, "alias\nFOLLOW_PROMPT_INJECTION"),
-        ("pinned worktree", False, "alias\rFOLLOW_PROMPT_INJECTION"),
-        ("pinned worktree", False, "alias\tFOLLOW_PROMPT_INJECTION"),
-        ("pinned worktree", False, "alias\n"),
-        ('pinned"}]} worktree', False, 'alias"}]} \\ name'),
-        ("pinned \u2028 worktree", False, "alias \u2029 name"),
-        ("핀 worktree", True, "스킬 name"),
+        ("pinned worktree", True, "pre-pr-tribunal", None),
+        ("pinned (release)", True, "pre-pr-tribunal", None),
+        ("pinned ((release))", True, "pre-pr-tribunal", None),
+        ("pinned) Edit(~", False, "pre-pr-tribunal", None),
+        ("pinned (release", False, "pre-pr-tribunal", None),
+        ("pinned*worktree", False, "pre-pr-tribunal", None),
+        ("pinned?worktree", False, "pre-pr-tribunal", None),
+        ("pinned[worktree]", False, "pre-pr-tribunal", None),
+        ("pinned\\worktree", False, "pre-pr-tribunal", None),
+        ('pinned"worktree', False, "pre-pr-tribunal", None),
+        ("pinned'worktree", False, "pre-pr-tribunal", None),
+        ("pinned,worktree", False, "pre-pr-tribunal", None),
+        ("pinned\nworktree", False, "pre-pr-tribunal", None),
+        ("pinned worktree\n", False, "pre-pr-tribunal", None),
+        ("pinned\nFOLLOW_PROMPT_INJECTION", False, "pre-pr-tribunal", None),
+        ("pinned\rFOLLOW_PROMPT_INJECTION", False, "pre-pr-tribunal", None),
+        ("pinned worktree ", False, "pre-pr-tribunal", None),
+        ("not a skill", False, "pre-pr-tribunal", None),
+        ("/", False, "pre-pr-tribunal", None),
+        (None, False, "pre-pr-tribunal", None),
+        ("pinned worktree", False, "alias\nFOLLOW_PROMPT_INJECTION", None),
+        ("pinned worktree", False, "alias\rFOLLOW_PROMPT_INJECTION", None),
+        ("pinned worktree", False, "alias\tFOLLOW_PROMPT_INJECTION", None),
+        ("pinned worktree", False, "alias\n", None),
+        ('pinned"}]} worktree', False, 'alias"}]} \\ name', None),
+        ("pinned \u2028 worktree", False, "alias \u2029 name", "C"),
+        ("pinned \u2028 worktree", False, "alias \u2029 name", "C.UTF-8"),
+        ("핀 worktree", True, "스킬 name", None),
     ],
 )
 def test_launcher_passes_all_sources_and_preserves_cli_exit(
-    tmp_path, cli_exit, pinned_name, grant_read, link_name,
+    tmp_path, cli_exit, pinned_name, grant_read, link_name, inherited_locale,
 ):
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
@@ -137,6 +138,8 @@ def test_launcher_passes_all_sources_and_preserves_cli_exit(
     before = {p: (p / "log.md").read_bytes() for p in [anchor, other]}
     env = dict(os.environ, HOME=str(test_home), REVIEW_TEST_CAPTURE=str(capture),
                REVIEW_TEST_EXIT=str(cli_exit))
+    if inherited_locale is not None:
+        env["LC_ALL"] = inherited_locale
 
     result = subprocess.run(["bash", str(scripts / "weekly-skill-review.sh"), str(anchor)],
                             env=env, capture_output=True, text=True)
