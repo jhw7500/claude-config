@@ -56,7 +56,7 @@ if __package__ in {None, ""}:
         validate_stored_reviewer_report,
     )
     from pre_pr_tribunal import telemetry, evidence_runtime, evidence_store, evidence_lifecycle  # type: ignore
-    from pre_pr_tribunal import intensity_grant, pr_override_grant, round_grant  # type: ignore
+    from pre_pr_tribunal import auto_run, intensity_grant, pr_override_grant, round_grant  # type: ignore
     from pre_pr_tribunal.policy import (  # type: ignore
         intensity_mode,
         validate_grant_lowering,
@@ -93,7 +93,7 @@ else:
         validate_stored_reviewer_report,
     )
     from . import telemetry, evidence_runtime, evidence_store, evidence_lifecycle
-    from . import intensity_grant, pr_override_grant, round_grant
+    from . import auto_run, intensity_grant, pr_override_grant, round_grant
     from .policy import intensity_mode, validate_grant_lowering
 
 
@@ -140,6 +140,24 @@ def _parser() -> argparse.ArgumentParser:
     begin.add_argument("--intensity", action="append")
     begin.add_argument("--intensity-requester", action="append")
     begin.add_argument("--intensity-reason", action="append")
+    begin.add_argument("--auto-run")
+    begin.add_argument("--expected-head")
+    begin.add_argument("--fix-commit", action="append", default=[])
+    auto_preview = commands.add_parser("auto-run-preview", add_help=False)
+    auto_preview.add_argument("--base", required=True)
+    auto_preview.add_argument("--runtime", required=True, choices=("claude", "codex"))
+    auto_grant = commands.add_parser("auto-run-grant", add_help=False)
+    auto_grant.add_argument("--base", required=True)
+    auto_grant.add_argument("--runtime", required=True, choices=("claude", "codex"))
+    auto_grant.add_argument("--binding-sha256", required=True)
+    auto_grant.add_argument("--choice", required=True)
+    auto_grant.add_argument("--reason", required=True)
+    auto_grant.add_argument("--relayed", action="store_true")
+    auto_status = commands.add_parser("auto-run-status", add_help=False)
+    auto_status.add_argument("--auto-run")
+    auto_stop = commands.add_parser("auto-run-stop", add_help=False)
+    auto_stop.add_argument("--auto-run", required=True)
+    auto_stop.add_argument("--reason", required=True)
     preview = commands.add_parser("policy-preview", add_help=False)
     preview.add_argument("--base", required=True)
     preview.add_argument("--runtime", required=True, choices=("claude", "codex"))
@@ -292,6 +310,9 @@ def _begin_with_telemetry(cwd, arguments, *, wall_clock=utc_now, monotonic_ns=ti
             intensity_values=getattr(arguments, "intensity", None),
             intensity_requester=getattr(arguments, "intensity_requester", None),
             intensity_reason=getattr(arguments, "intensity_reason", None),
+            auto_run_id=getattr(arguments, "auto_run", None),
+            expected_head=getattr(arguments, "expected_head", None),
+            fix_commits=getattr(arguments, "fix_commit", ()),
         )
     except TribunalError as primary_error:
         try:
@@ -1395,6 +1416,73 @@ def main(argv: list[str] | None = None, *, wall_clock=utc_now, monotonic_ns=time
                 "policy": policy.to_json(),
                 "active_reviewers": list(policy.active_reviewers),
             }
+        elif arguments.command == "auto-run-preview":
+            payload = auto_run.preview(
+                cwd,
+                base=arguments.base,
+                runtime=arguments.runtime,
+                now=wall_clock,
+            )
+        elif arguments.command == "auto-run-grant":
+            if not arguments.relayed:
+                if not sys.stdin.isatty():
+                    raise TribunalError("AUTO_RUN_TTY_REQUIRED")
+                confirmation = arguments.choice
+                if confirmation not in auto_run._CHOICES:
+                    raise TribunalError("AUTO_RUN_CONSENT_REQUIRED")
+                binding = auto_run.preview(
+                    cwd,
+                    base=arguments.base,
+                    runtime=arguments.runtime,
+                    now=wall_clock,
+                )
+                policy = binding["policy"]
+                models = ", ".join(
+                    f"{reviewer}={policy['reviewers'][reviewer]['model']}"
+                    for reviewer in binding["active_reviewers"]
+                )
+                paths = ", ".join(
+                    json.dumps(path, ensure_ascii=False)
+                    for path in binding["snapshot"]["initial_paths"]
+                )
+                sys.stderr.write(
+                    "pre-pr-tribunal bounded auto-run consent\n"
+                    f"  repository {binding['snapshot']['repository']}  runtime {binding['runtime']}\n"
+                    f"  branch {binding['snapshot']['head_ref']}\n"
+                    f"  head {binding['snapshot']['head_sha']}  base {binding['snapshot']['base_ref']}\n"
+                    f"  base SHA {binding['snapshot']['base_sha']}  diff {binding['snapshot']['diff_sha256']}\n"
+                    f"  intensity {policy['effective_intensity']}  mode {policy['mode']}  risk floor {policy['risk_floor']}\n"
+                    f"  reviewers {models}  maximum rounds 3 (including initial review)\n"
+                    f"  allowed paths: {paths}\n"
+                    "  scope: fix blockers, run focused tests, create necessary fix commits, and re-review\n"
+                    "  policy, runtime, contract, base, reviewers and prior verdict remain bound\n"
+                    "  estimated elapsed time/cost: unknown; includes up to three reviews plus validation\n"
+                    "  stop on PASS, inconclusive/unverified evidence, provider failure/quota, pending/integrity errors, scope drift, cancel/revocation, or round 3\n"
+                    "  this grants no PR creation or merge authority\n"
+                    f"Type {json.dumps(confirmation, ensure_ascii=False)} to authorize this bounded run: "
+                )
+                sys.stderr.flush()
+                if sys.stdin.readline().strip() != confirmation:
+                    raise TribunalError("AUTO_RUN_CONFIRMATION_MISMATCH")
+            payload = auto_run.record_grant(
+                cwd,
+                base=arguments.base,
+                runtime=arguments.runtime,
+                expected_binding_sha256=arguments.binding_sha256,
+                choice=arguments.choice,
+                reason=arguments.reason,
+                channel="relayed" if arguments.relayed else "tty",
+                now=wall_clock,
+            )
+        elif arguments.command == "auto-run-status":
+            payload = auto_run.status(cwd, auto_run_id=arguments.auto_run)
+        elif arguments.command == "auto-run-stop":
+            payload = auto_run.stop(
+                cwd,
+                auto_run_id=arguments.auto_run,
+                reason=arguments.reason,
+                now=wall_clock,
+            )
         elif arguments.command == "intensity-grant":
             payload = _intensity_grant(cwd, arguments, wall_clock=wall_clock)
         elif arguments.command == "pr-override-grant":

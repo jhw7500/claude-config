@@ -37,6 +37,7 @@ from runtime_hook_installer import (  # noqa: E402
 PACKAGE_SOURCE = REPO / "hooks" / "pre_pr_tribunal"
 SKILL_SOURCE = REPO / "skills" / "pre-pr-tribunal"
 SKILL_REQUIRED_NAMES = (
+    "auto-run.md",
     "reviewer-a.md",
     "reviewer-b.md",
     "reviewer-c.md",
@@ -49,6 +50,7 @@ _EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85
 PACKAGE_NAMES = (
     "__init__.py",
     "attempt_store.py",
+    "auto_run.py",
     "claude_hook.py",
     "cli.py",
     "codex_hook.py",
