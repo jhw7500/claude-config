@@ -56,6 +56,9 @@ def test_inventory_missing_anchor_fails_instead_of_claiming_empty(tmp_path):
     [
         ("pinned worktree", True),
         ("pinned (release)", True),
+        ("pinned ((release))", True),
+        ("pinned) Edit(~", False),
+        ("pinned (release", False),
         ("pinned*worktree", False),
         ("pinned?worktree", False),
         ("pinned[worktree]", False),

@@ -56,6 +56,12 @@ if [ -d "$HOME/.claude/skills" ]; then
             /|*'*'*|*'?'*|*'['*|*']'*|*"\\"*|*'"'*|*"'"*|*','*|\
             *[[:cntrl:]]*|*[[:space:]]) continue ;;
         esac
+        # 경로의 괄호가 도구 규칙의 경계를 닫거나 다음 규칙을 열지 못하게 한다.
+        path_parentheses="${live_root//[!()]/}"
+        while [[ "$path_parentheses" == *'()'* ]]; do
+            path_parentheses="${path_parentheses//\(\)/}"
+        done
+        [ -z "$path_parentheses" ] || continue
         LIVE_READ_RULES+=("Read(/${live_root})" "Read(/${live_root}/**)")
     done
 fi
