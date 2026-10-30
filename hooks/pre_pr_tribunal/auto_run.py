@@ -222,12 +222,18 @@ def _read_store_locked(review_fd: int, *, missing_ok: bool) -> dict[str, object]
     return value
 
 
-def _write_store_locked(review_fd: int, store: dict[str, object]) -> None:
+def _store_bytes(store: dict[str, object]) -> bytes:
     raw = json.dumps(store, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(raw) > MAX_STORE_BYTES:
+        raise m.SchemaError("AUTO_RUN_TOO_LARGE")
+    return raw
+
+
+def _write_store_locked(review_fd: int, store: dict[str, object]) -> None:
     atomic_replace_bytes(
         review_fd,
         STORE_NAME,
-        raw,
+        _store_bytes(store),
         maximum=MAX_STORE_BYTES,
         too_large="AUTO_RUN_TOO_LARGE",
         unsafe="AUTO_RUN_FILE_UNSAFE",
@@ -328,16 +334,29 @@ def _archive_round_directory(review_fd: int, run_id: str, round_number: int) -> 
 
 
 def _archive_create(directory: int, name: str, raw: bytes, maximum: int) -> str:
-    return atomic_create_bytes(
-        directory,
-        name,
-        raw,
-        maximum=maximum,
-        exists="AUTO_RUN_ARCHIVE_EXISTS",
-        unsafe="AUTO_RUN_ARCHIVE_UNSAFE",
-        exact_mode=0o600,
-        write_failed="AUTO_RUN_ARCHIVE_UNSAFE",
+    try:
+        return atomic_create_bytes(
+            directory,
+            name,
+            raw,
+            maximum=maximum,
+            exists="AUTO_RUN_ARCHIVE_EXISTS",
+            unsafe="AUTO_RUN_ARCHIVE_UNSAFE",
+            exact_mode=0o600,
+            write_failed="AUTO_RUN_ARCHIVE_UNSAFE",
+        )
+    except m.SchemaError as error:
+        if error.code != "AUTO_RUN_ARCHIVE_EXISTS":
+            raise
+    # A failed store replacement can leave a complete, authentic publication.
+    # Adopt only identical private bytes, without replacing or deleting evidence.
+    existing = read_named_file(
+        directory, name, maximum=maximum, missing="AUTO_RUN_ARCHIVE_UNSAFE",
+        unsafe="AUTO_RUN_ARCHIVE_UNSAFE", exact_mode=0o600,
     )
+    if existing != raw:
+        raise m.SchemaError("AUTO_RUN_ARCHIVE_EXISTS")
+    return hashlib.sha256(existing).hexdigest()
 
 
 def _find(store: dict[str, object], auto_run_id: str) -> dict[str, object]:
@@ -408,6 +427,24 @@ def record_grant(
             raise m.SchemaError("AUTO_RUN_STORE_FULL")
         if any(run.get("status") not in {"stopped"} for run in store["runs"]):
             raise m.SchemaError("AUTO_RUN_ALREADY_ACTIVE")
+        prior = binding["prior_terminal"]
+        for previous in store["runs"]:
+            previous_binding = previous.get("binding", {})
+            if (
+                previous_binding.get("repository_root") == binding["repository_root"]
+                and all(
+                    previous_binding.get("snapshot", {}).get(key) == binding["snapshot"][key]
+                    for key in ("repository", "head_ref", "base_ref")
+                )
+                and (
+                    previous_binding.get("prior_terminal") == prior
+                    or prior is not None and any(
+                        item.get("verdict_sha256") == prior["verdict_sha256"]
+                        for item in previous.get("rounds", [])
+                    )
+                )
+            ):
+                raise m.SchemaError("AUTO_RUN_LINEAGE_RESTART_FORBIDDEN")
         try:
             identifier = token_hex(16)
         except Exception:
@@ -466,14 +503,16 @@ def stop(
         store = _read_store_locked(review_fd, missing_ok=False)
         run = _find(store, auto_run_id)
         if run.get("status") == "stopped":
+            if _active_locked(review_fd) == auto_run_id:
+                _remove_active_locked(review_fd, auto_run_id)
             return json.loads(json.dumps(run))
         if run.get("status") not in {"granted", "awaiting_fix", "begin_reserved"}:
             raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
         run["status"] = "stopped"
         run["stop_reason"] = reason
         run["updated_at"] = now()
-        _remove_active_locked(review_fd, auto_run_id)
         _write_store_locked(review_fd, store)
+        _remove_active_locked(review_fd, auto_run_id)
         return dict(run)
 
 
@@ -694,20 +733,11 @@ def reserve_begin_locked(
             ):
                 raise m.SchemaError("AUTO_RUN_IDENTICAL_RETRY")
     evidence = _decision_evidence(decisions)
-    if pending.round > 1:
-        if decisions_raw is None:
-            raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
-        archive_fd = _archive_round_directory(
-            review_fd, auto_run_id, pending.round - 1
-        )
-        try:
-            decisions_archive_sha256 = _archive_create(
-                archive_fd, "decisions.json", decisions_raw, m.MAX_REPORT_BYTES
-            )
-        finally:
-            os.close(archive_fd)
-    else:
-        decisions_archive_sha256 = None
+    if pending.round > 1 and decisions_raw is None:
+        raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+    decisions_archive_sha256 = (
+        hashlib.sha256(decisions_raw).hexdigest() if pending.round > 1 else None
+    )
     run["status"] = "begin_reserved"
     run["current"] = {
         "round": pending.round,
@@ -722,6 +752,15 @@ def reserve_begin_locked(
         "reserved_at": now(),
     }
     run["updated_at"] = now()
+    _store_bytes(store)
+    if pending.round > 1:
+        archive_fd = _archive_round_directory(
+            review_fd, auto_run_id, pending.round - 1
+        )
+        try:
+            _archive_create(archive_fd, "decisions.json", decisions_raw, m.MAX_REPORT_BYTES)
+        finally:
+            os.close(archive_fd)
     _write_store_locked(review_fd, store)
 
 
@@ -741,6 +780,40 @@ def finalize_locked(
         if isinstance(run.get("current"), dict)
         and run["current"].get("lifecycle_id") == verdict.lifecycle_id
     ]
+    completed = [
+        (run, record)
+        for run in store["runs"] for record in run.get("rounds", [])
+        if record.get("lifecycle_id") == verdict.lifecycle_id
+    ]
+    if completed:
+        if matches or len(completed) != 1:
+            raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+        run, record = completed[0]
+        if (
+            run.get("current") is not None
+            or run.get("status") not in {"stopped", "awaiting_fix"}
+            or record.get("verdict_sha256") != hashlib.sha256(_verdict_raw(verdict)).hexdigest()
+        ):
+            raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+        archive_fd = _archive_round_directory(review_fd, run["id"], verdict.round)
+        try:
+            hashes = {"verdict": record["verdict_sha256"], **record["report_sha256"]}
+            for name, digest in hashes.items():
+                raw = read_named_file(
+                    archive_fd, f"{name}.json",
+                    maximum=m.MAX_VERDICT_BYTES if name == "verdict" else m.MAX_REPORT_BYTES,
+                    missing="AUTO_RUN_ARCHIVE_UNSAFE", unsafe="AUTO_RUN_ARCHIVE_UNSAFE",
+                    exact_mode=0o600,
+                )
+                if hashlib.sha256(raw).hexdigest() != digest:
+                    raise m.SchemaError("AUTO_RUN_ARCHIVE_UNSAFE")
+        finally:
+            os.close(archive_fd)
+        if run["status"] == "stopped":
+            _remove_active_locked(review_fd, run["id"])
+        elif _active_locked(review_fd) != run["id"]:
+            raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+        return
     if not matches:
         if _active_locked(review_fd) is not None:
             raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
@@ -751,45 +824,32 @@ def finalize_locked(
     stopped_during_round = run.get("status") == "stopped"
     if run.get("status") not in {"begin_reserved", "stopped"}:
         raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
+    if not stopped_during_round and _active_locked(review_fd) != run["id"]:
+        raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
     current = run["current"]
     if current.get("round") != verdict.round or verdict.gate.status is m.GateStatus.IN_PROGRESS:
         raise m.SchemaError("AUTO_RUN_STATE_INCONSISTENT")
     raw = _verdict_raw(verdict)
-    archive_fd = _archive_round_directory(review_fd, run["id"], verdict.round)
-    report_hashes: dict[str, str] = {}
+    report_bytes: dict[str, bytes] = {}
+    inbox_fd = open_directory(
+        review_fd, "inbox", create=False, code="AUTO_RUN_ARCHIVE_UNSAFE"
+    )
     try:
-        verdict_archive_sha256 = _archive_create(
-            archive_fd, "verdict.json", raw, m.MAX_VERDICT_BYTES
+        source_fd = open_directory(
+            inbox_fd, f"round-{verdict.round}",
+            create=False, code="AUTO_RUN_ARCHIVE_UNSAFE",
         )
-        inbox_fd = open_directory(
-            review_fd, "inbox", create=False, code="AUTO_RUN_ARCHIVE_UNSAFE"
-        )
-        try:
-            source_fd = open_directory(
-                inbox_fd,
-                f"round-{verdict.round}",
-                create=False,
-                code="AUTO_RUN_ARCHIVE_UNSAFE",
-            )
-        finally:
-            os.close(inbox_fd)
-        try:
-            for reviewer in verdict.policy.active_reviewers:
-                report_raw = read_named_file(
-                    source_fd,
-                    f"{reviewer}.json",
-                    maximum=m.MAX_REPORT_BYTES,
-                    missing="AUTO_RUN_ARCHIVE_UNSAFE",
-                    unsafe="AUTO_RUN_ARCHIVE_UNSAFE",
-                    exact_mode=0o600,
-                )
-                report_hashes[reviewer] = _archive_create(
-                    archive_fd, f"{reviewer}.json", report_raw, m.MAX_REPORT_BYTES
-                )
-        finally:
-            os.close(source_fd)
     finally:
-        os.close(archive_fd)
+        os.close(inbox_fd)
+    try:
+        for reviewer in verdict.policy.active_reviewers:
+            report_bytes[reviewer] = read_named_file(
+                source_fd, f"{reviewer}.json", maximum=m.MAX_REPORT_BYTES,
+                missing="AUTO_RUN_ARCHIVE_UNSAFE", unsafe="AUTO_RUN_ARCHIVE_UNSAFE",
+                exact_mode=0o600,
+            )
+    finally:
+        os.close(source_fd)
     completed_at = now()
     elapsed_ms = _elapsed_ms(current.get("reserved_at"), completed_at)
     record = {
@@ -800,8 +860,11 @@ def finalize_locked(
         "gate": verdict.gate.status.value,
         "blocking_count": verdict.gate.blocking_count,
         "verdict_sha256": hashlib.sha256(raw).hexdigest(),
-        "verdict_archive_sha256": verdict_archive_sha256,
-        "report_sha256": report_hashes,
+        "verdict_archive_sha256": hashlib.sha256(raw).hexdigest(),
+        "report_sha256": {
+            reviewer: hashlib.sha256(report_raw).hexdigest()
+            for reviewer, report_raw in report_bytes.items()
+        },
         "review_execution_sha256s": sorted({
             _execution_sha256(execution)
             for reviewer in verdict.policy.active_reviewers
@@ -839,6 +902,15 @@ def finalize_locked(
             else verdict.gate.status.value.upper()
         )
     run["updated_at"] = now()
+    # Validate the complete resulting record before creating any new archives.
+    _store_bytes(store)
+    archive_fd = _archive_round_directory(review_fd, run["id"], verdict.round)
+    try:
+        _archive_create(archive_fd, "verdict.json", raw, m.MAX_VERDICT_BYTES)
+        for reviewer, report_raw in report_bytes.items():
+            _archive_create(archive_fd, f"{reviewer}.json", report_raw, m.MAX_REPORT_BYTES)
+    finally:
+        os.close(archive_fd)
+    _write_store_locked(review_fd, store)
     if run["status"] == "stopped":
         _remove_active_locked(review_fd, run["id"])
-    _write_store_locked(review_fd, store)

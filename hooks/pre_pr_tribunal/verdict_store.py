@@ -1823,17 +1823,19 @@ def finalize_round(
             else GateStatus.PASS
         )
         final = replace(
-            pending, gate=GateSummary(status, len(blockers)), created_at=snapshot.created_at
+            pending, gate=GateSummary(status, len(blockers))
         )
-        _atomic_write(review_fd, final)
         from .auto_run import finalize_locked
 
+        # Commit authenticated archives and the run ledger before publishing a
+        # gate-authorizing verdict. Keep the snapshot timestamp stable on retry.
         finalize_locked(
             review_fd,
             verdict=final,
             continuation_allowed=not has_unverified,
             now=now,
         )
+        _atomic_write(review_fd, final)
         return final
 
 
