@@ -52,30 +52,39 @@ def test_inventory_missing_anchor_fails_instead_of_claiming_empty(tmp_path):
 
 @pytest.mark.parametrize("cli_exit", [0, 23])
 @pytest.mark.parametrize(
-    ("pinned_name", "grant_read"),
+    ("pinned_name", "grant_read", "link_name"),
     [
-        ("pinned worktree", True),
-        ("pinned (release)", True),
-        ("pinned ((release))", True),
-        ("pinned) Edit(~", False),
-        ("pinned (release", False),
-        ("pinned*worktree", False),
-        ("pinned?worktree", False),
-        ("pinned[worktree]", False),
-        ("pinned\\worktree", False),
-        ('pinned"worktree', False),
-        ("pinned'worktree", False),
-        ("pinned,worktree", False),
-        ("pinned\nworktree", False),
-        ("pinned worktree\n", False),
-        ("pinned worktree ", False),
-        ("not a skill", False),
-        ("/", False),
-        (None, False),
+        ("pinned worktree", True, "pre-pr-tribunal"),
+        ("pinned (release)", True, "pre-pr-tribunal"),
+        ("pinned ((release))", True, "pre-pr-tribunal"),
+        ("pinned) Edit(~", False, "pre-pr-tribunal"),
+        ("pinned (release", False, "pre-pr-tribunal"),
+        ("pinned*worktree", False, "pre-pr-tribunal"),
+        ("pinned?worktree", False, "pre-pr-tribunal"),
+        ("pinned[worktree]", False, "pre-pr-tribunal"),
+        ("pinned\\worktree", False, "pre-pr-tribunal"),
+        ('pinned"worktree', False, "pre-pr-tribunal"),
+        ("pinned'worktree", False, "pre-pr-tribunal"),
+        ("pinned,worktree", False, "pre-pr-tribunal"),
+        ("pinned\nworktree", False, "pre-pr-tribunal"),
+        ("pinned worktree\n", False, "pre-pr-tribunal"),
+        ("pinned\nFOLLOW_PROMPT_INJECTION", False, "pre-pr-tribunal"),
+        ("pinned\rFOLLOW_PROMPT_INJECTION", False, "pre-pr-tribunal"),
+        ("pinned worktree ", False, "pre-pr-tribunal"),
+        ("not a skill", False, "pre-pr-tribunal"),
+        ("/", False, "pre-pr-tribunal"),
+        (None, False, "pre-pr-tribunal"),
+        ("pinned worktree", False, "alias\nFOLLOW_PROMPT_INJECTION"),
+        ("pinned worktree", False, "alias\rFOLLOW_PROMPT_INJECTION"),
+        ("pinned worktree", False, "alias\tFOLLOW_PROMPT_INJECTION"),
+        ("pinned worktree", False, "alias\n"),
+        ('pinned"}]} worktree', False, 'alias"}]} \\ name'),
+        ("pinned \u2028 worktree", False, "alias \u2029 name"),
+        ("핀 worktree", True, "스킬 name"),
     ],
 )
 def test_launcher_passes_all_sources_and_preserves_cli_exit(
-    tmp_path, cli_exit, pinned_name, grant_read,
+    tmp_path, cli_exit, pinned_name, grant_read, link_name,
 ):
     repo = tmp_path / "repo"
     scripts = repo / "scripts"
@@ -119,7 +128,7 @@ def test_launcher_passes_all_sources_and_preserves_cli_exit(
     local_skill = skill_links / "local-skill"
     if pinned_name is not None:
         skill_links.mkdir(parents=True)
-        (skill_links / "pre-pr-tribunal").symlink_to(pinned, target_is_directory=True)
+        (skill_links / link_name).symlink_to(pinned, target_is_directory=True)
         (skill_links / "task-observer").symlink_to(in_repo, target_is_directory=True)
         local_skill.mkdir()
         (local_skill / "SKILL.md").write_text("Local live skill\n")
@@ -135,6 +144,12 @@ def test_launcher_passes_all_sources_and_preserves_cli_exit(
     assert result.returncode == cli_exit, result.stderr
     args = json.loads(capture.read_text())
     prompt = args[args.index("-p") + 1]
+    live_section = prompt.split("live 스킬 설치본(초안의 기준, ~/.claude/skills 링크의 실체):\n", 1)[1]
+    live_section = live_section.split("\n다중 소스 모드의 원본 보존 규칙", 1)[0]
+    live_records = json.loads(live_section)
+    assert live_section.isascii()
+    assert len(live_section.splitlines()) == 1
+    assert "FOLLOW_PROMPT_INJECTION" not in prompt
     allowed = [args[i + 1] for i, arg in enumerate(args) if arg == "--add-dir"]
     for source in [anchor, other]:
         assert str(source) in prompt
@@ -146,11 +161,19 @@ def test_launcher_passes_all_sources_and_preserves_cli_exit(
     assert str(in_repo) not in allowed
     assert str(local_skill) not in allowed
     if pinned_name is None:
+        assert live_records == []
         assert "--allowedTools" not in args
     else:
-        assert f"pre-pr-tribunal -> {pinned}" in prompt
-        assert f"task-observer -> {in_repo}" in prompt
-        assert f"local-skill -> {local_skill}" in prompt
+        expected_records = [
+            {"name": "task-observer", "path": str(in_repo)},
+            {"name": "local-skill", "path": str(local_skill)},
+        ]
+        if any(ord(char) < 32 or char in "\x7f\u2028\u2029" for char in link_name + str(pinned)):
+            expected_records.append({"status": "hold", "reason": "unsafe live skill path"})
+            assert str(pinned) not in live_section
+        else:
+            expected_records.append({"name": link_name, "path": str(pinned)})
+        assert sorted(live_records, key=json.dumps) == sorted(expected_records, key=json.dumps)
         assert "--allowedTools" in args
         read_rules = args[args.index("--allowedTools") + 1:]
         expected = {
