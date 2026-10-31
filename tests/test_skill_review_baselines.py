@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import runpy
@@ -142,6 +143,49 @@ def publication_api_fixture(tmp_path: Path):
     )
     stage.mkdir()
     return namespace, live, snapshot, stage, target
+
+
+def publication_audit_events(snapshot: Path) -> list[dict]:
+    audit = snapshot.parent / "publication-audit"
+    return [json.loads(path.read_text()) for path in sorted(audit.iterdir())]
+
+
+def test_retain_evidence_creates_private_immutable_locator(tmp_path):
+    api, _, snapshot, stage, target = publication_api_fixture(tmp_path)
+    stage.mkdir(exist_ok=True)
+    (stage / "draft").write_bytes(b"original model output")
+    original_snapshot = snapshot.read_bytes()
+    original_stage = (stage / "draft").read_bytes()
+    previous_umask = os.umask(0)
+    try:
+        result = api["retain_evidence"](snapshot)
+    finally:
+        os.umask(previous_umask)
+
+    locator = stage.parent / "private-evidence.json"
+    info = locator.lstat()
+    assert result == {"status": "retained", "evidence": str(locator)}
+    assert stat.S_ISREG(info.st_mode)
+    assert info.st_uid == os.getuid()
+    assert info.st_nlink == 1
+    assert stat.S_IMODE(info.st_mode) == 0o600
+    assert json.loads(locator.read_text("ascii")) == {
+        "version": 1,
+        "classification": "untrusted-data-only",
+        "original_stage": str(stage),
+        "snapshot": str(snapshot),
+        "audit_directory": str(snapshot.parent / "publication-audit"),
+        "public_target": str(target),
+    }
+    before = locator.stat()
+    before_bytes = locator.read_bytes()
+    with pytest.raises(FileExistsError):
+        api["retain_evidence"](snapshot)
+    after = locator.stat()
+    assert locator.read_bytes() == before_bytes
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert snapshot.read_bytes() == original_snapshot
+    assert (stage / "draft").read_bytes() == original_stage
 
 
 def install_mutating_fake_claude(test_home: Path) -> None:
@@ -425,6 +469,12 @@ def test_publish_refuses_existing_target_without_replacing_it(tmp_path):
     assert target.read_bytes() == b"existing public result"
     assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
     assert (stage / "example.skill").read_bytes() == b"candidate"
+    events = publication_audit_events(snapshot)
+    assert [event["event"] for event in events] == ["publication-start", "candidate-created"]
+    candidate = Path(events[1]["path"])
+    assert candidate.is_dir()
+    assert (candidate.stat().st_dev, candidate.stat().st_ino) == (
+        events[1]["device"], events[1]["inode"])
 
 
 def test_publish_revalidates_live_when_copying_a_bundle(tmp_path, monkeypatch):
@@ -452,6 +502,85 @@ def test_publish_revalidates_live_when_copying_a_bundle(tmp_path, monkeypatch):
     assert list(target.rglob("*.skill")) == []
     assert "HOLD:" in (target / "REVIEW.md").read_text()
     assert staged_bundle.read_bytes() == b"candidate"
+    events = publication_audit_events(snapshot)
+    candidates = [event for event in events if event["event"] == "candidate-created"]
+    assert len(candidates) == 2
+    retained = Path(candidates[0]["path"])
+    assert retained.is_dir()
+    assert (retained / "example.skill").read_bytes() == b"candidate"
+    assert (retained.stat().st_dev, retained.stat().st_ino) == (
+        candidates[0]["device"], candidates[0]["inode"])
+    assert (target.stat().st_dev, target.stat().st_ino) == (
+        candidates[1]["device"], candidates[1]["inode"])
+    assert result["audit_directory"] == str(snapshot.parent / "publication-audit")
+    assert result["retained_candidates"] == [str(retained)]
+
+
+def test_publish_records_partial_candidate_before_copy_failure(tmp_path, monkeypatch):
+    api, _, snapshot, stage, target = publication_api_fixture(tmp_path)
+    (stage / "example.skill").write_bytes(b"candidate")
+    (stage / "REVIEW.md").write_text("model report")
+    original_snapshot = snapshot.read_bytes()
+    function_globals = api["publish"].__globals__
+    original_write = function_globals["private_write"]
+
+    def fail_bundle_copy(path, data, mode=0o600):
+        if path.suffix == ".skill":
+            original_write(path, b"partial", mode)
+            raise OSError("injected copy failure")
+        return original_write(path, data, mode)
+
+    monkeypatch.setitem(function_globals, "private_write", fail_bundle_copy)
+
+    with pytest.raises(OSError, match="injected copy failure"):
+        api["publish"](snapshot)
+
+    assert not target.exists()
+    events = publication_audit_events(snapshot)
+    candidate = next(event for event in events if event["event"] == "candidate-created")
+    retained = Path(candidate["path"])
+    assert retained.is_dir()
+    assert (retained / "example.skill").read_bytes() == b"partial"
+    assert (retained.stat().st_dev, retained.stat().st_ino) == (
+        candidate["device"], candidate["inode"])
+    assert (stage / "example.skill").read_bytes() == b"candidate"
+    assert snapshot.read_bytes() == original_snapshot
+
+
+def test_publish_audit_permissions_ignore_umask(tmp_path):
+    api, _, snapshot, stage, target = publication_api_fixture(tmp_path)
+    (stage / "example.skill").write_bytes(b"candidate")
+    (stage / "REVIEW.md").write_text("model report")
+    previous_umask = os.umask(0)
+    try:
+        result = api["publish"](snapshot)
+    finally:
+        os.umask(previous_umask)
+
+    audit = Path(result["audit_directory"])
+    assert stat.S_IMODE(audit.stat().st_mode) == 0o700
+    assert audit.stat().st_uid == os.getuid()
+    for path in audit.iterdir():
+        info = path.lstat()
+        assert stat.S_ISREG(info.st_mode)
+        assert info.st_uid == os.getuid()
+        assert info.st_nlink == 1
+        assert stat.S_IMODE(info.st_mode) == 0o600
+    assert target.is_dir()
+
+
+def test_publish_refuses_preexisting_audit_symlink_without_outside_write(tmp_path):
+    api, _, snapshot, stage, target = publication_api_fixture(tmp_path)
+    (stage / "REVIEW.md").write_text("model report")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (snapshot.parent / "publication-audit").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        api["publish"](snapshot)
+
+    assert list(outside.iterdir()) == []
+    assert not target.exists()
 
 
 def test_publish_rechecks_stage_when_copying_a_bundle(tmp_path, monkeypatch):

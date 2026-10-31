@@ -158,9 +158,20 @@ ${LIVE_SKILLS}
         "${LIVE_READ_ARGS[@]}" \
         < /dev/null 2>&1
     REVIEW_EXIT=$?
+    printf '\n===== end model output =====\n'
+    python3 "$SCRIPT_DIR/skill-review-baselines.py" --retain-evidence \
+        "$SNAPSHOT_ROOT/comparison.json"
+    EVIDENCE_EXIT=$?
+    if [ "$EVIDENCE_EXIT" -eq 0 ]; then
+        printf 'private-evidence-index=%q\n' "$STAGING_ROOT/private-evidence.json"
+    fi
     if [ "$REVIEW_EXIT" -eq 0 ]; then
-        python3 "$SCRIPT_DIR/skill-review-baselines.py" --publish "$SNAPSHOT_ROOT/comparison.json"
-        REVIEW_EXIT=$?
+        if [ "$EVIDENCE_EXIT" -ne 0 ]; then
+            REVIEW_EXIT=$EVIDENCE_EXIT
+        else
+            python3 "$SCRIPT_DIR/skill-review-baselines.py" --publish "$SNAPSHOT_ROOT/comparison.json"
+            REVIEW_EXIT=$?
+        fi
     fi
     echo "exit=$REVIEW_EXIT"
     echo

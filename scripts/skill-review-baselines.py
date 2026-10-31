@@ -291,6 +291,29 @@ def read_snapshot(path: Path):
     return result
 
 
+def retain_evidence(snapshot_path: Path):
+    binding = read_snapshot(snapshot_path)
+    stage = Path(binding["stage"])
+    stage_parent = owned_directory(stage.parent)
+    if (stage_parent != binding["stage_parent"] or
+            stat.S_IMODE(stage_parent[2]) != 0o700):
+        raise Unavailable("private staging directory changed")
+    evidence = stage.parent / "private-evidence.json"
+    record = {
+        "version": 1,
+        "classification": "untrusted-data-only",
+        "original_stage": str(stage),
+        "snapshot": str(snapshot_path),
+        "audit_directory": str(snapshot_path.parent / "publication-audit"),
+        "public_target": binding["target"],
+    }
+    private_write(
+        evidence,
+        (json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n").encode("ascii"),
+    )
+    return {"status": "retained", "evidence": str(evidence)}
+
+
 def revalidate(snapshots):
     for snapshot in snapshots:
         root, alias = Path(snapshot["root"]), Path(snapshot["alias"])
@@ -389,6 +412,27 @@ def rename_noreplace(source: Path, target: Path, source_parent, target_parent):
 def publish(snapshot_path: Path):
     binding = read_snapshot(snapshot_path)
     stage, target = Path(binding["stage"]), Path(binding["target"])
+    audit = snapshot_path.parent / "publication-audit"
+    os.mkdir(audit, 0o700)
+    os.chmod(audit, 0o700, follow_symlinks=False)
+    audit_identity = owned_directory(audit)
+    if stat.S_IMODE(audit_identity[2]) != 0o700:
+        raise Unavailable("publication audit directory is unsafe")
+    event_number = 0
+    candidates = []
+
+    def audit_event(event):
+        nonlocal event_number
+        if owned_directory(audit) != audit_identity:
+            raise Unavailable("publication audit directory changed")
+        event_number += 1
+        private_write(
+            audit / f"{event_number:03d}-{event['event']}.json",
+            (json.dumps(event, ensure_ascii=True, sort_keys=True) + "\n").encode("ascii"),
+        )
+
+    audit_event({"version": 1, "event": "publication-start",
+                 "snapshot": str(snapshot_path), "stage": str(stage), "target": str(target)})
 
     def check_parents():
         if (owned_directory(stage.parent) != binding["stage_parent"] or
@@ -420,6 +464,12 @@ def publish(snapshot_path: Path):
 
     def candidate(reason):
         output = Path(tempfile.mkdtemp(prefix="publication-", dir=stage.parent))
+        info = output.stat()
+        record = {"version": 1, "event": "candidate-created", "path": str(output),
+                  "device": info.st_dev, "inode": info.st_ino, "reason": reason,
+                  "target": str(target)}
+        audit_event(record)
+        candidates.append(record)
         published = [] if reason else sorted(selected)
         for name in published:
             mode, data = selected[name]
@@ -456,7 +506,10 @@ def publish(snapshot_path: Path):
             output = candidate(held)
     check_parents()
     rename_noreplace(output, target, binding["stage_parent"], binding["target_parent"])
-    return {"status": "hold" if held else "published", "target": str(target)}
+    return {"status": "hold" if held else "published", "target": str(target),
+            "audit_directory": str(audit),
+            "retained_candidates": [item["path"] for item in candidates
+                                    if Path(item["path"]) != output]}
 
 
 if __name__ == "__main__":
@@ -464,6 +517,8 @@ if __name__ == "__main__":
         args = sys.argv[1:]
         if len(args) >= 6 and args[0] == "--prepare" and args[5] == "--":
             result = prepare(*(Path(value) for value in args[1:5]), args[6:])
+        elif len(args) == 2 and args[0] == "--retain-evidence":
+            result = retain_evidence(Path(args[1]))
         elif len(args) == 2 and args[0] == "--publish":
             result = publish(Path(args[1]))
         else:
