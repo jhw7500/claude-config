@@ -426,7 +426,14 @@ def publish(snapshot_path: Path):
             destination = output / name
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             private_write(destination, data, 0o600 | (mode & 0o111))
-        report = "# Publication check\n\nInstalled: 0. Published files listed below are authoritative.\n\n"
+        report = (
+            "# Draft staging check\n\n"
+            "Installed: 0. This is a point-in-time STAGED draft. "
+            "Installation requires a current live comparison and separate user approval.\n\n"
+            "Live writers can change files after their final check, including before publication. "
+            "Before installation, recheck current live files against the recorded base and proposed changes; "
+            "rebase and seek new approval if the baseline changed.\n\n"
+        )
         if reason:
             report += "HOLD: " + reason + "\n\n"
         elif withheld:

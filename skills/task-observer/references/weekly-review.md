@@ -214,8 +214,14 @@ Use exact live aliases for top-level outputs: `<name>/`, `<name>.skill`, and
 `<name>.diff`, with `REVIEW.md` as the combined report. After the model exits
 successfully, the launcher rechecks initially eligible live contents, file
 identities, and aliases immediately before atomic no-clobber publication.
-If an eligible live input changes during the review, publish a new report-only
-hold and retain every original output privately. Initially held or unrecognized
+If the final checks detect a changed eligible live input, publish a new
+report-only hold and retain every original output privately. Successful
+publication records a point-in-time STAGED draft. The checks do not lock live
+writers: changes after a file's final check, including before publication, can
+invalidate that draft. Before installation, recheck current live files against
+the recorded base and proposed changes, and obtain separate user approval for
+that current baseline. Rebase and review the draft again if live has changed.
+Initially held or unrecognized
 outputs are excluded independently of unchanged eligible skills. When anything
 is excluded, the public report lists actual published files rather than copying
 the model's STAGED claims or links. These checks classify output names; they do

@@ -481,6 +481,40 @@ def test_publish_rechecks_stage_when_copying_a_bundle(tmp_path, monkeypatch):
     assert staged_bundle.read_bytes() == b"changed after validation"
 
 
+def test_published_report_discloses_final_live_boundary_before_install(
+        tmp_path, monkeypatch):
+    api, live, snapshot, stage, target = publication_api_fixture(tmp_path)
+    (stage / "example.skill").write_bytes(b"point-in-time candidate")
+    (stage / "REVIEW.md").write_text("model report")
+    function_globals = api["publish"].__globals__
+    original_rename = function_globals["rename_noreplace"]
+    concurrent_live = b"changed at final publication boundary\n"
+    boundary_reached = False
+
+    def change_live_at_final_rename(source, destination, source_parent, target_parent):
+        nonlocal boundary_reached
+        boundary_reached = True
+        (live / "SKILL.md").write_bytes(concurrent_live)
+        return original_rename(source, destination, source_parent, target_parent)
+
+    monkeypatch.setitem(
+        function_globals, "rename_noreplace", change_live_at_final_rename)
+
+    result = api["publish"](snapshot)
+
+    assert boundary_reached
+    assert result["status"] == "published"
+    assert (target / "example.skill").read_bytes() == b"point-in-time candidate"
+    assert (live / "SKILL.md").read_bytes() == concurrent_live
+    report = (target / "REVIEW.md").read_text().lower()
+    assert "installed: 0" in report
+    assert any(term in report for term in ("point-in-time", "snapshot-bound", "specific-time"))
+    assert "live" in report
+    assert any(term in report for term in ("recheck", "re-check", "verify again"))
+    assert any(term in report for term in ("before install", "before installation"))
+    assert "approval" in report
+
+
 def test_publish_holds_stage_with_too_many_empty_directories(tmp_path):
     api, _, snapshot, stage, target = publication_api_fixture(tmp_path)
     (stage / "REVIEW.md").write_text("model report")
