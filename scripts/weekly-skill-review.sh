@@ -75,24 +75,8 @@ if [ -d "$HOME/.claude/skills" ]; then
         LIVE_READ_RULES+=("Read(/${live_root})" "Read(/${live_root}/**)")
     done
 fi
-# JSON 문자열로 경로를 인코딩해 따옴표·구분자·유니코드 줄바꿈도 데이터 경계 안에 둔다.
-LIVE_SKILLS="$(python3 - "${LIVE_SKILL_DATA[@]}" <<'PY'
-import json
-import sys
-
-records = []
-values = sys.argv[1:]
-for offset in range(0, len(values), 3):
-    name, path, status = values[offset:offset + 3]
-    if status == "unsafe":
-        records.append({"status": "hold", "reason": "unsafe live skill path"})
-    elif status == "unresolved":
-        records.append({"name": name, "status": "hold", "reason": "live target resolution failed"})
-    else:
-        records.append({"name": name, "path": path})
-print(json.dumps(records, ensure_ascii=True))
-PY
-)" || exit 1
+# 실제 Git 상대 경로로 로컬 origin/master와 비교하고 결과를 한 줄 ASCII JSON으로 만든다.
+LIVE_SKILLS="$(python3 "$SCRIPT_DIR/skill-review-baselines.py" "${LIVE_SKILL_DATA[@]}")" || exit 1
 LIVE_READ_ARGS=()
 if ((${#LIVE_READ_RULES[@]})); then
     LIVE_READ_ARGS=(--allowedTools "${LIVE_READ_RULES[@]}")
@@ -127,6 +111,10 @@ ${LIVE_SKILLS}
 - 기존 pending 보고서와 현재 live 파일을 대조해 유효한 초안을 중복 생성하지 않는다.
 - 초안의 기준(base)은 위 live 설치본 파일이다. 이전 pending 번들의 사본은 기준으로 쓰지 않고,
   그 번들이 어떤 델타를 넣으려 했는지 확인하는 목록으로만 쓴다.
+- 각 live 레코드의 comparison은 fetch하지 않은 로컬 origin/master의 고정 commit과 비교한 결과다.
+  원격의 최신 상태라고 주장하지 않는다. status가 hold이거나 comparison이 match가 아닌 스킬은
+  번들을 만들지 말고 REVIEW.md에 ref·commit·차이 파일·보류 사유를 기록한다.
+  origin/master를 읽을 수 없거나 Git으로 비교할 수 없는 스킬도 보류하며, 정본 파일로 live를 대체하지 않는다.
 - live 설치본을 읽을 수 없으면 그 스킬은 스테이징하지 말고 보류로 보고한다. 다른 체크아웃의
   같은 이름 파일을 대리 원본으로 쓰지 않는다.
 - 초안을 만든 뒤 live 기준과 비교한다. 관찰과 무관한 줄을 지우는 초안은 스테이징하지 않는다.

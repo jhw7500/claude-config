@@ -168,15 +168,24 @@ def test_launcher_passes_all_sources_and_preserves_cli_exit(
         assert "--allowedTools" not in args
     else:
         expected_records = [
-            {"name": "task-observer", "path": str(in_repo)},
-            {"name": "local-skill", "path": str(local_skill)},
+            {"name": "task-observer", "path": str(in_repo), "status": "hold"},
+            {"name": "local-skill", "path": str(local_skill), "status": "hold"},
         ]
         if any(ord(char) < 32 or char in "\x7f\u2028\u2029" for char in link_name + str(pinned)):
             expected_records.append({"status": "hold", "reason": "unsafe live skill path"})
             assert str(pinned) not in live_section
         else:
-            expected_records.append({"name": link_name, "path": str(pinned)})
-        assert sorted(live_records, key=json.dumps) == sorted(expected_records, key=json.dumps)
+            expected_records.append({"name": link_name, "path": str(pinned), "status": "hold"})
+        # These permission fixtures have no Git metadata: report unavailable,
+        # while preserving the existing path/permission safety boundaries.
+        projected = []
+        for record in live_records:
+            if "path" in record:
+                assert record["comparison"]["status"] == "unavailable"
+                projected.append({key: record[key] for key in ("name", "path", "status")})
+            else:
+                projected.append(record)
+        assert sorted(projected, key=json.dumps) == sorted(expected_records, key=json.dumps)
         assert "--allowedTools" in args
         read_rules = args[args.index("--allowedTools") + 1:]
         expected = {

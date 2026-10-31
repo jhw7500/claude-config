@@ -197,6 +197,15 @@ bundle references. Record STAGED statuses in the report only; explicitly state
 that the original OPEN statuses and per-source timestamps remain unchanged.
 An unreadable source is an incomplete review, never an empty or clean queue.
 
+When the launcher supplies `comparison` metadata for a live skill, require
+`comparison.status == "match"` and no top-level `status: "hold"` before making
+its bundle. The comparison uses the skill's actual Git path and a frozen local
+`origin/master` commit, without fetching; it does not establish the remote's
+latest state. For a difference or unavailable comparison, keep that skill on
+hold and record the ref, available commit, changed/live-only/origin-only files,
+and reason in REVIEW.md. Continue reviewing other eligible skills. The live
+files remain the base; do not substitute files from the remote-tracking tree.
+
 ## Constraints
 
 - Don't modify observation entries beyond their status field.
