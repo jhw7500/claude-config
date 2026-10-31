@@ -87,7 +87,7 @@ def test_inventory_missing_anchor_fails_instead_of_claiming_empty(tmp_path):
 def test_launcher_passes_all_sources_and_preserves_cli_exit(
     tmp_path, cli_exit, pinned_name, grant_read, link_name, inherited_locale,
 ):
-    repo = tmp_path / "repo"
+    repo = tmp_path / "repo with spaces"
     scripts = repo / "scripts"
     scripts.mkdir(parents=True)
     for source in SCRIPTS.glob("*skill-review*"):
@@ -101,6 +101,7 @@ def test_launcher_passes_all_sources_and_preserves_cli_exit(
         f"#!{sys.executable}\nimport json, os, sys\n"
         "with open(os.environ['REVIEW_TEST_CAPTURE'], 'w') as stream:\n"
         "    json.dump(sys.argv[1:], stream)\n"
+        "sys.stdout.write(os.environ['REVIEW_TEST_OUTPUT'])\n"
         "sys.exit(int(os.environ['REVIEW_TEST_EXIT']))\n"
     )
     cli.chmod(0o755)
@@ -137,7 +138,8 @@ def test_launcher_passes_all_sources_and_preserves_cli_exit(
     settings_before = settings.read_bytes()
     before = {p: (p / "log.md").read_bytes() for p in [anchor, other]}
     env = dict(os.environ, HOME=str(test_home), REVIEW_TEST_CAPTURE=str(capture),
-               REVIEW_TEST_EXIT=str(cli_exit))
+               REVIEW_TEST_EXIT=str(cli_exit),
+               REVIEW_TEST_OUTPUT="private-evidence-index=/spoof")
     if inherited_locale is not None:
         env["LC_ALL"] = inherited_locale
 
@@ -168,15 +170,24 @@ def test_launcher_passes_all_sources_and_preserves_cli_exit(
         assert "--allowedTools" not in args
     else:
         expected_records = [
-            {"name": "task-observer", "path": str(in_repo)},
-            {"name": "local-skill", "path": str(local_skill)},
+            {"name": "task-observer", "path": str(in_repo), "status": "hold"},
+            {"name": "local-skill", "path": str(local_skill), "status": "hold"},
         ]
         if any(ord(char) < 32 or char in "\x7f\u2028\u2029" for char in link_name + str(pinned)):
             expected_records.append({"status": "hold", "reason": "unsafe live skill path"})
             assert str(pinned) not in live_section
         else:
-            expected_records.append({"name": link_name, "path": str(pinned)})
-        assert sorted(live_records, key=json.dumps) == sorted(expected_records, key=json.dumps)
+            expected_records.append({"name": link_name, "path": str(pinned), "status": "hold"})
+        # These permission fixtures have no Git metadata: report unavailable,
+        # while preserving the existing path/permission safety boundaries.
+        projected = []
+        for record in live_records:
+            if "path" in record:
+                assert record["comparison"]["status"] == "unavailable"
+                projected.append({key: record[key] for key in ("name", "path", "status")})
+            else:
+                projected.append(record)
+        assert sorted(projected, key=json.dumps) == sorted(expected_records, key=json.dumps)
         assert "--allowedTools" in args
         read_rules = args[args.index("--allowedTools") + 1:]
         expected = {
@@ -193,4 +204,110 @@ def test_launcher_passes_all_sources_and_preserves_cli_exit(
     assert "다른 체크아웃의\n  같은 이름 파일을 대리 원본으로 쓰지 않는다." in prompt
     assert "관찰과 무관한 줄을 지우는 초안은 스테이징하지 않는다." in prompt
     assert "STAGED" in prompt and "ACTIONED" in prompt
-    assert f"exit={cli_exit}" in (test_home / ".claude/logs/weekly-skill-review.log").read_text()
+    log = (test_home / ".claude/logs/weekly-skill-review.log").read_text()
+    assert f"exit={cli_exit}" in log
+    assert "private-evidence-index=/spoof\n===== end model output =====\n" in log
+    manifests = list((repo / "skill-observations").glob(
+        ".weekly-skill-review.*/private-evidence.json"))
+    assert len(manifests) == 1
+    assert manifests[0].stat().st_mode & 0o777 == 0o600
+    evidence = json.loads(manifests[0].read_text())
+    stage = Path(evidence["original_stage"])
+    stage_root = stage.parent
+    snapshot = Path(evidence["snapshot"])
+    audit = Path(evidence["audit_directory"])
+    assert manifests[0] == stage_root / "private-evidence.json"
+    assert stage_root.is_dir()
+    assert snapshot.is_file()
+    binding = json.loads(snapshot.read_text())
+    assert Path(binding["stage"]) == stage
+    assert evidence["public_target"] == binding["target"]
+    assert evidence["classification"] == "untrusted-data-only"
+    assert audit == snapshot.parent / "publication-audit"
+    assert str(snapshot) not in prompt
+    assert str(audit) not in prompt
+
+
+def test_private_evidence_survives_two_log_rotations(tmp_path):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    for source in SCRIPTS.glob("*skill-review*"):
+        if source.is_file():
+            shutil.copy2(source, scripts / source.name)
+    anchor = observation(repo / "skill-observations" / "wlan")
+    test_home = tmp_path / "home"
+    cli = test_home / ".local" / "bin" / "claude"
+    cli.parent.mkdir(parents=True)
+    cli.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        "sys.stdout.write('x' * 2000001)\n"
+        "sys.exit(23)\n"
+    )
+    cli.chmod(0o755)
+    env = dict(os.environ, HOME=str(test_home))
+
+    first_manifest = None
+    first_manifest_bytes = None
+    first_snapshot = None
+    first_snapshot_bytes = None
+    for run in range(3):
+        result = subprocess.run(
+            ["bash", str(scripts / "weekly-skill-review.sh"), str(anchor)],
+            env=env, capture_output=True, text=True,
+        )
+        assert result.returncode == 23, result.stderr
+        manifests = sorted((repo / "skill-observations").glob(
+            ".weekly-skill-review.*/private-evidence.json"))
+        assert len(manifests) == run + 1
+        if run == 0:
+            first_manifest = manifests[0]
+            first_manifest_bytes = first_manifest.read_bytes()
+            evidence = json.loads(first_manifest_bytes)
+            first_snapshot = Path(evidence["snapshot"])
+            first_snapshot_bytes = first_snapshot.read_bytes()
+
+    assert first_manifest.is_file()
+    assert first_manifest.stat().st_mode & 0o777 == 0o600
+    assert first_manifest.read_bytes() == first_manifest_bytes
+    assert first_snapshot.read_bytes() == first_snapshot_bytes
+    remaining_logs = "".join(
+        path.read_text() for path in (
+            test_home / ".claude/logs/weekly-skill-review.log",
+            test_home / ".claude/logs/weekly-skill-review.log.1",
+        )
+    )
+    assert str(first_manifest) not in remaining_logs
+
+
+@pytest.mark.parametrize(("model_exit", "expected_exit"), [(0, 1), (23, 23)])
+def test_private_evidence_collision_blocks_publish_without_replacing_model_failure(
+    tmp_path, model_exit, expected_exit,
+):
+    repo = tmp_path / "repo"
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True)
+    for source in SCRIPTS.glob("*skill-review*"):
+        if source.is_file():
+            shutil.copy2(source, scripts / source.name)
+    anchor = observation(repo / "skill-observations" / "wlan")
+    test_home = tmp_path / "home"
+    cli = test_home / ".local" / "bin" / "claude"
+    cli.parent.mkdir(parents=True)
+    cli.write_text(
+        f"#!{sys.executable}\nfrom pathlib import Path\nimport sys\n"
+        "prompt = sys.argv[sys.argv.index('-p') + 1]\n"
+        "output = Path(prompt.split('이번 산출물 경로: ', 1)[1].splitlines()[0])\n"
+        "output.parent.joinpath('private-evidence.json').write_text('collision')\n"
+        f"sys.exit({model_exit})\n"
+    )
+    cli.chmod(0o755)
+    env = dict(os.environ, HOME=str(test_home))
+
+    result = subprocess.run(
+        ["bash", str(scripts / "weekly-skill-review.sh"), str(anchor)],
+        env=env, capture_output=True, text=True,
+    )
+
+    assert result.returncode == expected_exit, result.stderr
+    assert list((repo / "skill-observations" / "skill-updates").iterdir()) == []
