@@ -1,6 +1,6 @@
 # #47 Codex 서술 계측 설계안 — 2026-11-01
 
-상태: 사용자 “승인 구현”(2026-11-01)으로 승인됐으며 구현·검증을 완료했고 로컬 변경을 보존한다.
+상태: 사용자 “승인 구현”(2026-11-01) 후 PR #263으로 게시했으며, 후속 “진행”으로 비차단 지적 4건의 보완·같은 PR 재리뷰를 승인받았다.
 대상: https://github.com/jhw7500/claude-config/issues/47
 기준 커밋: 557b5e3f469b59050dca62fddc30e027b42ca193
 기존 Claude CLI 기준선: tests/test_delegation_ratio.py — 19 passed (0.40s).
@@ -34,10 +34,10 @@ CLI 이름·세부 집계 방식은 구현자의 제안으로 작성했고, 이�
 
 공식 0.166.0 및 실제 로컬 기록에서 확인한 session_meta / response_item을 기준으로 한다. 첫 session_meta만 파일의 정본 메타데이터로 쓴다. 자식 파일 뒤에 복사된 부모 메타데이터로 역할을 바꾸지 않는다.
 
-- id는 thread ID, session_id는 root ID다. 파일명이나 마지막 메타데이터로 이를 덮어쓰지 않는다.
-- source.subagent.thread_spawn 및 parent_thread_id로 자식의 출처를 확인한다. 단순히 subagent라는 이유만으로 부모 ID를 만들지 않는다.
+- id는 thread ID, session_id는 root ID다. 공식 SessionMetaLine 호환 규칙에 따라 session_id 키가 없으면 id로 읽으며, 명시된 null·빈 값·잘못된 자료형은 보류한다. 파일명이나 마지막 메타데이터로 이를 덮어쓰지 않는다.
+- source.subagent.thread_spawn 및 parent_thread_id로 자식의 출처를 확인한다. 외부 parent_thread_id가 없거나 null이면 중첩 spawn parent를 허용한다. 둘 다 명시됐는데 서로 다르면 이 계측기의 보수적인 정합성 정책으로 보류한다. 단순히 subagent라는 이유만으로 부모 ID를 만들지 않는다.
 - subagent_history_start_ordinal이 있으면 그 전의 부모 복사본은 자식 실행으로 세지 않는다.
-- 상속 구간 제외는 자식뿐 아니라 일반 main fork에도 적용한다. forked_from_id가 있으면 자신의 구간을 증명할 수 있어야 한다. 명시적인 own-history ordinal 또는 history_base가 나타내는 물리적인 자체 suffix를 사용하고, 어떤 경계도 확인하지 못하면 파일 전체를 coverage의 보류로 기록한다. 부모의 논리 ordinal을 자식 파일의 물리 ordinal로 추측 변환하지 않는다.
+- 상속 구간 제외는 자식뿐 아니라 일반 main fork에도 적용한다. forked_from_id가 있으면 자신의 구간을 증명할 수 있어야 한다. history_base가 없는 복사 main fork는 forked_from_ordinal_exclusive를 사용하고, 그 필드가 없는 기존 호환 입력은 subagent_history_start_ordinal을 유지한다. 자식은 자신의 subagent_history_start_ordinal을 사용하며 부모의 일반 fork cutoff만으로 자체 투영 경계를 추정하지 않는다. history_base가 있으면 물리적인 자체 suffix를 읽는다. 어떤 경계도 확인하지 못하면 파일 전체를 coverage의 보류로 기록한다. 이 세 경계에 동등성이나 최댓값 규칙을 강제하지 않는다.
 - history_base는 공유 prefix 참조다. 이 단계에서는 외부 prefix를 따라 읽지 않고, 물리적으로 기록된 자신의 구간만 센다. 상속된 문맥은 실행이 아니며, 세션 수명 전체를 복원했다고 말하지 않는다. 경계를 확인할 수 없는 root/main fork도 같은 보류 규칙을 따른다.
 - session_meta의 정체성·역할을 읽지 못한 파일은 main으로 추측하지 않고 보류한다.
 
@@ -59,6 +59,7 @@ CLI 이름·세부 집계 방식은 구현자의 제안으로 작성했고, 이�
 - 누락/미지원 자료를 정상적인 빈 데이터와 구분한다. root가 없거나 읽을 수 없으면 CLI는 nonzero로 끝낸다. 빈 root는 명시적인 0 결과다.
 
 coverage에는 적어도 발견/집계/보류 파일, main/sub thread 수, malformed/unknown metadata, inherited 구간 제외, 중복/충돌 호출, 고아 출력, opaque 호출, 미지원 레코드 수를 담는다. 보류 항목이 있는 결과를 완전한 전체 계측으로 표시하지 않는다.
+coverage.main_threads/sub_threads는 유효한 정체성의 전체 inventory이며 빈 thread·기간 밖 thread도 포함한다. 역할이 충돌하는 thread ID는 제외하고 동일 파일 복사본은 한 번 센다. overall/days의 sessions/subagent_sessions는 해당 기간에 포함된 호출·출력에 참여한 thread 수다.
 
 ## Claude 안에서 Codex에 보낸 Bash 호출
 
@@ -90,6 +91,9 @@ coverage에는 적어도 발견/집계/보류 파일, main/sub thread 수, malfo
 - https://github.com/jhw7500/claude-config/issues/47
 - 고정 공식 소스: openai/codex @ 6ff1e1ca3b30fc8b914720681fcf5fe62e95f856 (rust-v0.166.0)
 - 첫 메타데이터: https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/rollout/src/recorder.rs#L1162-L1185
+- 구버전 root ID 호환: https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/protocol/src/protocol.rs#L3483-L3508
+- optional parent의 중첩 fallback: https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/core/src/thread_manager.rs#L2425-L2432
+- 자식 투영 경계: https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/thread-store/src/local/thread_history_materialization.rs#L197-L235
 - 메타데이터·fork 경계: https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/protocol/src/protocol.rs#L3337-L3431
 - 도구 항목·출력: https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/protocol/src/models.rs#L1124-L1227
 - 저장 정책·잘림: https://github.com/openai/codex/blob/6ff1e1ca3b30fc8b914720681fcf5fe62e95f856/codex-rs/rollout/src/policy.rs#L230-L283

@@ -127,7 +127,8 @@ def event_item(payload, stamp, coverage):
 
 
 def ownership(meta):
-    if not isinstance(meta, dict) or not nonempty(meta.get("id")):
+    if (not isinstance(meta, dict) or not nonempty(meta.get("id"))
+            or not nonempty(meta.get("session_id", meta["id"]))):
         raise HeldFile("unknown_metadata")
     source = meta.get("source")
     if isinstance(source, str) and source in MAIN_SOURCES:
@@ -137,6 +138,13 @@ def ownership(meta):
         kind = "sub"
     else:
         raise HeldFile("unknown_source")
+    parent = meta.get("parent_thread_id")
+    if parent is not None and not nonempty(parent):
+        raise HeldFile("unknown_metadata")
+    if kind == "sub" and isinstance(source["subagent"], dict):
+        spawn = source["subagent"].get("thread_spawn")
+        if spawn is not None and parent is not None and parent != spawn["parent_thread_id"]:
+            raise HeldFile("unknown_metadata")
     start = meta.get("subagent_history_start_ordinal")
     if start is not None and not natural(start):
         raise HeldFile("unknown_boundary")
@@ -147,7 +155,16 @@ def ownership(meta):
         and natural(base.get("end_byte_offset"))
     ):
         raise HeldFile("unknown_boundary")
+    cutoff = meta.get("forked_from_ordinal_exclusive")
+    if cutoff is not None and not natural(cutoff):
+        raise HeldFile("unknown_boundary")
     fork = meta.get("forked_from_id")
+    if cutoff is not None and fork is None:
+        raise HeldFile("unknown_boundary")
+    # The parent's cutoff locates a copied main prefix, not a child projection.
+    # A history_base file already contains only its physical local suffix.
+    if kind == "main" and base is None and cutoff is not None:
+        start = cutoff
     if fork is not None and (not nonempty(fork) or start is None and base is None):
         raise HeldFile("unknown_boundary")
     return kind, start
@@ -325,6 +342,10 @@ def collect(root, since_dt):
                     thread, "fallback", row["signature"])
                 register(outputs, conflicting_outputs, key, row, coverage)
     coverage["conflicting_threads"] = len(conflicting_threads)
+    for kind in ("main", "sub"):
+        coverage[kind + "_threads"] = sum(
+            role == kind and thread not in conflicting_threads for thread, role in roles.items()
+        )
 
     def include(row):
         thread = row["thread"]

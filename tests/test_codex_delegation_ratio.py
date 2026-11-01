@@ -432,3 +432,171 @@ def test_near_limit_output_cannot_discard_a_valid_neighbor(tmp_path):
     write_rollout(tmp_path, "main", [metadata(), call(), deep_output])
     data = report(tmp_path)
     assert data["overall"]["main_tool_calls"] == 1
+
+
+@pytest.mark.parametrize("root_id", [None, "", [], 42, True])
+def test_explicit_invalid_root_identity_is_held(tmp_path, root_id):
+    write_rollout(tmp_path, "invalid-root", [metadata(session_id=root_id), call()])
+    data = report(tmp_path)
+    assert data["overall"]["main_tool_calls"] == 0
+    assert data["coverage"]["files_held"] == 1
+    assert data["coverage"]["unknown_metadata"] == 1
+    assert data["coverage"]["complete"] is False
+
+
+@pytest.mark.parametrize("sub", [False, True])
+def test_legacy_metadata_without_root_id_keeps_official_id_fallback(tmp_path, sub):
+    row = child() if sub else metadata()
+    row["payload"].pop("session_id")
+    write_rollout(tmp_path, "legacy-root", [row, call()])
+    data = report(tmp_path)
+    assert data["overall"]["sub_tool_calls" if sub else "main_tool_calls"] == 1
+    assert data["coverage"]["files_held"] == 0
+    assert data["coverage"]["complete"] is True
+
+
+@pytest.mark.parametrize("parent", ["different-parent", "", [], 42])
+def test_contradictory_spawn_parent_identity_is_held(tmp_path, parent):
+    row = child()
+    row["payload"]["parent_thread_id"] = parent
+    write_rollout(tmp_path, "invalid-parent", [row, call(), output("hello")])
+    data = report(tmp_path)
+    assert data["overall"]["sub_tool_calls"] == 0
+    assert data["overall"]["sub_bytes"] == 0
+    assert data["coverage"]["files_held"] == 1
+    assert data["coverage"]["complete"] is False
+
+
+@pytest.mark.parametrize("since, sessions", [(None, 2), ("2026-08-20", 1), ("2026-08-21", 0)])
+def test_thread_inventory_includes_empty_and_filtered_threads_but_not_conflicts(tmp_path, since, sessions):
+    old = datetime(2026, 8, 19, 23).astimezone().isoformat()
+    for source in ("main", "sub"):
+        for suffix in ("empty", "old", "current"):
+            thread = source + "-" + suffix
+            row = metadata(thread) if source == "main" else child(thread)
+            rows = [row] if suffix == "empty" else [row, call()]
+            if suffix == "old":
+                rows[1]["timestamp"] = old
+            write_rollout(tmp_path, thread, rows)
+    write_rollout(tmp_path, "copied-empty", [metadata("main-empty")])
+    write_rollout(tmp_path, "conflicting-main", [metadata("conflicting"), call()])
+    write_rollout(tmp_path, "conflicting-sub", [child("conflicting"), call()])
+    write_rollout(tmp_path, "held", [metadata("unknown", source="future")])
+    data = report(tmp_path, *(('--since', since) if since else ('--overall',)))
+    assert data["coverage"].get("main_threads") == 3
+    assert data["coverage"].get("sub_threads") == 3
+    assert data["overall"]["sessions"] == sessions
+    assert data["overall"]["subagent_sessions"] == sessions
+    assert data["coverage"]["conflicting_threads"] == 1
+    assert data["coverage"]["files_held"] == 1
+
+
+def test_empty_root_reports_zero_thread_inventory(tmp_path):
+    data = report(tmp_path)
+    assert data["coverage"].get("main_threads") == 0
+    assert data["coverage"].get("sub_threads") == 0
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_optional_outer_parent_keeps_nested_spawn_compatibility(tmp_path, missing):
+    row = child()
+    if missing:
+        row["payload"].pop("parent_thread_id")
+    else:
+        row["payload"]["parent_thread_id"] = None
+    write_rollout(tmp_path, "compatible-parent", [row, call(), output("hello")])
+    data = report(tmp_path)
+    assert data["overall"]["sub_tool_calls"] == 1
+    assert data["overall"]["sub_bytes"] == 7
+    assert data["coverage"]["files_held"] == 0
+    assert data["coverage"]["complete"] is True
+
+
+def test_copied_main_fork_uses_generic_parent_boundary(tmp_path):
+    write_rollout(tmp_path, "copied-main", [
+        metadata(forked_from_id="parent", forked_from_ordinal_exclusive=3),
+        call(cid="inherited", ordinal=2), call(cid="own", ordinal=3),
+    ])
+    data = report(tmp_path)
+    assert data["overall"]["main_tool_calls"] == 1
+    assert data["coverage"]["inherited_records_skipped"] == 1
+    assert data["coverage"]["files_held"] == 0
+    assert data["coverage"]["complete"] is True
+
+
+def test_zero_generic_parent_boundary_preserves_all_own_main_calls(tmp_path):
+    write_rollout(tmp_path, "zero-prefix", [
+        metadata(forked_from_id="parent", forked_from_ordinal_exclusive=0),
+        call(cid="first", ordinal=1), call(cid="second", ordinal=2),
+    ])
+    data = report(tmp_path)
+    assert data["overall"]["main_tool_calls"] == 2
+    assert data["coverage"]["files_held"] == 0
+
+
+@pytest.mark.parametrize("boundary", [True, -1, "2", [], {}])
+def test_invalid_generic_parent_boundary_is_held(tmp_path, boundary):
+    write_rollout(tmp_path, "bad-cutoff", [
+        metadata(forked_from_id="parent", forked_from_ordinal_exclusive=boundary,
+                 subagent_history_start_ordinal=2), call(ordinal=2),
+    ])
+    data = report(tmp_path)
+    assert data["overall"]["main_tool_calls"] == 0
+    assert data["coverage"]["files_held"] == 1
+    assert data["coverage"]["unknown_boundary"] == 1
+    assert data["coverage"]["complete"] is False
+
+
+def test_generic_boundary_without_logical_parent_is_held(tmp_path):
+    write_rollout(tmp_path, "orphan-cutoff", [
+        metadata(forked_from_ordinal_exclusive=2), call(ordinal=2),
+    ])
+    data = report(tmp_path)
+    assert data["overall"]["main_tool_calls"] == 0
+    assert data["coverage"]["files_held"] == 1
+
+
+def test_generic_main_boundary_requires_response_ordinals(tmp_path):
+    row = call()
+    row.pop("ordinal")
+    write_rollout(tmp_path, "missing-ordinal", [
+        metadata(forked_from_id="parent", forked_from_ordinal_exclusive=2), row,
+    ])
+    data = report(tmp_path)
+    assert data["overall"]["main_tool_calls"] == 0
+    assert data["coverage"]["files_held"] == 1
+    assert data["coverage"]["complete"] is False
+
+
+def test_generic_parent_boundary_cannot_replace_child_projection_boundary(tmp_path):
+    write_rollout(tmp_path, "unproved-child", [
+        child(forked_from_id="main", forked_from_ordinal_exclusive=2), call(ordinal=2),
+    ])
+    data = report(tmp_path)
+    assert data["overall"]["sub_tool_calls"] == 0
+    assert data["coverage"]["files_held"] == 1
+
+
+def test_child_projection_does_not_use_max_of_independent_fork_fields(tmp_path):
+    # Defensive shape: do not confuse the logical parent's cutoff with child ordinals.
+    write_rollout(tmp_path, "projected-child", [
+        child(forked_from_id="main", forked_from_ordinal_exclusive=99,
+              subagent_history_start_ordinal=3),
+        call(cid="inherited", ordinal=2), call(cid="own", ordinal=3),
+    ])
+    data = report(tmp_path)
+    assert data["overall"]["sub_tool_calls"] == 1
+    assert data["coverage"]["inherited_records_skipped"] == 1
+    assert data["coverage"]["files_held"] == 0
+
+
+def test_reverted_physical_base_and_generic_parent_boundary_need_not_match(tmp_path):
+    row = metadata(forked_from_id="logical-parent", forked_from_ordinal_exclusive=20,
+                   history_base={"thread_id": "different-rollout-id",
+                                 "end_ordinal_exclusive": 40, "end_byte_offset": 200})
+    row["ordinal"] = 40
+    write_rollout(tmp_path, "reverted-main", [row, call(cid="own-suffix", ordinal=41)])
+    data = report(tmp_path)
+    assert data["overall"]["main_tool_calls"] == 1
+    assert data["coverage"]["history_base_files"] == 1
+    assert data["coverage"]["files_held"] == 0
