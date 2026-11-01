@@ -196,6 +196,37 @@ def test_links_are_still_created_except_task_nudge_shim(home: Path) -> None:
     assert os.access(launcher, os.X_OK)
 
 
+def test_codex_metrics_entrypoints_install_and_rerun_safely(home: Path) -> None:
+    import sys
+
+    sessions = home / ".codex" / "sessions"
+    sessions.mkdir(parents=True)
+    result = run_install(home)
+    assert result.returncode == 0, result.stderr
+    cli = home / ".claude/scripts/codex-delegation-ratio.py"
+    primary = home / ".claude/scripts/delegation-ratio.py"
+    assert cli.is_symlink()
+    assert cli.resolve() == (REPO / "scripts/codex-delegation-ratio.py").resolve()
+    assert os.access(cli, os.X_OK)
+    before_target = cli.readlink()
+    settings = home / ".claude/settings.json"
+    before_settings = settings.read_bytes()
+    before_backups = backups(settings)
+    result = run_install(home)
+    assert result.returncode == 0, result.stderr
+    assert cli.readlink() == before_target
+    assert settings.read_bytes() == before_settings
+    assert backups(settings) == before_backups
+    env = dict(os.environ, HOME=str(home))
+    for argv in ([str(cli), "--overall", "--json"],
+                 [sys.executable, str(primary), "--source", "codex", "--overall", "--json"]):
+        measured = subprocess.run(argv, env=env, text=True, capture_output=True, check=False)
+        assert measured.returncode == 0, measured.stderr
+        data = json.loads(measured.stdout)
+        assert data["provider"] == "codex"
+        assert data["overall"]["main_tool_calls"] == 0
+
+
 def test_launcher_only_preserves_pinned_tribunal_and_runtime_configs(
     home: Path, tmp_path: Path,
 ) -> None:
