@@ -115,6 +115,46 @@ plug off bkit                            # 플러그인 끄기 → 세션에서 
 ~/.claude/scripts/apex-toggle.sh off     # APEX 커맨드 비활성화 → 새 세션
 ```
 
+### Claude/Codex 위임 계측
+
+```bash
+python3 scripts/delegation-ratio.py --days 14 --json                 # 기존 Claude 계측
+python3 scripts/delegation-ratio.py --source codex --days 14 --json  # 별도 Codex 계측
+python3 scripts/codex-delegation-ratio.py --overall --json            # Codex 전용 진입점
+```
+
+기본 입력은 Claude의 `~/.claude/projects`이며 기존 출력과 실험 기준은 유지됩니다.
+`--source codex`는 `~/.codex/sessions`의 독립 집계기로 연결합니다. 두 집계기 모두
+`--root`, `--days`, `--since YYYY-MM-DD`, `--overall`, `--json`을 지원합니다.
+
+Codex 결과는 `descriptive_only: true`인 서술 지표입니다. 첫 `session_meta`와 fork의
+own-history 경계로 메인/자식을 나누고, `response_item`의 도구 호출·출력을 집계합니다.
+부모 복사본과 `event_msg`의 UI 복사본은 새 실행으로 세지 않습니다. 외부 `history_base`
+prefix는 따라 읽지 않으며, 경계를 확인할 수 없는 fork는 보류합니다.
+복사된 main fork는 `forked_from_ordinal_exclusive`, 자식 투영은
+`subagent_history_start_ordinal`을 사용합니다. 두 경계를 합치거나 `history_base`와
+같아야 한다고 가정하지 않습니다. 구버전의 누락된 `session_id`는 `id`로 읽고,
+외부 parent 필드가 없거나 null이면 중첩된 spawn parent를 허용합니다. 명시된 root ID가
+잘못됐거나 외부·중첩 parent가 서로 다르면 해당 파일을 보류합니다.
+
+Codex `delegation_pct`는 메인의 spawn/followup 요청 수를 **전체 관측 main 도구 호출 수**로
+나눈 값입니다. `functions.exec` 같은 배치 wrapper는 `opaque_calls`로 표시하고 분모에
+포함합니다. 자식 호출은 `sub_tool_calls`, 출력은 `main_bytes`/`sub_bytes`로 분리합니다.
+출력 크기는 저장된 output JSON 값의 UTF-8 직렬화 바이트이며, 잘림 전 실행 결과 전체나
+토큰 수가 아닙니다. `offload_pct`도 이 저장된 출력 바이트의 자식 비중입니다.
+
+`coverage`는 보류·깨진/미지원 기록·충돌·고아 출력과 약한 ID의 수를 드러냅니다.
+`coverage.main_threads`/`sub_threads`는 중복·역할 충돌을 제외한 유효한 thread ID 수로,
+빈 thread와 날짜 범위 밖의 thread도 포함합니다. `overall.sessions`/`subagent_sessions`는
+선택한 기간 안에 집계된 호출·출력이 있는 thread 수입니다.
+`complete: false` 결과를 전체 계측으로 해석하지 마세요. 누락된 root는 실패하며, 빈 root의
+0 결과와 구분합니다. Codex 비율은 기존 Claude 비율과 분모가 달라 직접 비교하거나 합산하지
+않고, 사전등록한 delegate-nudge 성공/롤백 판정에도 넣지 않습니다.
+
+Claude의 codex-companion Bash 호출은 이번 변경에서 별도 위임 태그로 재분류하지 않습니다.
+명령 문자열만으로 실제 위임과 인용·실패를 구분하거나 두 로그를 공통 실행 ID로 연결할
+근거가 없어, Bash의 기존 분류를 보존하고 Codex 기록 자체를 별도로 관찰합니다.
+
 ## Project Control Task launcher
 
 <!-- jhw-control-host-v5-operator-contract:start -->

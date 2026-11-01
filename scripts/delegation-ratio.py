@@ -36,6 +36,7 @@ import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 ROOT = os.path.expanduser("~/.claude/projects")
 
@@ -205,8 +206,26 @@ def main():
     ap.add_argument("--since", help="YYYY-MM-DD 이후만 (--days 보다 우선)")
     ap.add_argument("--overall", action="store_true", help="전체 기간 (전량 스캔 — 느림)")
     ap.add_argument("--json", action="store_true", dest="as_json")
-    ap.add_argument("--root", default=ROOT, help="transcript 루트 (기본 ~/.claude/projects)")
+    ap.add_argument("--source", choices=("claude", "codex"), default="claude",
+                    help="기본 Claude 계측 또는 별도 Codex 서술 계측")
+    ap.add_argument("--root", help="transcript 루트 (Claude: ~/.claude/projects, Codex: ~/.codex/sessions)")
     args = ap.parse_args()
+
+    if args.source == "codex":
+        helper = Path(__file__).resolve().with_name("codex-delegation-ratio.py")
+        argv = [sys.executable, str(helper), "--days", str(args.days)]
+        if args.root is not None:
+            argv += ["--root", args.root]
+        if args.since is not None:
+            argv += ["--since", args.since]
+        if args.overall:
+            argv.append("--overall")
+        if args.as_json:
+            argv.append("--json")
+        os.execv(sys.executable, argv)
+
+    if args.root is None:
+        args.root = ROOT
 
     if args.since:
         try:
