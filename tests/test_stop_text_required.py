@@ -72,11 +72,48 @@ def test_blocks_tool_only_turn_from_inline_messages() -> None:
     assert "STOP_HOOK_BLOCK" in result.stderr
 
 
-def test_allows_explicit_stop_request() -> None:
-    result = run_hook({"messages": tool_only_messages("이제 종료")})
+@pytest.mark.parametrize("user_text", ["이제 종료", "exit", "quit", "그만", "끝"])
+def test_allows_explicit_stop_request(user_text: str) -> None:
+    result = run_hook({"messages": tool_only_messages(user_text)})
 
     assert result.returncode == 0
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize("user_text", [
+    "끝까지 작업하고 결과를 알려줘",
+    "exit code를 확인해줘",
+    "quit 명령을 설명해줘",
+])
+def test_stop_words_inside_ordinary_requests_do_not_bypass_guard(user_text: str) -> None:
+    result = run_hook({"messages": tool_only_messages(user_text)})
+
+    assert result.returncode == 2
+    assert "STOP_HOOK_BLOCK" in result.stderr
+
+
+@pytest.mark.parametrize("user_text", [
+    "끝까지 작업하고 결과를 알려줘",
+    "exit code를 확인해줘",
+    "quit 명령을 설명해줘",
+])
+@pytest.mark.parametrize("answer_source", ["messages", "last_assistant_message"])
+def test_stop_words_inside_ordinary_requests_reach_korean_check(
+    user_text: str,
+    answer_source: str,
+) -> None:
+    messages = [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": [{"type": "text", "text": ENGLISH_REPORT}]},
+    ]
+    payload = {"messages": messages}
+    if answer_source == "last_assistant_message":
+        payload["last_assistant_message"] = ENGLISH_REPORT
+
+    result = run_hook(payload)
+
+    assert result.returncode == 2
+    assert "STOP_HOOK_KOREAN" in result.stderr
 
 
 def test_blocks_tool_only_turn_from_jsonl_transcript(tmp_path: Path) -> None:
@@ -393,6 +430,71 @@ KOREAN_REPORT = (
 )
 
 
+def messages_with_tool_result(user_text: str) -> list[dict]:
+    return [
+        *tool_only_messages(user_text),
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tool-1"}],
+        },
+    ]
+
+
+def test_explicit_stop_request_survives_trailing_tool_result() -> None:
+    result = run_hook({"messages": messages_with_tool_result("끝")})
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_explicit_stop_request_with_tool_result_skips_korean_check() -> None:
+    messages = [
+        *messages_with_tool_result("끝"),
+        {"role": "assistant", "content": [{"type": "text", "text": ENGLISH_REPORT}]},
+    ]
+
+    result = run_hook({"messages": messages})
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_ordinary_request_before_tool_result_still_blocks() -> None:
+    result = run_hook({
+        "messages": messages_with_tool_result("끝까지 작업하고 결과를 알려줘"),
+    })
+
+    assert result.returncode == 2
+    assert "STOP_HOOK_BLOCK" in result.stderr
+
+
+def test_tool_result_text_is_not_treated_as_stop_request() -> None:
+    messages = messages_with_tool_result("계속")
+    messages[-1]["content"].append({"type": "text", "text": "끝"})
+
+    result = run_hook({"messages": messages})
+
+    assert result.returncode == 2
+    assert "STOP_HOOK_BLOCK" in result.stderr
+
+
+def test_latest_empty_prompt_does_not_inherit_older_stop_request() -> None:
+    messages = [
+        {"role": "user", "content": "끝"},
+        {"role": "assistant", "content": [{"type": "text", "text": "이전 턴"}]},
+        {"role": "user", "content": []},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "tool-2", "name": "Read", "input": {}}],
+        },
+    ]
+
+    result = run_hook({"messages": messages})
+
+    assert result.returncode == 2
+    assert "STOP_HOOK_BLOCK" in result.stderr
+
+
 @pytest.fixture(autouse=True)
 def enable_language_check(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLAUDE_STOP_KOREAN", raising=False)
@@ -607,15 +709,34 @@ def test_file_language_check_waits_even_when_first_read_is_short(
 def test_settle_can_replace_english_with_late_korean_text() -> None:
     english = final_messages(ENGLISH_REPORT)
     korean = final_messages(KOREAN_REPORT)
-    reads = [english, None, korean]
+    reads = [english, None, korean, None]
+
+    verdict, _tool_id, messages = HOOK.settle(
+        lambda: reads.pop(0), english, "non_korean", "",
+        attempts=4, delay=0, sleep=NO_SLEEP, wait_for_final=True,
+    )
+
+    assert verdict == "ok"
+    assert messages == korean
+    assert reads == []
+
+
+@pytest.mark.parametrize("reads", [
+    [None, None, None],
+    [final_messages(ENGLISH_REPORT), None, None],
+])
+def test_settle_preserves_confirmed_english_after_transient_read_failures(
+    reads: list[list[dict] | None],
+) -> None:
+    english = final_messages(ENGLISH_REPORT)
 
     verdict, _tool_id, messages = HOOK.settle(
         lambda: reads.pop(0), english, "non_korean", "",
         attempts=3, delay=0, sleep=NO_SLEEP,
     )
 
-    assert verdict == "ok"
-    assert messages == korean
+    assert verdict == "non_korean"
+    assert messages == english
     assert reads == []
 
 

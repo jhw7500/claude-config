@@ -43,6 +43,9 @@ source ~/.bashrc
   공식 `last_assistant_message`가 있으면 이를 사용하며, 없는 파일 기반 입력은 최대
   8회·0.1초 간격으로 다시 읽습니다. `stop_hook_active=true`에서는 다시 차단하지 않으며
   SubagentStop·Codex에는 언어 검사를 적용하지 않습니다.
+  재읽기 중 확인한 최종 답변 판정은 이후 일시적인 읽기 실패에도 유지합니다.
+  종료 면제는 `이제 종료`·`exit`·`quit` 같은 짧은 전체 발화에만 적용하므로,
+  `끝까지 작업해줘`·`exit code를 확인해줘` 같은 일반 요청은 검사를 우회하지 않습니다.
   - 영어 답변이 필요한 세션은 `CLAUDE_STOP_KOREAN=0 claude`로 시작합니다. 이 환경변수는 한국어 검사만 끄며 기존 빈 결과 보고 검사는 유지합니다. 기본 임계값은 오탐을 줄이도록 보수적으로 정했습니다. 새 호스트는 `./install.sh`로 설치하고, 기존 링크가 다른 runtime checkout을 가리키는 호스트는 해당 checkout을 갱신해야 반영됩니다.
 - **Task nudge (Claude/Codex)**: `task_nudge.py`와 Claude/Codex adapter는 심볼릭 링크가 아닌 owner-only 중립 사본으로 설치된다. source update 뒤에는 `./install.sh`를 다시 실행한다. Claude `settings.json`과 Codex `~/.codex/hooks.json`은 기존 항목을 보존하는 additive merge이며, 활성 전역 AGENTS의 `claude-config:task-nudge:START/END` marker 밖 내용도 보존한다.
   - 설치기는 portfolio 조회나 자격증명 접근을 실행하지 않는다. 새 설치 또는 파일 hash가 바뀐 뒤에는 Codex에서 `/hooks`를 열어 변경 hash를 직접 검토한 뒤 trust한다; installer는 trust를 자동 승인하지 않는다.

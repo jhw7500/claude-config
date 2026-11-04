@@ -44,7 +44,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-EXPLICIT_STOP_HINTS = ("종료", "exit", "quit", "그만", "끝", "stop session")
+EXPLICIT_STOP_REQUESTS = frozenset({
+    "종료", "이제 종료", "exit", "quit", "그만", "끝", "stop session",
+})
 
 
 def transcript_record_message(record: Any) -> dict | None:
@@ -159,6 +161,8 @@ def last_user_text(messages: list) -> str:
             continue
         if msg.get("role") != "user":
             continue
+        if user_tool_result_id(msg) is not None:
+            continue
         content = msg.get("content")
         if isinstance(content, str):
             return content
@@ -171,6 +175,12 @@ def last_user_text(messages: list) -> str:
                         parts.append(text)
             return "\n".join(parts)
     return ""
+
+
+def is_explicit_stop_request(text: str) -> bool:
+    """종료 면제는 정규화한 사용자 전체 발화가 명시적 종료 요청일 때만 인정한다."""
+    normalized = re.sub(r"[.!?。！？]+$", "", text.strip().lower()).strip()
+    return normalized in EXPLICIT_STOP_REQUESTS
 
 
 def assistant_has_text(turn: dict) -> bool:
@@ -397,6 +407,9 @@ def settle(
     wait_for_final은 짧은 초기 본문을 최종 답변으로 오인하지 않도록 전체 횟수를 읽는다.
     """
     readable = True
+    confirmed_final = (
+        (verdict, tool_id, messages) if verdict in ("ok", "non_korean") else None
+    )
     for _ in range(attempts):
         sleep(delay)
         retry = read_messages()
@@ -408,10 +421,14 @@ def settle(
         readable = True
         messages = retry
         verdict, tool_id = evaluate(retry, check_korean=check_korean)
+        if verdict in ("ok", "non_korean"):
+            confirmed_final = (verdict, tool_id, messages)
         if verdict == "ok" and not wait_for_final:
             return "ok", "", messages
     if not readable:
-        # 끝까지 읽지 못했다 — malformed transcript와 동일하게 fail-open
+        if confirmed_final is not None:
+            return confirmed_final
+        # 최종 text 판정을 한 번도 확보하지 못했다 — fail-open
         return "ok", "", messages
     return verdict, tool_id, messages
 
@@ -442,8 +459,8 @@ def main() -> int:
             return 0
         messages = [{"role": "assistant", "content": final_text}]
 
-    user_text = last_user_text(messages).lower()
-    if any(hint in user_text for hint in EXPLICIT_STOP_HINTS):
+    user_text = last_user_text(messages)
+    if is_explicit_stop_request(user_text):
         return 0  # 사용자가 명시적으로 종료 요청 — 통과
 
     verdict, tool_id = evaluate(messages, check_korean=check_korean, final_text=final_text)
