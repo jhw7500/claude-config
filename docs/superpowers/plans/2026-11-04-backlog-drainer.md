@@ -95,8 +95,8 @@
 
 - [x] Step 0b: 실제 저장된 ignored snapshot도 HEAD/index에서 미추적이면 정확한 실행 산출물로 받아들이고, tracked 파일은 계속 거부한다. actualRoot setup에서 발견한 통합 회귀를 고친 뒤 새 실험 checkpoint를 만든다.
 
-- [ ] Step 1: Codex pre/post-edit barrier의 running child를 실제 interrupt, interrupted/quiescent/도구종료 각각 확인. replacement는 새 ID/fork_turns=none, old transcript 없이 snapshot/Git/다음 단계만 받는다.
-- [ ] Step 2: 실제 설치 Claude stop/terminal/non-fork capability를 확인한다. 지원 시 같은 실험, 아니면 구체 근거와 unsupported를 기록한다. SDK 이벤트가 TUI에도 있다고 추정하지 않는다.
-- [ ] Step 3: 새 표적 후 전체 pytest -q -n 8, ruff, ShellCheck, diff check. 이전 5210 결과를 이번 통과로 재사용하지 않는다.
-- [ ] Step 4: fresh whole-branch 독립 리뷰. material finding은 RED/GREEN으로 수정하고 필요한 검증만 다시 실행한다.
-- [ ] Step 5: 검증/지원 runtime/한계를 문서화하고 parent 최종 v1 commit. READY_FOR_TRIBUNAL과 현재 Claim을 보고한다. 원안 전체 Issue 완료나 Task finish를 자동 처리하지 않는다.
+- [x] Step 1: 실제 Codex pre-edit child의 running → interrupt(previous running) → interrupted를 관측했다. 부모가 child-owned 도구 session을 조회할 수 없어 종료 영수증은 미확정이므로 이 환경은 UNSUPPORTED/PAUSED다. post-edit·replacement를 진행하지 않았고 C3 PASS로 세지 않는다.
+- [x] Step 2: Claude CLI 2.1.318 설치는 확인했으나 현재 Codex surface에는 Claude native Agent/TaskStop/terminal bridge가 없어 여기서의 복구는 unsupported로 기록한다. 전역 Claude TUI 기능 부재나 SDK/TUI 동등성을 주장하지 않는다.
+- [x] Step 3: 최종 잔여 수정 뒤 표적 160개와 새 전체 pytest -q -n 8의 5370개가 통과했다. 입력 working digest ea5616dc79c56e60bc88910347f7ab43ab57e9043fe89df8351b7d39d190a088 및 실행 소스 hash 불변을 확인했다. Ruff·15파일 compile·ShellCheck·전체 working diff도 통과했고 과거 5355/5368은 새 코드의 통과로 재사용하지 않았다.
+- [x] Step 4: fresh whole-branch 독립 리뷰의 I1/I2/M1/M2를 RED/GREEN으로 보완했다. 잔여 I1의 기존 디렉터리 경로도 같은 구현자와 범위 제한 재리뷰로 해결해 spec PASS·quality CLEAR·architectural CLEAR를 확인했다.
+- [x] Step 5: 검증/지원 runtime/한계를 문서화하고 parent 최종 v1 commit. READY_FOR_TRIBUNAL과 현재 Claim을 보고한다. 원안 전체 Issue 완료나 Task finish를 자동 처리하지 않는다.

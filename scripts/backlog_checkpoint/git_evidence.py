@@ -590,6 +590,10 @@ def _validate_manifest(manifest: object, parent_head: str) -> dict[str, Any]:
         change = source["change"]
         mode = source["mode"]
         digest = source["sha256"]
+        if not isinstance(change, str):
+            raise CheckpointError("source manifest change is invalid")
+        if mode is not None and not isinstance(mode, str):
+            raise CheckpointError("source manifest mode is invalid")
         if change == "delete":
             if mode is not None or digest is not None:
                 raise CheckpointError("deleted source manifest record is invalid")

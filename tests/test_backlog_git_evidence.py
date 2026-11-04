@@ -266,6 +266,40 @@ def test_collect_sources_omits_unchanged_and_future_allowed_paths(repo: Path) ->
     }
 
 
+def test_empty_allowlist_collects_a_clean_new_run_baseline(repo: Path) -> None:
+    manifest = collect_sources(str(repo), [])
+
+    assert manifest == {
+        "paths": [],
+        "count": 0,
+        "path_set_digest": EMPTY_PATH_DIGEST,
+        "change_digest": EMPTY_CHANGE_DIGEST,
+        "sources": [],
+        "parent_head": _head(repo),
+    }
+
+
+@pytest.mark.parametrize("dirty_kind", ["staged", "unstaged", "untracked"])
+def test_empty_allowlist_rejects_dirty_new_run_without_adopting_changes(
+    repo: Path, dirty_kind: str
+) -> None:
+    if dirty_kind == "untracked":
+        path = _write(repo, "new.txt", b"untracked\n")
+    else:
+        path = _write(repo, "base.txt", f"{dirty_kind}\n".encode())
+        if dirty_kind == "staged":
+            _git(repo, "add", "--", "base.txt")
+    before = _git(repo, "status", "--porcelain=v1", "-z")
+
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        collect_sources(str(repo), [])
+
+    assert _git(repo, "status", "--porcelain=v1", "-z") == before
+    assert path.read_bytes() == (
+        b"untracked\n" if dirty_kind == "untracked" else f"{dirty_kind}\n".encode()
+    )
+
+
 @pytest.mark.parametrize("ignored", [False, True], ids=["normal", "ignored"])
 def test_public_untracked_checkpoint_is_excluded_for_collect_and_bind(
     repo: Path, ignored: bool
@@ -483,6 +517,20 @@ def test_bind_commit_rejects_boolean_manifest_count(repo: Path) -> None:
     tampered["count"] = True
 
     with pytest.raises(CheckpointError, match="manifest"):
+        bind_commit(str(repo), manifest["parent_head"], tampered, commit_oid)
+
+
+@pytest.mark.parametrize(("field", "value"), [("change", []), ("mode", {})])
+def test_bind_commit_rejects_non_string_change_and_mode_as_checkpoint_error(
+    repo: Path, field: str, value: object
+) -> None:
+    _write(repo, "base.txt", b"changed\n")
+    manifest = collect_sources(str(repo), ["base.txt"])
+    commit_oid = _commit_all(repo)
+    tampered = copy.deepcopy(manifest)
+    tampered["sources"][0][field] = value
+
+    with pytest.raises(CheckpointError, match=f"source manifest {field}"):
         bind_commit(str(repo), manifest["parent_head"], tampered, commit_oid)
 
 

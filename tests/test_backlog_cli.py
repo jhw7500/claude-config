@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 REPO = Path(__file__).resolve().parents[1]
 ENTRY = REPO / "scripts/backlog-checkpoint.py"
@@ -132,3 +134,54 @@ def test_cli_requires_explicit_grouped_argv() -> None:
 
     assert result.returncode == 2
     assert result.stdout == ""
+
+
+@pytest.mark.parametrize(("field", "value"), [("change", []), ("mode", {})])
+def test_git_bind_malformed_change_or_mode_returns_bounded_json_error(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Fixture"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "fixture@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "base.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True)
+    parent = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    (repo / "base.txt").write_text("changed\n", encoding="utf-8")
+    collected = _run(
+        "git", "collect", "--root", str(repo), "--input", "-", input_value={"paths": ["base.txt"]}
+    )
+    manifest = json.loads(collected.stdout)["result"]
+    subprocess.run(["git", "add", "base.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "change"], cwd=repo, check=True)
+    commit_oid = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
+    manifest["sources"][0][field] = value
+
+    result = _run(
+        "git",
+        "bind",
+        "--root",
+        str(repo),
+        "--parent-head",
+        parent,
+        "--commit-oid",
+        commit_oid,
+        "--input",
+        "-",
+        input_value=manifest,
+    )
+
+    assert result.returncode == 1
+    error = json.loads(result.stderr)
+    assert error["ok"] is False
+    assert error["status"] == "ERROR"
+    assert field in error["error"]
+    assert "Traceback" not in result.stderr

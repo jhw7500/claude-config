@@ -13,6 +13,7 @@ Advance exactly one already-approved Issue and Task Claim to a review-ready comm
 
 - Reconfirm the live `/jhw:task` contract: exact Issue, Task, Claim, owner, physical worktree, branch, and current session identity. This skill never starts, resumes, finishes, switches, or takes over a Task.
 - Require an exact absolute cwd equal to the selected physical worktree. Verify its unique Git worktree record and freeze the parent HEAD.
+- For a new run, before creating any checkpoint or admission, call Git collect with the empty allowlist `{"paths":[]}` and no checkpoint path. Continue only when it returns a zero-source manifest whose parent HEAD is the frozen HEAD. Staged, unstaged, or untracked source state is `PAUSED`: preserve it exactly and do not reset, discard, or adopt it into the new run. This clean-start gate does not apply when resuming one exact existing run; that path uses the checkpoint, its owned expected edits, and the live-scope checks below.
 - Confirm the runtime exposes real native child dispatch/status controls and explicit installed roles. If any required capability or documented session identity is unavailable, save `PAUSED` as unsupported and stop. Do not substitute SDKs, daemons, Team, Goal, or inferred IDs.
 - Acquire one admission for the physical worktree. Existing or uncertain ownership is `PAUSED`, never a reason to delete or steal admission.
 

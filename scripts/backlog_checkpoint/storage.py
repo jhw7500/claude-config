@@ -72,8 +72,10 @@ def _open_or_create_directory(parent_fd: int, name: str) -> int:
     _require_secure_io()
     if not name or "/" in name or name in {".", ".."}:
         raise CheckpointError("unsafe directory component")
+    created = False
     try:
         os.mkdir(name, 0o700, dir_fd=parent_fd)
+        created = True
     except FileExistsError:
         pass
     except OSError as exc:
@@ -83,8 +85,14 @@ def _open_or_create_directory(parent_fd: int, name: str) -> int:
     except OSError as exc:
         raise CheckpointError("cannot open private state directory") from exc
     try:
-        os.fchmod(fd, 0o700)
+        if created:
+            os.fchmod(fd, 0o700)
         _check_owned_directory(fd, private=True)
+        os.fsync(fd)
+        os.fsync(parent_fd)
+    except OSError as exc:
+        os.close(fd)
+        raise CheckpointError("cannot durably create private state directory") from exc
     except Exception:
         os.close(fd)
         raise

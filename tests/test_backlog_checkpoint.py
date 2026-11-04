@@ -3,6 +3,7 @@ import json
 import multiprocessing
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -428,16 +429,187 @@ def test_write_evidence_is_content_addressed_immutable_and_private(
     assert evidence_stat.st_uid == os.getuid()
 
 
+def test_fresh_evidence_hierarchy_syncs_child_metadata_before_parent_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    real_fsync = os.fsync
+
+    def record_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            events.append(f"fsync:{Path(os.readlink(f'/proc/self/fd/{fd}')).name}")
+        real_fsync(fd)
+
+    monkeypatch.setattr(storage.os, "fsync", record_fsync)
+
+    write_evidence(tmp_path, RUN_ID, {"kind": "ordered"})
+
+    assert events[:6] == [
+        "fsync:backlog-drain",
+        f"fsync:{tmp_path.name}",
+        f"fsync:{RUN_ID}",
+        "fsync:backlog-drain",
+        "fsync:evidence",
+        f"fsync:{RUN_ID}",
+    ]
+
+
+def test_fresh_evidence_hierarchy_parent_sync_failure_prevents_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_fsync = os.fsync
+
+    def fail_root_link_sync(fd: int) -> None:
+        target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and target == tmp_path:
+            raise OSError("simulated new hierarchy parent sync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(storage.os, "fsync", fail_root_link_sync)
+
+    with pytest.raises(CheckpointError, match="directory"):
+        write_evidence(tmp_path, RUN_ID, {"kind": "not-published"})
+
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_existing_directory_reopen_completes_barrier_after_parent_sync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root_fd = storage._open_directory(tmp_path, private=True)
+    real_fsync = os.fsync
+
+    def fail_parent_sync(fd: int) -> None:
+        target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if target == tmp_path:
+            raise OSError("simulated creator parent sync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(storage.os, "fsync", fail_parent_sync)
+    try:
+        with pytest.raises(CheckpointError, match="directory"):
+            storage._open_or_create_directory(root_fd, "backlog-drain")
+        assert (tmp_path / "backlog-drain").is_dir()
+
+        events: list[str] = []
+
+        def record_reopen_barrier(fd: int) -> None:
+            events.append(Path(os.readlink(f"/proc/self/fd/{fd}")).name)
+            real_fsync(fd)
+
+        monkeypatch.setattr(storage.os, "fsync", record_reopen_barrier)
+        reopened_fd = storage._open_or_create_directory(root_fd, "backlog-drain")
+        os.close(reopened_fd)
+
+        assert events == ["backlog-drain", tmp_path.name]
+    finally:
+        os.close(root_fd)
+
+
+def test_concurrent_existing_directory_open_completes_its_own_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root_fd = storage._open_directory(tmp_path, private=True)
+    creator_at_parent = threading.Event()
+    release_creator = threading.Event()
+    creator_errors: list[BaseException] = []
+    events: list[tuple[str, str]] = []
+    real_fsync = os.fsync
+
+    def coordinate_fsync(fd: int) -> None:
+        target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        thread_name = threading.current_thread().name
+        events.append((thread_name, target.name))
+        if thread_name == "directory-creator" and target == tmp_path:
+            creator_at_parent.set()
+            if not release_creator.wait(5):
+                raise OSError("fixture timed out waiting to release creator")
+        real_fsync(fd)
+
+    def create_directory() -> None:
+        try:
+            created_fd = storage._open_or_create_directory(root_fd, "backlog-drain")
+            os.close(created_fd)
+        except BaseException as exc:
+            creator_errors.append(exc)
+
+    monkeypatch.setattr(storage.os, "fsync", coordinate_fsync)
+    creator = threading.Thread(target=create_directory, name="directory-creator")
+    creator.start()
+    try:
+        assert creator_at_parent.wait(5)
+        reopened_fd = storage._open_or_create_directory(root_fd, "backlog-drain")
+        os.close(reopened_fd)
+
+        assert ("MainThread", "backlog-drain") in events
+        assert ("MainThread", tmp_path.name) in events
+    finally:
+        release_creator.set()
+        creator.join(5)
+        os.close(root_fd)
+
+    assert not creator.is_alive()
+    assert creator_errors == []
+
+
+def test_representative_evidence_and_snapshot_round_trip_stay_within_budgets(
+    tmp_path: Path,
+) -> None:
+    sources = [
+        {
+            "change": "modify",
+            "mode": "100644",
+            "path": f"src/file-{index:04d}.py",
+            "sha256": f"{index:064x}",
+        }
+        for index in range(1000)
+    ]
+    tests = [
+        {"argv": ["pytest", f"tests/test_{index:03d}.py"], "exit": 0}
+        for index in range(200)
+    ]
+    reviews = [
+        {"reviewer": f"reviewer-{index:03d}", "verdict": "PASS"}
+        for index in range(100)
+    ]
+    evidence = {"sources": sources, "tests": tests, "reviews": reviews}
+
+    reference = write_evidence(tmp_path, RUN_ID, evidence)
+    assert len(sources) == 1000
+    assert len(tests) == 200
+    assert len(reviews) == 100
+    assert reference["size"] <= 1024 * 1024
+    assert read_evidence(tmp_path, RUN_ID, reference) == evidence
+
+    snapshot = valid_snapshot()
+    snapshot["git"]["source_count"] = 1000
+    snapshot["evidence"] = reference
+    checkpoint = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
+    stored = write_snapshot(checkpoint, snapshot, expected_generation=None)
+    encoded = checkpoint.read_bytes()
+
+    assert len(encoded) <= 12 * 1024
+    assert len(encoded.splitlines()) <= 15
+    assert read_snapshot(checkpoint) == stored
+
+
 def test_evidence_directory_fsync_failure_after_publish_is_indeterminate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    write_evidence(tmp_path, RUN_ID, {"kind": "hierarchy-seed"})
     value = {"kind": "review"}
     data = b'{"kind":"review"}'
     digest = hashlib.sha256(data).hexdigest()
     real_fsync = os.fsync
+    evidence_file_synced = False
 
     def fail_directory_fsync(fd: int) -> None:
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
+        nonlocal evidence_file_synced
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            real_fsync(fd)
+            evidence_file_synced = True
+            return
+        if evidence_file_synced:
             raise OSError("simulated directory fsync failure")
         real_fsync(fd)
 
@@ -459,6 +631,7 @@ def test_evidence_directory_fsync_failure_after_publish_is_indeterminate(
 def test_evidence_collision_fsync_failure_is_indeterminate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    write_evidence(tmp_path, RUN_ID, {"kind": "hierarchy-seed"})
     value = {"kind": "collision"}
     data = b'{"kind":"collision"}'
     digest = hashlib.sha256(data).hexdigest()
@@ -475,7 +648,9 @@ def test_evidence_collision_fsync_failure_is_indeterminate(
                 os.link(temporary, published)
                 collision_created = True
             return
-        raise OSError("simulated collision directory fsync failure")
+        if collision_created:
+            raise OSError("simulated collision directory fsync failure")
+        real_fsync(fd)
 
     monkeypatch.setattr(storage.os, "fsync", collide_then_fail_directory_fsync)
 
@@ -605,6 +780,8 @@ def test_read_evidence_rejects_symlink_and_digest_mismatch(tmp_path: Path) -> No
     run_root = tmp_path / "backlog-drain" / RUN_ID
     evidence_dir = run_root / "evidence"
     evidence_dir.mkdir(parents=True, mode=0o700)
+    for directory in (tmp_path / "backlog-drain", run_root, evidence_dir):
+        directory.chmod(0o700)
     outside_data = b'{"ok":true}'
     digest = hashlib.sha256(outside_data).hexdigest()
     outside = tmp_path / "outside.json"

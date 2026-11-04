@@ -201,6 +201,60 @@ def test_acquire_is_exclusive_and_creates_private_regular_state(admission_fixtur
         acquire_admission(state_root, worktree, record)
 
 
+def test_fresh_admission_hierarchy_syncs_child_metadata_before_parent_links(
+    admission_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root, worktree, record = admission_fixture
+    events: list[str] = []
+    real_fsync = os.fsync
+
+    def record_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            events.append(f"fsync:{Path(os.readlink(f'/proc/self/fd/{fd}')).name}")
+        real_fsync(fd)
+
+    monkeypatch.setattr(admission.os, "fsync", record_fsync)
+
+    acquire_admission(state_root, worktree, record)
+
+    assert events[:8] == [
+        "fsync:backlog-drain",
+        f"fsync:{state_root.name}",
+        "fsync:admissions",
+        "fsync:backlog-drain",
+        "fsync:admission-archive",
+        "fsync:backlog-drain",
+        "fsync:admission-snapshots",
+        "fsync:backlog-drain",
+    ]
+
+
+def test_fresh_admission_hierarchy_parent_sync_failure_prevents_active_record(
+    admission_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root, worktree, record = admission_fixture
+    backlog = state_root / "backlog-drain"
+    admissions = backlog / "admissions"
+    real_fsync = os.fsync
+    admissions_synced = False
+
+    def fail_backlog_link_sync(fd: int) -> None:
+        nonlocal admissions_synced
+        target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if target == admissions:
+            admissions_synced = True
+        if admissions_synced and target == backlog:
+            raise OSError("simulated admission hierarchy parent sync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(admission.os, "fsync", fail_backlog_link_sync)
+
+    with pytest.raises(CheckpointError, match="directory"):
+        acquire_admission(state_root, worktree, record)
+
+    assert not _active_path(state_root, worktree).exists()
+
+
 def test_acquire_rejects_worktree_alias_without_canonicalizing_scope(admission_fixture) -> None:
     state_root, worktree, record = admission_fixture
     alias = worktree.parent / "alias"
@@ -464,6 +518,7 @@ def test_reconcile_post_publish_fsync_is_indeterminate_without_rollback(
         reconcile_admission(state_root, worktree, record, successor, proof)
 
     assert _active_path(state_root, worktree).read_bytes() == canonical_bytes(successor)
+    monkeypatch.setattr(admission.os, "fsync", real_fsync)
     with pytest.raises(CheckpointError, match="stale"):
         reconcile_admission(state_root, worktree, record, successor, proof)
 
@@ -547,4 +602,3 @@ def test_reconcile_crash_keeps_old_or_successor_active(
     assert active_record["run_id"] == expected_run
     with pytest.raises(CheckpointError, match="PAUSED|stale"):
         reconcile_admission(state_root, worktree, record, successor, proof)
-

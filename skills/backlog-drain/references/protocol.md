@@ -90,6 +90,12 @@ Input has exactly the prior admission record, the new admission record, and this
 
 Git collect input is `{"paths":["repo/relative/path"]}`. Git bind input is the exact collected manifest. When the run checkpoint exists, both commands receive the same exact absolute `--checkpoint-path`. Only a current-UID, mode-0600, root-level regular file named `HANDOFF.backlog-<decoded-run-id>.md`, bound to that exact worktree and still untracked, is excluded. Other HANDOFF files, tracked artifacts, foreign paths, symlinks, or dirty paths remain errors.
 
+### New-run clean baseline
+
+After `git inspect` freezes the exact worktree and HEAD, but before creating a new checkpoint or acquiring admission, run `git collect --root ABS_ROOT --input FILE|-` with exactly `{"paths":[]}` and without `--checkpoint-path`. A successful result must have the frozen `parent_head`, `count:0`, `paths:[]`, and `sources:[]`; preserve that manifest as the clean baseline. Any staged, unstaged, or untracked source state makes empty-allowlist collection fail. Record `PAUSED`, leave every byte and index entry untouched, and do not reset, clean, discard, stash, or adopt those changes into the new run.
+
+This gate applies only when no exact run exists yet. To resume one exact existing run, read its named checkpoint, revalidate live Task/Claim/session/worktree scope, and collect only that run's owned expected edits while passing its exact checkpoint path. Do not require an existing run with preserved expected edits to become globally clean, and do not use new-run bootstrap to bypass the fault-recovery or admission-reconciliation rules below.
+
 For `git inspect`, `--record-root` is the exact physical path expected in `git worktree list --porcelain -z`. The result's `worktree_ref` is the symbolic Git branch ref such as `refs/heads/task/31`; neither value is the launcher's opaque `wt-*` worktree identifier. Compare the live launcher mapping separately. This helper validates Git consistency only and grants no Registry or Task authority.
 
 `queue plan --repo` runs the read-only official GitHub GET/pagination collector; optional explicit-edge input is a JSON array of exact `[blocker_url, dependent_url]` pairs. `queue plan --input` takes exactly `issues` and `dependencies` and calls the deterministic pure planner. Publish an ordered queue only when result `status` is `COMPLETE`. `CLOSED_SATISFIED` is informational and does not block its Issue. An `INCOMPLETE` result is never reconstructed into a ready order.
