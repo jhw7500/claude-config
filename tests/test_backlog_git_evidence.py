@@ -266,19 +266,22 @@ def test_collect_sources_omits_unchanged_and_future_allowed_paths(repo: Path) ->
     }
 
 
-def test_exact_untracked_checkpoint_is_excluded_for_collect_and_bind(
-    repo: Path,
+@pytest.mark.parametrize("ignored", [False, True], ids=["normal", "ignored"])
+def test_public_untracked_checkpoint_is_excluded_for_collect_and_bind(
+    repo: Path, ignored: bool
 ) -> None:
     run_id = "0123456789abcdef0123456789abcdef"
+    if ignored:
+        _write(repo, ".gitignore", b"/HANDOFF.*.md\n")
+        _commit_all(repo, "ignore runtime checkpoint")
     checkpoint = _checkpoint(repo, run_id)
     _write(repo, "base.txt", b"reviewed\n")
 
     status = set(_git(repo, "status", "--porcelain=v1", "-z").split(b"\0"))
-    assert status == {
-        b"",
-        b" M base.txt",
-        f"?? {checkpoint.name}".encode("ascii"),
-    }
+    expected_status = {b"", b" M base.txt"}
+    if not ignored:
+        expected_status.add(f"?? {checkpoint.name}".encode("ascii"))
+    assert status == expected_status
 
     manifest = collect_sources(str(repo), ["base.txt"], str(checkpoint))
     _git(repo, "add", "--", "base.txt")
@@ -294,7 +297,18 @@ def test_exact_untracked_checkpoint_is_excluded_for_collect_and_bind(
     assert checkpoint.exists()
 
 
-@pytest.mark.parametrize("kind", ["foreign", "extra", "tracked", "symlink", "mode"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "foreign",
+        "extra",
+        "staged",
+        "tracked",
+        "staged_deleted_recreated",
+        "symlink",
+        "mode",
+    ],
+)
 def test_checkpoint_exclusion_rejects_nonexact_runtime_artifact(
     repo: Path, tmp_path: Path, kind: str
 ) -> None:
@@ -306,9 +320,13 @@ def test_checkpoint_exclusion_rejects_nonexact_runtime_artifact(
         checkpoint.chmod(0o600)
     elif kind == "extra":
         _write(repo, "HANDOFF.backlog-fedcba9876543210fedcba9876543210.md", b"extra\n")
-    elif kind == "tracked":
+    elif kind in {"staged", "tracked", "staged_deleted_recreated"}:
         _git(repo, "add", "--", checkpoint.name)
-        _git(repo, "commit", "-m", "tracked checkpoint")
+        if kind != "staged":
+            _git(repo, "commit", "-m", "tracked checkpoint")
+            if kind == "staged_deleted_recreated":
+                _git(repo, "rm", "-f", "--", checkpoint.name)
+                checkpoint = _checkpoint(repo, run_id)
     elif kind == "symlink":
         checkpoint.unlink()
         checkpoint.symlink_to(repo / "base.txt")

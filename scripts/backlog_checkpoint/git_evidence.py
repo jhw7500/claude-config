@@ -338,9 +338,8 @@ def _checkpoint_artifact(
     raw_name = name.encode("utf-8")
     if _git(root, "ls-files", "--stage", "--", name):
         raise CheckpointError("checkpoint artifact must never be tracked")
-    status = _status_entries(_status(root)).get(raw_name)
-    if status != b"??":
-        raise CheckpointError("checkpoint artifact must be exactly untracked")
+    if _git(root, "ls-tree", "-z", "--full-tree", "HEAD", "--", name):
+        raise CheckpointError("checkpoint artifact must never exist in HEAD")
     return raw_name, (after, sha256_bytes(bytes(data)))
 
 
