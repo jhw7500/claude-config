@@ -74,6 +74,8 @@ supervisor/owner changed -> PAUSED (existing Task recovery contract)
 - commit 후 checkpoint 전 중단에서는 저장한 parent의 직계 자식 중 현재 HEAD와 일치하는 commit 하나만 위 조건으로 채택한다. 후보가 없거나 여럿이거나 중간 commit이 있으면 PAUSED이고 재커밋하지 않는다. 기존 증거가 post-commit binding을 통과한 뒤에만 READY_FOR_TRIBUNAL로 간다.
 - READY_FOR_TRIBUNAL에서 코드 변경과 자식 실행을 끝낸다. Task Claim은 유지하며 completed/finish/handoff를 자동 호출하지 않는다. 사용자에게 커밋·검증·현재 Claim·다음 구체 액션을 보고한다. 장기 중단·이슈 전환에는 기존 Task handoff 절차를 사용자 요청에 따라 적용한다. Tribunal·PR·머지는 각각 현재 허용 범위의 별도 요청으로만 실행한다. [R1][R2]
 
+터미널 해제의 현재 child slot은 READY phase와 attempt가 같아야 한다. 이 단계에 실제 자식이 없으면 이전 phase의 모든 자식·도구·writer 종료를 관측한 뒤 child_id=null, 현재 phase/attempt, quiescent로 기록한다. 과거 실제 child ID의 phase를 바꿔 꾸미지 않고 그 영수증은 immutable evidence에 보존한다. PAUSED 상태의 admission은 정상 해제하지 않는다. Task Claim 해제와는 별개다.
+
 ## 스냅샷 형식과 저장
 
 스냅샷은 repo root의 HANDOFF.backlog-<run-id>.md 한 파일이다. run-id는 충돌 방지용 난수이며 identity나 권한의 근거가 아니다. 하나의 엄격한 JSON 레코드를 한 줄로 담아 전체 15줄 이내를 유지한다. 감독만 이 파일을 갱신하며 .ai/handoff.md와 Registry를 직접 수정하지 않는다. 일반 /resume의 자유 형식 문서를 바꾸지 않고 backlog-drain의 명시 경로 재개만 지원한다. [R4][R8]

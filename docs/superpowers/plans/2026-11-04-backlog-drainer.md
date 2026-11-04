@@ -44,11 +44,11 @@
 **Interfaces:** consume Task 1 codec/private filesystem primitives. acquire_admission(state_root,worktree_root,record)->dict; release_admission(state_root,worktree_root,expected_record)->None; reconcile_admission(state_root,worktree_root,expected_record,successor_record,proof)->dict.
 **Contracts:** record는 run/root-key/checkpoint/owner observations만 담는다. proof는 승인된 외부 lifecycle 결과의 관측 입력이고 권한을 부여하지 않는다. 같은 root lock에서 old active 유지, exact archive copy/fsync, successor snapshot/temp fsync, CAS + active atomic replace. 처음만 O_EXCL 생성한다.
 
-- [ ] Step 1: duplicate run/alias, wrong expected bytes, missing proof, foreign owner와 archive/publish 전후 실제 fixture subprocess 중단 회귀를 작성한다.
-- [ ] Step 2: pytest -q tests/test_backlog_admission.py RED.
-- [ ] Step 3: 최소 구현한다. production test-only crash hook 없이 테스트 harness에서 실제 syscall 경계를 제어한다.
-- [ ] Step 4: Tasks 1/2 표적 GREEN과 정적 검사.
-- [ ] Step 5: 독립 task review 후 parent commit/ledger.
+- [x] Step 1: duplicate run/alias, wrong expected bytes, missing proof, foreign owner와 archive/publish 전후 실제 fixture subprocess 중단 회귀를 작성한다.
+- [x] Step 2: pytest -q tests/test_backlog_admission.py RED.
+- [x] Step 3: 최소 구현한다. production test-only crash hook 없이 테스트 harness에서 실제 syscall 경계를 제어한다.
+- [x] Step 4: Tasks 1/2 표적 GREEN과 정적 검사.
+- [x] Step 5: 독립 task review 후 parent commit/ledger.
 
 ### Task 3: Git 격리·source manifest·post-commit binding
 
