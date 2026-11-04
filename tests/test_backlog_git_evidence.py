@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -15,6 +14,7 @@ from scripts.backlog_checkpoint.git_evidence import (
     collect_sources,
     inspect_worktree,
 )
+from scripts.backlog_checkpoint.storage import write_snapshot
 
 
 EMPTY_PATH_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -109,13 +109,7 @@ def _checkpoint(root: Path, run_id: str) -> Path:
         },
         "evidence": {"ref": f"evidence/{'0' * 64}.json", "sha256": "0" * 64, "size": 0},
     }
-    record = json.dumps(
-        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    path.write_text(
-        f"# Backlog checkpoint schema 1\n```json\n{record}\n```\n", encoding="utf-8"
-    )
-    path.chmod(0o600)
+    write_snapshot(path, snapshot, expected_generation=None)
     return path
 
 
@@ -278,6 +272,13 @@ def test_exact_untracked_checkpoint_is_excluded_for_collect_and_bind(
     run_id = "0123456789abcdef0123456789abcdef"
     checkpoint = _checkpoint(repo, run_id)
     _write(repo, "base.txt", b"reviewed\n")
+
+    status = set(_git(repo, "status", "--porcelain=v1", "-z").split(b"\0"))
+    assert status == {
+        b"",
+        b" M base.txt",
+        f"?? {checkpoint.name}".encode("ascii"),
+    }
 
     manifest = collect_sources(str(repo), ["base.txt"], str(checkpoint))
     _git(repo, "add", "--", "base.txt")

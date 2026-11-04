@@ -215,6 +215,18 @@ def _open_lock(directory_fd: int, name: str) -> int:
     return fd
 
 
+def _lock_directory(directory_fd: int) -> int:
+    lock_fd = -1
+    try:
+        lock_fd = os.dup(directory_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        raise CheckpointError("cannot lock snapshot directory") from exc
+    return lock_fd
+
+
 def read_snapshot(path: str | os.PathLike[str]) -> dict:
     _require_secure_io()
     snapshot_path = Path(path)
@@ -235,7 +247,7 @@ def write_snapshot(
     directory_fd = _open_directory(snapshot_path.parent, private=False)
     lock_fd = -1
     try:
-        lock_fd = _open_lock(directory_fd, f".{snapshot_path.name}.lock")
+        lock_fd = _lock_directory(directory_fd)
         current_bytes = _existing_file_bytes(directory_fd, snapshot_path.name, 12 * 1024)
         stored = dict(snapshot)
         if current_bytes is None:

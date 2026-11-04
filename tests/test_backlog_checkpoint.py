@@ -1,5 +1,6 @@
 import hashlib
 import json
+import multiprocessing
 import os
 import stat
 from pathlib import Path
@@ -87,6 +88,16 @@ def replace(snapshot: dict, dotted_key: str, value: object) -> dict:
         target = target[part]
     target[parts[-1]] = value
     return copied
+
+
+def _race_snapshot_write(path: str, snapshot: dict, start, results) -> None:
+    start.wait()
+    try:
+        stored = write_snapshot(path, snapshot, expected_generation=0)
+    except CheckpointError as exc:
+        results.put(("error", str(exc)))
+    else:
+        results.put(("stored", stored["generation"]))
 
 
 def nested_list(depth: int) -> list:
@@ -255,6 +266,59 @@ def test_write_snapshot_updates_by_exact_generation_and_rejects_stale_cas(
     with pytest.raises(CheckpointError):
         write_snapshot(path, valid_snapshot(), expected_generation=0)
     assert read_snapshot(path) == updated
+
+
+def test_concurrent_snapshot_writers_serialize_one_cas_winner(tmp_path: Path) -> None:
+    path = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
+    write_snapshot(path, valid_snapshot(), expected_generation=None)
+    candidate = replace(valid_snapshot(), "phase", "INDEPENDENT_REVIEW")
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_race_snapshot_write,
+            args=(str(path), candidate, start, results),
+        )
+        for _ in range(2)
+    ]
+
+    try:
+        for process in processes:
+            process.start()
+        start.set()
+        for process in processes:
+            process.join(5)
+
+        assert [process.exitcode for process in processes] == [0, 0]
+        assert sorted(results.get(timeout=1) for _ in processes) == [
+            ("error", "stale snapshot generation"),
+            ("stored", 1),
+        ]
+        assert read_snapshot(path)["generation"] == 1
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(1)
+        results.close()
+
+
+def test_directory_lock_failure_is_bounded_before_snapshot_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
+
+    def fail_lock(_fd: int, operation: int) -> None:
+        if operation == storage.fcntl.LOCK_EX:
+            raise OSError("directory flock unsupported")
+
+    monkeypatch.setattr(storage.fcntl, "flock", fail_lock)
+
+    with pytest.raises(CheckpointError, match="lock"):
+        write_snapshot(path, valid_snapshot(), expected_generation=None)
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_partial_snapshot_write_preserves_the_previous_file(

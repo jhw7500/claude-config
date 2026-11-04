@@ -22,6 +22,7 @@ from .codec import (
 from .storage import (
     _check_owned_file,
     _existing_file_bytes,
+    _lock_directory,
     _open_directory,
     _open_lock,
     _open_or_create_directory,
@@ -149,7 +150,7 @@ def _locked_checkpoint(record: dict) -> Iterator[tuple[bytes, dict]]:
     directory_fd = _open_directory(path.parent, private=False)
     lock_fd = -1
     try:
-        lock_fd = _open_lock(directory_fd, f".{path.name}.lock")
+        lock_fd = _lock_directory(directory_fd)
         data = _read_file_at(directory_fd, path.name, MAX_SNAPSHOT_BYTES)
         snapshot = decode_snapshot(data)
         _validate_snapshot_binding(snapshot, record)

@@ -88,8 +88,10 @@
 
 ### Task 6: native 중단 증거와 최종 검증
 
-**Files:** docs/validation/2026-11-04-backlog-drainer.md; 필요 시 새 회귀 보완. raw native receipts는 이 계획의 ignored workspace에 보존한다.
+**Files:** docs/validation/2026-11-04-backlog-drainer.md; integration repair in scripts/backlog_checkpoint/storage.py, admission.py, tests/test_backlog_checkpoint.py, tests/test_backlog_git_evidence.py and directly related regression tests as required. raw native receipts는 이 계획의 ignored workspace에 보존한다.
 **Contracts:** 현재 Claim의 실제 root 안의 격리 fixture를 사용한다. native proof 때문에 새 Task/Claim을 만들지 않는다. synthetic status와 실제 lifecycle receipt를 구분한다. 실제 scope/Claim 확인은 parent가 기존 launcher 계약으로 수행한다.
+
+- [x] Step 0: 실제 snapshot write 뒤 private sidecar lock이 unknown Git source로 나타나는 통합 단절을 RED로 재현하고, snapshot parent-directory FD flock을 공유하여 추가 소스 산출물 없이 CAS·admission 조정을 유지한다. 표적 검사·독립 통합 리뷰·parent commit 후 native 실험을 시작한다.
 
 - [ ] Step 1: Codex pre/post-edit barrier의 running child를 실제 interrupt, interrupted/quiescent/도구종료 각각 확인. replacement는 새 ID/fork_turns=none, old transcript 없이 snapshot/Git/다음 단계만 받는다.
 - [ ] Step 2: 실제 설치 Claude stop/terminal/non-fork capability를 확인한다. 지원 시 같은 실험, 아니면 구체 근거와 unsupported를 기록한다. SDK 이벤트가 TUI에도 있다고 추정하지 않는다.
