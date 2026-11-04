@@ -56,11 +56,11 @@
 **Interfaces:** consume codec. inspect_worktree(root,expected_branch,expected_worktree_ref)->dict; collect_sources(root,allowed_paths)->dict(paths,count,path_set_digest,change_digest,sources,parent_head); bind_commit(root,parent_head,manifest,commit_oid)->dict.
 **Contracts:** porcelain -z를 bytes로 파싱, exact root/realpath/branch와 canonical worktree record 하나 확인, alias/child cwd 이탈 거부. source explicit allowlist, mode/내용/삭제/untracked 포함, rename delete+add. helper는 git add/commit/reset/rebase를 실행하지 않는다.
 
-- [ ] Step 1: 실제 tmp Git repos에서 modify/add/delete/rename/mode, unknown path, alias, exact single-parent commit, hook 변경, 추가 commit/multiple candidate 회귀를 작성한다.
-- [ ] Step 2: pytest -q tests/test_backlog_git_evidence.py RED.
-- [ ] Step 3: read-only Git 인터페이스와 exact manifest commit binding을 구현한다. 임의 dirty 파일을 숨기지 않는다.
-- [ ] Step 4: 표적 GREEN/정적 검사.
-- [ ] Step 5: 독립 task review 후 parent commit/ledger.
+- [x] Step 1: 실제 tmp Git repos에서 modify/add/delete/rename/mode, unknown path, alias, exact single-parent commit, hook 변경, 추가 commit/multiple candidate 회귀를 작성한다.
+- [x] Step 2: pytest -q tests/test_backlog_git_evidence.py RED.
+- [x] Step 3: read-only Git 인터페이스와 exact manifest commit binding을 구현한다. 임의 dirty 파일을 숨기지 않는다.
+- [x] Step 4: 표적 GREEN/정적 검사.
+- [x] Step 5: 독립 task review 후 parent commit/ledger.
 
 ### Task 4: 완전 조회 기반 읽기 전용 dependency queue
 
