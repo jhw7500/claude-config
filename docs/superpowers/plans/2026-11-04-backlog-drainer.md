@@ -68,11 +68,11 @@
 **Interfaces:** rank_issues(issues,dependencies)->dict(status,queue,blocked,reasons); collect_queue(repo,explicit_edges=(),runner=subprocess.run)->dict.
 **Contracts:** exact Issue URL/state/B->I edge. 공식 blocked_by + Link pagination, gh list argv/shell=False. 열린 Issue1000/관계10000 상한. incomplete/error는 queue 없이 INCOMPLETE. closed satisfied, external-open downstream blocked, Kahn+number tie, SCC cycle/downstream 구분.
 
-- [ ] Step 1: spec 고정 fixture [1,2,3,4,8], cycle {5,6}, downstream {7}; multi-page/closed/external/failure/cap을 literal 응답과 실제 fake gh executable로 검증한다.
-- [ ] Step 2: pytest -q tests/test_backlog_queue.py RED.
-- [ ] Step 3: bounded read adapter와 deterministic rank를 구현한다. 제목 유사도는 dependency가 아니다.
-- [ ] Step 4: 표적 GREEN/정적 검사.
-- [ ] Step 5: 독립 task review 후 parent commit/ledger.
+- [x] Step 1: spec 고정 fixture [1,2,3,4,8], cycle {5,6}, downstream {7}; multi-page/closed/external/failure/cap을 literal 응답과 실제 fake gh executable로 검증한다.
+- [x] Step 2: pytest -q tests/test_backlog_queue.py RED.
+- [x] Step 3: bounded read adapter와 deterministic rank를 구현한다. 제목 유사도는 dependency가 아니다.
+- [x] Step 4: 표적 GREEN/정적 검사.
+- [x] Step 5: 독립 task review 후 parent commit/ledger.
 
 ### Task 5: 명시 CLI·공통 SKILL·임시 HOME 설치
 
