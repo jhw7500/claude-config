@@ -235,7 +235,7 @@ if write_private(f, text) == "unchanged":
 PY
 echo "[install] 전역지침 머지 — notion: $NOTION, rtk: $RTK (OMC 블록 미변경)"
 
-# 5) 훅 배선 (settings.json) — timestamp-hook + stop-text-required. 멱등·가산·백업.
+# 5) 훅 배선 — stop-text-required가 빈 보고·영어 본문을 함께 검사한다. 멱등·가산·백업.
 #    statusLine(context-bar) 교체와 CLAUDE.md 머지는 별도 검토 대상이라 여기서 다루지 않음.
 SETTINGS="$HOME/.claude/settings.json"
 python3 - "$SETTINGS" "$NOTION" "$REPO_DIR/scripts/lib" <<'PY'
@@ -294,7 +294,7 @@ def ensure(event, command, matcher=None):
 S = "$HOME/.claude/scripts"
 H = "$HOME/.claude/hooks"
 ts = "python3 %s/timestamp-hook.py" % S
-st = "python3 %s/stop-text-required.py" % S
+st = "python3 %s/stop-text-required.py" % S  # 두 검사를 같은 링크·Stop 명령으로 배포
 gc = "python3 %s/general-continuation-hook.py" % H
 bt = "python3 %s/bg-task-progress-hook.py" % H
 pi = "python3 %s/post-info-tool-continuation-hook.py" % H

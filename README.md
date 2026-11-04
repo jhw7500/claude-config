@@ -31,9 +31,22 @@ source ~/.bashrc
   nudge·pre-PR tribunal 배포는 변경하지 않습니다.
 - **CLAUDE.md 전역지침 (env-aware)**: `~/.claude/CLAUDE.md`의 `claude-config:START/END` 블록만 관리 — 항상 `@global-guidance.md`, **notion MCP 있으면** `@CLAUDE-notion.md`, **`rtk` 있으면** `@RTK.md`를 자동 추가. **OMC 블록은 미변경**(inline/file-split 무관), 실행 전 `.bak` 백업
 - **훅 자동 배선**: `settings.json`에 멱등 추가 — `.bak` 백업, `statusLine`·기존 훅 보존
-  - **항상**: `timestamp`(프롬프트/완료) · `stop-text-required`(조기종료 방지) · `general-continuation` · `bg-task-progress`(Pre/Post/SubagentStop, `Agent|Bash`) · `post-info-tool-continuation`
+  - **항상**: `timestamp`(프롬프트/완료) · `stop-text-required`(조기종료 방지·한국어 최종 답변 검사) · `general-continuation` · `bg-task-progress`(Pre/Post/SubagentStop, `Agent|Bash`) · `post-info-tool-continuation`
   - **notion 환경**: `notion-continuous-exec` · `post-action-tool-report`
   - `carl-hook`은 파일만 동기화하고 자동 배선하지 않음(APEX/CARL 사용 시 수동 배선)
+- **한국어 최종 답변 검사 (Claude Code Stop)**: 기존 `stop-text-required.py`의 같은 링크·Stop 명령으로 배포됩니다.
+  코드 블록·인라인 코드·URL·경로와 명확한 `snake_case`·`camelCase`·여러 단어의 kebab 식별자,
+  CLI 옵션을 제외한 한글·영문 글자가 80자 이상이고 한글 비율이 10% 미만이면 exit 2로
+  한국어 재작성을 요청합니다. 평문 명령은 알려진 실행 파일로 시작하고 옵션·경로 등 명령
+  구문이 있는 줄만 제외합니다. 목록 안의 들여쓴 설명은 본문에 포함합니다.
+  짧은 답변·코드뿐인 답변은 언어 검사에서 통과하고, 빈 결과 보고는 기존 검사가 담당합니다.
+  공식 `last_assistant_message`가 있으면 이를 사용하며, 없는 파일 기반 입력은 최대
+  8회·0.1초 간격으로 다시 읽습니다. `stop_hook_active=true`에서는 다시 차단하지 않으며
+  SubagentStop·Codex에는 언어 검사를 적용하지 않습니다.
+  재읽기 중 확인한 최종 답변 판정은 이후 일시적인 읽기 실패에도 유지합니다.
+  종료 면제는 `이제 종료`·`exit`·`quit` 같은 짧은 전체 발화에만 적용하므로,
+  `끝까지 작업해줘`·`exit code를 확인해줘` 같은 일반 요청은 검사를 우회하지 않습니다.
+  - 영어 답변이 필요한 세션은 `CLAUDE_STOP_KOREAN=0 claude`로 시작합니다. 이 환경변수는 한국어 검사만 끄며 기존 빈 결과 보고 검사는 유지합니다. 기본 임계값은 오탐을 줄이도록 보수적으로 정했습니다. 새 호스트는 `./install.sh`로 설치하고, 기존 링크가 다른 runtime checkout을 가리키는 호스트는 해당 checkout을 갱신해야 반영됩니다.
 - **Task nudge (Claude/Codex)**: `task_nudge.py`와 Claude/Codex adapter는 심볼릭 링크가 아닌 owner-only 중립 사본으로 설치된다. source update 뒤에는 `./install.sh`를 다시 실행한다. Claude `settings.json`과 Codex `~/.codex/hooks.json`은 기존 항목을 보존하는 additive merge이며, 활성 전역 AGENTS의 `claude-config:task-nudge:START/END` marker 밖 내용도 보존한다.
   - 설치기는 portfolio 조회나 자격증명 접근을 실행하지 않는다. 새 설치 또는 파일 hash가 바뀐 뒤에는 Codex에서 `/hooks`를 열어 변경 hash를 직접 검토한 뒤 trust한다; installer는 trust를 자동 승인하지 않는다.
 - **Change Evidence 안내 (Claude/Codex)**: 커밋 생성 또는 PR 본문 생성·갱신을 준비할 때만 [Contract v1 정본](https://github.com/jhw7500/automation/blob/0d97a63891ba4473a3a189eae643f8059b76eb56/docs/change-evidence-contract-v1.md)과 JHW 작성 스킬을 참조한다. Claude는 `global-guidance.md`, Codex는 별도 `claude-config:change-evidence:START/END` AGENTS 블록으로 같은 조건을 받는다. 이 안내 자체는 새 훅이 아니며 task-nudge의 Task 선택이나 pre-PR Tribunal의 PR 생성 게이트를 변경하지 않는다. 커밋 형식 위반은 별도의 커밋 시점 게이트 훅(`scripts/install-commit-gate.py`가 `~/.local/share/claude-config/commit_gate/`에 설치)이 막는다.
