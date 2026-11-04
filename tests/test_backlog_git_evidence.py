@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -8,7 +9,7 @@ import subprocess
 import pytest
 
 import scripts.backlog_checkpoint.git_evidence as git_evidence
-from scripts.backlog_checkpoint.codec import CheckpointError
+from scripts.backlog_checkpoint.codec import CheckpointError, decode_snapshot
 from scripts.backlog_checkpoint.git_evidence import (
     bind_commit,
     collect_sources,
@@ -64,6 +65,58 @@ def _commit_all(root: Path, message: str = "change") -> str:
     _git(root, "add", "-A")
     _git(root, "commit", "-m", message)
     return _head(root)
+
+
+def _checkpoint(root: Path, run_id: str) -> Path:
+    path = root / f"HANDOFF.backlog-{run_id}.md"
+    snapshot = {
+        "schema": 1,
+        "run_id": run_id,
+        "generation": 0,
+        "phase": "IMPLEMENT",
+        "phase_status": "started",
+        "attempt": 0,
+        "next_action": "INDEPENDENT_REVIEW",
+        "blockers": [],
+        "supervisor_identity": {
+            "runtime": "codex",
+            "origin_adapter": "codex",
+            "host": "fixture",
+            "session_fingerprint": "0" * 64,
+        },
+        "binding": {
+            "issue_url": "https://github.com/o/r/issues/31",
+            "task_id": "task-31",
+            "claim_id": "claim-31",
+            "repo_root": str(root),
+            "worktree_root": str(root),
+        },
+        "git": {
+            "branch": "main",
+            "base_head": "0" * 40,
+            "observed_head": _head(root),
+            "source_count": 1,
+            "path_set_digest": "0" * 64,
+            "change_digest": "0" * 64,
+            "commit_parent": None,
+            "result_commit": None,
+        },
+        "child": {
+            "child_id": None,
+            "phase": "IMPLEMENT",
+            "attempt": 0,
+            "observed_status": "quiescent",
+        },
+        "evidence": {"ref": f"evidence/{'0' * 64}.json", "sha256": "0" * 64, "size": 0},
+    }
+    record = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    path.write_text(
+        f"# Backlog checkpoint schema 1\n```json\n{record}\n```\n", encoding="utf-8"
+    )
+    path.chmod(0o600)
+    return path
 
 
 def test_inspect_worktree_returns_exact_canonical_checkout(repo: Path) -> None:
@@ -217,6 +270,105 @@ def test_collect_sources_omits_unchanged_and_future_allowed_paths(repo: Path) ->
         "sources": [],
         "parent_head": _head(repo),
     }
+
+
+def test_exact_untracked_checkpoint_is_excluded_for_collect_and_bind(
+    repo: Path,
+) -> None:
+    run_id = "0123456789abcdef0123456789abcdef"
+    checkpoint = _checkpoint(repo, run_id)
+    _write(repo, "base.txt", b"reviewed\n")
+
+    manifest = collect_sources(str(repo), ["base.txt"], str(checkpoint))
+    _git(repo, "add", "--", "base.txt")
+    _git(repo, "commit", "-m", "change")
+    commit_oid = _head(repo)
+
+    assert (
+        bind_commit(
+            str(repo), manifest["parent_head"], manifest, commit_oid, str(checkpoint)
+        )["result_commit"]
+        == commit_oid
+    )
+    assert checkpoint.exists()
+
+
+@pytest.mark.parametrize("kind", ["foreign", "extra", "tracked", "symlink", "mode"])
+def test_checkpoint_exclusion_rejects_nonexact_runtime_artifact(
+    repo: Path, tmp_path: Path, kind: str
+) -> None:
+    run_id = "0123456789abcdef0123456789abcdef"
+    checkpoint = _checkpoint(repo, run_id)
+    if kind == "foreign":
+        checkpoint = tmp_path / checkpoint.name
+        checkpoint.write_text("foreign\n", encoding="utf-8")
+        checkpoint.chmod(0o600)
+    elif kind == "extra":
+        _write(repo, "HANDOFF.backlog-fedcba9876543210fedcba9876543210.md", b"extra\n")
+    elif kind == "tracked":
+        _git(repo, "add", "--", checkpoint.name)
+        _git(repo, "commit", "-m", "tracked checkpoint")
+    elif kind == "symlink":
+        checkpoint.unlink()
+        checkpoint.symlink_to(repo / "base.txt")
+    else:
+        checkpoint.chmod(0o644)
+    _write(repo, "base.txt", b"reviewed\n")
+
+    with pytest.raises(CheckpointError):
+        collect_sources(str(repo), ["base.txt"], str(checkpoint))
+
+
+def test_collect_rejects_checkpoint_changed_during_collection(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _checkpoint(repo, "0123456789abcdef0123456789abcdef")
+    _write(repo, "base.txt", b"reviewed\n")
+    real_source_records = git_evidence._source_records
+    calls = 0
+
+    def change_checkpoint(*args, **kwargs):
+        nonlocal calls
+        result = real_source_records(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            checkpoint.chmod(0o644)
+        return result
+
+    monkeypatch.setattr(git_evidence, "_source_records", change_checkpoint)
+
+    with pytest.raises(CheckpointError, match="checkpoint"):
+        collect_sources(str(repo), ["base.txt"], str(checkpoint))
+
+
+def test_collect_rejects_checkpoint_aba_mutation_restored_between_validations(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _checkpoint(repo, "0123456789abcdef0123456789abcdef")
+    assert checkpoint.stat().st_uid == os.geteuid()
+    original = checkpoint.read_bytes()
+    mutated = original.replace(b'"host":"fixture"', b'"host":"changed"')
+    assert mutated != original and len(mutated) == len(original)
+    decode_snapshot(mutated)
+    _write(repo, "base.txt", b"reviewed\n")
+    real_source_records = git_evidence._source_records
+    calls = 0
+
+    def mutate_and_restore(*args, **kwargs):
+        nonlocal calls
+        result = real_source_records(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            checkpoint.write_bytes(mutated)
+            checkpoint.write_bytes(original)
+            checkpoint.chmod(0o600)
+            assert checkpoint.read_bytes() == original
+        return result
+
+    monkeypatch.setattr(git_evidence, "_source_records", mutate_and_restore)
+
+    with pytest.raises(CheckpointError, match="checkpoint"):
+        collect_sources(str(repo), ["base.txt"], str(checkpoint))
 
 
 def test_collect_sources_rejects_unknown_dirty_before_reading_it(

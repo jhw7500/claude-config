@@ -9,10 +9,11 @@ import subprocess
 import unicodedata
 from typing import Any
 
-from .codec import CheckpointError, canonical_bytes, sha256_bytes
+from .codec import CheckpointError, canonical_bytes, decode_snapshot, sha256_bytes
 
 
 _OID = re.compile(r"[0-9a-f]{40}\Z")
+_CHECKPOINT_NAME = re.compile(r"HANDOFF\.backlog-([0-9a-f]{32})\.md\Z")
 _SOURCE_KEYS = {"change", "mode", "path", "sha256"}
 _MANIFEST_KEYS = {
     "paths",
@@ -262,6 +263,87 @@ def _status(root: str) -> bytes:
     )
 
 
+def _checkpoint_metadata(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _validate_checkpoint_metadata(metadata: os.stat_result) -> tuple[int, ...]:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise CheckpointError(
+            "checkpoint artifact must be current-UID mode 0600 regular file"
+        )
+    return _checkpoint_metadata(metadata)
+
+
+def _checkpoint_artifact(
+    root: str, path: str | None
+) -> tuple[bytes, tuple[tuple[int, ...], str]] | None:
+    if path is None:
+        return None
+    if (
+        not isinstance(path, str)
+        or not os.path.isabs(path)
+        or os.path.normpath(path) != path
+    ):
+        raise CheckpointError("checkpoint path must be an exact absolute path")
+    parent, name = os.path.split(path)
+    match = _CHECKPOINT_NAME.fullmatch(name)
+    if parent != root or match is None:
+        raise CheckpointError("checkpoint must be the selected root-level run artifact")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise CheckpointError("checkpoint artifact is unavailable") from exc
+    try:
+        opened = _validate_checkpoint_metadata(os.fstat(fd))
+        data = bytearray()
+        while len(data) <= 12 * 1024:
+            chunk = os.read(fd, 12 * 1024 + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > 12 * 1024:
+            raise CheckpointError("checkpoint artifact exceeds its size bound")
+        after = _validate_checkpoint_metadata(os.fstat(fd))
+        if opened != after:
+            raise CheckpointError("checkpoint artifact changed during validation")
+    finally:
+        os.close(fd)
+    try:
+        current = _validate_checkpoint_metadata(os.stat(path, follow_symlinks=False))
+    except OSError as exc:
+        raise CheckpointError("checkpoint artifact changed during validation") from exc
+    if current != after:
+        raise CheckpointError("checkpoint artifact changed during validation")
+    snapshot = decode_snapshot(bytes(data))
+    if (
+        snapshot["run_id"] != match.group(1)
+        or snapshot["binding"]["worktree_root"] != root
+    ):
+        raise CheckpointError("checkpoint artifact does not match its run and worktree")
+    raw_name = name.encode("utf-8")
+    if _git(root, "ls-files", "--stage", "--", name):
+        raise CheckpointError("checkpoint artifact must never be tracked")
+    status = _status_entries(_status(root)).get(raw_name)
+    if status != b"??":
+        raise CheckpointError("checkpoint artifact must be exactly untracked")
+    return raw_name, (after, sha256_bytes(bytes(data)))
+
+
 def _tree(root: str, object_id: str) -> dict[bytes, tuple[str, str, str]]:
     data = _git(root, "ls-tree", "-r", "-z", "--full-tree", object_id)
     entries: dict[bytes, tuple[str, str, str]] = {}
@@ -436,10 +518,13 @@ def _manifest(parent_head: str, sources: list[dict[str, Any]]) -> dict:
     }
 
 
-def collect_sources(root: str, allowed_paths: list[str]) -> dict:
+def collect_sources(
+    root: str, allowed_paths: list[str], checkpoint_path: str | None = None
+) -> dict:
     """Collect an exact source manifest without staging or mutating Git state."""
     checked_root = _canonical_root(root)
     checked_paths = _validate_paths(allowed_paths)
+    checkpoint = _checkpoint_artifact(checked_root, checkpoint_path)
     allowed = {raw for raw, _ in checked_paths}
     parent_head = _oid(
         _git(checked_root, "rev-parse", "--verify", "HEAD^{commit}"), "parent HEAD"
@@ -447,7 +532,8 @@ def collect_sources(root: str, allowed_paths: list[str]) -> dict:
     first_status = _status(checked_root)
     status_entries = _status_entries(first_status)
     dirty = set(status_entries)
-    unknown = dirty - allowed
+    runtime = set() if checkpoint is None else {checkpoint[0]}
+    unknown = dirty - allowed - runtime
     if unknown:
         raise CheckpointError("dirty Git paths exist outside the source allowlist")
     if any(
@@ -459,6 +545,9 @@ def collect_sources(root: str, allowed_paths: list[str]) -> dict:
     sources = _source_records(checked_root, checked_paths, parent_tree)
     second_sources = _source_records(checked_root, checked_paths, parent_tree)
     second_status = _status(checked_root)
+    if checkpoint_path is not None:
+        if _checkpoint_artifact(checked_root, checkpoint_path) != checkpoint:
+            raise CheckpointError("checkpoint artifact changed during collection")
     current_head = _oid(
         _git(checked_root, "rev-parse", "--verify", "HEAD^{commit}"), "current HEAD"
     )
@@ -469,7 +558,7 @@ def collect_sources(root: str, allowed_paths: list[str]) -> dict:
     ):
         raise CheckpointError("Git source state changed during collection")
     changed = {source["path"].encode("utf-8") for source in sources}
-    if dirty - changed:
+    if dirty - changed - runtime:
         raise CheckpointError("Git index state does not match the source worktree")
     return _manifest(parent_head, sources)
 
@@ -611,7 +700,13 @@ def _matching_direct_children(root: str, parent_head: str, manifest: dict) -> li
     return matching
 
 
-def bind_commit(root: str, parent_head: str, manifest: dict, commit_oid: str) -> dict:
+def bind_commit(
+    root: str,
+    parent_head: str,
+    manifest: dict,
+    commit_oid: str,
+    checkpoint_path: str | None = None,
+) -> dict:
     """Bind reviewed source evidence to one exact current direct child commit."""
     checked_root = _canonical_root(root)
     if not isinstance(parent_head, str) or _OID.fullmatch(parent_head) is None:
@@ -638,7 +733,7 @@ def bind_commit(root: str, parent_head: str, manifest: dict, commit_oid: str) ->
         raise CheckpointError("result commit does not match the source manifest")
     if _matching_direct_children(checked_root, parent_head, expected) != [commit_oid]:
         raise CheckpointError("result commit is not the unique matching direct child")
-    remaining = collect_sources(checked_root, expected["paths"])
+    remaining = collect_sources(checked_root, expected["paths"], checkpoint_path)
     if remaining["parent_head"] != commit_oid:
         raise CheckpointError("result commit is no longer the current HEAD")
     if remaining["count"] != 0:

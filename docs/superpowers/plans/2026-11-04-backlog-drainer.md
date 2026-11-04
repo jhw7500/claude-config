@@ -76,15 +76,15 @@
 
 ### Task 5: 명시 CLI·공통 SKILL·임시 HOME 설치
 
-**Files:** Create scripts/backlog-checkpoint.py, scripts/backlog_checkpoint/cli.py, scripts/install-backlog-drain.py, skills/backlog-drain/SKILL.md; modify install.sh, README.md; tests/test_backlog_cli.py, tests/test_backlog_install.py.
+**Files:** Create scripts/backlog-checkpoint.py, scripts/backlog_checkpoint/cli.py, scripts/install-backlog-drain.py, skills/backlog-drain/SKILL.md, skills/backlog-drain/references/protocol.md; modify install.sh, README.md, scripts/backlog_checkpoint/git_evidence.py, tests/test_backlog_git_evidence.py; tests/test_backlog_cli.py, tests/test_backlog_install.py. Git 수정은 exact untracked checkpoint 한 파일의 명시 제외·검증을 연결하는 통합 범위에 한정한다.
 **Interfaces:** snapshot read/write, evidence write/read, admission acquire/release/reconcile, git inspect/collect/bind, queue plan. JSON 파일/stdin과 명시 argv만 받으며 next_action shell은 실행하지 않는다. symlink entry는 __file__.resolve() 옆 package를 사용한다.
 **Contracts:** common SKILL이 실제 native capability, 현재 Task 계약, exact cwd, serial executor+independent reviewer, phase 시작/저장/검증/정지를 담당한다. 정상 fix는 follow-up, fault recovery만 새 child ID/context다. 설치는 양쪽 SKILL/helper symlink, foreign target 보존, 실제 HOME 미실행.
 
-- [ ] Step 1: 실제 CLI stdin/JSON/output/exit와 임시 HOME discovery/helper호출/재설치/foreign 보존 회귀를 먼저 작성한다.
-- [ ] Step 2: 표적 RED.
-- [ ] Step 3: CLI·SKILL·installer·README를 구현한다. 문서 text grep 테스트를 쓰지 않는다.
-- [ ] Step 4: 새 표적+기존 installer GREEN, ruff F/E9, shell syntax/ShellCheck, 공백 검사.
-- [ ] Step 5: 독립 task review 후 parent commit/ledger.
+- [x] Step 1: 실제 CLI stdin/JSON/output/exit와 임시 HOME discovery/helper호출/재설치/foreign 보존 회귀를 먼저 작성한다.
+- [x] Step 2: 표적 RED.
+- [x] Step 3: CLI·SKILL·installer·README를 구현한다. 문서 text grep 테스트를 쓰지 않는다.
+- [x] Step 4: 새 표적+기존 installer GREEN, ruff F/E9, shell syntax/ShellCheck, 공백 검사.
+- [x] Step 5: 독립 task review 후 parent commit/ledger.
 
 ### Task 6: native 중단 증거와 최종 검증
 
