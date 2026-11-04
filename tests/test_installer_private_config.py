@@ -173,6 +173,48 @@ def test_hook_wiring_stays_idempotent(home: Path) -> None:
     assert first > 0
 
 
+def test_installed_stop_command_checks_korean_without_duplicate_hooks(home: Path) -> None:
+    claude = home / ".claude"
+    claude.mkdir()
+    settings = claude / "settings.json"
+    existing = {"hooks": [{"type": "command", "command": "printf 'keep existing hook'"}]}
+    settings.write_text(json.dumps({"hooks": {"Stop": [existing]}}), encoding="utf-8")
+    for _ in range(2):
+        installed = run_install(home)
+        assert installed.returncode == 0, installed.stderr
+
+    groups = json.loads(settings.read_text(encoding="utf-8"))["hooks"]["Stop"]
+    assert existing in groups
+    commands = [hook["command"] for group in groups for hook in group["hooks"]]
+    command = "python3 $HOME/.claude/scripts/stop-text-required.py"
+    assert commands.count(command) == 1
+    script = claude / "scripts" / "stop-text-required.py"
+    assert script.is_symlink()
+    assert script.resolve() == (REPO / "scripts" / "stop-text-required.py").resolve()
+    payload = json.dumps({
+        "hook_event_name": "Stop",
+        "last_assistant_message": (
+            "The requested implementation is complete and all regression checks passed. "
+            "The updated behavior preserves the existing settings and handles the new cases."
+        ),
+    })
+    env = dict(os.environ, HOME=str(home))
+    env.pop("CLAUDE_STOP_KOREAN", None)
+    blocked = subprocess.run(
+        ["/bin/bash", "-c", command], input=payload,
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert blocked.returncode == 2
+    assert "STOP_HOOK_KOREAN" in blocked.stderr
+
+    opted_out = subprocess.run(
+        ["/bin/bash", "-c", command], input=payload,
+        env=dict(env, CLAUDE_STOP_KOREAN="0"), text=True, capture_output=True, check=False,
+    )
+    assert opted_out.returncode == 0
+    assert opted_out.stderr == ""
+
+
 def test_links_are_still_created_except_task_nudge_shim(home: Path) -> None:
     run_install(home)
     claude = home / ".claude"

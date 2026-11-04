@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop hook — 마지막 assistant turn이 비어 있거나 도구만 호출하고 텍스트 0줄이면 차단.
+"""Stop hook — 결과 보고가 없거나 최종 설명 본문이 대부분 영어이면 차단.
 
 목적: 모델이 도구 결과 수신 후 텍스트 응답 없이 turn을 종료하는 패턴 방지.
 
@@ -27,12 +27,18 @@
   마지막 text block record보다 먼저 파일을 읽으면 직전 tool_use record가 turn의
   끝으로 보이기 때문이다 (2026-08-24 실측 오탐 2건).
 - 차단 시 exit 2 + stderr 경고 → 모델 컨텍스트에 system-reminder로 노출
+- 한국어 검사: 코드·URL·경로를 뺀 한글/영문 80자 이상 본문에서 한글이 10% 미만이면
+  한국어 재작성을 요청한다. CLAUDE_STOP_KOREAN=0은 이 검사만 끈다.
+- last_assistant_message가 있으면 최종 텍스트로 사용한다. 없는 파일 기반 언어 검사는
+  처음에 짧은 본문만 보여도 전체 settle 시간 동안 다시 읽는다.
 
 설치 위치: ~/.claude/settings.json hooks.Stop.[].hooks
 """
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -194,6 +200,95 @@ def assistant_has_tool_use(turn: dict) -> bool:
 
 SETTLE_ATTEMPTS = 8
 SETTLE_DELAY_SEC = 0.1
+KOREAN_MIN_LETTERS = 80
+KOREAN_MIN_PERCENT = 10
+
+
+def language_prose(text: str) -> str:
+    """코드·명령·URL·경로·명확한 식별자를 제외하고 설명 문단을 남긴다."""
+    lines: list[str] = []
+    list_indents: list[int] = []
+    fence_char = ""
+    fence_length = 0
+    fence_indent = 0
+    paragraph_open = False
+    for raw_line in text.splitlines():
+        line = re.sub(r"^ {0,3}(?:> ?)+", "", raw_line.expandtabs(4))
+        indentation = len(line) - len(line.lstrip(" "))
+        if fence_char and fence_indent and line.strip() and indentation < fence_indent:
+            # 목록 컨테이너가 끝나면 그 안의 닫히지 않은 fence도 끝난다.
+            fence_char = ""
+        if fence_char:
+            fence = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", line[fence_indent:])
+            if (
+                fence
+                and fence[1][0] == fence_char
+                and len(fence[1]) >= fence_length
+                and not fence[2].strip()
+            ):
+                fence_char = ""
+            continue
+        if not line.strip():
+            lines.append("")
+            paragraph_open = False
+            continue
+        while list_indents and indentation < list_indents[-1]:
+            list_indents.pop()
+        content_indent = list_indents[-1] if list_indents else 0
+        # 들여쓴 코드는 문단을 끊지 못한다. 목록의 본문 시작 열을 기준으로 센다.
+        if indentation >= content_indent + 4 and not paragraph_open:
+            continue
+        marker = re.match(r"( {0,3})([-+*]|\d+[.)])( +)", line[content_indent:])
+        if marker:
+            padding = len(marker[3]) if len(marker[3]) <= 4 else 1
+            content_indent += len(marker[1]) + len(marker[2]) + padding
+            list_indents.append(content_indent)
+            paragraph_open = False
+        candidate = line[content_indent:]
+        if candidate.startswith("    ") and not paragraph_open:
+            continue
+        fence = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", candidate)
+        if fence:
+            fence_char, fence_length = fence[1][0], len(fence[1])
+            fence_indent = content_indent
+            paragraph_open = False
+            continue
+        command = re.match(
+            r"(?:\$ +)?(?:rtk(?: +proxy)? +)?"
+            r"(?:python(?:3(?:\.\d+)?)?|pytest|git|bash|sh|node|npm|npx|pnpm|yarn|uv|ruff|shellcheck|curl) +(.+)$",
+            candidate.strip(),
+        )
+        if command and re.search(r"(?:^|\s)(?:--?\w|\S*[\\/]\S*|\S+\.(?:py|sh|[mc]?js)\b)", command[1]):
+            continue
+        lines.append(line)
+        paragraph_open = True
+
+    prose = re.sub(r"(`+).*?\1", " ", "\n".join(lines), flags=re.S)
+    prose = re.sub(r"\b(?:https?://|www\.)[^\s<>`]+", " ", prose, flags=re.I)
+    prose = re.sub(
+        r"\b(?:[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+"
+        r"|[A-Za-z][A-Za-z0-9]*[a-z][A-Z][A-Za-z0-9]*"
+        r"|[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+){2,})\b"
+        r"|(?<!\w)--?[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*",
+        " ", prose,
+    )
+    return re.sub(
+        r"(?<![\w])(?:"
+        r"(?:[A-Za-z]:[\\/]|\$\{HOME\}/|\$HOME/|~?/|\.{1,2}/)[^\s<>\"'`()\[\]{}]+"
+        r"|(?:[\w.@+-]+[\\/])+[\w.@+\\/:~-]*"
+        r"|[\w@+-]+(?:\.[\w@+-]+)+(?::\d+)?"
+        r")",
+        " ", prose,
+    )
+
+
+def needs_korean_rewrite(text: str) -> bool:
+    """짧거나 기술 표기뿐인 답변은 면제하고 대부분 영어인 본문만 차단한다."""
+    prose = language_prose(text)
+    korean = len(re.findall(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7a3]", prose))
+    latin = len(re.findall(r"[A-Za-z]", prose))
+    total = korean + latin
+    return total >= KOREAN_MIN_LETTERS and korean * 100 < total * KOREAN_MIN_PERCENT
 
 
 def current_assistant_turn(messages: list) -> tuple[list, dict | None]:
@@ -239,8 +334,10 @@ def has_nonempty_text(blocks: list) -> bool:
     return False
 
 
-def evaluate(messages: list) -> tuple[str, str]:
-    """('ok' | 'tool_only' | 'empty', tool_use_id) 판정.
+def evaluate(
+    messages: list, *, check_korean: bool = True, final_text: str | None = None,
+) -> tuple[str, str]:
+    """('ok' | 'tool_only' | 'empty' | 'non_korean', tool_use_id) 판정.
 
     통과하려면 turn의 마지막 tool_use **이후**에 비어 있지 않은 text가 있어야 한다.
     """
@@ -254,10 +351,20 @@ def evaluate(messages: list) -> tuple[str, str]:
             last_tool = i
             tool_id = b.get("id") if isinstance(b.get("id"), str) else ""
 
+    after = blocks[last_tool + 1:]
+    if final_text is not None:
+        # Stop의 공식 최종 텍스트는 transcript의 지연/부분 기록보다 우선한다.
+        after = [{"type": "text", "text": final_text}]
+    if has_nonempty_text(after):
+        text = "\n".join(
+            b["text"] for b in after
+            if b.get("type") in ("text", "output_text") and isinstance(b.get("text"), str)
+        )
+        if check_korean and needs_korean_rewrite(text):
+            return "non_korean", ""
+        return "ok", ""
+
     if last_tool >= 0:
-        after = blocks[last_tool + 1:]
-        if has_nonempty_text(after):
-            return "ok", ""
         # 산출이 전혀 없으면 '침묵' 분기, thinking 등만 있으면 'text 0줄' 분기
         return ("empty", tool_id) if not after else ("tool_only", "")
 
@@ -278,12 +385,16 @@ def settle(
     attempts: int = SETTLE_ATTEMPTS,
     delay: float = SETTLE_DELAY_SEC,
     sleep: Any = time.sleep,
+    *,
+    check_korean: bool = True,
+    wait_for_final: bool = False,
 ) -> tuple[str, str, list]:
     """차단 판정을 transcript 재읽기로 확정한다.
 
     Stop 훅이 마지막 text block record보다 먼저 파일을 읽을 수 있으므로 차단
     조건이 성립해도 곧바로 확정하지 않는다. read_messages/sleep을 주입받아
     타이밍에 의존하지 않고 재시도 경로를 단위 테스트할 수 있게 한다.
+    wait_for_final은 짧은 초기 본문을 최종 답변으로 오인하지 않도록 전체 횟수를 읽는다.
     """
     readable = True
     for _ in range(attempts):
@@ -296,8 +407,8 @@ def settle(
             continue
         readable = True
         messages = retry
-        verdict, tool_id = evaluate(retry)
-        if verdict == "ok":
+        verdict, tool_id = evaluate(retry, check_korean=check_korean)
+        if verdict == "ok" and not wait_for_final:
             return "ok", "", messages
     if not readable:
         # 끝까지 읽지 못했다 — malformed transcript와 동일하게 fail-open
@@ -318,22 +429,44 @@ def main() -> int:
     if payload.get("stop_hook_active") is True:
         return 0
 
+    check_korean = (
+        os.environ.get("CLAUDE_STOP_KOREAN") != "0"
+        and payload.get("hook_event_name", "Stop") == "Stop"
+    )
+    final_text = payload.get("last_assistant_message")
+    if not isinstance(final_text, str):
+        final_text = None
     messages = read_transcript_messages(payload)
     if not messages:
-        return 0
+        if final_text is None:
+            return 0
+        messages = [{"role": "assistant", "content": final_text}]
 
     user_text = last_user_text(messages).lower()
     if any(hint in user_text for hint in EXPLICIT_STOP_HINTS):
         return 0  # 사용자가 명시적으로 종료 요청 — 통과
 
-    verdict, tool_id = evaluate(messages)
+    verdict, tool_id = evaluate(messages, check_korean=check_korean, final_text=final_text)
 
     # transcript는 content block 단위로 append되므로 마지막 text block이 아직
     # 기록되지 않았을 수 있다. 파일 기반일 때만 재읽기로 확정한다.
-    if verdict != "ok" and not isinstance(payload.get("messages"), list):
+    if (
+        not isinstance(payload.get("messages"), list)
+        and final_text is None
+        and (verdict != "ok" or check_korean)
+    ):
         verdict, tool_id, messages = settle(
-            lambda: read_transcript_messages(payload), messages, verdict, tool_id
+            lambda: read_transcript_messages(payload), messages, verdict, tool_id,
+            check_korean=check_korean, wait_for_final=check_korean,
         )
+
+    if verdict == "non_korean":
+        sys.stderr.write(
+            "STOP_HOOK_KOREAN: 최종 답변의 설명 본문에서 한국어 비율이 낮습니다.\n"
+            "직전 답변을 한국어로 다시 작성하세요. 코드·명령·경로·식별자는 원문을 유지하고, "
+            "결과와 설명을 한국어로 전달하세요.\n"
+        )
+        return 2
 
     if verdict == "tool_only":
         sys.stderr.write(
