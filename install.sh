@@ -93,7 +93,7 @@ SKILL_ARCHIVE=~/.claude/archive/skills-replaced/"$(date +%Y%m%d%H%M%S)-$$"
 for d in "$REPO_DIR"/skills/*/; do
   name="$(basename "$d")"
   case "$name" in
-    pre-pr-tribunal) continue ;;
+    pre-pr-tribunal|backlog-drain) continue ;;
   esac
   # 백업을 ~/.claude/skills/ 밖(아카이브)으로 빼는 게 핵심이다. 옆에 두면 사본에
   # SKILL.md 가 남아 중복 스킬로 로드된다 — scripts/lib/link-safely.sh 주석 참조.
@@ -352,6 +352,11 @@ PY
 /usr/bin/python3 "$REPO_DIR/scripts/install-task-nudge.py" \
   --repo "$REPO_DIR" \
   --home "$HOME"
+
+/usr/bin/python3 "$REPO_DIR/scripts/install-backlog-drain.py" \
+  --repo "$REPO_DIR" \
+  --home "$HOME"
+echo "[install] Backlog drain: Claude/Codex Skill + checkpoint helper"
 
 /usr/bin/python3 "$REPO_DIR/scripts/install-pre-pr-tribunal.py" \
   --repo "$REPO_DIR" \
