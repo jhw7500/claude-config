@@ -446,6 +446,60 @@ def test_collect_rejects_unallowed_mode_change_when_core_filemode_is_disabled(
     assert _git(repo, "config", "--get", "core.fileMode") == b"false\n"
 
 
+def _tracked_case_alias(repo: Path, tracked: str, extra: str) -> None:
+    _write(repo, tracked, b"tracked\n")
+    if (repo / extra).exists():
+        pytest.skip("case-sensitive fixture filesystem is required")
+    _commit_all(repo, "case-sensitive baseline")
+    _git(repo, "config", "core.ignoreCase", "true")
+
+
+@pytest.mark.parametrize(
+    ("tracked", "extra"), [("foo.py", "Foo.py"), ("pkg/source.py", "Pkg/source.py")]
+)
+def test_collect_rejects_case_alias_hidden_by_ignorecase(
+    repo: Path, tracked: str, extra: str
+) -> None:
+    _tracked_case_alias(repo, tracked, extra)
+    assert collect_sources(str(repo), [])["count"] == 0
+    _write(repo, extra, b"extra\n")
+    assert _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all") == b""
+
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        collect_sources(str(repo), [])
+
+    allowed = collect_sources(str(repo), [extra])
+    assert allowed["paths"] == [extra]
+    assert allowed["sources"][0]["change"] == "add"
+    assert _git(repo, "config", "--get", "core.ignoreCase") == b"true\n"
+    assert (repo / tracked).read_bytes() == b"tracked\n"
+    assert (repo / extra).read_bytes() == b"extra\n"
+
+
+@pytest.mark.parametrize(
+    ("tracked", "extra"), [("foo.py", "Foo.py"), ("pkg/source.py", "Pkg/source.py")]
+)
+def test_bind_rejects_case_alias_hidden_by_ignorecase(
+    repo: Path, tracked: str, extra: str
+) -> None:
+    _tracked_case_alias(repo, tracked, extra)
+    _write(repo, "reviewed.txt", b"before\n")
+    _commit_all(repo, "reviewed baseline")
+    _write(repo, "reviewed.txt", b"after\n")
+    manifest = collect_sources(str(repo), ["reviewed.txt"])
+    committed = _commit_all(repo, "reviewed change")
+    assert bind_commit(str(repo), manifest["parent_head"], manifest, committed)["result_commit"] == committed
+    _write(repo, extra, b"extra after commit\n")
+    assert _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all") == b""
+
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        bind_commit(str(repo), manifest["parent_head"], manifest, committed)
+
+    assert _git(repo, "config", "--get", "core.ignoreCase") == b"true\n"
+    assert (repo / tracked).read_bytes() == b"tracked\n"
+    assert (repo / extra).read_bytes() == b"extra after commit\n"
+
+
 @pytest.mark.parametrize(
     "ignore_source", ["diff", "local-submodule", "gitmodules"]
 )
