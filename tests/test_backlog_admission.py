@@ -4,6 +4,7 @@ import multiprocessing
 import os
 import signal
 import stat
+import subprocess
 import time
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from scripts.backlog_checkpoint.codec import (
     sha256_bytes,
 )
 from scripts.backlog_checkpoint.storage import read_snapshot, write_evidence, write_snapshot
+from scripts.backlog_checkpoint.git_evidence import bind_commit, collect_sources
 
 
 RUN_ID = "0123456789abcdef0123456789abcdef"
@@ -333,7 +335,160 @@ def test_release_requires_terminal_snapshot_and_explicit_quiescence(admission_fi
     assert _active_path(state_root, worktree).exists()
 
 
-def test_release_accepts_owned_terminal_checkpoint_observations(tmp_path: Path) -> None:
+@pytest.fixture
+def terminal_admission_fixture(tmp_path: Path) -> tuple:
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    def git(*args: str) -> str:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        return subprocess.check_output(
+            ["git", "-c", "core.hooksPath=/dev/null", *args], cwd=worktree, env=env
+        ).decode().strip()
+
+    git("init", "-q", "-b", "task/issue-31")
+    git("config", "user.name", "Fixture User")
+    git("config", "user.email", "fixture@example.invalid")
+    source = worktree / "source.py"
+    source.write_text("before\n")
+    git("add", "source.py")
+    git("commit", "-qm", "base")
+    source.write_text("reviewed\n")
+    manifest = collect_sources(str(worktree), ["source.py"])
+    git("add", "source.py")
+    git("commit", "-qm", "reviewed")
+    committed = git("rev-parse", "HEAD")
+    binding = bind_commit(str(worktree), manifest["parent_head"], manifest, committed)
+    owner = _owner(worktree)
+    snapshot = _snapshot(worktree, RUN_ID, owner, {}, terminal=True)
+    snapshot["git"].update(
+        binding, base_head=manifest["parent_head"], observed_head=committed
+    )
+    evidence = {
+        "admission_release": {
+            "schema": 1, "run_id": RUN_ID, "task_owner": owner["task_owner"],
+            "session_fingerprint": owner["session_fingerprint"],
+            "snapshot_generation": 0, "tools_quiescent": True, "writers_quiescent": True,
+        },
+        "source_manifest": manifest,
+        "commit_binding": binding,
+    }
+    return state_root, worktree, owner, snapshot, evidence, git
+
+
+def _admit_terminal(fixture: tuple) -> tuple[Path, Path, dict]:
+    state_root, worktree, owner, snapshot, evidence, _ = fixture
+    snapshot["evidence"] = write_evidence(state_root, RUN_ID, evidence)
+    path = worktree / f"HANDOFF.backlog-{RUN_ID}.md"
+    stored = write_snapshot(path, snapshot, None)
+    record = _record(worktree, RUN_ID, owner, path, stored, path.read_bytes())
+    acquire_admission(state_root, worktree, record)
+    return state_root, worktree, record
+
+
+def test_release_accepts_freshly_verified_commit_binding(terminal_admission_fixture) -> None:
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+
+    release_admission(state_root, worktree, record)
+
+    assert not _active_path(state_root, worktree).exists()
+
+
+def test_commit_observations_can_advance_in_the_same_checkpoint_before_release(
+    terminal_admission_fixture,
+) -> None:
+    state_root, worktree, owner, terminal, evidence, _ = terminal_admission_fixture
+    path = worktree / f"HANDOFF.backlog-{RUN_ID}.md"
+    started = copy.deepcopy(terminal)
+    started.update(phase="COMMIT", phase_status="started", next_action="READY_FOR_TRIBUNAL")
+    started["git"].update(commit_parent=None, result_commit=None)
+    started["child"]["phase"] = "COMMIT"
+    started["evidence"] = write_evidence(state_root, RUN_ID, {"source_manifest": evidence["source_manifest"]})
+    stored = write_snapshot(path, started, None)
+    record = _record(worktree, RUN_ID, owner, path, stored, path.read_bytes())
+    acquire_admission(state_root, worktree, record)
+    evidence["admission_release"]["snapshot_generation"] = 1
+    terminal["evidence"] = write_evidence(state_root, RUN_ID, evidence)
+
+    assert write_snapshot(path, terminal, 0)["generation"] == 1
+    release_admission(state_root, worktree, record)
+
+    assert not _active_path(state_root, worktree).exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("commit_parent", None), ("result_commit", None), ("base_head", ZERO40),
+     ("observed_head", ZERO40), ("source_count", 0),
+     ("path_set_digest", ZERO64), ("change_digest", ZERO64)],
+)
+def test_release_preserves_admission_when_snapshot_git_binding_differs(
+    terminal_admission_fixture, field: str, value: object
+) -> None:
+    terminal_admission_fixture[3]["git"][field] = value
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+
+    with pytest.raises(CheckpointError, match="commit|binding"):
+        release_admission(state_root, worktree, record)
+
+    assert _active_path(state_root, worktree).read_bytes() == canonical_bytes(record)
+
+
+@pytest.mark.parametrize("missing", ["source_manifest", "commit_binding"])
+def test_release_requires_authenticated_manifest_and_binding(
+    terminal_admission_fixture, missing: str
+) -> None:
+    terminal_admission_fixture[4].pop(missing)
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+
+    with pytest.raises(CheckpointError, match="manifest|binding"):
+        release_admission(state_root, worktree, record)
+
+    assert _active_path(state_root, worktree).exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("schema", True), ("tools_quiescent", 1), ("writers_quiescent", 1)]
+)
+def test_release_rejects_type_coercion_in_quiescence_evidence(
+    terminal_admission_fixture, field: str, value: object
+) -> None:
+    terminal_admission_fixture[4]["admission_release"][field] = value
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+
+    with pytest.raises(CheckpointError, match="quiescence"):
+        release_admission(state_root, worktree, record)
+
+    assert _active_path(state_root, worktree).exists()
+
+
+@pytest.mark.parametrize("changed", ["source", "head", "branch", "binding-evidence", "manifest-evidence"])
+def test_release_revalidates_live_git_and_recorded_evidence(
+    terminal_admission_fixture, changed: str
+) -> None:
+    evidence = terminal_admission_fixture[4]
+    if changed == "binding-evidence":
+        evidence["commit_binding"]["source_count"] = True
+    elif changed == "manifest-evidence":
+        evidence["source_manifest"]["sources"][0]["sha256"] = ZERO64
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+    git = terminal_admission_fixture[5]
+    if changed == "source":
+        (worktree / "source.py").write_text("after verification\n")
+    elif changed == "head":
+        git("commit", "--allow-empty", "-qm", "advanced")
+    elif changed == "branch":
+        git("checkout", "-qb", "other-branch")
+
+    with pytest.raises(CheckpointError):
+        release_admission(state_root, worktree, record)
+
+    assert _active_path(state_root, worktree).read_bytes() == canonical_bytes(record)
+
+
+def test_release_rejects_terminal_labels_without_a_commit_binding(tmp_path: Path) -> None:
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
     worktree = tmp_path / "worktree"
@@ -359,9 +514,10 @@ def test_release_accepts_owned_terminal_checkpoint_observations(tmp_path: Path) 
     record = _record(worktree, RUN_ID, owner, path, snapshot, data)
     acquire_admission(state_root, worktree, record)
 
-    release_admission(state_root, worktree, record)
+    with pytest.raises(CheckpointError, match="commit"):
+        release_admission(state_root, worktree, record)
 
-    assert not _active_path(state_root, worktree).exists()
+    assert _active_path(state_root, worktree).read_bytes() == canonical_bytes(record)
 
 
 @pytest.mark.parametrize(

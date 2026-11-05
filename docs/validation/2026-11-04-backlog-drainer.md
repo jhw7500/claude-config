@@ -1,5 +1,36 @@
 # Backlog drainer v3 validation — 2026-11-04
 
+## Tribunal round-1 follow-up — 2026-11-05
+
+This follow-up supersedes the current-readiness statements in the historical sections below. Those earlier measurements describe the pre-Tribunal source and do not verify these fixes. The finalized round-1 verdict remains FAIL until a separately approved re-review acknowledges the changes; this document does not turn the old verdict into PASS.
+
+- **A-R1-001:** release now requires non-null parent/result coordinates, the exact source manifest and commit binding in authenticated evidence, matching snapshot counts/digests, and a fresh branch/worktree inspection plus `bind_commit` before removing the active admission. Invalid evidence, a changed source/HEAD/branch, and JSON boolean/integer substitutions preserve admission.
+- **A-R1-002:** storage validates the exact absolute canonical root-level run slot and preserves run ID, supervisor identity, all binding fields, branch and frozen base HEAD across CAS. Changed identity or path cannot replace the old bytes. A normal COMMIT-to-READY update and separately created successor files remain supported.
+- **A-R1-003:** collection and final binding reject assume-unchanged/skip-worktree index flags and compare the visible index before/after collection. No index flags or source bytes are changed by rejection.
+
+The corrected boundaries were first exercised by failing regressions; the raw RED traces are preserved privately. Current support claims use the fresh, reproducible commands below. The final focused command is:
+
+```text
+rtk proxy env -u LD_LIBRARY_PATH "$HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python" -m pytest -q tests/test_backlog_admission.py tests/test_backlog_checkpoint.py tests/test_backlog_cli.py tests/test_backlog_git_evidence.py tests/test_backlog_install.py tests/test_backlog_queue.py
+201 passed in 9.28s
+```
+
+Ruff F/E9 and in-memory compilation of all 15 backlog Python files pass; `git diff --check` passes. The existing global Ruff executable was used because the test virtual environment has no Ruff module. No dependency was installed.
+
+A pure reference-skill application control using the old protocol omitted `source_manifest` and `commit_binding` and found no explicit immutable CAS fields. A fresh consumer of the updated reference produced all three required evidence fields and all 12 immutable identity fields. These are reference-application checks, not native interruption/recovery proof.
+
+Final full-suite result: PASS, exit 0; `5411 passed in 230.77s (0:03:50)`, driver elapsed 230.94 seconds.
+
+```text
+rtk proxy env -u LD_LIBRARY_PATH "$HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python" -m pytest -q -n 8
+```
+
+The command ran from the implementation worktree on parent HEAD `3c09cde6d380900b8202e9a89968817c4e036e71` plus tested working-change digest `04ccbb465cb7e2d95145a7919656fef1a1d5d11106c3ae33e13a8aeaab7eee97`. All 18 frozen execution/test/install/guidance hashes matched after the command. The raw combined log is 6156 bytes, SHA-256 `7e53707baf6f84034ec034c716030276780e680a6710e896ba1622045df7cb44`. The private input, result and log are `.superpowers/sdd/2026-11-04-backlog-drainer/review-fix-r1/full-suite-{input.json,result.json,log}`. Only this result paragraph and historical-scope wording changed after the suite; executable, test and guidance bytes remained frozen.
+
+Native C3 remains NOT PASS: no new native experiment was run, and the independently observable child-owned tool-terminal receipt / Claude bridge is still unavailable on the observed surface. The previous full-suite result is historical; the follow-up full-suite command and source hashes will be recorded separately. No actual-HOME deployment, push, PR, merge, Task finish or Claim lifecycle mutation is performed here.
+
+## Historical pre-Tribunal validation (2026-11-04)
+
 Validated base HEAD: `15c0ab85d5b6c216505a68f5e2513499e78951f1`
 Validated working-change digest: `ea5616dc79c56e60bc88910347f7ab43ab57e9043fe89df8351b7d39d190a088`
 Issue: `https://github.com/jhw7500/claude-config/issues/31`

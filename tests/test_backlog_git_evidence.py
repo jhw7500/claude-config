@@ -279,6 +279,41 @@ def test_empty_allowlist_collects_a_clean_new_run_baseline(repo: Path) -> None:
     }
 
 
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+@pytest.mark.parametrize("modified", [False, True])
+def test_clean_start_rejects_index_flags_that_can_hide_tracked_changes(
+    repo: Path, flag: str, modified: bool
+) -> None:
+    _git(repo, "update-index", flag, "--", "base.txt")
+    if modified:
+        _write(repo, "base.txt", b"hidden edit\n")
+    index_before = (repo / ".git" / "index").read_bytes()
+
+    with pytest.raises(CheckpointError, match="index.*flag"):
+        collect_sources(str(repo), [])
+
+    assert (repo / ".git" / "index").read_bytes() == index_before
+    assert (repo / "base.txt").read_bytes() == (
+        b"hidden edit\n" if modified else b"base\n"
+    )
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_bind_rejects_index_flags_hiding_post_commit_changes(
+    repo: Path, flag: str
+) -> None:
+    _write(repo, "base.txt", b"reviewed\n")
+    manifest = collect_sources(str(repo), ["base.txt"])
+    committed = _commit_all(repo)
+    _git(repo, "update-index", flag, "--", "base.txt")
+    _write(repo, "base.txt", b"hidden after commit\n")
+
+    with pytest.raises(CheckpointError, match="index.*flag"):
+        bind_commit(str(repo), manifest["parent_head"], manifest, committed)
+
+    assert (repo / "base.txt").read_bytes() == b"hidden after commit\n"
+
+
 @pytest.mark.parametrize("dirty_kind", ["staged", "unstaged", "untracked"])
 def test_empty_allowlist_rejects_dirty_new_run_without_adopting_changes(
     repo: Path, dirty_kind: str

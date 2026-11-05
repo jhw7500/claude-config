@@ -235,14 +235,43 @@ def _lock_directory(directory_fd: int) -> int:
     return lock_fd
 
 
+def _snapshot_path(path: str | os.PathLike[str], snapshot: dict | None = None) -> Path:
+    try:
+        supplied = os.fspath(path)
+    except TypeError as exc:
+        raise CheckpointError("invalid snapshot path") from exc
+    if (
+        not isinstance(supplied, str)
+        or not os.path.isabs(supplied)
+        or os.path.normpath(supplied) != supplied
+    ):
+        raise CheckpointError("snapshot path must be exact and absolute")
+    candidate = Path(supplied)
+    name = candidate.name
+    if not (
+        name.startswith("HANDOFF.backlog-")
+        and name.endswith(".md")
+        and _HEX32.fullmatch(name[len("HANDOFF.backlog-") : -3])
+    ):
+        raise CheckpointError("snapshot path must name an exact run checkpoint")
+    if snapshot is not None and supplied != str(
+        Path(snapshot["binding"]["worktree_root"])
+        / f"HANDOFF.backlog-{snapshot['run_id']}.md"
+    ):
+        raise CheckpointError("snapshot path does not match its run and worktree")
+    if os.path.realpath(supplied) != supplied:
+        raise CheckpointError("snapshot path must be canonical and not a symlink")
+    return candidate
+
+
 def read_snapshot(path: str | os.PathLike[str]) -> dict:
     _require_secure_io()
-    snapshot_path = Path(path)
-    if not snapshot_path.name or snapshot_path.name in {".", ".."}:
-        raise CheckpointError("invalid snapshot path")
+    snapshot_path = _snapshot_path(path)
     directory_fd = _open_directory(snapshot_path.parent, private=False)
     try:
-        return decode_snapshot(_read_file_at(directory_fd, snapshot_path.name, 12 * 1024))
+        snapshot = decode_snapshot(_read_file_at(directory_fd, snapshot_path.name, 12 * 1024))
+        _snapshot_path(path, snapshot)
+        return snapshot
     finally:
         os.close(directory_fd)
 
@@ -251,21 +280,30 @@ def write_snapshot(
     path: str | os.PathLike[str], snapshot: dict, expected_generation: int | None
 ) -> dict:
     _require_secure_io()
-    snapshot_path = Path(path)
+    stored = decode_snapshot(encode_snapshot(snapshot))
+    snapshot_path = _snapshot_path(path, stored)
     directory_fd = _open_directory(snapshot_path.parent, private=False)
     lock_fd = -1
     try:
         lock_fd = _lock_directory(directory_fd)
         current_bytes = _existing_file_bytes(directory_fd, snapshot_path.name, 12 * 1024)
-        stored = dict(snapshot)
         if current_bytes is None:
-            if expected_generation is not None or snapshot.get("generation") != 0:
+            if expected_generation is not None or stored["generation"] != 0:
                 raise CheckpointError("new snapshot requires expected_generation=None and generation 0")
             stored["generation"] = 0
         else:
             current = decode_snapshot(current_bytes)
+            _snapshot_path(path, current)
             if type(expected_generation) is not int or current["generation"] != expected_generation:
                 raise CheckpointError("stale snapshot generation")
+            if any(
+                stored[field] != current[field]
+                for field in ("run_id", "supervisor_identity", "binding")
+            ) or any(
+                stored["git"][field] != current["git"][field]
+                for field in ("branch", "base_head")
+            ):
+                raise CheckpointError("snapshot run identity cannot change during CAS")
             stored["generation"] = expected_generation + 1
         encoded = encode_snapshot(stored)
         _atomic_replace(directory_fd, snapshot_path.name, encoded)

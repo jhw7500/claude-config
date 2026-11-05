@@ -54,6 +54,8 @@ JSON objects reject unknown or missing keys. `hex32`, `hex40`, and `hex64` mean 
 
 Replace every placeholder with a live observation or helper result. `phase` and `child.phase` are one of `SELECTED|PREFLIGHT|APPROACH_REVIEW|IMPLEMENT|INDEPENDENT_REVIEW|VERIFY|COMMIT|READY_FOR_TRIBUNAL|PAUSED`; `phase_status` is `started|verified`; `attempt` is `0|1`; `next_action` is a phase or `STOP`; child status is `running|quiescent|interrupted|completed|unknown`; runtime and origin adapter must both be the same `claude` or `codex`. `commit_parent` and `result_commit` are null or hex40. Use Git collect's `count`, `path_set_digest`, and `change_digest` unchanged. The evidence ref must be exactly `evidence/<sha256>.json` and its size must match the canonical evidence bytes. `session_fingerprint = SHA256(canonical JSON [origin_adapter, documented_session_id, host])`; raw session ID is never stored.
 
+Snapshot reads and writes use exactly `binding.worktree_root/HANDOFF.backlog-<run_id>.md`, as an absolute canonical path with no alias or nested directory. Within an existing file, CAS preserves `run_id`, every `supervisor_identity` and `binding` field, `git.branch`, and the frozen `git.base_head`. Phase/status, attempt, next action, blockers, child observations, evidence, observed HEAD, source summaries, and commit-result fields may advance. A changed supervisor or Claim requires the separately authorized successor procedure and a new generation-0 run file; it cannot replace the old file's identity.
+
 ### Admission acquire/release
 
 ```json
@@ -66,13 +68,17 @@ Replace every placeholder with a live observation or helper result. `phase` and 
 
 `root_key = SHA256(UTF-8 exact physical worktree path)`. The run ID in the exact checkpoint filename must equal the record run ID. Owner fields must match the live Task observations and snapshot binding; they do not grant authority. Acquire and release receive the same exact record bytes.
 
-Before release, write an evidence object containing this exact nested record and store its returned reference in the terminal snapshot:
+Before release, write an evidence object with these three REQUIRED top-level fields and store its returned reference in the terminal snapshot. Copy the entire `git collect` result into `source_manifest` and the entire successful `git bind` result into `commit_binding`; do not rebuild either object's digests. The following one-source example shows their complete shapes:
 
 ```json
-{"admission_release":{"schema":1,"run_id":"hex32","task_owner":"OWNER","session_fingerprint":"hex64","snapshot_generation":0,"tools_quiescent":true,"writers_quiescent":true}}
+{
+  "admission_release":{"schema":1,"run_id":"hex32","task_owner":"OWNER","session_fingerprint":"hex64","snapshot_generation":0,"tools_quiescent":true,"writers_quiescent":true},
+  "source_manifest":{"parent_head":"P_hex40","paths":["src/example.py"],"count":1,"sources":[{"change":"modify","mode":"100644","path":"src/example.py","sha256":"source_hex64"}],"path_set_digest":"paths_hex64","change_digest":"changes_hex64"},
+  "commit_binding":{"commit_parent":"P_hex40","result_commit":"C_hex40","source_count":1,"path_set_digest":"paths_hex64","change_digest":"changes_hex64"}
+}
 ```
 
-Release additionally requires snapshot phase `READY_FOR_TRIBUNAL`, status `verified`, next action `STOP`, and child phase/attempt equal to the current snapshot with status `quiescent|completed`.
+Release additionally requires snapshot phase `READY_FOR_TRIBUNAL`, status `verified`, next action `STOP`, and child phase/attempt equal to the current snapshot with status `quiescent|completed`. Set non-null `git.commit_parent = git.base_head = P` and `git.result_commit = git.observed_head = C`; the source count and both digests must equal the recorded binding. Release itself freshly inspects the exact branch/worktree and reruns `git bind` against `source_manifest`, C, and this exact checkpoint. Null, stale, mismatched, or dirty Git state preserves the active admission and fails. Quiescence booleans must be literal JSON `true`, not integers.
 
 ### Admission reconcile
 
@@ -91,6 +97,8 @@ Input has exactly the prior admission record, the new admission record, and this
 Git collect input is `{"paths":["repo/relative/path"]}`. Git bind input is the exact collected manifest. When the run checkpoint exists, both commands receive the same exact absolute `--checkpoint-path`. Only a current-UID, mode-0600, root-level regular file named `HANDOFF.backlog-<decoded-run-id>.md`, bound to that exact worktree and still untracked, is excluded. Other HANDOFF files, tracked artifacts, foreign paths, symlinks, or dirty paths remain errors.
 
 ### New-run clean baseline
+
+Git collection and post-commit binding reject any tracked index entry with `assume-unchanged` or `skip-worktree`, including otherwise clean entries. These flags can suppress source changes from status output. Preserve the index and source bytes; do not clear flags automatically.
 
 After `git inspect` freezes the exact worktree and HEAD, but before creating a new checkpoint or acquiring admission, run `git collect --root ABS_ROOT --input FILE|-` with exactly `{"paths":[]}` and without `--checkpoint-path`. A successful result must have the frozen `parent_head`, `count:0`, `paths:[]`, and `sources:[]`; preserve that manifest as the clean baseline. Any staged, unstaged, or untracked source state makes empty-allowlist collection fail. Record `PAUSED`, leave every byte and index entry untouched, and do not reset, clean, discard, stash, or adopt those changes into the new run.
 

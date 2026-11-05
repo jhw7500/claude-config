@@ -19,6 +19,7 @@ from .codec import (
     decode_snapshot,
     sha256_bytes,
 )
+from .git_evidence import bind_commit, inspect_worktree
 from .storage import (
     _check_owned_file,
     _existing_file_bytes,
@@ -321,6 +322,14 @@ def _validate_release(snapshot: dict, record: dict, state_root: str | os.PathLik
         and snapshot["child"]["observed_status"] in {"quiescent", "completed"}
     ):
         raise CheckpointError("release requires an owned terminal checkpoint")
+    git = snapshot["git"]
+    if (
+        git["commit_parent"] is None
+        or git["result_commit"] is None
+        or git["base_head"] != git["commit_parent"]
+        or git["observed_head"] != git["result_commit"]
+    ):
+        raise CheckpointError("release requires a verified commit binding")
     manifest = read_evidence(state_root, record["run_id"], snapshot["evidence"])
     observation = _exact_dict(
         manifest.get("admission_release"),
@@ -337,8 +346,25 @@ def _validate_release(snapshot: dict, record: dict, state_root: str | os.PathLik
         "tools_quiescent": True,
         "writers_quiescent": True,
     }
-    if observation != expected:
+    if canonical_bytes(observation) != canonical_bytes(expected):
         raise CheckpointError("release quiescence evidence does not match the current checkpoint")
+    fields = {"commit_parent", "result_commit", "source_count", "path_set_digest", "change_digest"}
+    recorded_binding = _exact_dict(manifest.get("commit_binding"), fields, "commit_binding")
+    snapshot_binding = {field: git[field] for field in fields}
+    if canonical_bytes(recorded_binding) != canonical_bytes(snapshot_binding):
+        raise CheckpointError("release commit binding differs from its snapshot")
+    source_manifest = manifest.get("source_manifest")
+    if not isinstance(source_manifest, dict):
+        raise CheckpointError("release requires an authenticated source manifest")
+    root = owner["worktree_root"]
+    inspected = inspect_worktree(root, owner["branch"], root)
+    if inspected["head"] != git["observed_head"]:
+        raise CheckpointError("release commit binding differs from the live HEAD")
+    fresh_binding = bind_commit(
+        root, git["base_head"], source_manifest, git["result_commit"], record["checkpoint_path"]
+    )
+    if canonical_bytes(fresh_binding) != canonical_bytes(recorded_binding):
+        raise CheckpointError("release commit binding differs from the live source manifest")
 
 
 def release_admission(

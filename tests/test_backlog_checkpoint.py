@@ -34,7 +34,7 @@ ZERO64 = "0" * 64
 ONE64 = "1" * 64
 
 
-def valid_snapshot() -> dict:
+def valid_snapshot(worktree: Path | None = None) -> dict:
     return {
         "schema": 1,
         "run_id": RUN_ID,
@@ -54,8 +54,8 @@ def valid_snapshot() -> dict:
             "issue_url": "https://github.com/jhw7500/claude-config/issues/31",
             "task_id": "task-31",
             "claim_id": "claim-31",
-            "repo_root": "/srv/claude-config",
-            "worktree_root": "/srv/claude-config-31",
+            "repo_root": str(worktree) if worktree is not None else "/srv/claude-config",
+            "worktree_root": str(worktree) if worktree is not None else "/srv/claude-config-31",
         },
         "git": {
             "branch": "task/issue-31",
@@ -242,7 +242,7 @@ def test_maximum_valid_snapshot_stays_inside_the_12_kib_budget() -> None:
 def test_write_snapshot_creates_generation_zero_and_mode_0600(tmp_path: Path) -> None:
     path = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
 
-    stored = write_snapshot(path, valid_snapshot(), expected_generation=None)
+    stored = write_snapshot(path, valid_snapshot(tmp_path), expected_generation=None)
 
     assert stored["generation"] == 0
     assert read_snapshot(path) == stored
@@ -251,28 +251,98 @@ def test_write_snapshot_creates_generation_zero_and_mode_0600(tmp_path: Path) ->
     assert file_stat.st_uid == os.getuid()
 
 
+@pytest.mark.parametrize("spelling", ["relative", "alias", "nested", "wrong-name", "wrong-run"])
+def test_snapshot_write_rejects_paths_outside_its_exact_run_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
+) -> None:
+    snapshot = replace(valid_snapshot(tmp_path), "binding.worktree_root", str(tmp_path))
+    name = f"HANDOFF.backlog-{RUN_ID}.md"
+    path: str | Path = tmp_path / name
+    if spelling == "relative":
+        monkeypatch.chdir(tmp_path)
+        path = name
+    elif spelling == "alias":
+        path = f"{tmp_path}/./{name}"
+    elif spelling == "nested":
+        (tmp_path / "nested").mkdir()
+        path = tmp_path / "nested" / name
+    elif spelling == "wrong-name":
+        path = tmp_path / "HANDOFF.md"
+    else:
+        path = tmp_path / f"HANDOFF.backlog-{'f' * 32}.md"
+
+    with pytest.raises(CheckpointError, match="snapshot.*path"):
+        write_snapshot(path, snapshot, None)
+
+    assert not Path(path).exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("run_id", "f" * 32),
+        ("supervisor_identity.host", "other-host"),
+        ("supervisor_identity.session_fingerprint", ONE64),
+        ("binding.issue_url", "https://github.com/o/r/issues/32"),
+        ("binding.task_id", "task-32"),
+        ("binding.claim_id", "claim-32"),
+        ("binding.repo_root", "/other/repo"),
+        ("binding.worktree_root", "/other/worktree"),
+        ("git.branch", "task/other"),
+        ("git.base_head", ONE40),
+    ],
+)
+def test_snapshot_cas_preserves_run_identity_and_original_bytes(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    snapshot = replace(valid_snapshot(tmp_path), "binding.worktree_root", str(tmp_path))
+    path = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
+    write_snapshot(path, snapshot, None)
+    before = path.read_bytes()
+
+    with pytest.raises(CheckpointError):
+        write_snapshot(path, replace(snapshot, field, value), 0)
+
+    assert path.read_bytes() == before
+    assert read_snapshot(path)["generation"] == 0
+
+
+def test_snapshot_cas_rejects_supervisor_runtime_replacement(tmp_path: Path) -> None:
+    snapshot = replace(valid_snapshot(tmp_path), "binding.worktree_root", str(tmp_path))
+    path = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
+    write_snapshot(path, snapshot, None)
+    before = path.read_bytes()
+    changed = replace(snapshot, "supervisor_identity.runtime", "claude")
+    changed["supervisor_identity"]["origin_adapter"] = "claude"
+
+    with pytest.raises(CheckpointError):
+        write_snapshot(path, changed, 0)
+
+    assert path.read_bytes() == before
+
+
 def test_write_snapshot_updates_by_exact_generation_and_rejects_stale_cas(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
-    write_snapshot(path, valid_snapshot(), expected_generation=None)
+    write_snapshot(path, valid_snapshot(tmp_path), expected_generation=None)
 
     updated = write_snapshot(
         path,
-        replace(valid_snapshot(), "phase", "INDEPENDENT_REVIEW"),
+        replace(valid_snapshot(tmp_path), "phase", "INDEPENDENT_REVIEW"),
         expected_generation=0,
     )
 
     assert updated["generation"] == 1
     with pytest.raises(CheckpointError):
-        write_snapshot(path, valid_snapshot(), expected_generation=0)
+        write_snapshot(path, valid_snapshot(tmp_path), expected_generation=0)
     assert read_snapshot(path) == updated
 
 
 def test_concurrent_snapshot_writers_serialize_one_cas_winner(tmp_path: Path) -> None:
     path = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
-    write_snapshot(path, valid_snapshot(), expected_generation=None)
-    candidate = replace(valid_snapshot(), "phase", "INDEPENDENT_REVIEW")
+    write_snapshot(path, valid_snapshot(tmp_path), expected_generation=None)
+    candidate = replace(valid_snapshot(tmp_path), "phase", "INDEPENDENT_REVIEW")
     context = multiprocessing.get_context("fork")
     start = context.Event()
     results = context.Queue()
@@ -317,7 +387,7 @@ def test_directory_lock_failure_is_bounded_before_snapshot_publish(
     monkeypatch.setattr(storage.fcntl, "flock", fail_lock)
 
     with pytest.raises(CheckpointError, match="lock"):
-        write_snapshot(path, valid_snapshot(), expected_generation=None)
+        write_snapshot(path, valid_snapshot(tmp_path), expected_generation=None)
 
     assert list(tmp_path.iterdir()) == []
 
@@ -326,7 +396,7 @@ def test_partial_snapshot_write_preserves_the_previous_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
-    first = write_snapshot(path, valid_snapshot(), expected_generation=None)
+    first = write_snapshot(path, valid_snapshot(tmp_path), expected_generation=None)
     old_bytes = path.read_bytes()
     real_write = os.write
     write_calls = 0
@@ -343,7 +413,7 @@ def test_partial_snapshot_write_preserves_the_previous_file(
     with pytest.raises(CheckpointError):
         write_snapshot(
             path,
-            replace(valid_snapshot(), "phase", "INDEPENDENT_REVIEW"),
+            replace(valid_snapshot(tmp_path), "phase", "INDEPENDENT_REVIEW"),
             expected_generation=first["generation"],
         )
 
@@ -356,7 +426,7 @@ def test_directory_fsync_failure_after_publish_is_indeterminate_and_not_rolled_b
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
-    first = write_snapshot(path, valid_snapshot(), expected_generation=None)
+    first = write_snapshot(path, valid_snapshot(tmp_path), expected_generation=None)
     real_fsync = os.fsync
 
     def fail_directory_fsync(fd: int) -> None:
@@ -369,7 +439,7 @@ def test_directory_fsync_failure_after_publish_is_indeterminate_and_not_rolled_b
     with pytest.raises(CheckpointIndeterminateError):
         write_snapshot(
             path,
-            replace(valid_snapshot(), "phase", "INDEPENDENT_REVIEW"),
+            replace(valid_snapshot(tmp_path), "phase", "INDEPENDENT_REVIEW"),
             expected_generation=first["generation"],
         )
 
@@ -386,24 +456,26 @@ def test_missing_nofollow_capability_fails_before_snapshot_side_effects(
     monkeypatch.setattr(storage, "_NOFOLLOW", missing_flag)
 
     with pytest.raises(CheckpointError):
-        write_snapshot(path, valid_snapshot(), expected_generation=None)
+        write_snapshot(path, valid_snapshot(tmp_path), expected_generation=None)
 
     assert list(tmp_path.iterdir()) == []
 
 
 def test_snapshot_storage_rejects_symlink_targets(tmp_path: Path) -> None:
-    target = tmp_path / "outside.md"
-    target.write_bytes(encode_snapshot(valid_snapshot()))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / f"HANDOFF.backlog-{RUN_ID}.md"
+    target.write_bytes(encode_snapshot(valid_snapshot(outside)))
     target.chmod(0o600)
-    assert read_snapshot(target) == valid_snapshot()
+    assert read_snapshot(target) == valid_snapshot(outside)
     path = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
     path.symlink_to(target)
 
     with pytest.raises(CheckpointError):
-        write_snapshot(path, valid_snapshot(), expected_generation=None)
+        write_snapshot(path, valid_snapshot(tmp_path), expected_generation=None)
     with pytest.raises(CheckpointError):
         read_snapshot(path)
-    assert read_snapshot(target) == valid_snapshot()
+    assert read_snapshot(target) == valid_snapshot(outside)
 
 
 def test_write_evidence_is_content_addressed_immutable_and_private(
@@ -581,7 +653,7 @@ def test_representative_evidence_and_snapshot_round_trip_stay_within_budgets(
     assert reference["size"] <= 1024 * 1024
     assert read_evidence(tmp_path, RUN_ID, reference) == evidence
 
-    snapshot = valid_snapshot()
+    snapshot = valid_snapshot(tmp_path)
     snapshot["git"]["source_count"] = 1000
     snapshot["evidence"] = reference
     checkpoint = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"

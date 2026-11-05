@@ -517,12 +517,24 @@ def _manifest(parent_head: str, sources: list[dict[str, Any]]) -> dict:
     }
 
 
+def _visible_index(root: str) -> bytes:
+    entries = _git(root, "ls-files", "-v", "-z")
+    if any(
+        entry[:1].islower() or entry[:1] == b"S"
+        for entry in entries.split(b"\0")
+        if entry
+    ):
+        raise CheckpointError("Git index flags can hide tracked worktree changes")
+    return entries
+
+
 def collect_sources(
     root: str, allowed_paths: list[str], checkpoint_path: str | None = None
 ) -> dict:
     """Collect an exact source manifest without staging or mutating Git state."""
     checked_root = _canonical_root(root)
     checked_paths = _validate_paths(allowed_paths)
+    first_index = _visible_index(checked_root)
     checkpoint = _checkpoint_artifact(checked_root, checkpoint_path)
     allowed = {raw for raw, _ in checked_paths}
     parent_head = _oid(
@@ -544,6 +556,7 @@ def collect_sources(
     sources = _source_records(checked_root, checked_paths, parent_tree)
     second_sources = _source_records(checked_root, checked_paths, parent_tree)
     second_status = _status(checked_root)
+    second_index = _visible_index(checked_root)
     if checkpoint_path is not None:
         if _checkpoint_artifact(checked_root, checkpoint_path) != checkpoint:
             raise CheckpointError("checkpoint artifact changed during collection")
@@ -553,6 +566,7 @@ def collect_sources(
     if (
         sources != second_sources
         or first_status != second_status
+        or first_index != second_index
         or parent_head != current_head
     ):
         raise CheckpointError("Git source state changed during collection")
