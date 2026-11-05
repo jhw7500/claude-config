@@ -1,6 +1,134 @@
 # Backlog drainer v3 validation — 2026-11-04
 
-## PR #266 terminal admission release cleanup — 2026-11-05
+## PR #266 file/directory replacement evidence correction — 2026-11-05
+
+This follow-up addresses Codex comment `4479909379` on parent `949ae10d583b7a5e7497bed5a2d5e1e299468ebc`. When a tracked directory is replaced by a regular file, its former descendants are deleted Git sources. The earlier helper rejected their non-directory ancestor before it could emit deletion records, even with every changed path allowlisted. The symmetric replacement of a tracked file by a directory also rejected the directory instead of representing absence of the former file blob.
+
+Git evidence now recognizes each absence only after a no-follow, nonblocking component open and descriptor/named-path rechecks agree on device, inode, mode, size, mtime, and ctime. A regular-file ancestor makes its former descendants absent; a verified directory at an exact source path makes the former file blob absent. The helper retains parent descriptors, closes its verification descriptor on every path, and shares this validation between both cases. Symlink parents, unsupported file types, changed components, and dirty paths outside the allowlist remain rejected.
+
+Eight functional real-Git scenarios failed before the corresponding production behavior was added: flat/nested collection and direct-child commit binding in each replacement direction. The combined GREEN passes 23 new regression/control cases, including missing allowlist entries, symlink-parent rejection, actual replacements before and after the probe open, and an owned-process FIFO replacement that must fail without blocking. Source contents and Git status are checked for unintended mutation.
+
+The known native independent reviewer usage-limit error remains a validation gap; a separate Root source-review pass is not independent approval. The nine earlier JSON packets below retain their exact original bytes and tested inputs. Native cross-runtime recovery, live Claim-transition, and public-entry foreign-UID gaps remain unchanged. The prior manual exception round's Gemini failure and consumed budgets remain preserved. Any next external review needs the documented exact new-snapshot exception; this local validation does not request one.
+
+<!-- backlog-fix-pr266-replacement-suite:begin -->
+```json
+{
+  "schema": 1,
+  "scope": "PR #266 file/directory replacement Git evidence correction in both directions; component and whole-project checks, not independent/native-C3/Tribunal approval",
+  "finding": 4479909379,
+  "parent_head": "949ae10d583b7a5e7497bed5a2d5e1e299468ebc",
+  "tested_working_change_digest": "261ef327fa67afbd97f74059526120b9063c9f2ea688dddb5478f3fdc0a12029",
+  "source_manifest": {
+    "change_digest": "261ef327fa67afbd97f74059526120b9063c9f2ea688dddb5478f3fdc0a12029",
+    "count": 3,
+    "parent_head": "949ae10d583b7a5e7497bed5a2d5e1e299468ebc",
+    "path_set_digest": "b5d919799768ebeb060da2d5bb67ce6c14bd41d9d70b071959409cf2bc103608",
+    "paths": [
+      "docs/validation/2026-11-04-backlog-drainer.md",
+      "scripts/backlog_checkpoint/git_evidence.py",
+      "tests/test_backlog_git_evidence.py"
+    ],
+    "sources": [
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "docs/validation/2026-11-04-backlog-drainer.md",
+        "sha256": "3484d9973002b087de436dbf6a19eb1db5d36353a6cc47b16539bebfe7d5f248"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "scripts/backlog_checkpoint/git_evidence.py",
+        "sha256": "248a7b2b2bc235f9b977586b06a655a9d870094126f5248f4329c905020941f4"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "tests/test_backlog_git_evidence.py",
+        "sha256": "6c9c4feb5783d32022a52f791f6eaecc458e5873bce0d8959119217d6a326c0f"
+      }
+    ]
+  },
+  "source_hashes": {
+    "install.sh": "e498f4565c4fbc89d7b7b6a116b497fed94a73ac4a7fe675ba6a9907b7364ecf",
+    "scripts/backlog-checkpoint.py": "95c09efb70b907f1fad1f07a9c74d56211127c91be70c5e27ad76266dd617526",
+    "scripts/backlog_checkpoint/__init__.py": "1c62a4c05db819c7d779f2c22acd2af63b56fb4f648ef4ae236af838a307da2a",
+    "scripts/backlog_checkpoint/admission.py": "ab3934226bc02bf78fe9c2addc6320d6081bef9d2a985787d3a3077e637c3dcc",
+    "scripts/backlog_checkpoint/cli.py": "b6ce9591980a9705765a23e41a69119de5f8705834e39387c76107be288942e3",
+    "scripts/backlog_checkpoint/codec.py": "aef3989e5a3eed08cf2f32a994191a7fc42f62b0eb531b02787cfb68d9c28179",
+    "scripts/backlog_checkpoint/git_evidence.py": "248a7b2b2bc235f9b977586b06a655a9d870094126f5248f4329c905020941f4",
+    "scripts/backlog_checkpoint/queue.py": "cd889886dde12c433278c3451b9cd9bc931c7bdaa1dc2acd56bf825479841ffd",
+    "scripts/backlog_checkpoint/storage.py": "56509e8f63f7c067550cc5a47149e2ca76c21a536f8e01ea7677192b35fcd1e4",
+    "scripts/install-backlog-drain.py": "8df080971d07066c585d81c40fe1d40ac644ae96582f3991bd6cd015f62ecc19",
+    "skills/backlog-drain/SKILL.md": "dce1c5a6907dd507e342c81229544cc37dab116e9174903d10f060add2a57c85",
+    "skills/backlog-drain/references/protocol.md": "5723be361b52d810d490cfefbdc612fb5ca87d9c8eb366293480d546c2058bb4",
+    "tests/test_backlog_admission.py": "c4548db5d3abfe82ad87b0986705c54c637181f279de7ff14665db9770fad11e",
+    "tests/test_backlog_checkpoint.py": "75278441871f2e466639bd2bf209b4823c2ada42ea6c93aeebf50eacee6516db",
+    "tests/test_backlog_cli.py": "dc527b6d476d30e445d7d80b68c58224ce7fcdaaf4b1d1470f04ff075e6d09be",
+    "tests/test_backlog_git_evidence.py": "6c9c4feb5783d32022a52f791f6eaecc458e5873bce0d8959119217d6a326c0f",
+    "tests/test_backlog_install.py": "ce30f2c11ac5dbd0cba6653906f3c3bb108360ad5824035a0b169cd47080458e",
+    "tests/test_backlog_queue.py": "4fedd10261709a7321f4113d51933bea850be5bc853a3139afc921b85bf31f8a"
+  },
+  "suite": {
+    "command": "rtk proxy /usr/bin/env -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 \"$HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python\" -m pytest -q -n 8 -p no:cacheprovider",
+    "exit_code": 0,
+    "timed_out": false,
+    "elapsed_seconds": 332.259,
+    "summary": "5487 passed in 332.08s (0:05:32)",
+    "capture_sha256": "c3490c3da76919e173723c877ba75640597266bda8438d7c17be937b3c9b6db7",
+    "complete": true,
+    "output_limited": false,
+    "stdout_bytes": 6236,
+    "stderr_bytes": 0,
+    "stdout": "bringing up nodes...\nbringing up nodes...\n\n........................................................................ [  1%]\n........................................................................ [  2%]\n........................................................................ [  3%]\n........................................................................ [  5%]\n........................................................................ [  6%]\n........................................................................ [  7%]\n........................................................................ [  9%]\n........................................................................ [ 10%]\n........................................................................ [ 11%]\n........................................................................ [ 13%]\n........................................................................ [ 14%]\n........................................................................ [ 15%]\n........................................................................ [ 17%]\n........................................................................ [ 18%]\n........................................................................ [ 19%]\n........................................................................ [ 20%]\n........................................................................ [ 22%]\n........................................................................ [ 23%]\n........................................................................ [ 24%]\n........................................................................ [ 26%]\n........................................................................ [ 27%]\n........................................................................ [ 28%]\n........................................................................ [ 30%]\n........................................................................ [ 31%]\n........................................................................ [ 32%]\n........................................................................ [ 34%]\n........................................................................ [ 35%]\n........................................................................ [ 36%]\n........................................................................ [ 38%]\n........................................................................ [ 39%]\n........................................................................ [ 40%]\n........................................................................ [ 41%]\n........................................................................ [ 43%]\n........................................................................ [ 44%]\n........................................................................ [ 45%]\n........................................................................ [ 47%]\n........................................................................ [ 48%]\n........................................................................ [ 49%]\n........................................................................ [ 51%]\n........................................................................ [ 52%]\n........................................................................ [ 53%]\n........................................................................ [ 55%]\n........................................................................ [ 56%]\n........................................................................ [ 57%]\n........................................................................ [ 59%]\n........................................................................ [ 60%]\n........................................................................ [ 61%]\n........................................................................ [ 62%]\n........................................................................ [ 64%]\n........................................................................ [ 65%]\n........................................................................ [ 66%]\n........................................................................ [ 68%]\n........................................................................ [ 69%]\n........................................................................ [ 70%]\n........................................................................ [ 72%]\n........................................................................ [ 73%]\n........................................................................ [ 74%]\n........................................................................ [ 76%]\n........................................................................ [ 77%]\n........................................................................ [ 78%]\n........................................................................ [ 80%]\n........................................................................ [ 81%]\n........................................................................ [ 82%]\n........................................................................ [ 83%]\n........................................................................ [ 85%]\n........................................................................ [ 86%]\n........................................................................ [ 87%]\n........................................................................ [ 89%]\n........................................................................ [ 90%]\n........................................................................ [ 91%]\n........................................................................ [ 93%]\n........................................................................ [ 94%]\n........................................................................ [ 95%]\n........................................................................ [ 97%]\n........................................................................ [ 98%]\n........................................................................ [ 99%]\n...............                                                          [100%]\n5487 passed in 332.08s (0:05:32)\n",
+    "stderr": ""
+  },
+  "original_capture_record_sha256": "c1a62a4c9fb91ab47c1a6a9b79af1f507d5ee2442407e477a6b4fb8c91758041",
+  "tested_validation_document": {
+    "sha256": "3484d9973002b087de436dbf6a19eb1db5d36353a6cc47b16539bebfe7d5f248",
+    "bytes": 170784
+  },
+  "independent_review": {
+    "status": "NOT_COMPLETED",
+    "reason": "known native reviewer usage_limit; no fresh independent verdict or model bypass",
+    "availability_evidence": "../pr266-ignorecase-fix-zv6h51ea/independent-review-unavailable.json"
+  },
+  "local_root_review": {
+    "status": "ROOT_REVIEW_COMPLETED",
+    "independent": false,
+    "scope": [
+      "scripts/backlog_checkpoint/git_evidence.py",
+      "tests/test_backlog_git_evidence.py",
+      "docs/validation/2026-11-04-backlog-drainer.md"
+    ],
+    "findings": [],
+    "report_sha256": "939683dceb202824645b65bf1e8c558dac08efc3e48c394ef71f1a45d48425bf"
+  },
+  "tdd": {
+    "directory_to_file_initial_red_cases": 4,
+    "initial_production_sha256": "3a17888d9581006ae4867d1d55533c4811063a2a99975ca4783f9cb464c1bd29",
+    "initial_red_capture_sha256": "65843ee09d2af6ac746a951b79eaef01782f44981ff910b441e5f66498479484",
+    "intermediate_directory_to_file_green": "15 passed, 66 deselected in 2.18s",
+    "symmetric_file_to_directory_red_cases": 4,
+    "symmetric_red_production_sha256": "ac883bb1cf2042c09f3a2217dff1b86e65bada7582965f7a401d73ca0010a44c",
+    "symmetric_red_capture_sha256": "d4bcf6b5ead26c993238fb080c2a291e7f5f7980ec934136e8ec39844d842beb",
+    "combined_green": "23 passed, 66 deselected in 3.48s",
+    "git_module": "89 passed in 12.64s",
+    "backlog_modules": "277 passed in 22.06s"
+  },
+  "performer_report_sha256": "42d6fb1932910ce700941690416fd55b278fde526ac61328be6c6bfb8711ebce",
+  "repository_configuration_mutated": false,
+  "native_C3_pass": false,
+  "public_foreign_uid_fixture_pass": false,
+  "live_claim_transition_pass": false,
+  "post_suite_change_scope": [
+    "docs/validation/2026-11-04-backlog-drainer.md"
+  ]
+}
+```
+<!-- backlog-fix-pr266-replacement-suite:end -->
+
+## Historical PR #266 terminal admission release cleanup for `949ae10` — 2026-11-05
 
 This follow-up addresses Codex comment `4478519511` on parent `313ee920f072ce0ae69ec93639a6c2f6f08d283f`. Release previously removed only the active admission and left the terminal checkpoint untracked, preventing a later authorized run from passing empty-allowlist bootstrap in a checkout without a handoff ignore rule.
 

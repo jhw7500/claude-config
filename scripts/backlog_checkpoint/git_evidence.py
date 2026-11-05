@@ -408,6 +408,38 @@ def _read_regular(
         os.close(descriptor)
 
 
+def _verify_source_component(
+    parent_descriptor: int, name: bytes, metadata: os.stat_result
+) -> None:
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+    if stat.S_ISDIR(metadata.st_mode):
+        flags |= os.O_DIRECTORY
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError as exc:
+        raise CheckpointError("source component changed during collection") from exc
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        identities = [
+            (
+                item.st_dev,
+                item.st_ino,
+                item.st_mode,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+            )
+            for item in (metadata, opened, current)
+        ]
+        if identities[0] != identities[1] or identities[1] != identities[2]:
+            raise CheckpointError("source component changed during collection")
+    except OSError as exc:
+        raise CheckpointError("source component changed during collection") from exc
+    finally:
+        os.close(descriptor)
+
+
 def _worktree_entry(root: str, raw_path: bytes) -> tuple[str, bytes] | None:
     if (
         not hasattr(os, "O_DIRECTORY")
@@ -433,6 +465,21 @@ def _worktree_entry(root: str, raw_path: bytes) -> tuple[str, bytes] | None:
                 )
             except FileNotFoundError:
                 return None
+            except NotADirectoryError as exc:
+                try:
+                    metadata = os.stat(
+                        part, dir_fd=descriptors[-1], follow_symlinks=False
+                    )
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise CheckpointError(
+                            "source path has an unsupported parent component"
+                        ) from exc
+                except OSError as changed:
+                    raise CheckpointError(
+                        "source component changed during collection"
+                    ) from changed
+                _verify_source_component(descriptors[-1], part, metadata)
+                return None
             except OSError as exc:
                 raise CheckpointError(
                     "source path has an unsupported parent component"
@@ -443,6 +490,9 @@ def _worktree_entry(root: str, raw_path: bytes) -> tuple[str, bytes] | None:
             return None
         except OSError as exc:
             raise CheckpointError("source metadata could not be inspected") from exc
+        if stat.S_ISDIR(metadata.st_mode):
+            _verify_source_component(descriptors[-1], parts[-1], metadata)
+            return None
         if stat.S_ISREG(metadata.st_mode):
             mode = "100755" if metadata.st_mode & 0o111 else "100644"
             return mode, _read_regular(descriptors[-1], parts[-1], metadata)

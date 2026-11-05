@@ -356,6 +356,273 @@ def test_collect_sources_records_literal_complete_worktree_state(repo: Path) -> 
     }
 
 
+def _directory_file_replacement(repo: Path, descendant: str) -> str:
+    original = _write(repo, descendant, b"original\n")
+    _commit_all(repo, "directory replacement baseline")
+    parent = _head(repo)
+    assert collect_sources(str(repo), [])["count"] == 0
+    original.unlink()
+    directory = original.parent
+    while directory != repo:
+        directory.rmdir()
+        directory = directory.parent
+    (repo / "pkg").write_bytes(b"replacement\n")
+    return parent
+
+
+@pytest.mark.parametrize("descendant", ["pkg/old.py", "pkg/nested/old.py"])
+def test_directory_file_replacement_records_removed_descendants(
+    repo: Path, descendant: str
+) -> None:
+    parent = _directory_file_replacement(repo, descendant)
+    before = _git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+
+    manifest = collect_sources(str(repo), ["pkg", descendant, "pkg/zz-future.py"])
+
+    assert manifest["parent_head"] == parent
+    assert manifest["paths"] == ["pkg", descendant]
+    assert manifest["count"] == 2
+    assert manifest["sources"] == [
+        {
+            "change": "add",
+            "mode": "100644",
+            "path": "pkg",
+            "sha256": "1d054714357ce5ee01723ed91fcaa69206e221faaf9c1fad64f73be2e5d051da",
+        },
+        {"change": "delete", "mode": None, "path": descendant, "sha256": None},
+    ]
+    assert _head(repo) == parent
+    assert _git(repo, "status", "--porcelain=v1", "--untracked-files=all") == before
+    assert (repo / "pkg").read_bytes() == b"replacement\n"
+
+
+@pytest.mark.parametrize("descendant", ["pkg/old.py", "pkg/nested/old.py"])
+def test_directory_file_replacement_binds_reviewed_commit(
+    repo: Path, descendant: str
+) -> None:
+    parent = _directory_file_replacement(repo, descendant)
+    manifest = collect_sources(str(repo), ["pkg", descendant])
+    commit_oid = _commit_all(repo, "replace directory with reviewed file")
+
+    assert bind_commit(str(repo), parent, manifest, commit_oid) == {
+        "commit_parent": parent,
+        "result_commit": commit_oid,
+        "source_count": 2,
+        "path_set_digest": manifest["path_set_digest"],
+        "change_digest": manifest["change_digest"],
+    }
+    assert _git(repo, "rev-parse", "HEAD^").decode().strip() == parent
+    assert _git(repo, "status", "--porcelain=v1", "--untracked-files=all") == b""
+    assert (repo / "pkg").read_bytes() == b"replacement\n"
+
+
+@pytest.mark.parametrize("allowed", [["pkg"], ["pkg/old.py"]])
+def test_directory_file_replacement_requires_every_dirty_path(
+    repo: Path, allowed: list[str]
+) -> None:
+    _directory_file_replacement(repo, "pkg/old.py")
+    before = _git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        collect_sources(str(repo), allowed)
+
+    assert _git(repo, "status", "--porcelain=v1", "--untracked-files=all") == before
+
+
+@pytest.mark.parametrize("descendant", ["pkg/old.py", "pkg/nested/old.py"])
+def test_directory_file_replacement_rejects_symlink_parent(
+    repo: Path, tmp_path: Path, descendant: str
+) -> None:
+    _directory_file_replacement(repo, descendant)
+    outside = tmp_path / "outside"
+    external = _write(outside, descendant.removeprefix("pkg/"), b"outside\n")
+    (repo / "pkg").unlink()
+    (repo / "pkg").symlink_to(outside, target_is_directory=True)
+    before = _git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+
+    with pytest.raises(CheckpointError, match="unsupported parent component"):
+        collect_sources(str(repo), ["pkg", descendant])
+
+    assert external.read_bytes() == b"outside\n"
+    assert _git(repo, "status", "--porcelain=v1", "--untracked-files=all") == before
+
+
+@pytest.mark.parametrize("phase", ["before_open", "after_open"])
+@pytest.mark.parametrize("kind", ["regular", "symlink", "directory"])
+def test_directory_file_replacement_rejects_changed_parent(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, kind: str
+) -> None:
+    _directory_file_replacement(repo, "pkg/old.py")
+    parent = repo / "pkg"
+    prepared = tmp_path / "prepared-parent"
+    outside = tmp_path / "outside"
+    external = _write(outside, "old.py", b"outside\n")
+    if kind == "regular":
+        prepared.write_bytes(b"changed parent\n")
+    elif kind == "symlink":
+        prepared.symlink_to(outside, target_is_directory=True)
+    else:
+        prepared.mkdir()
+        _write(prepared, "old.py", b"changed parent\n")
+    real_open = os.open
+    directory_failed = False
+    replaced = False
+
+    def replace_parent() -> None:
+        nonlocal replaced
+        parent.unlink()
+        prepared.rename(parent)
+        replaced = True
+
+    def open_with_parent_replacement(name, flags, *args, **kwargs):
+        nonlocal directory_failed
+        is_parent = name == b"pkg" and kwargs.get("dir_fd") is not None
+        if is_parent and flags & os.O_DIRECTORY:
+            try:
+                return real_open(name, flags, *args, **kwargs)
+            except NotADirectoryError:
+                directory_failed = True
+                raise
+        if is_parent and directory_failed and not replaced:
+            if phase == "before_open":
+                replace_parent()
+            descriptor = real_open(name, flags, *args, **kwargs)
+            if phase == "after_open":
+                replace_parent()
+            return descriptor
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_with_parent_replacement)
+    monkeypatch.setattr(
+        os, "supports_dir_fd", set(os.supports_dir_fd) | {open_with_parent_replacement}
+    )
+
+    with pytest.raises(CheckpointError, match="component changed"):
+        collect_sources(str(repo), ["pkg", "pkg/old.py"])
+
+    assert replaced
+    assert external.read_bytes() == b"outside\n"
+
+
+def test_directory_file_replacement_probe_rejects_fifo_without_blocking(
+    repo: Path,
+) -> None:
+    _write(repo, "pkg", b"replacement\n")
+    _commit_all(repo, "regular parent baseline")
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    process = context.Process(
+        target=_collect_sources_in_child,
+        args=(str(repo), ["pkg/future.py"], None, "pkg", results),
+    )
+
+    _assert_collection_rejects_without_blocking(
+        process, results, expect_replacement=True
+    )
+    assert (repo / "pkg").is_fifo()
+
+
+def _file_directory_replacement(repo: Path, descendant: str) -> str:
+    _write(repo, "pkg", b"original\n")
+    _commit_all(repo, "file replacement baseline")
+    parent = _head(repo)
+    assert collect_sources(str(repo), [])["count"] == 0
+    (repo / "pkg").unlink()
+    _write(repo, descendant, b"replacement\n")
+    return parent
+
+
+@pytest.mark.parametrize("descendant", ["pkg/new.py", "pkg/nested/new.py"])
+def test_file_directory_replacement_records_removed_file(
+    repo: Path, descendant: str
+) -> None:
+    parent = _file_directory_replacement(repo, descendant)
+    before = _git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+
+    manifest = collect_sources(str(repo), ["pkg", descendant])
+
+    assert manifest["parent_head"] == parent
+    assert manifest["paths"] == ["pkg", descendant]
+    assert manifest["count"] == 2
+    assert manifest["sources"] == [
+        {"change": "delete", "mode": None, "path": "pkg", "sha256": None},
+        {
+            "change": "add",
+            "mode": "100644",
+            "path": descendant,
+            "sha256": "1d054714357ce5ee01723ed91fcaa69206e221faaf9c1fad64f73be2e5d051da",
+        },
+    ]
+    assert _head(repo) == parent
+    assert _git(repo, "status", "--porcelain=v1", "--untracked-files=all") == before
+    assert (repo / descendant).read_bytes() == b"replacement\n"
+
+
+@pytest.mark.parametrize("descendant", ["pkg/new.py", "pkg/nested/new.py"])
+def test_file_directory_replacement_binds_reviewed_commit(
+    repo: Path, descendant: str
+) -> None:
+    parent = _file_directory_replacement(repo, descendant)
+    manifest = collect_sources(str(repo), ["pkg", descendant])
+    commit_oid = _commit_all(repo, "replace file with reviewed directory")
+
+    assert bind_commit(str(repo), parent, manifest, commit_oid) == {
+        "commit_parent": parent,
+        "result_commit": commit_oid,
+        "source_count": 2,
+        "path_set_digest": manifest["path_set_digest"],
+        "change_digest": manifest["change_digest"],
+    }
+    assert _git(repo, "rev-parse", "HEAD^").decode().strip() == parent
+    assert _git(repo, "status", "--porcelain=v1", "--untracked-files=all") == b""
+
+
+@pytest.mark.parametrize("phase", ["before_open", "after_open"])
+@pytest.mark.parametrize("kind", ["regular", "symlink"])
+def test_file_directory_replacement_rejects_changed_directory(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, kind: str
+) -> None:
+    _file_directory_replacement(repo, "pkg/new.py")
+    parent = repo / "pkg"
+    prepared = tmp_path / "prepared-parent"
+    outside = tmp_path / "outside"
+    external = _write(outside, "new.py", b"outside\n")
+    if kind == "regular":
+        prepared.write_bytes(b"changed parent\n")
+    else:
+        prepared.symlink_to(outside, target_is_directory=True)
+    real_open = os.open
+    replaced = False
+
+    def replace_directory() -> None:
+        nonlocal replaced
+        parent.rename(tmp_path / "retired-directory")
+        prepared.rename(parent)
+        replaced = True
+
+    def open_with_directory_replacement(name, flags, *args, **kwargs):
+        is_parent = name == b"pkg" and kwargs.get("dir_fd") is not None
+        if is_parent and flags & os.O_DIRECTORY and not replaced:
+            if phase == "before_open":
+                replace_directory()
+            descriptor = real_open(name, flags, *args, **kwargs)
+            if phase == "after_open":
+                replace_directory()
+            return descriptor
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_with_directory_replacement)
+    monkeypatch.setattr(
+        os, "supports_dir_fd", set(os.supports_dir_fd) | {open_with_directory_replacement}
+    )
+
+    with pytest.raises(CheckpointError, match="component changed"):
+        collect_sources(str(repo), ["pkg", "pkg/new.py"])
+
+    assert replaced
+    assert external.read_bytes() == b"outside\n"
+
+
 def test_collect_sources_omits_unchanged_and_future_allowed_paths(repo: Path) -> None:
     assert collect_sources(str(repo), ["base.txt", "future.txt"]) == {
         "paths": [],
