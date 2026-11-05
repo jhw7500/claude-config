@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import multiprocessing
 import os
 from pathlib import Path
 import subprocess
@@ -111,6 +112,60 @@ def _checkpoint(root: Path, run_id: str) -> Path:
     }
     write_snapshot(path, snapshot, expected_generation=None)
     return path
+
+
+def _collect_sources_in_child(
+    root: str,
+    paths: list[str],
+    checkpoint: str | None,
+    replace_with_fifo: str | None,
+    results,
+) -> None:
+    replaced = False
+    if replace_with_fifo is not None:
+        real_open = git_evidence.os.open
+
+        def replace_at_regular_file_open(name, flags, *args, **kwargs):
+            nonlocal replaced
+            if (
+                not replaced
+                and name == os.fsencode(replace_with_fifo)
+                and kwargs.get("dir_fd") is not None
+                and not flags & os.O_DIRECTORY
+            ):
+                replaced = True
+                os.unlink(name, dir_fd=kwargs["dir_fd"])
+                os.mkfifo(name, mode=0o600, dir_fd=kwargs["dir_fd"])
+            return real_open(name, flags, *args, **kwargs)
+
+        git_evidence.os.open = replace_at_regular_file_open
+        git_evidence.os.supports_dir_fd = set(os.supports_dir_fd) | {
+            replace_at_regular_file_open
+        }
+    try:
+        collect_sources(root, paths, checkpoint)
+    except CheckpointError as exc:
+        results.put(("error", str(exc), replaced))
+    else:
+        results.put(("returned", "manifest", replaced))
+
+
+def _assert_collection_rejects_without_blocking(
+    process, results, *, expect_replacement: bool = False
+) -> None:
+    try:
+        process.start()
+        process.join(2)
+        assert not process.is_alive(), "unsafe Git evidence read blocked during open"
+        assert process.exitcode == 0
+        outcome, detail, replaced = results.get(timeout=1)
+        assert outcome == "error", detail
+        assert replaced is expect_replacement, detail
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(1)
+        results.close()
 
 
 def test_inspect_worktree_returns_exact_canonical_checkout(repo: Path) -> None:
@@ -407,6 +462,20 @@ def test_checkpoint_exclusion_rejects_nonexact_runtime_artifact(
         collect_sources(str(repo), ["base.txt"], str(checkpoint))
 
 
+def test_checkpoint_collection_rejects_owned_fifo_without_blocking(repo: Path) -> None:
+    """Catch checkpoint artifact opens that block before regular-file validation."""
+    checkpoint = repo / "HANDOFF.backlog-0123456789abcdef0123456789abcdef.md"
+    os.mkfifo(checkpoint, mode=0o600)
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    process = context.Process(
+        target=_collect_sources_in_child,
+        args=(str(repo), ["base.txt"], str(checkpoint), None, results),
+    )
+
+    _assert_collection_rejects_without_blocking(process, results)
+
+
 def test_collect_rejects_checkpoint_changed_during_collection(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -476,6 +545,23 @@ def test_collect_sources_rejects_allowed_special_file(repo: Path) -> None:
 
     with pytest.raises(CheckpointError, match="unsupported"):
         collect_sources(str(repo), ["source.fifo"])
+
+
+def test_collect_rejects_regular_source_replaced_with_fifo_before_open(
+    repo: Path,
+) -> None:
+    """Catch a metadata/open race that otherwise blocks on a replacement FIFO."""
+    _write(repo, "base.txt", b"reviewed\n")
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    process = context.Process(
+        target=_collect_sources_in_child,
+        args=(str(repo), ["base.txt"], None, "base.txt", results),
+    )
+
+    _assert_collection_rejects_without_blocking(
+        process, results, expect_replacement=True
+    )
 
 
 def test_collect_sources_ignores_poisoned_git_environment(

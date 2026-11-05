@@ -101,6 +101,34 @@ def _race_snapshot_write(path: str, snapshot: dict, start, results) -> None:
         results.put(("stored", stored["generation"]))
 
 
+def _read_storage_fixture(kind: str, path: str, reference: dict | None, results) -> None:
+    try:
+        if kind == "snapshot":
+            read_snapshot(path)
+        else:
+            assert reference is not None
+            read_evidence(path, RUN_ID, reference)
+    except CheckpointError as exc:
+        results.put(("error", str(exc)))
+    else:
+        results.put(("returned", kind))
+
+
+def _assert_process_rejects_without_blocking(process, results) -> None:
+    try:
+        process.start()
+        process.join(2)
+        assert not process.is_alive(), "unsafe special-file read blocked during open"
+        assert process.exitcode == 0
+        outcome, detail = results.get(timeout=1)
+        assert outcome == "error", detail
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(1)
+        results.close()
+
+
 def nested_list(depth: int) -> list:
     value: list = []
     for _ in range(depth - 1):
@@ -476,6 +504,54 @@ def test_snapshot_storage_rejects_symlink_targets(tmp_path: Path) -> None:
     with pytest.raises(CheckpointError):
         read_snapshot(path)
     assert read_snapshot(target) == valid_snapshot(outside)
+
+
+@pytest.mark.parametrize("kind", ["snapshot", "evidence", "raw-log"])
+def test_storage_reads_reject_owned_fifos_without_blocking(
+    tmp_path: Path, kind: str
+) -> None:
+    """Catch blocking opens before snapshot, evidence, and raw-log type checks."""
+    reference = None
+    read_root = str(tmp_path)
+    if kind == "snapshot":
+        fifo = tmp_path / f"HANDOFF.backlog-{RUN_ID}.md"
+        read_root = str(fifo)
+    elif kind == "evidence":
+        evidence_dir = tmp_path / "backlog-drain" / RUN_ID / "evidence"
+        evidence_dir.mkdir(parents=True, mode=0o700)
+        for directory in (tmp_path / "backlog-drain", evidence_dir.parent, evidence_dir):
+            directory.chmod(0o700)
+        fifo = evidence_dir / f"{ZERO64}.json"
+        reference = {
+            "ref": f"evidence/{ZERO64}.json",
+            "sha256": ZERO64,
+            "size": 0,
+        }
+    else:
+        reference = write_evidence(
+            tmp_path,
+            RUN_ID,
+            {
+                "raw_log": {
+                    "ref": "raw-logs/test.log",
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                    "size": 0,
+                }
+            },
+        )
+        raw_dir = tmp_path / "backlog-drain" / RUN_ID / "raw-logs"
+        raw_dir.mkdir(mode=0o700)
+        fifo = raw_dir / "test.log"
+    os.mkfifo(fifo, mode=0o600)
+
+    context = multiprocessing.get_context("fork")
+    results = context.Queue()
+    process = context.Process(
+        target=_read_storage_fixture,
+        args=(kind, read_root, reference, results),
+    )
+
+    _assert_process_rejects_without_blocking(process, results)
 
 
 def test_write_evidence_is_content_addressed_immutable_and_private(

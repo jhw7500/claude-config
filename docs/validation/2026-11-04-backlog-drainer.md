@@ -1,5 +1,126 @@
 # Backlog drainer v3 validation — 2026-11-04
 
+## PR #266 FIFO correction — 2026-11-05
+
+This follow-up addresses Codex comment `4477013647` on parent `84e609b737e83d90c92ab040804d3927e82b79f1`. A current-user mode-0600 FIFO could block a stored-artifact or Git checkpoint open before descriptor validation. A regular source replaced with a FIFO between metadata inspection and open had the same problem. These reads now open nonblocking before the existing type, owner, mode, and identity checks; regular-file validation and size limits remain in place.
+
+Five real-FIFO regressions cover snapshot, evidence manifest, nested raw log, Git checkpoint, and the source metadata/open replacement. Each runs in an owned child with bounded cleanup. The separate source-race RED follows an earlier instrumentation mismatch; that mismatch is not counted as a product failure.
+
+The four earlier JSON packets below are preserved as historical records for their own parent and working-manifest inputs. Their source hashes are not assertions about later working trees. This follow-up does not establish native C3 recovery, live Claim transitions, or public-entry foreign-UID fixtures; those limits remain unchanged.
+
+<!-- backlog-fix-pr266-fifo-suite:begin -->
+```json
+{
+  "schema": 1,
+  "scope": "PR #266 FIFO rejection fix: actual owned-FIFO/race component regressions and final whole-project verification; not native-C3 recovery or reusable Tribunal evidence",
+  "parent_head": "84e609b737e83d90c92ab040804d3927e82b79f1",
+  "tested_working_change_digest": "cd4138d130ce074e6842e2f9699840d5760d613d89d9ff4405d9abafd7b2fb62",
+  "source_manifest": {
+    "change_digest": "cd4138d130ce074e6842e2f9699840d5760d613d89d9ff4405d9abafd7b2fb62",
+    "count": 5,
+    "parent_head": "84e609b737e83d90c92ab040804d3927e82b79f1",
+    "path_set_digest": "4b2f6c1715dfed1c2195dedb5cb33a5302f4770aeb49e8e31ba9637bd9ee10a9",
+    "paths": [
+      "docs/validation/2026-11-04-backlog-drainer.md",
+      "scripts/backlog_checkpoint/git_evidence.py",
+      "scripts/backlog_checkpoint/storage.py",
+      "tests/test_backlog_checkpoint.py",
+      "tests/test_backlog_git_evidence.py"
+    ],
+    "sources": [
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "docs/validation/2026-11-04-backlog-drainer.md",
+        "sha256": "cd89978e415b8141afc409bccf71288727b2310fd643e8eabd79bcc1afa08fb2"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "scripts/backlog_checkpoint/git_evidence.py",
+        "sha256": "4f0fcc3703c8862e179c55836b62f0d85109dd035bc5b9b1b23f53b33c5eaa65"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "scripts/backlog_checkpoint/storage.py",
+        "sha256": "56509e8f63f7c067550cc5a47149e2ca76c21a536f8e01ea7677192b35fcd1e4"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "tests/test_backlog_checkpoint.py",
+        "sha256": "75278441871f2e466639bd2bf209b4823c2ada42ea6c93aeebf50eacee6516db"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "tests/test_backlog_git_evidence.py",
+        "sha256": "e8983801896811d6160f14e0e678deff64989020facbaf5f696c336a280e3981"
+      }
+    ]
+  },
+  "source_hashes": {
+    "install.sh": "e498f4565c4fbc89d7b7b6a116b497fed94a73ac4a7fe675ba6a9907b7364ecf",
+    "scripts/backlog-checkpoint.py": "95c09efb70b907f1fad1f07a9c74d56211127c91be70c5e27ad76266dd617526",
+    "scripts/backlog_checkpoint/__init__.py": "1c62a4c05db819c7d779f2c22acd2af63b56fb4f648ef4ae236af838a307da2a",
+    "scripts/backlog_checkpoint/admission.py": "c9aec0c5474d83dbdd67a0481e26becee3ecddc048948fc15264d6001607ae6e",
+    "scripts/backlog_checkpoint/cli.py": "b6ce9591980a9705765a23e41a69119de5f8705834e39387c76107be288942e3",
+    "scripts/backlog_checkpoint/codec.py": "aef3989e5a3eed08cf2f32a994191a7fc42f62b0eb531b02787cfb68d9c28179",
+    "scripts/backlog_checkpoint/git_evidence.py": "4f0fcc3703c8862e179c55836b62f0d85109dd035bc5b9b1b23f53b33c5eaa65",
+    "scripts/backlog_checkpoint/queue.py": "cd889886dde12c433278c3451b9cd9bc931c7bdaa1dc2acd56bf825479841ffd",
+    "scripts/backlog_checkpoint/storage.py": "56509e8f63f7c067550cc5a47149e2ca76c21a536f8e01ea7677192b35fcd1e4",
+    "scripts/install-backlog-drain.py": "8df080971d07066c585d81c40fe1d40ac644ae96582f3991bd6cd015f62ecc19",
+    "skills/backlog-drain/SKILL.md": "dce1c5a6907dd507e342c81229544cc37dab116e9174903d10f060add2a57c85",
+    "skills/backlog-drain/references/protocol.md": "7a618109cdaf5e6b15d09735bf4260c019db9489906a683a3eee3c8dfaabfd80",
+    "tests/test_backlog_admission.py": "75f9befd46a36eb6a83a4a0a6e069287890209e4eef7285c7fa9266261e2b013",
+    "tests/test_backlog_checkpoint.py": "75278441871f2e466639bd2bf209b4823c2ada42ea6c93aeebf50eacee6516db",
+    "tests/test_backlog_cli.py": "dc527b6d476d30e445d7d80b68c58224ce7fcdaaf4b1d1470f04ff075e6d09be",
+    "tests/test_backlog_git_evidence.py": "e8983801896811d6160f14e0e678deff64989020facbaf5f696c336a280e3981",
+    "tests/test_backlog_install.py": "ce30f2c11ac5dbd0cba6653906f3c3bb108360ad5824035a0b169cd47080458e",
+    "tests/test_backlog_queue.py": "4fedd10261709a7321f4113d51933bea850be5bc853a3139afc921b85bf31f8a"
+  },
+  "suite": {
+    "command": "rtk proxy /usr/bin/env -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 \"$HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python\" -m pytest -q -n 8 -p no:cacheprovider",
+    "exit_code": 0,
+    "timed_out": false,
+    "elapsed_seconds": 214.478,
+    "summary": "5433 passed in 214.31s (0:03:34)",
+    "capture_sha256": "f40838534cbc9e76a5d3e0c3df6273797608a2b649ab3747ce30286f61c9cc0d",
+    "complete": true,
+    "output_limited": false,
+    "stdout_bytes": 6156,
+    "stderr_bytes": 0,
+    "stdout": "bringing up nodes...\nbringing up nodes...\n\n........................................................................ [  1%]\n........................................................................ [  2%]\n........................................................................ [  3%]\n........................................................................ [  5%]\n........................................................................ [  6%]\n........................................................................ [  7%]\n........................................................................ [  9%]\n........................................................................ [ 10%]\n........................................................................ [ 11%]\n........................................................................ [ 13%]\n........................................................................ [ 14%]\n........................................................................ [ 15%]\n........................................................................ [ 17%]\n........................................................................ [ 18%]\n........................................................................ [ 19%]\n........................................................................ [ 21%]\n........................................................................ [ 22%]\n........................................................................ [ 23%]\n........................................................................ [ 25%]\n........................................................................ [ 26%]\n........................................................................ [ 27%]\n........................................................................ [ 29%]\n........................................................................ [ 30%]\n........................................................................ [ 31%]\n........................................................................ [ 33%]\n........................................................................ [ 34%]\n........................................................................ [ 35%]\n........................................................................ [ 37%]\n........................................................................ [ 38%]\n........................................................................ [ 39%]\n........................................................................ [ 41%]\n........................................................................ [ 42%]\n........................................................................ [ 43%]\n........................................................................ [ 45%]\n........................................................................ [ 46%]\n........................................................................ [ 47%]\n........................................................................ [ 49%]\n........................................................................ [ 50%]\n........................................................................ [ 51%]\n........................................................................ [ 53%]\n........................................................................ [ 54%]\n........................................................................ [ 55%]\n........................................................................ [ 56%]\n........................................................................ [ 58%]\n........................................................................ [ 59%]\n........................................................................ [ 60%]\n........................................................................ [ 62%]\n........................................................................ [ 63%]\n........................................................................ [ 64%]\n........................................................................ [ 66%]\n........................................................................ [ 67%]\n........................................................................ [ 68%]\n........................................................................ [ 70%]\n........................................................................ [ 71%]\n........................................................................ [ 72%]\n........................................................................ [ 74%]\n........................................................................ [ 75%]\n........................................................................ [ 76%]\n........................................................................ [ 78%]\n........................................................................ [ 79%]\n........................................................................ [ 80%]\n........................................................................ [ 82%]\n........................................................................ [ 83%]\n........................................................................ [ 84%]\n........................................................................ [ 86%]\n........................................................................ [ 87%]\n........................................................................ [ 88%]\n........................................................................ [ 90%]\n........................................................................ [ 91%]\n........................................................................ [ 92%]\n........................................................................ [ 94%]\n........................................................................ [ 95%]\n........................................................................ [ 96%]\n........................................................................ [ 98%]\n........................................................................ [ 99%]\n.................................                                        [100%]\n5433 passed in 214.31s (0:03:34)\n",
+    "stderr": ""
+  },
+  "original_capture_record_sha256": "ed6450bbe58bf7d17d57d3b7d7f83c7ba09145f3e308efd04629977852cf01c8",
+  "tested_validation_document": {
+    "sha256": "cd89978e415b8141afc409bccf71288727b2310fd643e8eabd79bcc1afa08fb2",
+    "bytes": 102215
+  },
+  "independent_fix_review": {
+    "status": "APPROVED",
+    "scope": [
+      "scripts/backlog_checkpoint/storage.py",
+      "scripts/backlog_checkpoint/git_evidence.py",
+      "tests/test_backlog_checkpoint.py",
+      "tests/test_backlog_git_evidence.py"
+    ],
+    "findings": [],
+    "report_sha256": "c1ecaad331938844e23c7e248102fc59403bc6456a4d9337b8598be8604280d5"
+  },
+  "new_regression_count": 5,
+  "native_C3_pass": false,
+  "public_foreign_uid_fixture_pass": false,
+  "live_claim_transition_pass": false,
+  "post_suite_change_scope": [
+    "docs/validation/2026-11-04-backlog-drainer.md"
+  ]
+}
+```
+<!-- backlog-fix-pr266-fifo-suite:end -->
+
 ## Follow-up to the evidence review at `57b1cd0` — 2026-11-05
 
 This section records fixes for the fresh review lifecycle `b89ad53faf25648e8559fd22676011f5`, parent HEAD `57b1cd0fad6220aa155e3a3ef138208989b5b7e5`. Finding IDs are round-local: the A-R1-001/A-R1-002 entries here are the state-root and file-input findings from this lifecycle. The earlier same-numbered findings below concern different code and remain historical. Formal re-review requires its own bound lifecycle; these implementation checks do not authorize PR creation or merge.
@@ -981,7 +1102,7 @@ rtk proxy python3 -c 'import hashlib,json,subprocess; from pathlib import Path; 
 <!-- backlog-native-quiescent-followup:end -->
 
 
-## Current fix verification input and complete capture
+## Historical fix verification input and complete capture for `84e609b`
 
 This record describes the current fix input and complete test streams. The source hashes cover executable, test, installation and guidance files; they are checked against current bytes. The working manifest also includes the exact validation-document input used by the run. Its final result metadata was added afterward, so that document hash is historical and is not substituted for the final commit manifest.
 

@@ -305,7 +305,10 @@ def _checkpoint_artifact(
     if parent != root or match is None:
         raise CheckpointError("checkpoint must be the selected root-level run artifact")
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        fd = os.open(
+            path,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
     except OSError as exc:
         raise CheckpointError("checkpoint artifact is unavailable") from exc
     try:
@@ -368,7 +371,7 @@ def _tree(root: str, object_id: str) -> dict[bytes, tuple[str, str, str]]:
 def _read_regular(
     parent_descriptor: int, name: bytes, metadata: os.stat_result
 ) -> bytes:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:

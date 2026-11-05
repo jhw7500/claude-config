@@ -169,7 +169,11 @@ def _check_owned_file(fd: int) -> None:
 def _read_file_at(directory_fd: int, name: str, limit: int) -> bytes:
     _require_secure_io()
     try:
-        fd = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory_fd)
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | _NOFOLLOW,
+            dir_fd=directory_fd,
+        )
     except OSError as exc:
         raise CheckpointError("cannot open safe regular file") from exc
     try:
