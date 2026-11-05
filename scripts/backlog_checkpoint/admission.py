@@ -27,8 +27,9 @@ from .storage import (
     _open_directory,
     _open_lock,
     _open_or_create_directory,
+    _open_state_root,
+    _read_evidence_at,
     _read_file_at,
-    read_evidence,
 )
 
 
@@ -164,10 +165,7 @@ def _locked_checkpoint(record: dict) -> Iterator[tuple[bytes, dict]]:
 
 
 def _open_admission_directories(state_root: str | os.PathLike[str]) -> tuple[int, int, int, int, int]:
-    root = Path(os.fspath(state_root))
-    if not root.is_absolute():
-        raise CheckpointError("state_root must be absolute")
-    root_fd = _open_directory(root, private=True)
+    root_fd = _open_state_root(state_root)
     backlog_fd = admissions_fd = archive_fd = snapshots_fd = -1
     try:
         backlog_fd = _open_or_create_directory(root_fd, "backlog-drain")
@@ -312,7 +310,7 @@ def acquire_admission(
         _close_directories(fds)
 
 
-def _validate_release(snapshot: dict, record: dict, state_root: str | os.PathLike[str]) -> None:
+def _validate_release(snapshot: dict, record: dict, state_root_fd: int) -> None:
     if not (
         snapshot["phase"] == "READY_FOR_TRIBUNAL"
         and snapshot["phase_status"] == "verified"
@@ -330,7 +328,7 @@ def _validate_release(snapshot: dict, record: dict, state_root: str | os.PathLik
         or git["observed_head"] != git["result_commit"]
     ):
         raise CheckpointError("release requires a verified commit binding")
-    manifest = read_evidence(state_root, record["run_id"], snapshot["evidence"])
+    manifest = _read_evidence_at(state_root_fd, record["run_id"], snapshot["evidence"])
     observation = _exact_dict(
         manifest.get("admission_release"),
         {"schema", "run_id", "task_owner", "session_fingerprint", "snapshot_generation", "tools_quiescent", "writers_quiescent"},
@@ -384,7 +382,7 @@ def release_admission(
         if _active_bytes(fds[2], active_name) != expected_bytes:
             raise CheckpointError("stale or foreign admission record")
         with _locked_checkpoint(expected) as (_, snapshot):
-            _validate_release(snapshot, expected, state_root)
+            _validate_release(snapshot, expected, fds[0])
             os.unlink(active_name, dir_fd=fds[2])
             try:
                 os.fsync(fds[2])
@@ -471,7 +469,9 @@ def reconcile_admission(
                 or checked_proof["git"]["change_digest"] != successor_snapshot["git"]["change_digest"]
             ):
                 raise CheckpointError("successor proof snapshot or Git evidence does not match")
-            manifest = read_evidence(state_root, successor["run_id"], successor_snapshot["evidence"])
+            manifest = _read_evidence_at(
+                fds[0], successor["run_id"], successor_snapshot["evidence"]
+            )
             successor_observation = _exact_dict(
                 manifest.get("admission_successor"),
                 {"prior_run_id", "prior_snapshot_sha256", "prior_snapshot_generation"},

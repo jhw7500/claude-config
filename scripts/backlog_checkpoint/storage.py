@@ -68,6 +68,47 @@ def _open_directory(path: Path, *, private: bool) -> int:
     return fd
 
 
+def _open_state_root(path_value: str | os.PathLike[str]) -> int:
+    """Open an absolute state root without following any path component."""
+    _require_secure_io()
+    try:
+        supplied = os.fspath(path_value)
+    except TypeError as exc:
+        raise CheckpointError("state_root must be an exact absolute path") from exc
+    if not isinstance(supplied, str):
+        raise CheckpointError("state_root must be an exact absolute path")
+    path = Path(supplied)
+    if (
+        path.anchor != "/"
+        or not os.path.isabs(supplied)
+        or os.path.normpath(supplied) != supplied
+    ):
+        raise CheckpointError("state_root must be an exact absolute path")
+    if ".." in path.parts:
+        raise CheckpointError("state_root must not contain parent references")
+    flags = os.O_RDONLY | _DIRECTORY | _NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd = -1
+    try:
+        fd = os.open("/", flags)
+        for component in path.parts[1:]:
+            if component in {"", "."}:
+                continue
+            child_fd = os.open(component, flags, dir_fd=fd)
+            parent_fd = fd
+            fd = child_fd
+            os.close(parent_fd)
+        _check_owned_directory(fd, private=True)
+        return fd
+    except CheckpointError:
+        if fd >= 0:
+            os.close(fd)
+        raise
+    except OSError as exc:
+        if fd >= 0:
+            os.close(fd)
+        raise CheckpointError(f"cannot open safe state root: {path}") from exc
+
+
 def _open_or_create_directory(parent_fd: int, name: str) -> int:
     _require_secure_io()
     if not name or "/" in name or name in {".", ".."}:
@@ -315,12 +356,12 @@ def write_snapshot(
         os.close(directory_fd)
 
 
-def _state_directories(
-    state_root: Path, run_id: str, *, create: bool
+def _state_directories_from_root(
+    root_fd: int, run_id: str, *, create: bool
 ) -> tuple[int, int, int, int]:
-    if not state_root.is_absolute() or _HEX32.fullmatch(run_id) is None:
-        raise CheckpointError("state_root must be absolute and run_id lowercase hex")
-    root_fd = _open_directory(state_root, private=True)
+    if not isinstance(run_id, str) or _HEX32.fullmatch(run_id) is None:
+        os.close(root_fd)
+        raise CheckpointError("run_id must be lowercase hex")
     backlog_fd = run_fd = evidence_fd = -1
     try:
         opener = _open_or_create_directory if create else _open_private_directory
@@ -333,6 +374,13 @@ def _state_directories(
             if fd >= 0:
                 os.close(fd)
         raise
+
+
+def _state_directories(
+    state_root: str | os.PathLike[str], run_id: str, *, create: bool
+) -> tuple[int, int, int, int]:
+    root_fd = _open_state_root(state_root)
+    return _state_directories_from_root(root_fd, run_id, create=create)
 
 
 def _close_directories(fds: tuple[int, int, int, int]) -> None:
@@ -351,7 +399,7 @@ def write_evidence(
         raise CheckpointError("evidence manifest exceeds 1 MiB")
     digest = sha256_bytes(data)
     name = f"{digest}.json"
-    fds = _state_directories(Path(state_root), run_id, create=True)
+    fds = _state_directories(state_root, run_id, create=True)
     try:
         existing = _existing_file_bytes(fds[3], name, MAX_MANIFEST_BYTES)
         if existing is None:
@@ -462,12 +510,14 @@ def _validate_raw_log_references(value: object, run_fd: int) -> None:
                 raise CheckpointError("raw log size or digest does not match")
 
 
-def read_evidence(
-    state_root: str | os.PathLike[str], run_id: str, reference: dict
-) -> dict:
-    _require_secure_io()
+def _read_evidence_at(root_fd: int, run_id: str, reference: dict) -> dict:
+    """Read evidence below an already validated, retained state-root descriptor."""
     name, digest, size = _validate_read_reference(reference)
-    fds = _state_directories(Path(state_root), run_id, create=False)
+    try:
+        borrowed_fd = os.dup(root_fd)
+    except OSError as exc:
+        raise CheckpointError("cannot retain safe state root") from exc
+    fds = _state_directories_from_root(borrowed_fd, run_id, create=False)
     try:
         data = _read_file_at(fds[3], name, MAX_MANIFEST_BYTES)
         if len(data) != size or sha256_bytes(data) != digest:
@@ -488,3 +538,14 @@ def read_evidence(
         return value
     finally:
         _close_directories(fds)
+
+
+def read_evidence(
+    state_root: str | os.PathLike[str], run_id: str, reference: dict
+) -> dict:
+    _require_secure_io()
+    root_fd = _open_state_root(state_root)
+    try:
+        return _read_evidence_at(root_fd, run_id, reference)
+    finally:
+        os.close(root_fd)

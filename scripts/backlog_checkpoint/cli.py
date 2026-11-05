@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
+import os
+import stat
 import sys
 from typing import Any, Sequence
 
@@ -28,13 +29,33 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _input(path: str) -> Any:
+    descriptor = -1
     try:
         if path == "-":
             raw = sys.stdin.buffer.read(_MAX_INPUT + 1)
         else:
-            raw = Path(path).read_bytes()
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise CheckpointError("input JSON must be a regular file")
+            chunks: list[bytes] = []
+            remaining = _MAX_INPUT + 1
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+    except CheckpointError:
+        raise
     except OSError as exc:
         raise CheckpointError("input JSON is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if len(raw) > _MAX_INPUT:
         raise CheckpointError("input JSON exceeds 1 MiB")
     try:

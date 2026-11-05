@@ -1,11 +1,13 @@
 import copy
 import hashlib
+import json
 import multiprocessing
 import os
 import signal
 import stat
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -270,6 +272,42 @@ def test_acquire_rejects_worktree_alias_without_canonicalizing_scope(admission_f
     assert not _active_path(state_root, worktree).exists()
 
 
+def test_acquire_rejects_symlinked_state_root_ancestor(admission_fixture) -> None:
+    # Wrong branch: accepting admission storage after following an ancestor alias.
+    state_root, worktree, record = admission_fixture
+    alias = state_root.parent / "state-alias"
+    alias.symlink_to(state_root.parent, target_is_directory=True)
+    aliased_root = alias / state_root.name
+
+    with pytest.raises(CheckpointError):
+        acquire_admission(aliased_root, worktree, record)
+
+    assert not _active_path(state_root, worktree).exists()
+
+
+def test_acquire_rejects_repointed_state_root_alias_between_invocations(
+    admission_fixture, tmp_path: Path
+) -> None:
+    # Wrong branch: treating a repointed ancestor alias as either physical state root.
+    state_root, worktree, record = admission_fixture
+    other_parent = tmp_path / "other"
+    other_parent.mkdir(mode=0o700)
+    other_root = other_parent / state_root.name
+    other_root.mkdir(mode=0o700)
+    alias = tmp_path / "state-parent-alias"
+    alias.symlink_to(state_root.parent, target_is_directory=True)
+
+    with pytest.raises(CheckpointError):
+        acquire_admission(alias / state_root.name, worktree, record)
+    alias.unlink()
+    alias.symlink_to(other_parent, target_is_directory=True)
+    with pytest.raises(CheckpointError):
+        acquire_admission(alias / state_root.name, worktree, record)
+
+    assert not _active_path(state_root, worktree).exists()
+    assert not _active_path(other_root, worktree).exists()
+
+
 @pytest.mark.parametrize("spelling", ["dot", "repeated", "trailing"])
 def test_acquire_rejects_nonexact_lexical_worktree_spelling(
     admission_fixture, spelling: str
@@ -394,6 +432,34 @@ def test_release_accepts_freshly_verified_commit_binding(terminal_admission_fixt
     release_admission(state_root, worktree, record)
 
     assert not _active_path(state_root, worktree).exists()
+
+
+def test_release_reads_evidence_from_retained_state_root(
+    terminal_admission_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Wrong branch: reopening release evidence through a replaced state-root pathname.
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+    retained_root = state_root.with_name("retained-state")
+    real_locked_checkpoint = admission._locked_checkpoint
+    repointed = False
+
+    @contextmanager
+    def repoint_before_checkpoint_yield(current_record):
+        nonlocal repointed
+        with real_locked_checkpoint(current_record) as value:
+            if not repointed:
+                repointed = True
+                state_root.rename(retained_root)
+                state_root.mkdir(mode=0o700)
+            yield value
+
+    monkeypatch.setattr(admission, "_locked_checkpoint", repoint_before_checkpoint_yield)
+
+    release_admission(state_root, worktree, record)
+
+    assert repointed is True
+    assert not _active_path(retained_root, worktree).exists()
+    assert not (state_root / "backlog-drain").exists()
 
 
 def test_commit_observations_can_advance_in_the_same_checkpoint_before_release(
@@ -594,6 +660,36 @@ def test_reconcile_archives_exact_old_bytes_and_publishes_successor(admission_fi
     assert archive.read_bytes() == old_bytes
     assert snapshot_copy.read_bytes() == Path(successor["checkpoint_path"]).read_bytes()
     assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+
+
+def test_reconcile_reads_evidence_from_retained_state_root(
+    admission_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Wrong branch: reopening successor evidence through a replaced state-root pathname.
+    state_root, worktree, record = admission_fixture
+    acquire_admission(state_root, worktree, record)
+    successor, proof = _make_successor(state_root, worktree, record)
+    retained_root = state_root.with_name("retained-state")
+    real_locked_checkpoint = admission._locked_checkpoint
+    repointed = False
+
+    @contextmanager
+    def repoint_before_checkpoint_yield(current_record):
+        nonlocal repointed
+        with real_locked_checkpoint(current_record) as value:
+            if not repointed:
+                repointed = True
+                state_root.rename(retained_root)
+                state_root.mkdir(mode=0o700)
+            yield value
+
+    monkeypatch.setattr(admission, "_locked_checkpoint", repoint_before_checkpoint_yield)
+
+    assert reconcile_admission(state_root, worktree, record, successor, proof) == successor
+
+    assert repointed is True
+    assert json.loads(_active_path(retained_root, worktree).read_bytes())["run_id"] == NEXT_RUN_ID
+    assert not (state_root / "backlog-drain").exists()
 
 
 def test_reconcile_rejects_proof_for_different_prior_snapshot(admission_fixture) -> None:

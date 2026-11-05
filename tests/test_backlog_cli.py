@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import resource
 import subprocess
 import sys
 
@@ -18,6 +19,7 @@ def _run(
     input_value: object | None = None,
     cwd: Path | None = None,
     env_extra: dict[str, str] | None = None,
+    timeout: float | None = None,
 ):
     env = {key: value for key, value in os.environ.items() if key != "LD_LIBRARY_PATH"}
     env.update(env_extra or {})
@@ -30,6 +32,7 @@ def _run(
         cwd=cwd or REPO,
         env=env,
         check=False,
+        timeout=timeout,
     )
 
 
@@ -127,6 +130,95 @@ def test_missing_exact_snapshot_path_is_bounded_error(tmp_path: Path) -> None:
     assert error["ok"] is False
     assert error["status"] == "ERROR"
     assert "Traceback" not in result.stderr
+
+
+def test_file_input_accepts_exactly_one_mib_and_rejects_one_byte_more(
+    tmp_path: Path,
+) -> None:
+    # Wrong branch: reading the complete file before enforcing the one-MiB boundary.
+    prefix = b'{"issues":[],"dependencies":[]}'
+    exact = tmp_path / "exact.json"
+    exact.write_bytes(prefix + b" " * (1_048_576 - len(prefix)))
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(prefix + b" " * (1_048_577 - len(prefix)))
+
+    accepted = _run("queue", "plan", "--input", str(exact))
+    rejected = _run("queue", "plan", "--input", str(oversized))
+
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads(accepted.stdout)["result"]["status"] == "COMPLETE"
+    assert rejected.returncode == 1
+    assert json.loads(rejected.stderr)["error"] == "input JSON exceeds 1 MiB"
+
+
+def test_file_input_rejects_fifo_without_waiting_for_a_writer(tmp_path: Path) -> None:
+    # Wrong branch: blocking in Path.read_bytes while opening a FIFO input.
+    fifo = tmp_path / "payload.fifo"
+    os.mkfifo(fifo, 0o600)
+
+    try:
+        result = _run(
+            "queue", "plan", "--input", str(fifo), cwd=tmp_path, timeout=5
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("owned CLI child blocked while opening FIFO input")
+
+    assert result.returncode == 1
+    assert json.loads(result.stderr)["error"] == "input JSON must be a regular file"
+
+
+@pytest.mark.parametrize("kind", ["symlink", "device"])
+def test_file_input_rejects_nonregular_or_symlink_input(
+    tmp_path: Path, kind: str
+) -> None:
+    # Wrong branch: following a symlink or reading a non-regular file as JSON input.
+    regular = tmp_path / "regular.json"
+    regular.write_text('{"issues":[],"dependencies":[]}', encoding="utf-8")
+    supplied = tmp_path / "input.json"
+    if kind == "symlink":
+        supplied.symlink_to(regular)
+    else:
+        supplied = Path("/dev/null")
+
+    result = _run("queue", "plan", "--input", str(supplied), cwd=tmp_path)
+
+    assert result.returncode == 1
+    error = json.loads(result.stderr)["error"]
+    if kind == "symlink":
+        assert error == "input JSON is unavailable"
+    else:
+        assert error == "input JSON must be a regular file"
+
+
+def test_sparse_file_input_is_bounded_under_child_address_space_limit(
+    tmp_path: Path,
+) -> None:
+    # Wrong branch: allocating storage proportional to a sparse file before size rejection.
+    sparse = tmp_path / "sparse.json"
+    with sparse.open("wb") as stream:
+        stream.truncate(1024 * 1024 * 1024)
+    env = {key: value for key, value in os.environ.items() if key != "LD_LIBRARY_PATH"}
+
+    def cap_address_space() -> None:
+        resource.setrlimit(
+            resource.RLIMIT_AS,
+            (128 * 1024 * 1024, 128 * 1024 * 1024),
+        )
+
+    result = subprocess.run(
+        [sys.executable, str(ENTRY), "queue", "plan", "--input", str(sparse)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=REPO,
+        env=env,
+        check=False,
+        timeout=5,
+        preexec_fn=cap_address_space,
+    )
+
+    assert result.returncode == 1
+    assert json.loads(result.stderr)["error"] == "input JSON exceeds 1 MiB"
 
 
 def test_cli_requires_explicit_grouped_argv() -> None:

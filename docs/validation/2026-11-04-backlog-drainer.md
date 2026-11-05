@@ -1,8 +1,28 @@
 # Backlog drainer v3 validation — 2026-11-04
 
-## Tribunal round-1 follow-up — 2026-11-05
+## Follow-up to the evidence review at `57b1cd0` — 2026-11-05
 
-This follow-up supersedes the current-readiness statements in the historical sections below. Those earlier measurements describe the pre-Tribunal source and do not verify these fixes. The finalized round-1 verdict remains FAIL until a separately approved re-review acknowledges the changes; this document does not turn the old verdict into PASS.
+This section records fixes for the fresh review lifecycle `b89ad53faf25648e8559fd22676011f5`, parent HEAD `57b1cd0fad6220aa155e3a3ef138208989b5b7e5`. Finding IDs are round-local: the A-R1-001/A-R1-002 entries here are the state-root and file-input findings from this lifecycle. The earlier same-numbered findings below concern different code and remain historical. Formal re-review requires its own bound lifecycle; these implementation checks do not authorize PR creation or merge.
+
+- **A-R1-001:** state-root resolution walks from `/` with a retained parent descriptor and no-follow directory opens for every component. Only the canonical single `/` anchor is accepted, including rejection of the POSIX implementation-defined `//` spelling. The final root keeps the existing current-UID/0700 rule while system-owned ancestors remain traversable. Release and reconciliation read evidence through that same retained root descriptor, rather than looking up the pathname again. The generic snapshot/worktree directory helper is unchanged.
+- **A-R1-002:** file input is opened nonblocking and no-follow, must be a regular file, and reads at most 1 MiB plus one byte. All descriptors close on success and error. Existing bounded stdin, JSON parsing and structured-error behavior remain in place; valid input exactly at the cap is accepted.
+
+The implementation added 17 filesystem/subprocess regressions. The meaningful initial REDs covered ancestor aliases, descriptor walking/root replacement, FIFO blocking, symlink following, non-regular inputs and sparse-file allocation under a child address-space limit. A separate RED covered nonexact raw string spellings. Focused GREEN and the six-file backlog suite passed: **218 passed in 4.80s**. Ruff F/E9, six-file in-memory compilation and `git diff --check` passed. Raw RED/GREEN logs are private current-user regular 0600 files under `.superpowers/sdd/2026-11-04-backlog-drainer/review-fix-e1/`.
+
+The independent bounded fix review found and then rechecked one `//` anchor gap; its final result has no material findings. A fresh focused selection passed 17 tests. The six code/test files remain frozen. The parent then completed the single final whole-project run with exit 0: **5428 passed in 231.88s (0:03:51)**, driver elapsed 232.141 seconds. All 18 frozen execution/test/install/guidance hashes and the complete tested working manifest matched before and after execution. Only final result metadata in this validation document changed afterward. Earlier 5411-test logs and native-control artifacts are historical observations, not proof of these new bytes. Native C3 full-product/Claude recovery remains unverified. The Task Claim stays active; no Task lifecycle, push, PR or merge action is performed by this follow-up.
+
+The exact final full-suite command was:
+
+```text
+rtk proxy /usr/bin/env -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 "$HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python" -m pytest -q -n 8 -p no:cacheprovider
+5428 passed in 231.88s (0:03:51)
+```
+
+It ran from the selected Task worktree on parent `57b1cd0fad6220aa155e3a3ef138208989b5b7e5` plus tested working-change digest `e7c7a9544b95d91feea97fe48129d87cd9fb2b347935bc2c3d68799862bb8980`. The complete stdout/stderr capture is 6156 bytes, SHA-256 `bc26b08fc2be6ea34db9b4ada545161bc019c55b3c8150bfbcb9ca642c541804`. Private input/result/log and the tested pre-result-metadata document remain under `review-fix-e1/`; the public current-source record below separates this working input from later documentation-only metadata. All earlier archived packets remain byte-identical.
+
+## Historical first Tribunal round-1 follow-up — 2026-11-05
+
+This historical follow-up describes the fixes committed as `5bf46737048dd81a5b14e5e122095023c2ed41fb`. Its round-local finding IDs refer to the earlier `3c09cde` review, not the later `57b1cd0` evidence-review lifecycle. Its measurements do not verify later source changes.
 
 - **A-R1-001:** release now requires non-null parent/result coordinates, the exact source manifest and commit binding in authenticated evidence, matching snapshot counts/digests, and a fresh branch/worktree inspection plus `bind_commit` before removing the active admission. Invalid evidence, a changed source/HEAD/branch, and JSON boolean/integer substitutions preserve admission.
 - **A-R1-002:** storage validates the exact absolute canonical root-level run slot and preserves run ID, supervisor identity, all binding fields, branch and frozen base HEAD across CAS. Changed identity or path cannot replace the old bytes. A normal COMMIT-to-READY update and separately created successor files remain supported.
@@ -201,7 +221,7 @@ The following additions expose previously private execution records and add boun
 
 ### Exact full-suite records for an isolated reader
 
-The JSON packet below carries the original UTF-8 bytes of all five archived files as JSON strings. Decode a string to UTF-8 and verify its byte count and SHA-256 before interpreting it; the serialization around the string is not the archived file. Verify every frozen `source_hashes` entry against the current tracked file and Git blob. These 18 executable/test/install/guidance files match commit `5bf4673`; the tested-versus-committed manifest difference is only this validation document. The two manifest digests remain distinct.
+The JSON packet below carries the original UTF-8 bytes of all five archived files as JSON strings. Decode a string to UTF-8 and verify its byte count and SHA-256 before interpreting it; the serialization around the string is not the archived file. Verify every frozen `source_hashes` entry against the exact historical Git blob at `5bf46737048dd81a5b14e5e122095023c2ed41fb`. These 18 executable/test/install/guidance hashes describe that commit, not later working files; the tested-versus-committed manifest difference is only this validation document. The two manifest digests remain distinct.
 
 This permits independent record/source consistency checks from the committed checkout without opening the implementation worktree's private directory. It does not retroactively witness the historical execution or authenticate an entire historical environment. Current-source functional verification can be reproduced with a Python environment containing `requirements-test.lock`, pytest and pytest-xdist, from the checkout root: `env -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider -n 8`. A pre-existing local test interpreter is also named in the archived command; no actual-HOME installation is required. A fresh run produces a new observation with its own duration and receipt.
 
@@ -932,10 +952,10 @@ This packet contains fixture result records and parent observations projected fr
 
 ### Read-only evidence packet verification
 
-The following reader only parses committed JSON data, hashes bytes and checks the explicitly stated limits. It neither executes archived commands nor writes files. Its success establishes record/source consistency and a complete stored fresh capture; it does not change the Tribunal verdict or prove native recovery.
+The following reader only parses committed JSON data, hashes bytes and checks the explicitly stated limits. It neither executes archived commands nor writes files. Its success establishes historical record/Git-blob consistency and a complete stored capture; it does not verify later working-source fixes, change the Tribunal verdict or prove native recovery.
 
 ```bash
-rtk proxy python3 -c 'import hashlib,json; from pathlib import Path; s=Path("docs/validation/2026-11-04-backlog-drainer.md").read_text(); read=lambda tag:json.loads(s.split("<!-- "+tag+":begin -->\n```json\n",1)[1].split("\n```\n<!-- "+tag+":end -->",1)[0]); a=read("backlog-suite-archive"); f=read("backlog-fresh-suite"); n=read("backlog-native-observations"); artifacts={x["name"]:x for x in a["artifacts"]}; assert len(artifacts)==5; assert all(len(x["data"].encode())==x["bytes"] and hashlib.sha256(x["data"].encode()).hexdigest()==x["sha256"] for x in artifacts.values()); assert len(a["source_hashes"])==18; assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest()==h for p,h in a["source_hashes"].items()); r=f["trusted_capture_record"]; assert r["complete"] and not r["output_limited"] and not r["timed_out"] and r["exit_code"]==0; assert hashlib.sha256((r["stdout"]+r["stderr"]).encode()).hexdigest()==r["capture_sha256"]; assert f["before"]==f["after"] and "5411 passed" in r["stdout"]; assert n["cwd_escape"]["parent_observation"]["canary_absent"]; assert not n["interrupted_original"]["native_recovery_pass"] and not n["hosted_sleep_probe"]["parent_observation"]["actual_interruption_seen"]; print("PASS: 5 exact archived records, 18 current source hashes, fresh capture streams and stated native limits")'
+rtk proxy python3 -c 'import hashlib,json,subprocess; from pathlib import Path; s=Path("docs/validation/2026-11-04-backlog-drainer.md").read_text(); read=lambda tag:json.loads(s.split("<!-- "+tag+":begin -->\n```json\n",1)[1].split("\n```\n<!-- "+tag+":end -->",1)[0]); a=read("backlog-suite-archive"); f=read("backlog-fresh-suite"); n=read("backlog-native-observations"); artifacts={x["name"]:x for x in a["artifacts"]}; assert len(artifacts)==5; assert all(len(x["data"].encode())==x["bytes"] and hashlib.sha256(x["data"].encode()).hexdigest()==x["sha256"] for x in artifacts.values()); assert len(a["source_hashes"])==18; assert all(hashlib.sha256(subprocess.check_output(["git","--no-replace-objects","cat-file","blob","5bf46737048dd81a5b14e5e122095023c2ed41fb:"+p])).hexdigest()==h for p,h in a["source_hashes"].items()); r=f["trusted_capture_record"]; assert r["complete"] and not r["output_limited"] and not r["timed_out"] and r["exit_code"]==0; assert hashlib.sha256((r["stdout"]+r["stderr"]).encode()).hexdigest()==r["capture_sha256"]; assert f["before"]==f["after"] and "5411 passed" in r["stdout"]; assert n["cwd_escape"]["parent_observation"]["canary_absent"]; assert not n["interrupted_original"]["native_recovery_pass"] and not n["hosted_sleep_probe"]["parent_observation"]["actual_interruption_seen"]; print("PASS: 5 exact archived records, 18 historical Git-blob hashes, stored capture streams and stated native limits")'
 ```
 
 
@@ -959,3 +979,135 @@ rtk proxy python3 -c 'import hashlib,json; from pathlib import Path; s=Path("doc
 이 관측은 C3의 Codex native-control 증거와 C4의 제한된 불일치 차단 증거를 보강한다. 진행 중인 도구 종료, Claude native recovery, 실제 supervisor/Claim 전환, 전체 product 단계 복구를 통과했다고 올리지 않는다. 이 turn의 Native2 bridge는 issued turn_token이 필요하지만 제공되지 않았으므로 호출하지 않았다. 이것을 모든 runtime의 영구 미지원으로 일반화하지 않는다.
 
 <!-- backlog-native-quiescent-followup:end -->
+
+
+## Current fix verification input and complete capture
+
+This record describes the current fix input and complete test streams. The source hashes cover executable, test, installation and guidance files; they are checked against current bytes. The working manifest also includes the exact validation-document input used by the run. Its final result metadata was added afterward, so that document hash is historical and is not substituted for the final commit manifest.
+
+<!-- backlog-fix-e1-suite:begin -->
+```json
+{
+  "schema": 1,
+  "scope": "final current-code/test verification after state-root and file-input fixes; working-source observation, not native-C3 recovery or reusable Tribunal evidence",
+  "parent_head": "57b1cd0fad6220aa155e3a3ef138208989b5b7e5",
+  "tested_working_change_digest": "e7c7a9544b95d91feea97fe48129d87cd9fb2b347935bc2c3d68799862bb8980",
+  "source_manifest": {
+    "paths": [
+      "docs/validation/2026-11-04-backlog-drainer.md",
+      "scripts/backlog_checkpoint/admission.py",
+      "scripts/backlog_checkpoint/cli.py",
+      "scripts/backlog_checkpoint/storage.py",
+      "tests/test_backlog_admission.py",
+      "tests/test_backlog_checkpoint.py",
+      "tests/test_backlog_cli.py"
+    ],
+    "count": 7,
+    "path_set_digest": "2936d7451b68e70e8bfe14efaf3ef86e6291b84ceceea9474449c3efaa5f1c53",
+    "change_digest": "e7c7a9544b95d91feea97fe48129d87cd9fb2b347935bc2c3d68799862bb8980",
+    "sources": [
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "docs/validation/2026-11-04-backlog-drainer.md",
+        "sha256": "3bee9c84333b3ff14204add4e3b931256de5bd75e83c2526fdbf112f5dc23114"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "scripts/backlog_checkpoint/admission.py",
+        "sha256": "c9aec0c5474d83dbdd67a0481e26becee3ecddc048948fc15264d6001607ae6e"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "scripts/backlog_checkpoint/cli.py",
+        "sha256": "b6ce9591980a9705765a23e41a69119de5f8705834e39387c76107be288942e3"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "scripts/backlog_checkpoint/storage.py",
+        "sha256": "0d5454493051f38c4e7e45eeda79b1465f1784c3d1ccdfcf5e94634bce4d2da9"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "tests/test_backlog_admission.py",
+        "sha256": "75f9befd46a36eb6a83a4a0a6e069287890209e4eef7285c7fa9266261e2b013"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "tests/test_backlog_checkpoint.py",
+        "sha256": "5ffac123852ba9c732cdc5c1293007c900fb4570c8759b728a337a901ccb4406"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "tests/test_backlog_cli.py",
+        "sha256": "dc527b6d476d30e445d7d80b68c58224ce7fcdaaf4b1d1470f04ff075e6d09be"
+      }
+    ],
+    "parent_head": "57b1cd0fad6220aa155e3a3ef138208989b5b7e5"
+  },
+  "source_hashes": {
+    "install.sh": "e498f4565c4fbc89d7b7b6a116b497fed94a73ac4a7fe675ba6a9907b7364ecf",
+    "scripts/backlog-checkpoint.py": "95c09efb70b907f1fad1f07a9c74d56211127c91be70c5e27ad76266dd617526",
+    "scripts/backlog_checkpoint/__init__.py": "1c62a4c05db819c7d779f2c22acd2af63b56fb4f648ef4ae236af838a307da2a",
+    "scripts/backlog_checkpoint/admission.py": "c9aec0c5474d83dbdd67a0481e26becee3ecddc048948fc15264d6001607ae6e",
+    "scripts/backlog_checkpoint/cli.py": "b6ce9591980a9705765a23e41a69119de5f8705834e39387c76107be288942e3",
+    "scripts/backlog_checkpoint/codec.py": "aef3989e5a3eed08cf2f32a994191a7fc42f62b0eb531b02787cfb68d9c28179",
+    "scripts/backlog_checkpoint/git_evidence.py": "9553b5b20c700c39fdefa0ab129495faa46b3ae2899ebb1472b938f0b5730083",
+    "scripts/backlog_checkpoint/queue.py": "cd889886dde12c433278c3451b9cd9bc931c7bdaa1dc2acd56bf825479841ffd",
+    "scripts/backlog_checkpoint/storage.py": "0d5454493051f38c4e7e45eeda79b1465f1784c3d1ccdfcf5e94634bce4d2da9",
+    "scripts/install-backlog-drain.py": "8df080971d07066c585d81c40fe1d40ac644ae96582f3991bd6cd015f62ecc19",
+    "skills/backlog-drain/SKILL.md": "dce1c5a6907dd507e342c81229544cc37dab116e9174903d10f060add2a57c85",
+    "skills/backlog-drain/references/protocol.md": "7a618109cdaf5e6b15d09735bf4260c019db9489906a683a3eee3c8dfaabfd80",
+    "tests/test_backlog_admission.py": "75f9befd46a36eb6a83a4a0a6e069287890209e4eef7285c7fa9266261e2b013",
+    "tests/test_backlog_checkpoint.py": "5ffac123852ba9c732cdc5c1293007c900fb4570c8759b728a337a901ccb4406",
+    "tests/test_backlog_cli.py": "dc527b6d476d30e445d7d80b68c58224ce7fcdaaf4b1d1470f04ff075e6d09be",
+    "tests/test_backlog_git_evidence.py": "346b9a91c7dae0ede35db4abecfea8d6086776ba1cdc56ffbc0f5b70dfbe0f46",
+    "tests/test_backlog_install.py": "ce30f2c11ac5dbd0cba6653906f3c3bb108360ad5824035a0b169cd47080458e",
+    "tests/test_backlog_queue.py": "4fedd10261709a7321f4113d51933bea850be5bc853a3139afc921b85bf31f8a"
+  },
+  "suite": {
+    "command": "rtk proxy /usr/bin/env -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 \"$HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python\" -m pytest -q -n 8 -p no:cacheprovider",
+    "exit_code": 0,
+    "timed_out": false,
+    "elapsed_seconds": 232.141,
+    "summary": "5428 passed in 231.88s (0:03:51)",
+    "capture_sha256": "bc26b08fc2be6ea34db9b4ada545161bc019c55b3c8150bfbcb9ca642c541804",
+    "complete": true,
+    "output_limited": false,
+    "stdout_bytes": 6156,
+    "stderr_bytes": 0,
+    "stdout": "bringing up nodes...\nbringing up nodes...\n\n........................................................................ [  1%]\n........................................................................ [  2%]\n........................................................................ [  3%]\n........................................................................ [  5%]\n........................................................................ [  6%]\n........................................................................ [  7%]\n........................................................................ [  9%]\n........................................................................ [ 10%]\n........................................................................ [ 11%]\n........................................................................ [ 13%]\n........................................................................ [ 14%]\n........................................................................ [ 15%]\n........................................................................ [ 17%]\n........................................................................ [ 18%]\n........................................................................ [ 19%]\n........................................................................ [ 21%]\n........................................................................ [ 22%]\n........................................................................ [ 23%]\n........................................................................ [ 25%]\n........................................................................ [ 26%]\n........................................................................ [ 27%]\n........................................................................ [ 29%]\n........................................................................ [ 30%]\n........................................................................ [ 31%]\n........................................................................ [ 33%]\n........................................................................ [ 34%]\n........................................................................ [ 35%]\n........................................................................ [ 37%]\n........................................................................ [ 38%]\n........................................................................ [ 39%]\n........................................................................ [ 41%]\n........................................................................ [ 42%]\n........................................................................ [ 43%]\n........................................................................ [ 45%]\n........................................................................ [ 46%]\n........................................................................ [ 47%]\n........................................................................ [ 49%]\n........................................................................ [ 50%]\n........................................................................ [ 51%]\n........................................................................ [ 53%]\n........................................................................ [ 54%]\n........................................................................ [ 55%]\n........................................................................ [ 57%]\n........................................................................ [ 58%]\n........................................................................ [ 59%]\n........................................................................ [ 61%]\n........................................................................ [ 62%]\n........................................................................ [ 63%]\n........................................................................ [ 64%]\n........................................................................ [ 66%]\n........................................................................ [ 67%]\n........................................................................ [ 68%]\n........................................................................ [ 70%]\n........................................................................ [ 71%]\n........................................................................ [ 72%]\n........................................................................ [ 74%]\n........................................................................ [ 75%]\n........................................................................ [ 76%]\n........................................................................ [ 78%]\n........................................................................ [ 79%]\n........................................................................ [ 80%]\n........................................................................ [ 82%]\n........................................................................ [ 83%]\n........................................................................ [ 84%]\n........................................................................ [ 86%]\n........................................................................ [ 87%]\n........................................................................ [ 88%]\n........................................................................ [ 90%]\n........................................................................ [ 91%]\n........................................................................ [ 92%]\n........................................................................ [ 94%]\n........................................................................ [ 95%]\n........................................................................ [ 96%]\n........................................................................ [ 98%]\n........................................................................ [ 99%]\n............................                                             [100%]\n5428 passed in 231.88s (0:03:51)\n",
+    "stderr": ""
+  },
+  "original_capture_record_sha256": "cd943121ce52241ae16aa7cbcf9a97ec39fb0ee44da9f0498cba6b8ba0a3aa1f",
+  "tested_validation_document": {
+    "bytes": 86267,
+    "sha256": "3bee9c84333b3ff14204add4e3b931256de5bd75e83c2526fdbf112f5dc23114",
+    "scope": "private exact tested input; later metadata-only document delta is excluded from current execution/test/guidance hash equality"
+  },
+  "independent_fix_review": {
+    "scope": "bounded implementation fix slice only",
+    "material_findings": 0,
+    "focused_tests": 17,
+    "source_hashes_unchanged": true,
+    "response_sha256": "5f261aa6ca5d8ef33f57e8858b2342cf2ca25186ed5ac0a0eaef0660c90e3be7"
+  },
+  "native_C3_pass": false,
+  "post_suite_change_scope": [
+    "docs/validation/2026-11-04-backlog-drainer.md"
+  ]
+}
+```
+<!-- backlog-fix-e1-suite:end -->
+
+The bounded reader below hashes current execution inputs and the complete stored streams; it does not execute any archived command or establish native recovery.
+
+```bash
+rtk proxy python3 -c 'import hashlib,json; from pathlib import Path; s=Path("docs/validation/2026-11-04-backlog-drainer.md").read_text(); p=json.loads(s.split("<!-- backlog-fix-e1-suite:begin -->\n```json\n",1)[1].split("\n```\n<!-- backlog-fix-e1-suite:end -->",1)[0]); assert len(p["source_hashes"])==18; assert all(hashlib.sha256(Path(n).read_bytes()).hexdigest()==h for n,h in p["source_hashes"].items()); r=p["suite"]; assert r["exit_code"]==0 and r["complete"] and not r["output_limited"] and not r["timed_out"]; assert len(r["stdout"].encode())==r["stdout_bytes"] and len(r["stderr"].encode())==r["stderr_bytes"]; assert hashlib.sha256((r["stdout"]+r["stderr"]).encode()).hexdigest()==r["capture_sha256"]; assert "5428 passed in 231.88s" in r["stdout"]; assert not p["native_C3_pass"]; print("PASS: 18 current source hashes, complete 5428-pass streams and unchanged native boundary")'
+```

@@ -776,6 +776,118 @@ def test_write_evidence_requires_a_private_state_root(tmp_path: Path) -> None:
         write_evidence(tmp_path, RUN_ID, {"ok": True})
 
 
+def test_evidence_rejects_symlinked_state_root_ancestor_without_redirecting(
+    tmp_path: Path,
+) -> None:
+    # Wrong branch: accepting an absolute root after following a symlinked ancestor.
+    physical = tmp_path / "physical"
+    physical.mkdir(mode=0o700)
+    state_root = physical / "state"
+    state_root.mkdir(mode=0o700)
+    reference = write_evidence(state_root, RUN_ID, {"origin": "physical"})
+    alias = tmp_path / "alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    aliased_root = alias / "state"
+
+    with pytest.raises(CheckpointError):
+        write_evidence(aliased_root, RUN_ID, {"origin": "redirected"})
+    with pytest.raises(CheckpointError):
+        read_evidence(aliased_root, RUN_ID, reference)
+
+    assert read_evidence(state_root, RUN_ID, reference) == {"origin": "physical"}
+    evidence_files = sorted(
+        (state_root / "backlog-drain" / RUN_ID / "evidence").glob("*.json")
+    )
+    assert len(evidence_files) == 1
+
+
+def test_evidence_rejects_lexical_parent_state_root(tmp_path: Path) -> None:
+    # Wrong branch: allowing '..' to select a private root through kernel normalization.
+    child = tmp_path / "child"
+    child.mkdir(mode=0o700)
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    supplied = child / ".." / "state"
+
+    with pytest.raises(CheckpointError):
+        write_evidence(supplied, RUN_ID, {"ok": True})
+
+    assert not (state_root / "backlog-drain").exists()
+
+
+@pytest.mark.parametrize(
+    "spelling", ["dot", "duplicate", "trailing", "double-root"]
+)
+def test_evidence_rejects_nonexact_string_state_root_spelling(
+    tmp_path: Path, spelling: str
+) -> None:
+    # Wrong branch: accepting a nonexact spelling or noncanonical root anchor.
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    if spelling == "dot":
+        supplied = f"{tmp_path}/./state"
+    elif spelling == "duplicate":
+        supplied = f"{tmp_path}//state"
+    elif spelling == "double-root":
+        supplied = f"/{state_root}"
+    else:
+        supplied = f"{state_root}/"
+
+    with pytest.raises(CheckpointError):
+        write_evidence(supplied, RUN_ID, {"ok": True})
+
+    assert not (state_root / "backlog-drain").exists()
+
+
+def test_evidence_rejects_final_state_root_symlink(tmp_path: Path) -> None:
+    # Wrong branch: following a final state-root symlink during the component walk.
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    alias = tmp_path / "state-alias"
+    alias.symlink_to(state_root, target_is_directory=True)
+
+    with pytest.raises(CheckpointError):
+        write_evidence(alias, RUN_ID, {"ok": True})
+
+    assert not (state_root / "backlog-drain").exists()
+
+
+def test_evidence_walk_stays_on_open_ancestor_when_path_is_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Wrong branch: resolving the whole pathname instead of walking from a retained '/'.
+    ancestor = tmp_path / "ancestor"
+    ancestor.mkdir(mode=0o700)
+    state_root = ancestor / "state"
+    state_root.mkdir(mode=0o700)
+    moved = tmp_path / "moved"
+    real_open = os.open
+    replaced = False
+
+    def replace_after_ancestor_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "ancestor" and dir_fd is not None and not replaced:
+            replaced = True
+            ancestor.rename(moved)
+            ancestor.mkdir(mode=0o700)
+            (ancestor / "state").mkdir(mode=0o700)
+        return fd
+
+    monkeypatch.setattr(storage.os, "open", replace_after_ancestor_open)
+    monkeypatch.setattr(
+        storage.os,
+        "supports_dir_fd",
+        set(os.supports_dir_fd) | {replace_after_ancestor_open},
+    )
+
+    reference = write_evidence(state_root, RUN_ID, {"pinned": True})
+
+    assert replaced is True
+    assert read_evidence(moved / "state", RUN_ID, reference) == {"pinned": True}
+    assert not (ancestor / "state" / "backlog-drain").exists()
+
+
 def test_read_evidence_rejects_manifest_larger_than_one_mib(tmp_path: Path) -> None:
     data = b'{"data":"' + b"x" * 1_048_576 + b'"}'
     digest = hashlib.sha256(data).hexdigest()
