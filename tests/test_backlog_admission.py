@@ -434,6 +434,224 @@ def test_release_accepts_freshly_verified_commit_binding(terminal_admission_fixt
     assert not _active_path(state_root, worktree).exists()
 
 
+def _release_intent_path(state_root: Path, worktree: Path) -> Path:
+    return state_root / "backlog-drain" / "admissions" / f"{_root_key(worktree)}.release"
+
+
+def test_release_cleanup_archives_checkpoint_and_allows_new_bootstrap(
+    terminal_admission_fixture,
+) -> None:
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+    checkpoint = Path(record["checkpoint_path"])
+    old_bytes = checkpoint.read_bytes()
+
+    release_admission(state_root, worktree, record)
+
+    assert not checkpoint.exists()
+    assert not _active_path(state_root, worktree).exists()
+    assert not _release_intent_path(state_root, worktree).exists()
+    archived = state_root / "backlog-drain" / "admission-snapshots" / (
+        f"{record['root_key']}-{sha256_bytes(old_bytes)}.md"
+    )
+    admission_copy = state_root / "backlog-drain" / "admission-archive" / (
+        f"{record['root_key']}-{sha256_bytes(canonical_bytes(record))}.json"
+    )
+    assert archived.read_bytes() == old_bytes
+    assert admission_copy.read_bytes() == canonical_bytes(record)
+    for path in (archived, admission_copy):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert path.stat().st_uid == os.getuid()
+    assert collect_sources(str(worktree), [])["count"] == 0
+
+
+@pytest.mark.parametrize("boundary", ["intent_file", "intent_directory"])
+def test_release_cleanup_intent_failure_preserves_old_state(
+    terminal_admission_fixture, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+    checkpoint = Path(record["checkpoint_path"])
+    old_bytes = checkpoint.read_bytes()
+    intent = _release_intent_path(state_root, worktree)
+    real_fsync = admission.os.fsync
+
+    def fail_intent_sync(fd: int) -> None:
+        target = os.readlink(f"/proc/self/fd/{fd}")
+        fail_file = boundary == "intent_file" and target == str(intent)
+        fail_directory = boundary == "intent_directory" and target == str(intent.parent) and intent.exists()
+        if fail_file or fail_directory:
+            raise OSError("fixture release intent fsync failure")
+        real_fsync(fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(admission.os, "fsync", fail_intent_sync)
+        with pytest.raises(CheckpointError, match="release intent|indeterminate|PAUSED"):
+            release_admission(state_root, worktree, record)
+
+    assert checkpoint.read_bytes() == old_bytes
+    assert _active_path(state_root, worktree).read_bytes() == canonical_bytes(record)
+    assert intent.is_file()
+    with pytest.raises(CheckpointError, match="PAUSED"):
+        release_admission(state_root, worktree, record)
+    successor, proof = _make_successor(state_root, worktree, record)
+    with pytest.raises(CheckpointError, match="PAUSED"):
+        reconcile_admission(state_root, worktree, record, successor, proof)
+
+
+@pytest.mark.parametrize("boundary", ["checkpoint", "active"])
+def test_release_cleanup_unlink_ambiguity_blocks_new_admission(
+    terminal_admission_fixture, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+    checkpoint = Path(record["checkpoint_path"])
+    old_bytes = checkpoint.read_bytes()
+    active = _active_path(state_root, worktree)
+    target = checkpoint.name if boundary == "checkpoint" else active.name
+    real_unlink = admission.os.unlink
+
+    def unlink_then_fail(path, *args, **kwargs):
+        result = real_unlink(path, *args, **kwargs)
+        if path == target:
+            raise OSError("fixture release unlink result is uncertain")
+        return result
+
+    os.supports_dir_fd.add(unlink_then_fail)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(admission.os, "unlink", unlink_then_fail)
+            with pytest.raises(CheckpointIndeterminateError, match="retirement|release"):
+                release_admission(state_root, worktree, record)
+    finally:
+        os.supports_dir_fd.discard(unlink_then_fail)
+
+    archived = state_root / "backlog-drain" / "admission-snapshots" / (
+        f"{record['root_key']}-{sha256_bytes(old_bytes)}.md"
+    )
+    assert archived.read_bytes() == old_bytes
+    assert not checkpoint.exists()
+    assert active.exists() is (boundary == "checkpoint")
+    assert _release_intent_path(state_root, worktree).is_file()
+    with pytest.raises(CheckpointError, match="PAUSED"):
+        acquire_admission(state_root, worktree, record)
+
+
+def test_release_cleanup_preserves_unrelated_handoff(
+    terminal_admission_fixture,
+) -> None:
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+    checkpoint = Path(record["checkpoint_path"])
+    original = checkpoint.read_bytes()
+    unrelated = worktree / "HANDOFF.backlog-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md"
+    unrelated.write_bytes(b"unrelated\n")
+
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        release_admission(state_root, worktree, record)
+
+    assert unrelated.read_bytes() == b"unrelated\n"
+    assert checkpoint.read_bytes() == original
+    assert _active_path(state_root, worktree).read_bytes() == canonical_bytes(record)
+    assert not _release_intent_path(state_root, worktree).exists()
+
+
+def test_release_cleanup_rechecks_checkpoint_after_intent(
+    terminal_admission_fixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+    checkpoint = Path(record["checkpoint_path"])
+    real_exclusive = admission._exclusive_active
+    changed = b""
+
+    def prepare_then_change(directory_fd: int, name: str, data: bytes) -> None:
+        nonlocal changed
+        real_exclusive(directory_fd, name, data)
+        if name.endswith(".release"):
+            current = read_snapshot(checkpoint)
+            current["attempt"] = 1
+            current["child"]["attempt"] = 1
+            write_snapshot(checkpoint, current, expected_generation=0)
+            changed = checkpoint.read_bytes()
+
+    monkeypatch.setattr(admission, "_exclusive_active", prepare_then_change)
+    with pytest.raises(CheckpointError, match="changed before retirement"):
+        release_admission(state_root, worktree, record)
+
+    assert changed and checkpoint.read_bytes() == changed
+    assert _active_path(state_root, worktree).read_bytes() == canonical_bytes(record)
+    assert _release_intent_path(state_root, worktree).is_file()
+
+
+def _crash_release(state_root: str, worktree: str, record: dict, boundary: str) -> None:
+    real_unlink = admission.os.unlink
+    target = Path(record["checkpoint_path"]).name if boundary == "checkpoint" else f"{record['root_key']}.json"
+
+    def stop_after_unlink(path, *args, **kwargs):
+        result = real_unlink(path, *args, **kwargs)
+        if path == target:
+            os.kill(os.getpid(), signal.SIGSTOP)
+        return result
+
+    admission.os.unlink = stop_after_unlink
+    os.supports_dir_fd.add(stop_after_unlink)
+    release_admission(state_root, worktree, record)
+
+
+@pytest.mark.parametrize("boundary", ["checkpoint", "active"])
+def test_release_cleanup_process_death_keeps_pause_intent(
+    terminal_admission_fixture, boundary: str,
+) -> None:
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+    checkpoint = Path(record["checkpoint_path"])
+    old_bytes = checkpoint.read_bytes()
+    context = multiprocessing.get_context("fork")
+    process = context.Process(target=_crash_release, args=(str(state_root), str(worktree), record, boundary))
+    process.start()
+    _kill_owned_stopped_child(process)
+
+    archived = state_root / "backlog-drain" / "admission-snapshots" / (
+        f"{record['root_key']}-{sha256_bytes(old_bytes)}.md"
+    )
+    assert archived.read_bytes() == old_bytes
+    assert not checkpoint.exists()
+    assert _active_path(state_root, worktree).exists() is (boundary == "checkpoint")
+    assert _release_intent_path(state_root, worktree).is_file()
+    with pytest.raises(CheckpointError, match="PAUSED"):
+        acquire_admission(state_root, worktree, record)
+
+
+def test_release_cleanup_final_sync_error_is_indeterminate(
+    terminal_admission_fixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root, worktree, record = _admit_terminal(terminal_admission_fixture)
+    intent = _release_intent_path(state_root, worktree)
+    checkpoint = Path(record["checkpoint_path"])
+    real_unlink = admission.os.unlink
+    real_fsync = admission.os.fsync
+    intent_removed = False
+
+    def mark_intent_removal(path, *args, **kwargs):
+        nonlocal intent_removed
+        result = real_unlink(path, *args, **kwargs)
+        if path == intent.name:
+            intent_removed = True
+        return result
+
+    def fail_after_intent_removal(fd: int) -> None:
+        if intent_removed and os.readlink(f"/proc/self/fd/{fd}") == str(intent.parent):
+            raise OSError("fixture final release fsync failure")
+        real_fsync(fd)
+
+    os.supports_dir_fd.add(mark_intent_removal)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(admission.os, "unlink", mark_intent_removal)
+            patch.setattr(admission.os, "fsync", fail_after_intent_removal)
+            with pytest.raises(CheckpointIndeterminateError, match="release"):
+                release_admission(state_root, worktree, record)
+    finally:
+        os.supports_dir_fd.discard(mark_intent_removal)
+    assert not checkpoint.exists()
+    assert not _active_path(state_root, worktree).exists()
+
+
 def test_release_reads_evidence_from_retained_state_root(
     terminal_admission_fixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

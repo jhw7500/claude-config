@@ -80,6 +80,10 @@ Before release, write an evidence object with these three REQUIRED top-level fie
 
 Release additionally requires snapshot phase `READY_FOR_TRIBUNAL`, status `verified`, next action `STOP`, and child phase/attempt equal to the current snapshot with status `quiescent|completed`. Set non-null `git.commit_parent = git.base_head = P` and `git.result_commit = git.observed_head = C`; the source count and both digests must equal the recorded binding. Release itself freshly inspects the exact branch/worktree and reruns `git bind` against `source_manifest`, C, and this exact checkpoint. Null, stale, mismatched, or dirty Git state preserves the active admission and fails. Quiescence booleans must be literal JSON `true`, not integers.
 
+On successful release, the helper durably archives the exact admission bytes in `STATE_ROOT/backlog-drain/admission-archive/<root_key>-<admission_sha256>.json` and the exact terminal checkpoint bytes in `STATE_ROOT/backlog-drain/admission-snapshots/<root_key>-<snapshot_sha256>.md`, then removes the live checkpoint and active admission. Those private archives remain evidence, not Task authority; a released checkpoint is no longer a resumable live run. A later separately authorized run can use the ordinary empty-allowlist bootstrap without inheriting this checkpoint as an untracked source.
+
+Before retiring the checkpoint, release synchronizes a private `STATE_ROOT/backlog-drain/admissions/<root_key>.release` intent. It clears the intent only after checkpoint retirement and durable active-admission removal. An unfinished release intent makes acquire, release, and reconcile return `PAUSED`; preserve it and its archives for authenticated reconciliation rather than deleting it or blindly retrying. Unrelated handoff files remain outside the source allowlist and are never cleaned up by release.
+
 ### Admission reconcile
 
 Input has exactly the prior admission record, the new admission record, and this proof:

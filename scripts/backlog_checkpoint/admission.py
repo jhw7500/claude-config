@@ -309,6 +309,8 @@ def _reject_incomplete(
     snapshots_fd: int,
     key: str,
 ) -> None:
+    if _existing_file_bytes(admissions_fd, f"{key}.release", _MAX_ADMISSION_BYTES) is not None:
+        raise CheckpointError("incomplete admission release requires PAUSED reconciliation")
     if _existing_file_bytes(admissions_fd, next_name, _MAX_ADMISSION_BYTES) is not None:
         raise CheckpointError("incomplete successor admission requires PAUSED reconciliation")
     prefix = f".{key}-"
@@ -411,13 +413,39 @@ def release_admission(
         _reject_incomplete(fds[2], f"{key}.next", fds[3], fds[4], key)
         if _active_bytes(fds[2], active_name) != expected_bytes:
             raise CheckpointError("stale or foreign admission record")
-        with _locked_checkpoint(expected) as (_, snapshot):
+        with _locked_checkpoint(expected) as (checkpoint_bytes, snapshot):
             _validate_release(snapshot, expected, fds[0])
+        _immutable_copy(
+            fds[3], f"{key}-{sha256_bytes(expected_bytes)}.json", expected_bytes
+        )
+        release_name = f"{key}.release"
+        try:
+            _exclusive_active(fds[2], release_name, expected_bytes)
+        except CheckpointIndeterminateError as exc:
+            raise CheckpointIndeterminateError(
+                "release intent durability is indeterminate; reconciliation is PAUSED"
+            ) from exc
+        except CheckpointError as exc:
+            raise CheckpointError("release intent preparation failed; reconciliation is PAUSED") from exc
+        try:
+            if _active_bytes(fds[2], active_name) != expected_bytes:
+                raise CheckpointError("active admission changed before checkpoint retirement")
+            _archive_and_retire_checkpoint(
+                expected,
+                checkpoint_bytes,
+                fds[4],
+                f"{key}-{sha256_bytes(checkpoint_bytes)}.md",
+            )
+            if _active_bytes(fds[2], active_name) != expected_bytes:
+                raise CheckpointError("active admission changed before release")
             os.unlink(active_name, dir_fd=fds[2])
-            try:
-                os.fsync(fds[2])
-            except OSError as exc:
-                raise CheckpointIndeterminateError("admission release durability is indeterminate") from exc
+            os.fsync(fds[2])
+            os.unlink(release_name, dir_fd=fds[2])
+            os.fsync(fds[2])
+        except CheckpointError:
+            raise
+        except OSError as exc:
+            raise CheckpointIndeterminateError("admission release durability is indeterminate") from exc
     finally:
         if lock_fd >= 0:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)

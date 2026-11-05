@@ -1,6 +1,137 @@
 # Backlog drainer v3 validation — 2026-11-04
 
-## PR #266 case-sensitive source evidence correction — 2026-11-05
+## PR #266 terminal admission release cleanup — 2026-11-05
+
+This follow-up addresses Codex comment `4478519511` on parent `313ee920f072ce0ae69ec93639a6c2f6f08d283f`. Release previously removed only the active admission and left the terminal checkpoint untracked, preventing a later authorized run from passing empty-allowlist bootstrap in a checkout without a handoff ignore rule.
+
+The helper now archives the exact admission bytes and durably prepares a private release intent before retiring the exact verified terminal checkpoint. It reuses the existing no-follow archive/retirement helper, including the checkpoint-directory lock and byte recheck, without recursively acquiring that lock. After durable checkpoint retirement it removes and synchronizes the active admission, then clears and synchronizes the release intent. Acquire, release, and reconcile reject a remaining intent as PAUSED. Failure or process death never authorizes rollback, deletion by glob, a Task transition, or adoption of unrelated handoffs.
+
+Ten real-Git regression/control cases cover successful cleanup and fresh empty-allowlist bootstrap, intent file/directory synchronization failure, checkpoint/active unlink ambiguity, unrelated handoff preservation, checkpoint changes after intent creation, owned-process interruption at each deletion boundary, and final synchronization ambiguity. The initial pre-edit run had nine product failures and one passing unrelated-file control; the targeted GREEN passed all ten. Final module checks also exercise the incomplete-release guard through reconcile. The protocol reference describes the new archive and incomplete-release behavior.
+
+The previously observed native independent reviewer usage-limit error remains an explicit validation gap. Root performs a separate source-review pass, which is not independent approval. The eight earlier JSON packets below retain their exact original bytes and their own tested inputs. Native cross-runtime recovery, live Claim-transition, and public-entry foreign-UID gaps remain unchanged. Additional PR review requires the documented bounded exception route because the normal reviewer rounds are exhausted; no exception request is executed by this local validation.
+
+<!-- backlog-fix-pr266-release-suite:begin -->
+```json
+{
+  "schema": 1,
+  "scope": "PR #266 terminal admission release cleanup; component and whole-project checks, not independent/native-C3/Tribunal approval",
+  "finding": 4478519511,
+  "parent_head": "313ee920f072ce0ae69ec93639a6c2f6f08d283f",
+  "tested_working_change_digest": "7f79795c8f357a25885071788eef2e44ab3e716eb4dd711a8a49b74a40259187",
+  "source_manifest": {
+    "change_digest": "7f79795c8f357a25885071788eef2e44ab3e716eb4dd711a8a49b74a40259187",
+    "count": 4,
+    "parent_head": "313ee920f072ce0ae69ec93639a6c2f6f08d283f",
+    "path_set_digest": "575a06fda676fdec6fbb43ad0d9838cd6070a32c08e8bc0f862bcd968e65ca9f",
+    "paths": [
+      "docs/validation/2026-11-04-backlog-drainer.md",
+      "scripts/backlog_checkpoint/admission.py",
+      "skills/backlog-drain/references/protocol.md",
+      "tests/test_backlog_admission.py"
+    ],
+    "sources": [
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "docs/validation/2026-11-04-backlog-drainer.md",
+        "sha256": "a955a25de23ac3d0ae4de74586e1d8339d7211578bffc687d27c3fd1657f1f22"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "scripts/backlog_checkpoint/admission.py",
+        "sha256": "ab3934226bc02bf78fe9c2addc6320d6081bef9d2a985787d3a3077e637c3dcc"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "skills/backlog-drain/references/protocol.md",
+        "sha256": "5723be361b52d810d490cfefbdc612fb5ca87d9c8eb366293480d546c2058bb4"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "tests/test_backlog_admission.py",
+        "sha256": "c4548db5d3abfe82ad87b0986705c54c637181f279de7ff14665db9770fad11e"
+      }
+    ]
+  },
+  "source_hashes": {
+    "install.sh": "e498f4565c4fbc89d7b7b6a116b497fed94a73ac4a7fe675ba6a9907b7364ecf",
+    "scripts/backlog-checkpoint.py": "95c09efb70b907f1fad1f07a9c74d56211127c91be70c5e27ad76266dd617526",
+    "scripts/backlog_checkpoint/__init__.py": "1c62a4c05db819c7d779f2c22acd2af63b56fb4f648ef4ae236af838a307da2a",
+    "scripts/backlog_checkpoint/admission.py": "ab3934226bc02bf78fe9c2addc6320d6081bef9d2a985787d3a3077e637c3dcc",
+    "scripts/backlog_checkpoint/cli.py": "b6ce9591980a9705765a23e41a69119de5f8705834e39387c76107be288942e3",
+    "scripts/backlog_checkpoint/codec.py": "aef3989e5a3eed08cf2f32a994191a7fc42f62b0eb531b02787cfb68d9c28179",
+    "scripts/backlog_checkpoint/git_evidence.py": "3a17888d9581006ae4867d1d55533c4811063a2a99975ca4783f9cb464c1bd29",
+    "scripts/backlog_checkpoint/queue.py": "cd889886dde12c433278c3451b9cd9bc931c7bdaa1dc2acd56bf825479841ffd",
+    "scripts/backlog_checkpoint/storage.py": "56509e8f63f7c067550cc5a47149e2ca76c21a536f8e01ea7677192b35fcd1e4",
+    "scripts/install-backlog-drain.py": "8df080971d07066c585d81c40fe1d40ac644ae96582f3991bd6cd015f62ecc19",
+    "skills/backlog-drain/SKILL.md": "dce1c5a6907dd507e342c81229544cc37dab116e9174903d10f060add2a57c85",
+    "skills/backlog-drain/references/protocol.md": "5723be361b52d810d490cfefbdc612fb5ca87d9c8eb366293480d546c2058bb4",
+    "tests/test_backlog_admission.py": "c4548db5d3abfe82ad87b0986705c54c637181f279de7ff14665db9770fad11e",
+    "tests/test_backlog_checkpoint.py": "75278441871f2e466639bd2bf209b4823c2ada42ea6c93aeebf50eacee6516db",
+    "tests/test_backlog_cli.py": "dc527b6d476d30e445d7d80b68c58224ce7fcdaaf4b1d1470f04ff075e6d09be",
+    "tests/test_backlog_git_evidence.py": "978544f8457b6dd01e00a67d9d191ed3a9dd59b69801b4f04a8dd38e08b5b1d3",
+    "tests/test_backlog_install.py": "ce30f2c11ac5dbd0cba6653906f3c3bb108360ad5824035a0b169cd47080458e",
+    "tests/test_backlog_queue.py": "4fedd10261709a7321f4113d51933bea850be5bc853a3139afc921b85bf31f8a"
+  },
+  "suite": {
+    "command": "rtk proxy /usr/bin/env -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 \"$HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python\" -m pytest -q -n 8 -p no:cacheprovider",
+    "exit_code": 0,
+    "timed_out": false,
+    "elapsed_seconds": 274.601,
+    "summary": "5464 passed in 274.43s (0:04:34)",
+    "capture_sha256": "a88091eaa0d73c340bf8a47a557240d2a2ee0426ae9b21dd5c0241567be8dc7c",
+    "complete": true,
+    "output_limited": false,
+    "stdout_bytes": 6156,
+    "stderr_bytes": 0,
+    "stdout": "bringing up nodes...\nbringing up nodes...\n\n........................................................................ [  1%]\n........................................................................ [  2%]\n........................................................................ [  3%]\n........................................................................ [  5%]\n........................................................................ [  6%]\n........................................................................ [  7%]\n........................................................................ [  9%]\n........................................................................ [ 10%]\n........................................................................ [ 11%]\n........................................................................ [ 13%]\n........................................................................ [ 14%]\n........................................................................ [ 15%]\n........................................................................ [ 17%]\n........................................................................ [ 18%]\n........................................................................ [ 19%]\n........................................................................ [ 21%]\n........................................................................ [ 22%]\n........................................................................ [ 23%]\n........................................................................ [ 25%]\n........................................................................ [ 26%]\n........................................................................ [ 27%]\n........................................................................ [ 28%]\n........................................................................ [ 30%]\n........................................................................ [ 31%]\n........................................................................ [ 32%]\n........................................................................ [ 34%]\n........................................................................ [ 35%]\n........................................................................ [ 36%]\n........................................................................ [ 38%]\n........................................................................ [ 39%]\n........................................................................ [ 40%]\n........................................................................ [ 42%]\n........................................................................ [ 43%]\n........................................................................ [ 44%]\n........................................................................ [ 46%]\n........................................................................ [ 47%]\n........................................................................ [ 48%]\n........................................................................ [ 50%]\n........................................................................ [ 51%]\n........................................................................ [ 52%]\n........................................................................ [ 54%]\n........................................................................ [ 55%]\n........................................................................ [ 56%]\n........................................................................ [ 57%]\n........................................................................ [ 59%]\n........................................................................ [ 60%]\n........................................................................ [ 61%]\n........................................................................ [ 63%]\n........................................................................ [ 64%]\n........................................................................ [ 65%]\n........................................................................ [ 67%]\n........................................................................ [ 68%]\n........................................................................ [ 69%]\n........................................................................ [ 71%]\n........................................................................ [ 72%]\n........................................................................ [ 73%]\n........................................................................ [ 75%]\n........................................................................ [ 76%]\n........................................................................ [ 77%]\n........................................................................ [ 79%]\n........................................................................ [ 80%]\n........................................................................ [ 81%]\n........................................................................ [ 83%]\n........................................................................ [ 84%]\n........................................................................ [ 85%]\n........................................................................ [ 86%]\n........................................................................ [ 88%]\n........................................................................ [ 89%]\n........................................................................ [ 90%]\n........................................................................ [ 92%]\n........................................................................ [ 93%]\n........................................................................ [ 94%]\n........................................................................ [ 96%]\n........................................................................ [ 97%]\n........................................................................ [ 98%]\n................................................................         [100%]\n5464 passed in 274.43s (0:04:34)\n",
+    "stderr": ""
+  },
+  "original_capture_record_sha256": "de98945a1b7dc34de58c4186aebc4765dd8aba12215583a2be889ebfd23caf3a",
+  "tested_validation_document": {
+    "sha256": "a955a25de23ac3d0ae4de74586e1d8339d7211578bffc687d27c3fd1657f1f22",
+    "bytes": 156364
+  },
+  "independent_review": {
+    "status": "NOT_COMPLETED",
+    "reason": "known prior native reviewer usage_limit; no fresh independent verdict or quota bypass",
+    "availability_evidence": "../pr266-ignorecase-fix-zv6h51ea/independent-review-unavailable.json"
+  },
+  "local_root_review": {
+    "status": "ROOT_REVIEW_COMPLETED",
+    "independent": false,
+    "scope": [
+      "scripts/backlog_checkpoint/admission.py",
+      "tests/test_backlog_admission.py",
+      "docs/validation/2026-11-04-backlog-drainer.md",
+      "skills/backlog-drain/references/protocol.md"
+    ],
+    "findings": [],
+    "report_sha256": "a0e80a81e5779b8a7a85cc5b55f011244ab8270082f89272a544801e73adabb3"
+  },
+  "tdd": {
+    "valid_initial_red_failures": 9,
+    "initial_unrelated_control_passed": 1,
+    "targeted_green": "10 passed, 50 deselected in 4.00s",
+    "admission_module": "60 passed in 9.87s",
+    "backlog_modules": "254 passed in 20.64s",
+    "additional_assertion": "unfinished release intent blocks reconcile with a valid successor proof"
+  },
+  "performer_report_sha256": "8dc0ee6ceed4301b5b12899712d1fad2cb4e1942a46f3f2c77b3c00bc75e4647",
+  "native_C3_pass": false,
+  "public_foreign_uid_fixture_pass": false,
+  "live_claim_transition_pass": false,
+  "post_suite_change_scope": [
+    "docs/validation/2026-11-04-backlog-drainer.md"
+  ]
+}
+```
+<!-- backlog-fix-pr266-release-suite:end -->
+
+## Historical PR #266 case-sensitive source correction for `313ee92` — 2026-11-05
 
 This follow-up addresses Codex comment `4478259925` on parent `027ee3ad6a90371cb19e1c30ef80f119b7b0ade9`. On a case-sensitive checkout, repository `core.ignoreCase=true` can suppress an extra untracked path that differs only in case from a tracked path. Git evidence probes now use a command-scoped `core.ignoreCase=false` override, so clean-start collection and post-commit binding detect those distinct source paths while preserving repository configuration.
 
