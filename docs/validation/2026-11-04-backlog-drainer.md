@@ -1,6 +1,144 @@
 # Backlog drainer v3 validation — 2026-11-04
 
-## PR #266 executable-mode evidence correction — 2026-11-05
+## PR #266 recovery-checkpoint and submodule evidence correction — 2026-11-05
+
+This follow-up addresses Codex comments `4477733172` and `4477733175` on parent `f679f500b8976ceb37c9b237181ece1856c14a59`. Reconciliation previously left the predecessor checkpoint as a second untracked path, so Git collection for the successor rejected an otherwise recovered run. The correction archives the exact predecessor snapshot and retires only that authenticated checkpoint after durably preparing the successor record, including its admissions-directory entry. The successor checkpoint remains available to the existing collection and commit-binding checks; unrelated handoff files remain outside the source allowlist.
+
+The recovery regressions use a real Git checkout without a handoff ignore rule. They cover successor collection, exact archived bytes, unrelated handoff rejection, a changed predecessor, unlink/directory-sync uncertainty, and an owned child interrupted immediately after predecessor removal. These are component fixtures; they do not perform a live Registry Claim or supervisor transition.
+
+Git status probes also force `--ignore-submodules=none`. Real Git fixtures cover `diff.ignoreSubmodules`, local `submodule.<name>.ignore`, and `.gitmodules` ignore settings during clean-start collection and post-commit binding. The probes preserve repository settings and submodule contents and continue rejecting dirty gitlinks rather than adopting submodule sources.
+
+The six older JSON packets below retain their original bytes and describe their own recorded inputs. This follow-up does not establish native cross-runtime C3 recovery, live Claim transitions, public-entry foreign-UID coverage, or a fresh Tribunal verdict.
+
+<!-- backlog-fix-pr266-recovery-submodule-suite:begin -->
+```json
+{
+  "schema": 1,
+  "scope": "PR #266 recovery checkpoint retirement and submodule status evidence corrections; component regressions and whole-project verification, not native-C3/Registry transition or reusable Tribunal evidence",
+  "parent_head": "f679f500b8976ceb37c9b237181ece1856c14a59",
+  "tested_working_change_digest": "bf391820bf21c40791d6ce27bd5058caab8bcb7b27a51739b74d54d51600f727",
+  "source_manifest": {
+    "change_digest": "bf391820bf21c40791d6ce27bd5058caab8bcb7b27a51739b74d54d51600f727",
+    "count": 5,
+    "parent_head": "f679f500b8976ceb37c9b237181ece1856c14a59",
+    "path_set_digest": "a2e92e9de3022d28b2715d60dc07d5b245ab1ade11c8ab3b0f2768150785dea3",
+    "paths": [
+      "docs/validation/2026-11-04-backlog-drainer.md",
+      "scripts/backlog_checkpoint/admission.py",
+      "scripts/backlog_checkpoint/git_evidence.py",
+      "tests/test_backlog_admission.py",
+      "tests/test_backlog_git_evidence.py"
+    ],
+    "sources": [
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "docs/validation/2026-11-04-backlog-drainer.md",
+        "sha256": "1995e6a340dfb7d68da24b58af0279ea12003ae38f9c0668974145741a653fbf"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "scripts/backlog_checkpoint/admission.py",
+        "sha256": "6d917147540bcefd49f3e8161d67e1bc5282504033f8e92e698e5583227c7f7b"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "scripts/backlog_checkpoint/git_evidence.py",
+        "sha256": "496ae7d2eb94c4f4faae48340ec7d4c05d4213fce369e1b8282cf2ac0a2fb150"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "tests/test_backlog_admission.py",
+        "sha256": "ba8e0561149b9793f3278366ec9212311d1c065b3deebaffa2c801bbca92edd5"
+      },
+      {
+        "change": "modify",
+        "mode": "100644",
+        "path": "tests/test_backlog_git_evidence.py",
+        "sha256": "1a88ff170f8c95503c756b20c4827723e81470066c0be99cd8fcaf4c8f035c14"
+      }
+    ]
+  },
+  "source_hashes": {
+    "install.sh": "e498f4565c4fbc89d7b7b6a116b497fed94a73ac4a7fe675ba6a9907b7364ecf",
+    "scripts/backlog-checkpoint.py": "95c09efb70b907f1fad1f07a9c74d56211127c91be70c5e27ad76266dd617526",
+    "scripts/backlog_checkpoint/__init__.py": "1c62a4c05db819c7d779f2c22acd2af63b56fb4f648ef4ae236af838a307da2a",
+    "scripts/backlog_checkpoint/admission.py": "6d917147540bcefd49f3e8161d67e1bc5282504033f8e92e698e5583227c7f7b",
+    "scripts/backlog_checkpoint/cli.py": "b6ce9591980a9705765a23e41a69119de5f8705834e39387c76107be288942e3",
+    "scripts/backlog_checkpoint/codec.py": "aef3989e5a3eed08cf2f32a994191a7fc42f62b0eb531b02787cfb68d9c28179",
+    "scripts/backlog_checkpoint/git_evidence.py": "496ae7d2eb94c4f4faae48340ec7d4c05d4213fce369e1b8282cf2ac0a2fb150",
+    "scripts/backlog_checkpoint/queue.py": "cd889886dde12c433278c3451b9cd9bc931c7bdaa1dc2acd56bf825479841ffd",
+    "scripts/backlog_checkpoint/storage.py": "56509e8f63f7c067550cc5a47149e2ca76c21a536f8e01ea7677192b35fcd1e4",
+    "scripts/install-backlog-drain.py": "8df080971d07066c585d81c40fe1d40ac644ae96582f3991bd6cd015f62ecc19",
+    "skills/backlog-drain/SKILL.md": "dce1c5a6907dd507e342c81229544cc37dab116e9174903d10f060add2a57c85",
+    "skills/backlog-drain/references/protocol.md": "7a618109cdaf5e6b15d09735bf4260c019db9489906a683a3eee3c8dfaabfd80",
+    "tests/test_backlog_admission.py": "ba8e0561149b9793f3278366ec9212311d1c065b3deebaffa2c801bbca92edd5",
+    "tests/test_backlog_checkpoint.py": "75278441871f2e466639bd2bf209b4823c2ada42ea6c93aeebf50eacee6516db",
+    "tests/test_backlog_cli.py": "dc527b6d476d30e445d7d80b68c58224ce7fcdaaf4b1d1470f04ff075e6d09be",
+    "tests/test_backlog_git_evidence.py": "1a88ff170f8c95503c756b20c4827723e81470066c0be99cd8fcaf4c8f035c14",
+    "tests/test_backlog_install.py": "ce30f2c11ac5dbd0cba6653906f3c3bb108360ad5824035a0b169cd47080458e",
+    "tests/test_backlog_queue.py": "4fedd10261709a7321f4113d51933bea850be5bc853a3139afc921b85bf31f8a"
+  },
+  "suite": {
+    "command": "rtk proxy /usr/bin/env -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 \"$HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python\" -m pytest -q -n 8 -p no:cacheprovider",
+    "exit_code": 0,
+    "timed_out": false,
+    "elapsed_seconds": 274.142,
+    "summary": "5450 passed in 273.95s (0:04:33)",
+    "capture_sha256": "bcb6cc837db03449d76622a3139cbe017e9e253eac8b8b2581fa2ac062c4f890",
+    "complete": true,
+    "output_limited": false,
+    "stdout_bytes": 6156,
+    "stderr_bytes": 0,
+    "stdout": "bringing up nodes...\nbringing up nodes...\n\n........................................................................ [  1%]\n........................................................................ [  2%]\n........................................................................ [  3%]\n........................................................................ [  5%]\n........................................................................ [  6%]\n........................................................................ [  7%]\n........................................................................ [  9%]\n........................................................................ [ 10%]\n........................................................................ [ 11%]\n........................................................................ [ 13%]\n........................................................................ [ 14%]\n........................................................................ [ 15%]\n........................................................................ [ 17%]\n........................................................................ [ 18%]\n........................................................................ [ 19%]\n........................................................................ [ 21%]\n........................................................................ [ 22%]\n........................................................................ [ 23%]\n........................................................................ [ 25%]\n........................................................................ [ 26%]\n........................................................................ [ 27%]\n........................................................................ [ 29%]\n........................................................................ [ 30%]\n........................................................................ [ 31%]\n........................................................................ [ 33%]\n........................................................................ [ 34%]\n........................................................................ [ 35%]\n........................................................................ [ 36%]\n........................................................................ [ 38%]\n........................................................................ [ 39%]\n........................................................................ [ 40%]\n........................................................................ [ 42%]\n........................................................................ [ 43%]\n........................................................................ [ 44%]\n........................................................................ [ 46%]\n........................................................................ [ 47%]\n........................................................................ [ 48%]\n........................................................................ [ 50%]\n........................................................................ [ 51%]\n........................................................................ [ 52%]\n........................................................................ [ 54%]\n........................................................................ [ 55%]\n........................................................................ [ 56%]\n........................................................................ [ 58%]\n........................................................................ [ 59%]\n........................................................................ [ 60%]\n........................................................................ [ 62%]\n........................................................................ [ 63%]\n........................................................................ [ 64%]\n........................................................................ [ 66%]\n........................................................................ [ 67%]\n........................................................................ [ 68%]\n........................................................................ [ 70%]\n........................................................................ [ 71%]\n........................................................................ [ 72%]\n........................................................................ [ 73%]\n........................................................................ [ 75%]\n........................................................................ [ 76%]\n........................................................................ [ 77%]\n........................................................................ [ 79%]\n........................................................................ [ 80%]\n........................................................................ [ 81%]\n........................................................................ [ 83%]\n........................................................................ [ 84%]\n........................................................................ [ 85%]\n........................................................................ [ 87%]\n........................................................................ [ 88%]\n........................................................................ [ 89%]\n........................................................................ [ 91%]\n........................................................................ [ 92%]\n........................................................................ [ 93%]\n........................................................................ [ 95%]\n........................................................................ [ 96%]\n........................................................................ [ 97%]\n........................................................................ [ 99%]\n..................................................                       [100%]\n5450 passed in 273.95s (0:04:33)\n",
+    "stderr": ""
+  },
+  "original_capture_record_sha256": "c60dc6d223a6de09a246ca78dd8f16da620598d43fbf42f7a30853859d08eb7e",
+  "tested_validation_document": {
+    "sha256": "1995e6a340dfb7d68da24b58af0279ea12003ae38f9c0668974145741a653fbf",
+    "bytes": 128103
+  },
+  "independent_fix_review": {
+    "status": "APPROVED",
+    "scope": [
+      "scripts/backlog_checkpoint/admission.py",
+      "scripts/backlog_checkpoint/git_evidence.py",
+      "tests/test_backlog_admission.py",
+      "tests/test_backlog_git_evidence.py"
+    ],
+    "findings": [],
+    "report_sha256": "aaef9a768262942041c88314f55d3793726bc73328dddd663b9ee7ebc19df0d2",
+    "exact_response_sha256": "49725ab83c90d8dc39c987908f7a750660441027867cb44f8933869e0bfe7f74",
+    "initial_durability_high_fixed": true
+  },
+  "tdd_evidence": {
+    "submodule_valid_initial_red_cases": 6,
+    "recovery_valid_initial_red_cases": 2,
+    "recovery_excluded_initial_harness_failures": 1,
+    "recovery_supplemental_parent_counterfactual_product_failures": 3,
+    "supplemental_counterfactual_is_after_implementation": true,
+    "pre_retirement_directory_fsync_valid_red_cases": 1,
+    "initial_green_harness_failures_preserved": true
+  },
+  "performer_report_sha256": {
+    "reconcile-performer": "a5df167c82508b52c8182ed8e47aaabdf797d8adc56d3819ee386950c97bacc6",
+    "submodule-performer": "38d0b280d88fc63ad1d1486407a58fe6d2a87ce936cbc7ec07edeace9534f514"
+  },
+  "repository_config_mutated": false,
+  "native_C3_pass": false,
+  "public_foreign_uid_fixture_pass": false,
+  "live_claim_transition_pass": false,
+  "post_suite_change_scope": [
+    "docs/validation/2026-11-04-backlog-drainer.md"
+  ]
+}
+```
+<!-- backlog-fix-pr266-recovery-submodule-suite:end -->
+
+## Historical PR #266 executable-mode correction for `f679f50` — 2026-11-05
 
 This follow-up addresses Codex comment `4477353814` on parent `c5511271d0f0cc288b5b0c7f82ae3f30230d1a9e`. With repository `core.fileMode=false`, Git status could hide executable-bit changes outside the source allowlist even though an explicitly collected file used its actual mode. Git evidence probes now use a command-scoped `core.fileMode=true` override, so clean-start, allowlist checks, and post-commit binding observe the same mode semantics without rewriting repository configuration.
 

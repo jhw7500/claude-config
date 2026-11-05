@@ -272,6 +272,36 @@ def _active_bytes(admissions_fd: int, active_name: str) -> bytes:
     return current
 
 
+def _archive_and_retire_checkpoint(
+    record: dict, expected_bytes: bytes, snapshots_fd: int, archive_name: str
+) -> None:
+    path = Path(record["checkpoint_path"])
+    directory_fd = _open_directory(path.parent, private=False)
+    lock_fd = -1
+    try:
+        lock_fd = _lock_directory(directory_fd)
+        current = _read_file_at(directory_fd, path.name, MAX_SNAPSHOT_BYTES)
+        snapshot = decode_snapshot(current)
+        _validate_snapshot_binding(snapshot, record)
+        if current != expected_bytes:
+            raise CheckpointError("predecessor checkpoint changed before retirement")
+        _immutable_copy(snapshots_fd, archive_name, current)
+        if _read_file_at(directory_fd, path.name, MAX_SNAPSHOT_BYTES) != current:
+            raise CheckpointError("predecessor checkpoint changed before retirement")
+        try:
+            os.unlink(path.name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except OSError as exc:
+            raise CheckpointIndeterminateError(
+                "predecessor checkpoint retirement is indeterminate"
+            ) from exc
+    finally:
+        if lock_fd >= 0:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
 def _reject_incomplete(
     admissions_fd: int,
     next_name: str,
@@ -499,6 +529,15 @@ def reconcile_admission(
             os.fsync(fd)
             os.close(fd)
             fd = -1
+            os.fsync(fds[2])
+            if _active_bytes(fds[2], active_name) != expected_bytes:
+                raise CheckpointError("active admission changed before successor publish")
+            _archive_and_retire_checkpoint(
+                expected,
+                old_snapshot_bytes,
+                fds[4],
+                f"{key}-{sha256_bytes(old_snapshot_bytes)}.md",
+            )
             if _active_bytes(fds[2], active_name) != expected_bytes:
                 raise CheckpointError("active admission changed before successor publish")
             os.replace(next_name, active_name, src_dir_fd=fds[2], dst_dir_fd=fds[2])

@@ -68,6 +68,52 @@ def _commit_all(root: Path, message: str = "change") -> str:
     return _head(root)
 
 
+def _configured_submodule(
+    repo: Path, tmp_path: Path, ignore_source: str
+) -> tuple[Path, tuple[str, ...]]:
+    dependency = tmp_path / f"dependency-{ignore_source}"
+    dependency.mkdir()
+    _git(dependency, "init", "-b", "main")
+    _git(dependency, "config", "user.name", "Fixture User")
+    _git(dependency, "config", "user.email", "fixture@example.invalid")
+    _write(dependency, "dependency.txt", b"clean\n")
+    _commit_all(dependency, "dependency baseline")
+    _git(
+        repo,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(dependency),
+        "dependency",
+    )
+    _commit_all(repo, "submodule baseline")
+    if ignore_source == "diff":
+        config_args = ("config", "--get", "diff.ignoreSubmodules")
+        _git(repo, "config", "diff.ignoreSubmodules", "all")
+    elif ignore_source == "local-submodule":
+        config_args = ("config", "--get", "submodule.dependency.ignore")
+        _git(repo, "config", "submodule.dependency.ignore", "all")
+    else:
+        config_args = (
+            "config",
+            "-f",
+            ".gitmodules",
+            "--get",
+            "submodule.dependency.ignore",
+        )
+        _git(
+            repo,
+            "config",
+            "-f",
+            ".gitmodules",
+            "submodule.dependency.ignore",
+            "all",
+        )
+        _commit_all(repo, "ignore submodule in gitmodules")
+    return repo / "dependency", config_args
+
+
 def _checkpoint(root: Path, run_id: str) -> Path:
     path = root / f"HANDOFF.backlog-{run_id}.md"
     snapshot = {
@@ -398,6 +444,48 @@ def test_collect_rejects_unallowed_mode_change_when_core_filemode_is_disabled(
         collect_sources(str(repo), ["selected.txt"])
 
     assert _git(repo, "config", "--get", "core.fileMode") == b"false\n"
+
+
+@pytest.mark.parametrize(
+    "ignore_source", ["diff", "local-submodule", "gitmodules"]
+)
+def test_clean_start_rejects_dirty_submodule_despite_ignore_configuration(
+    repo: Path, tmp_path: Path, ignore_source: str
+) -> None:
+    submodule, config_args = _configured_submodule(repo, tmp_path, ignore_source)
+    configured = _git(repo, *config_args)
+    assert collect_sources(str(repo), [])["count"] == 0
+    _write(submodule, "dependency.txt", b"dirty\n")
+    assert _git(repo, "status", "--porcelain=v1", "-z") == b""
+
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        collect_sources(str(repo), [])
+
+    assert _git(repo, *config_args) == configured == b"all\n"
+    assert (submodule / "dependency.txt").read_bytes() == b"dirty\n"
+
+
+@pytest.mark.parametrize(
+    "ignore_source", ["diff", "local-submodule", "gitmodules"]
+)
+def test_bind_rejects_dirty_submodule_despite_ignore_configuration(
+    repo: Path, tmp_path: Path, ignore_source: str
+) -> None:
+    submodule, config_args = _configured_submodule(repo, tmp_path, ignore_source)
+    _write(repo, "reviewed.txt", b"before\n")
+    _commit_all(repo, "reviewed baseline")
+    _write(repo, "reviewed.txt", b"after\n")
+    manifest = collect_sources(str(repo), ["reviewed.txt"])
+    committed = _commit_all(repo, "reviewed change")
+    configured = _git(repo, *config_args)
+    _write(submodule, "dependency.txt", b"dirty after commit\n")
+    assert _git(repo, "status", "--porcelain=v1", "-z") == b""
+
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        bind_commit(str(repo), manifest["parent_head"], manifest, committed)
+
+    assert _git(repo, *config_args) == configured == b"all\n"
+    assert (submodule / "dependency.txt").read_bytes() == b"dirty after commit\n"
 
 
 @pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])

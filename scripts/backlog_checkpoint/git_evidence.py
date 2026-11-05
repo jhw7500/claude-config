@@ -262,6 +262,7 @@ def _status(root: str) -> bytes:
         "-z",
         "--untracked-files=all",
         "--no-renames",
+        "--ignore-submodules=none",
     )
 
 

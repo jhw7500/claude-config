@@ -644,6 +644,7 @@ def test_reconcile_requires_complete_success_proof(admission_fixture) -> None:
 def test_reconcile_archives_exact_old_bytes_and_publishes_successor(admission_fixture) -> None:
     state_root, worktree, record = admission_fixture
     acquire_admission(state_root, worktree, record)
+    old_snapshot_bytes = Path(record["checkpoint_path"]).read_bytes()
     successor, proof = _make_successor(state_root, worktree, record)
     old_bytes = canonical_bytes(record)
 
@@ -656,10 +657,114 @@ def test_reconcile_archives_exact_old_bytes_and_publishes_successor(admission_fi
     snapshot_copy = state_root / "backlog-drain" / "admission-snapshots" / (
         f"{record['root_key']}-{proof['successor']['snapshot_sha256']}.md"
     )
+    prior_snapshot_copy = state_root / "backlog-drain" / "admission-snapshots" / (
+        f"{record['root_key']}-{proof['prior']['snapshot_sha256']}.md"
+    )
     assert active.read_bytes() == canonical_bytes(successor)
     assert archive.read_bytes() == old_bytes
     assert snapshot_copy.read_bytes() == Path(successor["checkpoint_path"]).read_bytes()
+    assert prior_snapshot_copy.read_bytes() == old_snapshot_bytes
+    assert not Path(record["checkpoint_path"]).exists()
+    assert Path(successor["checkpoint_path"]).is_file()
     assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+    assert stat.S_IMODE(prior_snapshot_copy.stat().st_mode) == 0o600
+
+
+def test_reconcile_retires_only_predecessor_before_successor_git_collection(
+    admission_fixture,
+) -> None:
+    state_root, worktree, record = admission_fixture
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+    def git(*args: str) -> str:
+        return subprocess.check_output(
+            ["git", "-c", "core.hooksPath=/dev/null", *args], cwd=worktree, env=environment
+        ).decode().strip()
+
+    git("init", "-q", "-b", "task/issue-31")
+    git("config", "user.name", "Fixture User")
+    git("config", "user.email", "fixture@example.invalid")
+    (worktree / "source.py").write_text("unchanged\n")
+    git("add", "source.py")
+    git("commit", "-qm", "base")
+    acquire_admission(state_root, worktree, record)
+    successor, proof = _make_successor(state_root, worktree, record)
+
+    assert reconcile_admission(state_root, worktree, record, successor, proof) == successor
+    assert collect_sources(str(worktree), [], successor["checkpoint_path"])["count"] == 0
+
+    foreign = worktree / "HANDOFF.backlog-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md"
+    foreign.write_text("foreign\n")
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        collect_sources(str(worktree), [], successor["checkpoint_path"])
+    assert foreign.read_text() == "foreign\n"
+
+
+def test_reconcile_predecessor_retirement_failure_is_indeterminate_and_paused(
+    admission_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root, worktree, record = admission_fixture
+    acquire_admission(state_root, worktree, record)
+    successor, proof = _make_successor(state_root, worktree, record)
+    old_snapshot_bytes = Path(record["checkpoint_path"]).read_bytes()
+    real_unlink = admission.os.unlink
+
+    def unlink_then_fail(path, *args, **kwargs):
+        result = real_unlink(path, *args, **kwargs)
+        if path == Path(record["checkpoint_path"]).name:
+            raise OSError("fixture predecessor retirement result is uncertain")
+        return result
+
+    monkeypatch.setattr(admission.os, "unlink", unlink_then_fail)
+    os.supports_dir_fd.add(unlink_then_fail)
+    try:
+        with pytest.raises(CheckpointIndeterminateError, match="retirement"):
+            reconcile_admission(state_root, worktree, record, successor, proof)
+
+        prior_snapshot_copy = state_root / "backlog-drain" / "admission-snapshots" / (
+            f"{record['root_key']}-{proof['prior']['snapshot_sha256']}.md"
+        )
+        assert prior_snapshot_copy.read_bytes() == old_snapshot_bytes
+        assert _active_path(state_root, worktree).read_bytes() == canonical_bytes(record)
+        assert not Path(record["checkpoint_path"]).exists()
+        assert Path(successor["checkpoint_path"]).is_file()
+        with pytest.raises(CheckpointError, match="PAUSED"):
+            reconcile_admission(state_root, worktree, record, successor, proof)
+    finally:
+        os.supports_dir_fd.discard(unlink_then_fail)
+
+
+def test_reconcile_does_not_retire_predecessor_changed_after_initial_validation(
+    admission_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root, worktree, record = admission_fixture
+    acquire_admission(state_root, worktree, record)
+    successor, proof = _make_successor(state_root, worktree, record)
+    real_immutable_copy = admission._immutable_copy
+    changed_bytes = b""
+
+    def mutate_prior_after_successor_archive(directory_fd: int, name: str, data: bytes) -> None:
+        nonlocal changed_bytes
+        real_immutable_copy(directory_fd, name, data)
+        if name.endswith(f"-{proof['successor']['snapshot_sha256']}.md"):
+            current = read_snapshot(record["checkpoint_path"])
+            current["attempt"] = 1
+            current["child"]["attempt"] = 1
+            write_snapshot(record["checkpoint_path"], current, expected_generation=0)
+            changed_bytes = Path(record["checkpoint_path"]).read_bytes()
+
+    monkeypatch.setattr(admission, "_immutable_copy", mutate_prior_after_successor_archive)
+
+    with pytest.raises(CheckpointError, match="changed before retirement"):
+        reconcile_admission(state_root, worktree, record, successor, proof)
+
+    assert changed_bytes
+    assert Path(record["checkpoint_path"]).read_bytes() == changed_bytes
+    assert _active_path(state_root, worktree).read_bytes() == canonical_bytes(record)
+    prior_snapshot_copy = state_root / "backlog-drain" / "admission-snapshots" / (
+        f"{record['root_key']}-{proof['prior']['snapshot_sha256']}.md"
+    )
+    assert not prior_snapshot_copy.exists()
 
 
 def test_reconcile_reads_evidence_from_retained_state_root(
@@ -742,6 +847,41 @@ def test_reconcile_successor_temp_fsync_failure_pauses_with_old_active(
         reconcile_admission(state_root, worktree, record, successor, proof)
 
 
+def test_reconcile_fsyncs_prepared_successor_before_retiring_predecessor(
+    admission_fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root, worktree, record = admission_fixture
+    acquire_admission(state_root, worktree, record)
+    successor, proof = _make_successor(state_root, worktree, record)
+    old_snapshot_bytes = Path(record["checkpoint_path"]).read_bytes()
+    next_path = (
+        state_root
+        / "backlog-drain"
+        / "admissions"
+        / f"{record['root_key']}.next"
+    )
+    real_fsync = admission.os.fsync
+
+    def fail_pre_retirement_directory_fsync(fd: int) -> None:
+        target = os.readlink(f"/proc/self/fd/{fd}")
+        if target.endswith("/backlog-drain/admissions") and next_path.exists():
+            raise OSError("fixture admissions directory fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(admission.os, "fsync", fail_pre_retirement_directory_fsync)
+
+    with pytest.raises(CheckpointError, match="successor temp preparation.*PAUSED"):
+        reconcile_admission(state_root, worktree, record, successor, proof)
+
+    assert _active_path(state_root, worktree).read_bytes() == canonical_bytes(record)
+    assert Path(record["checkpoint_path"]).read_bytes() == old_snapshot_bytes
+    assert Path(successor["checkpoint_path"]).is_file()
+    assert next_path.is_file()
+    monkeypatch.setattr(admission.os, "fsync", real_fsync)
+    with pytest.raises(CheckpointError, match="PAUSED"):
+        reconcile_admission(state_root, worktree, record, successor, proof)
+
+
 def test_reconcile_post_publish_fsync_is_indeterminate_without_rollback(
     admission_fixture, monkeypatch
 ) -> None:
@@ -805,6 +945,18 @@ def _crash_reconcile(
             return result
 
         admission.os.replace = stop_after_replace
+    elif boundary == "retire_after_unlink":
+        real_unlink = admission.os.unlink
+        predecessor_name = Path(expected["checkpoint_path"]).name
+
+        def stop_after_predecessor_unlink(path, *args, **kwargs):
+            result = real_unlink(path, *args, **kwargs)
+            if path == predecessor_name:
+                os.kill(os.getpid(), signal.SIGSTOP)
+            return result
+
+        admission.os.unlink = stop_after_predecessor_unlink
+        os.supports_dir_fd.add(stop_after_predecessor_unlink)
     reconcile_admission(state_root, worktree, expected, successor, proof)
 
 
@@ -833,13 +985,18 @@ def _kill_owned_stopped_child(process: multiprocessing.Process) -> None:
 
 @pytest.mark.parametrize(
     ("boundary", "expected_run"),
-    [("archive_after_link", RUN_ID), ("publish_after_replace", NEXT_RUN_ID)],
+    [
+        ("archive_after_link", RUN_ID),
+        ("retire_after_unlink", RUN_ID),
+        ("publish_after_replace", NEXT_RUN_ID),
+    ],
 )
 def test_reconcile_crash_keeps_old_or_successor_active(
     admission_fixture, boundary: str, expected_run: str
 ) -> None:
     state_root, worktree, record = admission_fixture
     acquire_admission(state_root, worktree, record)
+    old_snapshot_bytes = Path(record["checkpoint_path"]).read_bytes()
     successor, proof = _make_successor(state_root, worktree, record)
     context = multiprocessing.get_context("fork")
     process = context.Process(
@@ -852,5 +1009,11 @@ def test_reconcile_crash_keeps_old_or_successor_active(
 
     active_record = __import__("json").loads(_active_path(state_root, worktree).read_bytes())
     assert active_record["run_id"] == expected_run
+    if boundary == "retire_after_unlink":
+        prior_snapshot_copy = state_root / "backlog-drain" / "admission-snapshots" / (
+            f"{record['root_key']}-{proof['prior']['snapshot_sha256']}.md"
+        )
+        assert prior_snapshot_copy.read_bytes() == old_snapshot_bytes
+        assert not Path(record["checkpoint_path"]).exists()
     with pytest.raises(CheckpointError, match="PAUSED|stale"):
         reconcile_admission(state_root, worktree, record, successor, proof)
