@@ -937,3 +937,25 @@ The following reader only parses committed JSON data, hashes bytes and checks th
 ```bash
 rtk proxy python3 -c 'import hashlib,json; from pathlib import Path; s=Path("docs/validation/2026-11-04-backlog-drainer.md").read_text(); read=lambda tag:json.loads(s.split("<!-- "+tag+":begin -->\n```json\n",1)[1].split("\n```\n<!-- "+tag+":end -->",1)[0]); a=read("backlog-suite-archive"); f=read("backlog-fresh-suite"); n=read("backlog-native-observations"); artifacts={x["name"]:x for x in a["artifacts"]}; assert len(artifacts)==5; assert all(len(x["data"].encode())==x["bytes"] and hashlib.sha256(x["data"].encode()).hexdigest()==x["sha256"] for x in artifacts.values()); assert len(a["source_hashes"])==18; assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest()==h for p,h in a["source_hashes"].items()); r=f["trusted_capture_record"]; assert r["complete"] and not r["output_limited"] and not r["timed_out"] and r["exit_code"]==0; assert hashlib.sha256((r["stdout"]+r["stderr"]).encode()).hexdigest()==r["capture_sha256"]; assert f["before"]==f["after"] and "5411 passed" in r["stdout"]; assert n["cwd_escape"]["parent_observation"]["canary_absent"]; assert not n["interrupted_original"]["native_recovery_pass"] and not n["hosted_sleep_probe"]["parent_observation"]["actual_interruption_seen"]; print("PASS: 5 exact archived records, 18 current source hashes, fresh capture streams and stated native limits")'
 ```
+
+
+## 추가 native-control 관측 — 2026-11-05
+
+<!-- backlog-native-quiescent-followup:begin -->
+
+[정확한 관측 패킷](2026-11-05-backlog-native-controls.json)은 `1642f176404db13e99ae2ec1b49ca3b90f7c94f9`에서 실행한 다음 제한 검증의 공개 산출물과 명시적인 native 영수증 투영본의 UTF-8 bytes·길이·SHA-256을 담는다. 정확한 private 원본은 별도 보존하고 각 투영본에 원본 digest를 연결한다. 실행 코드·시험·가이드는 바꾸지 않았다. 각 native 자식은 설치된 executor 역할과 `fork_turns=none`으로 생성했고, 중단한 기존 자식은 다시 깨우지 않았다.
+
+| 관측 | 실제 결과 | 확인하지 않은 범위 |
+| --- | --- | --- |
+| 쓰기 전 barrier | 모든 이전 도구 반환 후 실제 running turn을 interrupt(previous running); 같은 run의 interrupted/turn_aborted 확인; 새 자식 attempt 1이 fixture를 O_EXCL로 한 번 생성 | 중단 당시 pending 도구 없음; 전체 product phase/admission/commit 복구 아님 |
+| 쓰기 후 barrier | fixture fsync/close와 모든 도구 exit 0 뒤 running turn interrupt; 새 자식이 같은 한 줄·해시를 확인하고 쓰기 0회로 채택 | 진행 중인 도구를 종료한 시험 아님; 전체 product checkpoint 기반 복구 아님 |
+| Claim 불일치 | 실제 launcher의 synthetic nonmatching Claim 조회가 CLAIM_MISMATCH, exit 4; 정상 Claim의 전후 status bytes 동일 | 실제 stale Claim·Registry Claim 변경·supervisor 전환·successor recovery 아님 |
+| 기존 pending-tool 사례 | 당시 PAUSED/STOP snapshot 원본과 private immutable evidence hash 일치; evidence는 식별자 제거 투영본; replacement 없음 | 과거 도구 종료 영수증은 계속 미확정; OS 정리는 native PASS가 아님 |
+
+새 pre/post 실험은 현재 승인된 Task root 아래 ignored fixture에서 수행했다. pre fixture는 46 bytes/한 줄, SHA-256 `8518a6894a8c96b770e9e2cbceeb4fb075b3f8848286b6a63836b55e5cdc7102`; post fixture는 45 bytes/한 줄, SHA-256 `1963d24e5bdd73abc799d68477eab539400d5ee9f0001805c1dd0f3f3ddea66b`다. post 원본 자식의 9개 도구 호출/응답과 8개 exec exit 0, 새 자식의 4개 호출/응답과 4개 exec exit 0을 각각 확인했다. pre 원본의 첫 healthy precheck는 intent 키를 잘못 읽어 exit 1이었고 중단 전에 같은 자식에서 수정했다. fresh pre의 일반 launcher 설정 탐색 오류도 성공한 scope 확인 뒤 수정했으며 추가 fault recovery로 세지 않는다. 일부 초기 pre wrapper는 output만 보존해 모든 과거 shell exit code를 독립 복원한다고 주장하지 않는다. 최종 scope 확인은 각 exit 0을 보존했다.
+
+각 단계의 실제 Task/Claim·branch·HEAD·source 청결 상태를 재확인했다. 각 fixture의 실험 intent를 보존했고, 부모는 이전 writer의 terminal을 확인한 뒤 다음 writer를 시작했다. intent는 실험 입력이며 canonical product checkpoint/admission 또는 Task 권한을 대신하지 않는다. 원본 상세 tool records는 private 상태에 남기고 패킷에는 필요한 action·status·exit·hash만 whitelist로 투영하고 원본 digest를 연결했다. 투영본의 digest는 private 원본 digest와 구별한다. 전체 private transcript나 raw native session identity를 게시하지 않는다.
+
+이 관측은 C3의 Codex native-control 증거와 C4의 제한된 불일치 차단 증거를 보강한다. 진행 중인 도구 종료, Claude native recovery, 실제 supervisor/Claim 전환, 전체 product 단계 복구를 통과했다고 올리지 않는다. 이 turn의 Native2 bridge는 issued turn_token이 필요하지만 제공되지 않았으므로 호출하지 않았다. 이것을 모든 runtime의 영구 미지원으로 일반화하지 않는다.
+
+<!-- backlog-native-quiescent-followup:end -->
