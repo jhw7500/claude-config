@@ -27,7 +27,7 @@ rtk proxy env -u LD_LIBRARY_PATH "$HOME/ai/opencode/projects/claude-config/.supe
 
 The command ran from the implementation worktree on parent HEAD `3c09cde6d380900b8202e9a89968817c4e036e71` plus tested working-change digest `04ccbb465cb7e2d95145a7919656fef1a1d5d11106c3ae33e13a8aeaab7eee97`. All 18 frozen execution/test/install/guidance hashes matched after the command. The raw combined log is 6156 bytes, SHA-256 `7e53707baf6f84034ec034c716030276780e680a6710e896ba1622045df7cb44`. The private input, result and log are `.superpowers/sdd/2026-11-04-backlog-drainer/review-fix-r1/full-suite-{input.json,result.json,log}`. Only this result paragraph and historical-scope wording changed after the suite; executable, test and guidance bytes remained frozen.
 
-Native C3 remains NOT PASS: no new native experiment was run, and the independently observable child-owned tool-terminal receipt / Claude bridge is still unavailable on the observed surface. The previous full-suite result is historical; the follow-up full-suite command and source hashes will be recorded separately. No actual-HOME deployment, push, PR, merge, Task finish or Claim lifecycle mutation is performed here.
+Native C3 remains NOT PASS: no new native experiment was run, and the independently observable child-owned tool-terminal receipt / Claude bridge is still unavailable on the observed surface. The previous full-suite result is historical; the follow-up full-suite command and source hashes are recorded above and the exact archived bytes are embedded below. No actual-HOME deployment, push, PR, merge, Task finish or Claim lifecycle mutation is performed here.
 
 ## Historical pre-Tribunal validation (2026-11-04)
 
@@ -193,3 +193,747 @@ Every durable `Ruling:` is retained with the cost if wrong.
 | Full suite | repository-wide | `.superpowers/sdd/2026-11-04-backlog-drainer/residual-i1-full-pytest-result.json`, `residual-i1-full-suite-input.json`, and private raw log |
 
 Design criteria are defined in `docs/superpowers/specs/2026-11-04-backlog-drainer-design.md`. Implementation sequence is in `docs/superpowers/plans/2026-11-04-backlog-drainer.md`. Task reports under the private SDD workspace preserve RED/GREEN and review receipts; they are supporting evidence, not substitutes for the actual tests and source cited above.
+
+
+## Evidence accessibility follow-up — 2026-11-05
+
+The following additions expose previously private execution records and add bounded native observations for independent verification. They do not alter approved completion criteria or establish complete verification by themselves.
+
+### Exact full-suite records for an isolated reader
+
+The JSON packet below carries the original UTF-8 bytes of all five archived files as JSON strings. Decode a string to UTF-8 and verify its byte count and SHA-256 before interpreting it; the serialization around the string is not the archived file. Verify every frozen `source_hashes` entry against the current tracked file and Git blob. These 18 executable/test/install/guidance files match commit `5bf4673`; the tested-versus-committed manifest difference is only this validation document. The two manifest digests remain distinct.
+
+This permits independent record/source consistency checks from the committed checkout without opening the implementation worktree's private directory. It does not retroactively witness the historical execution or authenticate an entire historical environment. Current-source functional verification can be reproduced with a Python environment containing `requirements-test.lock`, pytest and pytest-xdist, from the checkout root: `env -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider -n 8`. A pre-existing local test interpreter is also named in the archived command; no actual-HOME installation is required. A fresh run produces a new observation with its own duration and receipt.
+
+A fresh non-fork native verifier independently selected and ran the entire pytest suite in a separate clean detached checkout at HEAD `5bf46737048dd81a5b14e5e122095023c2ed41fb`, tree `56698cd69026d25d357ed766eb255f636ef835f8`. It observed `5411 passed in 236.31s (0:03:56)`, exit 0, no timeout; HEAD/tree/clean state matched before and after. Its full stdout-plus-stderr SHA-256 is `21e707b5bfe9def69e9e61d534353c9941965dee0feeffc72f5d12de32417d79`. This is a newly witnessed execution of that committed snapshot, distinct from the archived 230.77-second run. The installed `capture-run` record below contains the complete streams; publication does not automatically make Python execution reusable under the Tribunal evidence-profile rules.
+
+### Additional bounded native observations
+
+Two fresh non-fork Codex executor children ran sequentially in the actual approved Task worktree. Each independently queried the read-only launcher status, checked exact cwd/branch/HEAD and clean empty-allowlist Git state, and exclusively wrote only its own mode-0600 fixture result. Parent verified the first child and all returned tool calls before starting the second; the second preserved the first artifact's bytes. Neither acquired a separate Claim or invoked lifecycle recovery. Their native completion and terminal foreground tool receipts are distinct from interruption recovery.
+
+A separate native child began inside a nested directory of the same Task checkout. The live Task/Claim mapping matched, but exact cwd did not. It returned `PAUSED_NO_WRITE`, left the candidate canary absent, and performed no Git, admission, checkpoint or lifecycle mutation. The parent verified actual native completion and returned foreground calls.
+
+The original interrupted pre-edit child's own retained history contains `turn_aborted` with reason `interrupted`, in addition to the parent's running/interruption observations. It contains only the earlier running exec-session receipt, with no subsequent tool-terminal result. A new non-writing hosted-sleep capability probe reported that `clock.sleep` was not exposed to that child; no sleep or interruption occurred in this probe. Neither observation is counted as C3 PASS. No old interrupted child was woken.
+
+Official [multi-agent action semantics](https://developers.openai.com/api/docs/guides/responses-multi-agent#how-multi-agent-works) distinguish an interrupted turn from other tool actions; [Codex subagent settings](https://learn.chatgpt.com/docs/agent-configuration/subagents#global-settings) describe an interruption message. These descriptions do not establish parent access to child exec termination. The local unsupported/PAUSED conclusion rests on the actual observations above, not a universal claim about Codex or Claude products.
+
+| Criterion | Additional evidence | Remaining boundary |
+| --- | --- | --- |
+| C3 | interrupted turn corroborated; sleep probe not run | tool termination/replacement and Claude native bridge unverified |
+| C4 | unchanged live Task/Claim mapping observed | no live supervisor/Claim transition |
+| C8 | bounded children stopped without external actions | no complete native recovered workflow |
+| C11 | actual child cwd escape caused PAUSED_NO_WRITE | bounded case, no broader runtime confinement claim |
+| C12 | two healthy native children serialized in valid Task root | native interruption/replacement remains unverified |
+| C14 | prior component crash tests retained | no Registry-approved live successor recovery |
+
+Deliberately changing a live Claim/supervisor or invoking successor recovery still requires the existing separately approved Task lifecycle procedure. No new Task/Claim was created merely for proof. Current gaps must remain PARTIAL or NOT PASS until corresponding live evidence exists.
+
+<!-- backlog-suite-archive:begin -->
+```json
+{
+  "schema": 1,
+  "kind": "archived-test-records",
+  "historical_result_commit": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+  "historical_parent_head": "3c09cde6d380900b8202e9a89968817c4e036e71",
+  "historical_tested_working_change_digest": "04ccbb465cb7e2d95145a7919656fef1a1d5d11106c3ae33e13a8aeaab7eee97",
+  "scope": "Exact archived UTF-8 file bytes, source consistency and reproduction inputs; not independent historical execution attestation, native recovery or live Claim-transition proof",
+  "metadata_only_delta": [
+    "docs/validation/2026-11-04-backlog-drainer.md"
+  ],
+  "source_hashes": {
+    "scripts/backlog_checkpoint/__init__.py": "1c62a4c05db819c7d779f2c22acd2af63b56fb4f648ef4ae236af838a307da2a",
+    "scripts/backlog_checkpoint/admission.py": "111d8b8e147de690ccab6cc9ae23a1faeabee2aefb0a41d57add9f24e36f2bca",
+    "scripts/backlog_checkpoint/cli.py": "9f0d03dfd085113e90e96dcde996054231b19b0c385df6b5d9713183a3fbe7b6",
+    "scripts/backlog_checkpoint/codec.py": "aef3989e5a3eed08cf2f32a994191a7fc42f62b0eb531b02787cfb68d9c28179",
+    "scripts/backlog_checkpoint/git_evidence.py": "9553b5b20c700c39fdefa0ab129495faa46b3ae2899ebb1472b938f0b5730083",
+    "scripts/backlog_checkpoint/queue.py": "cd889886dde12c433278c3451b9cd9bc931c7bdaa1dc2acd56bf825479841ffd",
+    "scripts/backlog_checkpoint/storage.py": "fe1eb9a352c5a43542c939e03afb8b90a24acc4b2ef37c4711ef73e1e321a82a",
+    "scripts/backlog-checkpoint.py": "95c09efb70b907f1fad1f07a9c74d56211127c91be70c5e27ad76266dd617526",
+    "scripts/install-backlog-drain.py": "8df080971d07066c585d81c40fe1d40ac644ae96582f3991bd6cd015f62ecc19",
+    "install.sh": "e498f4565c4fbc89d7b7b6a116b497fed94a73ac4a7fe675ba6a9907b7364ecf",
+    "tests/test_backlog_admission.py": "0a3e9481e1c31b4ce6db827553937656f3b4b05e5a671dcf73f51947e4cc08e7",
+    "tests/test_backlog_checkpoint.py": "3c5a82ed94825358f6645e75543155f29c41c5ea9208e38ebed4f36202c45e14",
+    "tests/test_backlog_cli.py": "655c3e1d5b31dbc38753a85adc8fefdb14df3c1000dd69a97b929cd11d18456a",
+    "tests/test_backlog_git_evidence.py": "346b9a91c7dae0ede35db4abecfea8d6086776ba1cdc56ffbc0f5b70dfbe0f46",
+    "tests/test_backlog_install.py": "ce30f2c11ac5dbd0cba6653906f3c3bb108360ad5824035a0b169cd47080458e",
+    "tests/test_backlog_queue.py": "4fedd10261709a7321f4113d51933bea850be5bc853a3139afc921b85bf31f8a",
+    "skills/backlog-drain/SKILL.md": "dce1c5a6907dd507e342c81229544cc37dab116e9174903d10f060add2a57c85",
+    "skills/backlog-drain/references/protocol.md": "7a618109cdaf5e6b15d09735bf4260c019db9489906a683a3eee3c8dfaabfd80"
+  },
+  "artifacts": [
+    {
+      "name": "full-suite-input.json",
+      "bytes": 4701,
+      "sha256": "5ecc42c515143f86eba96494e1d2904ec4d03203894b8c3f4cf0592f336988e7",
+      "encoding": "utf-8",
+      "data": "{\n  \"head\": \"3c09cde6d380900b8202e9a89968817c4e036e71\",\n  \"command\": \"rtk proxy env -u LD_LIBRARY_PATH \\\"$HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python\\\" -m pytest -q -n 8\",\n  \"cwd\": \"/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31\",\n  \"source_hashes\": {\n    \"scripts/backlog_checkpoint/__init__.py\": \"1c62a4c05db819c7d779f2c22acd2af63b56fb4f648ef4ae236af838a307da2a\",\n    \"scripts/backlog_checkpoint/admission.py\": \"111d8b8e147de690ccab6cc9ae23a1faeabee2aefb0a41d57add9f24e36f2bca\",\n    \"scripts/backlog_checkpoint/cli.py\": \"9f0d03dfd085113e90e96dcde996054231b19b0c385df6b5d9713183a3fbe7b6\",\n    \"scripts/backlog_checkpoint/codec.py\": \"aef3989e5a3eed08cf2f32a994191a7fc42f62b0eb531b02787cfb68d9c28179\",\n    \"scripts/backlog_checkpoint/git_evidence.py\": \"9553b5b20c700c39fdefa0ab129495faa46b3ae2899ebb1472b938f0b5730083\",\n    \"scripts/backlog_checkpoint/queue.py\": \"cd889886dde12c433278c3451b9cd9bc931c7bdaa1dc2acd56bf825479841ffd\",\n    \"scripts/backlog_checkpoint/storage.py\": \"fe1eb9a352c5a43542c939e03afb8b90a24acc4b2ef37c4711ef73e1e321a82a\",\n    \"scripts/backlog-checkpoint.py\": \"95c09efb70b907f1fad1f07a9c74d56211127c91be70c5e27ad76266dd617526\",\n    \"scripts/install-backlog-drain.py\": \"8df080971d07066c585d81c40fe1d40ac644ae96582f3991bd6cd015f62ecc19\",\n    \"install.sh\": \"e498f4565c4fbc89d7b7b6a116b497fed94a73ac4a7fe675ba6a9907b7364ecf\",\n    \"tests/test_backlog_admission.py\": \"0a3e9481e1c31b4ce6db827553937656f3b4b05e5a671dcf73f51947e4cc08e7\",\n    \"tests/test_backlog_checkpoint.py\": \"3c5a82ed94825358f6645e75543155f29c41c5ea9208e38ebed4f36202c45e14\",\n    \"tests/test_backlog_cli.py\": \"655c3e1d5b31dbc38753a85adc8fefdb14df3c1000dd69a97b929cd11d18456a\",\n    \"tests/test_backlog_git_evidence.py\": \"346b9a91c7dae0ede35db4abecfea8d6086776ba1cdc56ffbc0f5b70dfbe0f46\",\n    \"tests/test_backlog_install.py\": \"ce30f2c11ac5dbd0cba6653906f3c3bb108360ad5824035a0b169cd47080458e\",\n    \"tests/test_backlog_queue.py\": \"4fedd10261709a7321f4113d51933bea850be5bc853a3139afc921b85bf31f8a\",\n    \"skills/backlog-drain/SKILL.md\": \"dce1c5a6907dd507e342c81229544cc37dab116e9174903d10f060add2a57c85\",\n    \"skills/backlog-drain/references/protocol.md\": \"7a618109cdaf5e6b15d09735bf4260c019db9489906a683a3eee3c8dfaabfd80\"\n  },\n  \"working_manifest\": {\n    \"paths\": [\n      \"docs/validation/2026-11-04-backlog-drainer.md\",\n      \"scripts/backlog_checkpoint/admission.py\",\n      \"scripts/backlog_checkpoint/git_evidence.py\",\n      \"scripts/backlog_checkpoint/storage.py\",\n      \"skills/backlog-drain/references/protocol.md\",\n      \"tests/test_backlog_admission.py\",\n      \"tests/test_backlog_checkpoint.py\",\n      \"tests/test_backlog_git_evidence.py\"\n    ],\n    \"count\": 8,\n    \"path_set_digest\": \"8f8b21c0e79965aba7e6e708a8e8eaa68da407c0d30f8d127aa91ba96ac1dd51\",\n    \"change_digest\": \"04ccbb465cb7e2d95145a7919656fef1a1d5d11106c3ae33e13a8aeaab7eee97\",\n    \"sources\": [\n      {\n        \"change\": \"modify\",\n        \"mode\": \"100644\",\n        \"path\": \"docs/validation/2026-11-04-backlog-drainer.md\",\n        \"sha256\": \"3752f28445dbb7d26a71610370a1b12bc8828be4957eb225c25d354aed7bd15c\"\n      },\n      {\n        \"change\": \"modify\",\n        \"mode\": \"100644\",\n        \"path\": \"scripts/backlog_checkpoint/admission.py\",\n        \"sha256\": \"111d8b8e147de690ccab6cc9ae23a1faeabee2aefb0a41d57add9f24e36f2bca\"\n      },\n      {\n        \"change\": \"modify\",\n        \"mode\": \"100644\",\n        \"path\": \"scripts/backlog_checkpoint/git_evidence.py\",\n        \"sha256\": \"9553b5b20c700c39fdefa0ab129495faa46b3ae2899ebb1472b938f0b5730083\"\n      },\n      {\n        \"change\": \"modify\",\n        \"mode\": \"100644\",\n        \"path\": \"scripts/backlog_checkpoint/storage.py\",\n        \"sha256\": \"fe1eb9a352c5a43542c939e03afb8b90a24acc4b2ef37c4711ef73e1e321a82a\"\n      },\n      {\n        \"change\": \"modify\",\n        \"mode\": \"100644\",\n        \"path\": \"skills/backlog-drain/references/protocol.md\",\n        \"sha256\": \"7a618109cdaf5e6b15d09735bf4260c019db9489906a683a3eee3c8dfaabfd80\"\n      },\n      {\n        \"change\": \"modify\",\n        \"mode\": \"100644\",\n        \"path\": \"tests/test_backlog_admission.py\",\n        \"sha256\": \"0a3e9481e1c31b4ce6db827553937656f3b4b05e5a671dcf73f51947e4cc08e7\"\n      },\n      {\n        \"change\": \"modify\",\n        \"mode\": \"100644\",\n        \"path\": \"tests/test_backlog_checkpoint.py\",\n        \"sha256\": \"3c5a82ed94825358f6645e75543155f29c41c5ea9208e38ebed4f36202c45e14\"\n      },\n      {\n        \"change\": \"modify\",\n        \"mode\": \"100644\",\n        \"path\": \"tests/test_backlog_git_evidence.py\",\n        \"sha256\": \"346b9a91c7dae0ede35db4abecfea8d6086776ba1cdc56ffbc0f5b70dfbe0f46\"\n      }\n    ],\n    \"parent_head\": \"3c09cde6d380900b8202e9a89968817c4e036e71\"\n  }\n}"
+    },
+    {
+      "name": "full-suite-result.json",
+      "bytes": 818,
+      "sha256": "8e973466761fee6721cfead7f0ba6b361d02d2a22f7063ba5b145b89e578a95f",
+      "encoding": "utf-8",
+      "data": "{\n  \"command\": \"rtk proxy env -u LD_LIBRARY_PATH \\\"$HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python\\\" -m pytest -q -n 8\",\n  \"exit_code\": 0,\n  \"elapsed_seconds\": 230.94,\n  \"source_hashes_unchanged\": true,\n  \"capture_sha256\": \"7e53707baf6f84034ec034c716030276780e680a6710e896ba1622045df7cb44\",\n  \"log_bytes\": 6156,\n  \"summary_tail\": \"........................................................................ [ 97%]\\n........................................................................ [ 98%]\\n........................................................................ [ 99%]\\n...........                                                              [100%]\\n5411 passed in 230.77s (0:03:50)\\n\",\n  \"working_change_digest\": \"04ccbb465cb7e2d95145a7919656fef1a1d5d11106c3ae33e13a8aeaab7eee97\"\n}"
+    },
+    {
+      "name": "full-suite.log",
+      "bytes": 6156,
+      "sha256": "7e53707baf6f84034ec034c716030276780e680a6710e896ba1622045df7cb44",
+      "encoding": "utf-8",
+      "data": "bringing up nodes...\nbringing up nodes...\n\n........................................................................ [  1%]\n........................................................................ [  2%]\n........................................................................ [  3%]\n........................................................................ [  5%]\n........................................................................ [  6%]\n........................................................................ [  7%]\n........................................................................ [  9%]\n........................................................................ [ 10%]\n........................................................................ [ 11%]\n........................................................................ [ 13%]\n........................................................................ [ 14%]\n........................................................................ [ 15%]\n........................................................................ [ 17%]\n........................................................................ [ 18%]\n........................................................................ [ 19%]\n........................................................................ [ 21%]\n........................................................................ [ 22%]\n........................................................................ [ 23%]\n........................................................................ [ 25%]\n........................................................................ [ 26%]\n........................................................................ [ 27%]\n........................................................................ [ 29%]\n........................................................................ [ 30%]\n........................................................................ [ 31%]\n........................................................................ [ 33%]\n........................................................................ [ 34%]\n........................................................................ [ 35%]\n........................................................................ [ 37%]\n........................................................................ [ 38%]\n........................................................................ [ 39%]\n........................................................................ [ 41%]\n........................................................................ [ 42%]\n........................................................................ [ 43%]\n........................................................................ [ 45%]\n........................................................................ [ 46%]\n........................................................................ [ 47%]\n........................................................................ [ 49%]\n........................................................................ [ 50%]\n........................................................................ [ 51%]\n........................................................................ [ 53%]\n........................................................................ [ 54%]\n........................................................................ [ 55%]\n........................................................................ [ 57%]\n........................................................................ [ 58%]\n........................................................................ [ 59%]\n........................................................................ [ 61%]\n........................................................................ [ 62%]\n........................................................................ [ 63%]\n........................................................................ [ 65%]\n........................................................................ [ 66%]\n........................................................................ [ 67%]\n........................................................................ [ 69%]\n........................................................................ [ 70%]\n........................................................................ [ 71%]\n........................................................................ [ 73%]\n........................................................................ [ 74%]\n........................................................................ [ 75%]\n........................................................................ [ 77%]\n........................................................................ [ 78%]\n........................................................................ [ 79%]\n........................................................................ [ 81%]\n........................................................................ [ 82%]\n........................................................................ [ 83%]\n........................................................................ [ 85%]\n........................................................................ [ 86%]\n........................................................................ [ 87%]\n........................................................................ [ 89%]\n........................................................................ [ 90%]\n........................................................................ [ 91%]\n........................................................................ [ 93%]\n........................................................................ [ 94%]\n........................................................................ [ 95%]\n........................................................................ [ 97%]\n........................................................................ [ 98%]\n........................................................................ [ 99%]\n...........                                                              [100%]\n5411 passed in 230.77s (0:03:50)\n"
+    },
+    {
+      "name": "commit-manifest.json",
+      "bytes": 2271,
+      "sha256": "2b97ba270fbf92a61f1b2677de06c4209db84c3f4641d9d32d3d6cea2851ecd3",
+      "encoding": "utf-8",
+      "data": "{\n  \"paths\": [\n    \"docs/validation/2026-11-04-backlog-drainer.md\",\n    \"scripts/backlog_checkpoint/admission.py\",\n    \"scripts/backlog_checkpoint/git_evidence.py\",\n    \"scripts/backlog_checkpoint/storage.py\",\n    \"skills/backlog-drain/references/protocol.md\",\n    \"tests/test_backlog_admission.py\",\n    \"tests/test_backlog_checkpoint.py\",\n    \"tests/test_backlog_git_evidence.py\"\n  ],\n  \"count\": 8,\n  \"path_set_digest\": \"8f8b21c0e79965aba7e6e708a8e8eaa68da407c0d30f8d127aa91ba96ac1dd51\",\n  \"change_digest\": \"864bcbfe98afeed1ed0aca66e593dc9a180bf1bea85c493e20dccff84a7e2f22\",\n  \"sources\": [\n    {\n      \"change\": \"modify\",\n      \"mode\": \"100644\",\n      \"path\": \"docs/validation/2026-11-04-backlog-drainer.md\",\n      \"sha256\": \"405ed8818b79f02aa55dc4bb09de22f0ec24c12fbc23213d879faab381283845\"\n    },\n    {\n      \"change\": \"modify\",\n      \"mode\": \"100644\",\n      \"path\": \"scripts/backlog_checkpoint/admission.py\",\n      \"sha256\": \"111d8b8e147de690ccab6cc9ae23a1faeabee2aefb0a41d57add9f24e36f2bca\"\n    },\n    {\n      \"change\": \"modify\",\n      \"mode\": \"100644\",\n      \"path\": \"scripts/backlog_checkpoint/git_evidence.py\",\n      \"sha256\": \"9553b5b20c700c39fdefa0ab129495faa46b3ae2899ebb1472b938f0b5730083\"\n    },\n    {\n      \"change\": \"modify\",\n      \"mode\": \"100644\",\n      \"path\": \"scripts/backlog_checkpoint/storage.py\",\n      \"sha256\": \"fe1eb9a352c5a43542c939e03afb8b90a24acc4b2ef37c4711ef73e1e321a82a\"\n    },\n    {\n      \"change\": \"modify\",\n      \"mode\": \"100644\",\n      \"path\": \"skills/backlog-drain/references/protocol.md\",\n      \"sha256\": \"7a618109cdaf5e6b15d09735bf4260c019db9489906a683a3eee3c8dfaabfd80\"\n    },\n    {\n      \"change\": \"modify\",\n      \"mode\": \"100644\",\n      \"path\": \"tests/test_backlog_admission.py\",\n      \"sha256\": \"0a3e9481e1c31b4ce6db827553937656f3b4b05e5a671dcf73f51947e4cc08e7\"\n    },\n    {\n      \"change\": \"modify\",\n      \"mode\": \"100644\",\n      \"path\": \"tests/test_backlog_checkpoint.py\",\n      \"sha256\": \"3c5a82ed94825358f6645e75543155f29c41c5ea9208e38ebed4f36202c45e14\"\n    },\n    {\n      \"change\": \"modify\",\n      \"mode\": \"100644\",\n      \"path\": \"tests/test_backlog_git_evidence.py\",\n      \"sha256\": \"346b9a91c7dae0ede35db4abecfea8d6086776ba1cdc56ffbc0f5b70dfbe0f46\"\n    }\n  ],\n  \"parent_head\": \"3c09cde6d380900b8202e9a89968817c4e036e71\"\n}"
+    },
+    {
+      "name": "post-commit-binding.json",
+      "bytes": 413,
+      "sha256": "409a4091d13f15f5f2535dbffd72b4010019bf6f2744ef4adfde9cb010754867",
+      "encoding": "utf-8",
+      "data": "{\n  \"binding\": {\n    \"commit_parent\": \"3c09cde6d380900b8202e9a89968817c4e036e71\",\n    \"result_commit\": \"5bf46737048dd81a5b14e5e122095023c2ed41fb\",\n    \"source_count\": 8,\n    \"path_set_digest\": \"8f8b21c0e79965aba7e6e708a8e8eaa68da407c0d30f8d127aa91ba96ac1dd51\",\n    \"change_digest\": \"864bcbfe98afeed1ed0aca66e593dc9a180bf1bea85c493e20dccff84a7e2f22\"\n  },\n  \"source_hashes_unchanged\": true,\n  \"source_clean\": true\n}"
+    }
+  ]
+}
+```
+<!-- backlog-suite-archive:end -->
+
+
+### Bounded native observation data
+
+This packet contains fixture result records and parent observations projected from the retained native traces. It preserves their stated scope and failure outcomes; it is not an independent historical attestation or a native recovery PASS. Raw full responses and transcripts remain private. No raw session ID, token or full environment is published.
+
+<!-- backlog-native-observations:begin -->
+```json
+{
+  "schema": 1,
+  "kind": "bounded-native-observations",
+  "observed_head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+  "authority": "Task/Claim fields and native identities are observations only; no new permission or ownership is conferred",
+  "serial_1": {
+    "artifact": {
+      "case_id": "issue31-native-preflight-serial-1",
+      "checks": [
+        {
+          "command": "rtk /home/jhw/.local/bin/jhw-control-host task status --task <task> --claim <claim>",
+          "exit": 0,
+          "result": "exact task/claim/worktree_ref/branch/head matched; dirty=false"
+        },
+        {
+          "command": "rtk pwd -P",
+          "exit": 0,
+          "result": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31"
+        },
+        {
+          "command": "rtk git rev-parse --show-toplevel",
+          "exit": 0,
+          "result": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31"
+        },
+        {
+          "command": "rtk git branch --show-current",
+          "exit": 0,
+          "result": "task/8b1902dad18f-jhw7500-claude-config-31"
+        },
+        {
+          "command": "rtk git rev-parse HEAD",
+          "exit": 0,
+          "result": "5bf46737048dd81a5b14e5e122095023c2ed41fb"
+        },
+        {
+          "command": "rtk git status --porcelain=v1 --untracked-files=all",
+          "exit": 0,
+          "result": "empty"
+        },
+        {
+          "command": "rtk proxy git worktree list --porcelain",
+          "exit": 0,
+          "result": "one exact matching physical-root record"
+        },
+        {
+          "command": "rtk proxy /usr/bin/python3 scripts/backlog-checkpoint.py git collect --root <root> --input -",
+          "exit": 0,
+          "result": "count=0,parent_head=5bf46737048dd81a5b14e5e122095023c2ed41fb"
+        },
+        {
+          "command": "rtk proxy stat -c <format> <artifact>",
+          "exit": 1,
+          "result": "artifact absent before exclusive creation"
+        }
+      ],
+      "claim_granted_or_changed": false,
+      "input_sha256": {
+        ".superpowers/sdd/2026-11-04-backlog-drainer/gap-audit/scope-input.json": "3264a58c24591d003bc349a00c52f3347bb7c51a77a4725e1f53936d88e67ee0",
+        "skills/backlog-drain/SKILL.md": "dce1c5a6907dd507e342c81229544cc37dab116e9174903d10f060add2a57c85",
+        "skills/backlog-drain/references/protocol.md": "7a618109cdaf5e6b15d09735bf4260c019db9489906a683a3eee3c8dfaabfd80"
+      },
+      "lifecycle_action": "none",
+      "lifecycle_mutation": false,
+      "matched_scope": {
+        "branch": "task/8b1902dad18f-jhw7500-claude-config-31",
+        "claim_id": "clm-01a1a6a9-410d-7963-b922-d5f46ea6766a",
+        "head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+        "root": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31",
+        "task_id": "tsk-01a1570c-89ce-7cf6-8cd8-8b1902dad18f",
+        "worktree_ref": "wt-8b1902dad18f-jhw7500-claude-config-31"
+      },
+      "observations": {
+        "branch": "task/8b1902dad18f-jhw7500-claude-config-31",
+        "change_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "empty_allowlist_count": 0,
+        "git_root": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31",
+        "head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+        "launcher_claim_match": true,
+        "launcher_worktree_dirty": false,
+        "path_set_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "physical_cwd": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31",
+        "source_clean": true,
+        "unique_worktree_record": {
+          "branch_ref": "refs/heads/task/8b1902dad18f-jhw7500-claude-config-31",
+          "head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+          "root": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31"
+        }
+      },
+      "product_backlog_run_started_or_resumed": false,
+      "schema": 1,
+      "verdict": "PASS",
+      "write_process": {
+        "creation": "O_CREAT|O_EXCL|O_NOFOLLOW",
+        "fd_close_completed": true,
+        "fd_fsync_completed": true,
+        "pid": 1811618,
+        "requested_mode": "0600"
+      }
+    },
+    "parent_observation": {
+      "case": "serial-1",
+      "native_task_complete": true,
+      "tool_calls": 12,
+      "tool_outputs": 12,
+      "unreturned_calls": [],
+      "native_tool_result_metadata": [
+        {
+          "exit_code": 1,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 1,
+          "has_session": false
+        }
+      ],
+      "artifact_sha256": "e1d33c1ba287e7bc3e9774de90ccd760d4204372c8e3aaabb4e13398330a8625",
+      "lifecycle_mutation": false,
+      "scope": "healthy bounded native step only, not interruption recovery"
+    }
+  },
+  "serial_2": {
+    "artifact": {
+      "actual_commands": {
+        "git_branch": {
+          "exit": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_sha256": "9c20109440d798b68c0498e6f48fe9166b6d432125cb08b5abd417db6b8e4798"
+        },
+        "git_collect_empty_allowlist": {
+          "exit": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_sha256": "6ebf20cd2011421c1f1f2d0c11645fa42abf1ce6adafc48261741da95f0a15da"
+        },
+        "git_head": {
+          "exit": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_sha256": "0c8a9535b905663df8baca0de51ef19a0389c30998eaa2c1d594fa3ef0d70e2f"
+        },
+        "git_inspect": {
+          "exit": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_sha256": "06dc2930ab8199daae5925c012b9a017358e8607094e9217e58e1e539bee1054"
+        },
+        "git_status": {
+          "exit": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "git_worktree_list": {
+          "exit": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_sha256": "f8ae645c18f0d0100d6f1c21a9efbc2ee186b41401a7f3e48b65a8dd7c04b3e4"
+        },
+        "task_status": {
+          "exit": 0,
+          "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stdout_sha256": "bea28854ab8563564aea28b413b31b0d50ced5a82470da16b601699f6957cb5f"
+        }
+      },
+      "case": "serial-2",
+      "lifecycle_mutation": false,
+      "matched_scope": {
+        "branch": "task/8b1902dad18f-jhw7500-claude-config-31",
+        "claim_id": "clm-01a1a6a9-410d-7963-b922-d5f46ea6766a",
+        "head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+        "live_claim_match": true,
+        "physical_root": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31",
+        "source_clean": true,
+        "task_id": "tsk-01a1570c-89ce-7cf6-8cd8-8b1902dad18f",
+        "unique_live_worktree_record": true,
+        "worktree_ref": "wt-8b1902dad18f-jhw7500-claude-config-31"
+      },
+      "observed": {
+        "collect": {
+          "change_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "count": 0,
+          "parent_head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+          "path_set_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "paths": [],
+          "sources": []
+        },
+        "guide_sha256": "dce1c5a6907dd507e342c81229544cc37dab116e9174903d10f060add2a57c85",
+        "parent_tool_calls": 12,
+        "parent_tool_outputs": 12,
+        "parent_unreturned_calls": [],
+        "parent_verification_sha256": "c51238885fc19091fc509d9442da23c4415cc04c9723e6841f3720605ff1dcb9",
+        "prior_artifact_sha256": "e1d33c1ba287e7bc3e9774de90ccd760d4204372c8e3aaabb4e13398330a8625",
+        "protocol_sha256": "7a618109cdaf5e6b15d09735bf4260c019db9489906a683a3eee3c8dfaabfd80",
+        "scope_input_sha256": "3264a58c24591d003bc349a00c52f3347bb7c51a77a4725e1f53936d88e67ee0"
+      },
+      "prior_artifact_unchanged": true,
+      "purpose": "bounded native preflight/serial-writer verification fixture; no product backlog run or independent Claim",
+      "quiescence": {
+        "background_work": false,
+        "children_started": false,
+        "foreground_commands": "terminal",
+        "retained_tool_sessions": false,
+        "writers": "quiescent"
+      },
+      "schema": 1,
+      "tool_terminal_observed": true,
+      "verdict": "PASS",
+      "write": {
+        "exclusive_create": true,
+        "fsync_before_close": true,
+        "mode": "0600",
+        "no_follow": true,
+        "pid": 1841354
+      }
+    },
+    "parent_observation": {
+      "case": "serial-2",
+      "native_task_complete": true,
+      "tool_calls": 5,
+      "tool_outputs": 5,
+      "unreturned_calls": [],
+      "native_tool_result_metadata": [
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        }
+      ],
+      "tool_output_forms": [
+        "content-block array"
+      ],
+      "artifact_sha256": "c7f041e4b4104d82aab040002d9aa9f81b4ea5e7dbdce0541e094a1bc6570a53",
+      "serial_1_artifact_unchanged": true,
+      "lifecycle_mutation": false,
+      "scope": "healthy serial child after serial-1 parent verification; not interruption recovery"
+    }
+  },
+  "cwd_escape": {
+    "reported_outcome": {
+      "verdict": "PAUSED_NO_WRITE",
+      "observed": {
+        "cwd": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31/.superpowers/sdd/2026-11-04-backlog-drainer/gap-audit/cwd-escape",
+        "physical_git_root": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31",
+        "branch": "task/8b1902dad18f-jhw7500-claude-config-31",
+        "head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+        "task_mapping_match": true,
+        "claim_mapping_match": true,
+        "worktree_clean": true
+      },
+      "mismatched_predicate": {
+        "name": "exact_cwd_equals_selected_physical_worktree",
+        "required": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31",
+        "actual": "/home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31/.superpowers/sdd/2026-11-04-backlog-drainer/gap-audit/cwd-escape",
+        "matched": false
+      },
+      "commands": [
+        {
+          "command": "rtk /bin/bash -lc 'pwd -P; git rev-parse --show-toplevel; git branch --show-current; git rev-parse HEAD; git status --short --branch'",
+          "exit": 0
+        },
+        {
+          "command": "rtk sed -n '1,260p' /home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31/skills/backlog-drain/SKILL.md",
+          "exit": 0
+        },
+        {
+          "command": "rtk sed -n '1,360p' /home/jhw/ai/opencode/worktrees/jhw-control/wt-8b1902dad18f-jhw7500-claude-config-31/skills/backlog-drain/references/protocol.md",
+          "exit": 0
+        },
+        {
+          "command": "rtk rg -n 'live.*Task|task.*status|claim_id|worktree_root|jhw:task|task show|claim show' <authorized-root>/skills <authorized-root>/docs <authorized-root>/scripts",
+          "exit": 0
+        },
+        {
+          "command": "rtk sed -n '450,500p' <authorized-root>/docs/plans/2026-08-27-jhw-control-host-v4-lifecycle.md",
+          "exit": 2
+        },
+        {
+          "command": "rtk rg --files <authorized-root> | rtk rg '2026-08-27-jhw-control-host-v4-lifecycle.md$|jhw-task/SKILL.md$|task-nudge'",
+          "exit": 0
+        },
+        {
+          "command": "rtk sed -n '1,260p' /home/jhw/.codex/skills/jhw-task/SKILL.md",
+          "exit": 0
+        },
+        {
+          "command": "rtk sed -n '1,360p' /home/jhw/.codex/skills/jhw-task/references/task.md",
+          "exit": 0
+        },
+        {
+          "command": "rtk /home/jhw/.local/bin/jhw-control-host task status --task tsk-01a1570c-89ce-7cf6-8cd8-8b1902dad18f --claim clm-01a1a6a9-410d-7963-b922-d5f46ea6766a",
+          "exit": 0
+        },
+        {
+          "command": "rtk sha256sum <authorized-root>/skills/backlog-drain/SKILL.md <authorized-root>/skills/backlog-drain/references/protocol.md",
+          "exit": 0
+        },
+        {
+          "command": "rtk /bin/bash -lc '<check candidate absence; print physical cwd, Git root, branch, HEAD, and status>'",
+          "exit": 0
+        },
+        {
+          "command": "rtk /home/jhw/.local/bin/jhw-control-host task status --task tsk-01a1570c-89ce-7cf6-8cd8-8b1902dad18f --claim clm-01a1a6a9-410d-7963-b922-d5f46ea6766a",
+          "exit": 0
+        }
+      ],
+      "hashes": {
+        "skills/backlog-drain/SKILL.md": "dce1c5a6907dd507e342c81229544cc37dab116e9174903d10f060add2a57c85",
+        "skills/backlog-drain/references/protocol.md": "7a618109cdaf5e6b15d09735bf4260c019db9489906a683a3eee3c8dfaabfd80",
+        "git_head": "5bf46737048dd81a5b14e5e122095023c2ed41fb"
+      },
+      "canary_created": false,
+      "lifecycle_mutation": false,
+      "admission_or_checkpoint_created": false,
+      "git_mutation": false,
+      "quiescence": {
+        "foreground_tools_terminal": true,
+        "background_work_started": false,
+        "native_children_spawned": false,
+        "writers_quiescent": true,
+        "tools_quiescent": true
+      }
+    },
+    "parent_observation": {
+      "native_task_complete": true,
+      "tool_calls": 12,
+      "tool_outputs": 12,
+      "tool_names": [
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec"
+      ],
+      "unreturned_calls": [],
+      "tool_records": {
+        "call_626ba1d593fa4d9998274389091f1294": {
+          "name": "exec",
+          "record_sha256": "e2e5ecd07ccdda9cd655f39f11c950b03aa6711a2dba9dea106d1b525dc1f6f9"
+        },
+        "call_2fb0538a312f41c99dbbff2d71567f9b": {
+          "name": "exec",
+          "record_sha256": "68f9f844ab9a82b48ecbc18e3c41690fe8cf85fa8d738016d68fcfe478abd0ee"
+        },
+        "call_616f8d649793422698a6cb15aa4aeae2": {
+          "name": "exec",
+          "record_sha256": "5e2714bd9c405d8109ecbc54ee60c0cae3b99f13d5c5c2802e232a0259736932"
+        },
+        "call_c6850f75b0e7407494c131ac81dbf933": {
+          "name": "exec",
+          "record_sha256": "931693c5e744e4e901bf3a95492d89ae944d9dedcb016cff7ec1e3caebcc7b24"
+        },
+        "call_bf0272450c8d4c9387a30fa3fb1e2655": {
+          "name": "exec",
+          "record_sha256": "1642d0ec45018853352edb2a0d49510190a9a994b2aabf34d7fe412f657d3cfc"
+        },
+        "call_d5f76d51423744498ae30d41fd3e8b8b": {
+          "name": "exec",
+          "record_sha256": "5893670d70f04b210bb4aed5b9afbca9b905123008369fe45bd147f77789d799"
+        },
+        "call_12e145a11b964c05a00c7f8abf40c53c": {
+          "name": "exec",
+          "record_sha256": "5d88b2bc7e5feef88ccaa2dcb70e2e2500e5e49486cb2abb3c5df68eb9f47ae3"
+        },
+        "call_1bf3014a042e4544af6dc419317aed9e": {
+          "name": "exec",
+          "record_sha256": "b9e6d8d284e1e0828f29d235b36316d1ccfb78bdf67c2bd7bf7340662ab912c6"
+        },
+        "call_7aae25d37cdb486fb4825b5d86bec04d": {
+          "name": "exec",
+          "record_sha256": "886434cacaddd5d1ea218c24ae0aa4dcf27cebc213e2844d977bc1e346d4127b"
+        },
+        "call_034503874d2f40de83bd1fb1121ab18b": {
+          "name": "exec",
+          "record_sha256": "75542c0de75942c1dac7c5619480ec38d50837cae3fe3fd56099ad08368edaf3"
+        },
+        "call_4520124efc37467caa14ad93c39ac835": {
+          "name": "exec",
+          "record_sha256": "f799854a5da7056095c83f37834a7865f58aec8d821ef9edd086bb57528a2aa7"
+        },
+        "call_80cc9cf196bb47f2ac006050bed18680": {
+          "name": "exec",
+          "record_sha256": "bb820889bc678df8388ebb2be15a9d382f70956cbf9c6335f69e9ff22cad67f3"
+        }
+      },
+      "output_record_hashes": {
+        "call_626ba1d593fa4d9998274389091f1294": "a0dff35a73afdff7cf6b89820d7c79d7fb93401b9f38c363d76a0a97b3861c5d",
+        "call_2fb0538a312f41c99dbbff2d71567f9b": "2c4db0ae3712721cc125be7c9e2d422296b928be8702328a681026c85922c45f",
+        "call_616f8d649793422698a6cb15aa4aeae2": "6736100f66e9eb9e75ccf7b0fe5e0916d89803fba8c3aec25ac1d745a2527360",
+        "call_c6850f75b0e7407494c131ac81dbf933": "15ac6be15d87d91846e6f02e99e6d701e227b334e78a2b63a11f2ab89cd0b8b1",
+        "call_bf0272450c8d4c9387a30fa3fb1e2655": "18da367b3903a2e03210b10ba12608f0989e9d0644de8623a9ac1642da7d3cff",
+        "call_d5f76d51423744498ae30d41fd3e8b8b": "ea8c7bfe1ea5e05d8e167e0fd38b2e157e517d4c7dfb5d7c1e61a5dc072a3a84",
+        "call_12e145a11b964c05a00c7f8abf40c53c": "cd40fa52fd9d122fd98ac3f156f96a59f64263ae2a931aeca2bf1fcc02b57e6e",
+        "call_1bf3014a042e4544af6dc419317aed9e": "f67246e0d6f4073293236cee066ee06a2cdb6bddea3441d7d47a7af9f91c6a7e",
+        "call_7aae25d37cdb486fb4825b5d86bec04d": "7e71db29f2e752c491222ad361dc699d58931d432cef3ce162cfa976fb97470e",
+        "call_034503874d2f40de83bd1fb1121ab18b": "c623f9bcb8e8af982b67a330a0595f20f89aa65ec46ad457bc20b7571c984954",
+        "call_4520124efc37467caa14ad93c39ac835": "fbf00d30265d35fb8569540091a4dc03ca8a4db9247b95c5d3ca6a996cf1c7bf",
+        "call_80cc9cf196bb47f2ac006050bed18680": "24574de8a2bac9fd56dbd04045f776d5742dbedd82ac7271801dd6459103c222"
+      },
+      "native_tool_result_metadata": [
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 2,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        },
+        {
+          "exit_code": 0,
+          "has_session": false
+        }
+      ],
+      "verdict": "PAUSED_NO_WRITE",
+      "canary_absent": true,
+      "lifecycle_mutation": false,
+      "scope": "actual native child cwd-escape guard on unchanged live Task/Claim; not supervisor takeover or interruption recovery"
+    }
+  },
+  "interrupted_original": {
+    "case": "pre-edit original child",
+    "selected_records": [
+      {
+        "line": 18,
+        "type": "custom_tool_call_output",
+        "reason": null,
+        "record_sha256": "2389051c06344fad3bd2ff183ea316b3d65ee77b6edc0be99e74b7e406b98ab6"
+      },
+      {
+        "line": 59,
+        "type": "turn_aborted",
+        "reason": "interrupted",
+        "record_sha256": "f213b4aba02e7fbbfe1d1ff533de3e0945c12c59b1c6349bf9360e399f942a2a"
+      }
+    ],
+    "selected_raw_sha256": "d138f7460091b67d9e7b0b6b09df7a4d07d36befa7a0b408bf8d2c095df7d77e",
+    "observed_turn_aborted": true,
+    "tool_terminal_receipt_present": false,
+    "native_recovery_pass": false,
+    "scope": "existing evidence only; no old child was woken and no new recovery experiment ran"
+  },
+  "original_parent_lookup_failure": [
+    {
+      "call_id": "call_1b5b0f29407342cc8a322d55737eb0dc",
+      "text": "Script error:\nwrite_stdin failed: Unknown process id 98446",
+      "source_record_sha256": "b22a1712d460297456a0b23d341e42d58f1448427779cda9ded69ddec2a5b344"
+    }
+  ],
+  "hosted_sleep_probe": {
+    "reported_outcome": {
+      "case": "clock-terminal-probe",
+      "error": "clock.sleep tool unavailable",
+      "writers": 0,
+      "processes": 0,
+      "lifecycle_mutation": false
+    },
+    "parent_observation": {
+      "native_task_complete": true,
+      "tool_calls": 1,
+      "tool_outputs": 1,
+      "tool_names": [
+        "send_message"
+      ],
+      "unreturned_calls": [],
+      "tool_records": {
+        "call_5e6de68d1d8640608bccfcd85636fd4f": {
+          "name": "send_message",
+          "record_sha256": "d9f2e0e7037452f64c5ed169c1f260a9654442a03a2ddc8fd022f832da85898d"
+        }
+      },
+      "output_record_hashes": {
+        "call_5e6de68d1d8640608bccfcd85636fd4f": "9e6d90081a8b0e27fb756492c5ce420b866307981490a59dce6c7440886474d5"
+      },
+      "native_tool_result_metadata": [],
+      "verdict": "NOT_RUN_UNAVAILABLE",
+      "child_reported": "clock.sleep tool unavailable",
+      "native_sleep_call_seen": false,
+      "actual_interruption_seen": false,
+      "native_recovery_pass": false,
+      "lifecycle_mutation": false
+    }
+  },
+  "scope_limits": [
+    "No new native recovery PASS",
+    "No Claude native bridge used",
+    "No live supervisor/Claim transition or successor recovery",
+    "No Task lifecycle mutation, new Task/Claim, PR, merge or next issue",
+    "Projected observation records are not exact copies of full private native transcripts"
+  ]
+}
+```
+<!-- backlog-native-observations:end -->
+
+
+### Fresh independent full-suite capture
+
+<!-- backlog-fresh-suite:begin -->
+```json
+{
+  "schema": 1,
+  "kind": "fresh-independent-full-suite-observation",
+  "head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+  "tree": "56698cd69026d25d357ed766eb255f636ef835f8",
+  "native_observer": "/root/issue31_fresh_full_evidence",
+  "before": {
+    "head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+    "tree": "56698cd69026d25d357ed766eb255f636ef835f8",
+    "clean": true,
+    "coordinate_capture_sha256": "d8975165fc124c0376c68217e85bcf455ac6c5613160e3157eb6071792123bb6"
+  },
+  "after": {
+    "head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+    "tree": "56698cd69026d25d357ed766eb255f636ef835f8",
+    "clean": true,
+    "coordinate_capture_sha256": "d8975165fc124c0376c68217e85bcf455ac6c5613160e3157eb6071792123bb6"
+  },
+  "summary": "5411 passed in 236.31s (0:03:56)",
+  "scope_limits": [
+    "This is one fresh independent observation of the current committed source only.",
+    "It does not retroactively authenticate the earlier 5411-passed, 230.77-second execution.",
+    "It does not close native recovery or live Claim-transition evidence gaps.",
+    "No Tribunal review, historical-execution attestation, source mutation, index mutation, HEAD mutation, Task mutation, Claim mutation, runtime mutation, installation, model CLI, subagent, or background execution was performed."
+  ],
+  "trusted_capture_record": {
+    "schema": 1,
+    "helper": "/home/jhw/.local/share/claude-config/pre_pr_tribunal/cli.py",
+    "command": "rtk proxy /usr/bin/env -u LD_LIBRARY_PATH PYTHONDONTWRITEBYTECODE=1 $HOME/ai/opencode/projects/claude-config/.superpowers/venv-issue264/bin/python -m pytest -q -n 8 -p no:cacheprovider",
+    "cwd": "/tmp/issue31-full-evidence-3h3t4vz_/checkout",
+    "head": "5bf46737048dd81a5b14e5e122095023c2ed41fb",
+    "exit_code": 0,
+    "timed_out": false,
+    "capture_sha256": "21e707b5bfe9def69e9e61d534353c9941965dee0feeffc72f5d12de32417d79",
+    "stdout_bytes": 6156,
+    "stderr_bytes": 0,
+    "output_limited": false,
+    "complete": true,
+    "stdout": "bringing up nodes...\nbringing up nodes...\n\n........................................................................ [  1%]\n........................................................................ [  2%]\n........................................................................ [  3%]\n........................................................................ [  5%]\n........................................................................ [  6%]\n........................................................................ [  7%]\n........................................................................ [  9%]\n........................................................................ [ 10%]\n........................................................................ [ 11%]\n........................................................................ [ 13%]\n........................................................................ [ 14%]\n........................................................................ [ 15%]\n........................................................................ [ 17%]\n........................................................................ [ 18%]\n........................................................................ [ 19%]\n........................................................................ [ 21%]\n........................................................................ [ 22%]\n........................................................................ [ 23%]\n........................................................................ [ 25%]\n........................................................................ [ 26%]\n........................................................................ [ 27%]\n........................................................................ [ 29%]\n........................................................................ [ 30%]\n........................................................................ [ 31%]\n........................................................................ [ 33%]\n........................................................................ [ 34%]\n........................................................................ [ 35%]\n........................................................................ [ 37%]\n........................................................................ [ 38%]\n........................................................................ [ 39%]\n........................................................................ [ 41%]\n........................................................................ [ 42%]\n........................................................................ [ 43%]\n........................................................................ [ 45%]\n........................................................................ [ 46%]\n........................................................................ [ 47%]\n........................................................................ [ 49%]\n........................................................................ [ 50%]\n........................................................................ [ 51%]\n........................................................................ [ 53%]\n........................................................................ [ 54%]\n........................................................................ [ 55%]\n........................................................................ [ 57%]\n........................................................................ [ 58%]\n........................................................................ [ 59%]\n........................................................................ [ 61%]\n........................................................................ [ 62%]\n........................................................................ [ 63%]\n........................................................................ [ 65%]\n........................................................................ [ 66%]\n........................................................................ [ 67%]\n........................................................................ [ 69%]\n........................................................................ [ 70%]\n........................................................................ [ 71%]\n........................................................................ [ 73%]\n........................................................................ [ 74%]\n........................................................................ [ 75%]\n........................................................................ [ 77%]\n........................................................................ [ 78%]\n........................................................................ [ 79%]\n........................................................................ [ 81%]\n........................................................................ [ 82%]\n........................................................................ [ 83%]\n........................................................................ [ 85%]\n........................................................................ [ 86%]\n........................................................................ [ 87%]\n........................................................................ [ 89%]\n........................................................................ [ 90%]\n........................................................................ [ 91%]\n........................................................................ [ 93%]\n........................................................................ [ 94%]\n........................................................................ [ 95%]\n........................................................................ [ 97%]\n........................................................................ [ 98%]\n........................................................................ [ 99%]\n...........                                                              [100%]\n5411 passed in 236.31s (0:03:56)\n",
+    "stderr": ""
+  },
+  "original_record_bytes": 6862,
+  "original_record_sha256": "ad0a0f0b4f39d0563772ab41610a6aba6d3986fcc559e97bb676aee47b1e282b"
+}
+```
+<!-- backlog-fresh-suite:end -->
+
+
+### Read-only evidence packet verification
+
+The following reader only parses committed JSON data, hashes bytes and checks the explicitly stated limits. It neither executes archived commands nor writes files. Its success establishes record/source consistency and a complete stored fresh capture; it does not change the Tribunal verdict or prove native recovery.
+
+```bash
+rtk proxy python3 -c 'import hashlib,json; from pathlib import Path; s=Path("docs/validation/2026-11-04-backlog-drainer.md").read_text(); read=lambda tag:json.loads(s.split("<!-- "+tag+":begin -->\n```json\n",1)[1].split("\n```\n<!-- "+tag+":end -->",1)[0]); a=read("backlog-suite-archive"); f=read("backlog-fresh-suite"); n=read("backlog-native-observations"); artifacts={x["name"]:x for x in a["artifacts"]}; assert len(artifacts)==5; assert all(len(x["data"].encode())==x["bytes"] and hashlib.sha256(x["data"].encode()).hexdigest()==x["sha256"] for x in artifacts.values()); assert len(a["source_hashes"])==18; assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest()==h for p,h in a["source_hashes"].items()); r=f["trusted_capture_record"]; assert r["complete"] and not r["output_limited"] and not r["timed_out"] and r["exit_code"]==0; assert hashlib.sha256((r["stdout"]+r["stderr"]).encode()).hexdigest()==r["capture_sha256"]; assert f["before"]==f["after"] and "5411 passed" in r["stdout"]; assert n["cwd_escape"]["parent_observation"]["canary_absent"]; assert not n["interrupted_original"]["native_recovery_pass"] and not n["hosted_sleep_probe"]["parent_observation"]["actual_interruption_seen"]; print("PASS: 5 exact archived records, 18 current source hashes, fresh capture streams and stated native limits")'
+```
