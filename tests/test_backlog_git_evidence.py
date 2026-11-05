@@ -334,6 +334,72 @@ def test_empty_allowlist_collects_a_clean_new_run_baseline(repo: Path) -> None:
     }
 
 
+def _set_tracked_mode_with_filemode_disabled(
+    repo: Path, *, baseline_mode: int, worktree_mode: int
+) -> None:
+    (repo / "base.txt").chmod(baseline_mode)
+    if baseline_mode != 0o644:
+        _commit_all(repo, "mode baseline")
+    _git(repo, "config", "core.fileMode", "false")
+    (repo / "base.txt").chmod(worktree_mode)
+
+
+@pytest.mark.parametrize(
+    ("baseline_mode", "worktree_mode", "manifest_mode"),
+    [(0o644, 0o755, "100755"), (0o755, 0o644, "100644")],
+)
+def test_collect_sources_records_mode_only_change_when_core_filemode_is_disabled(
+    repo: Path, baseline_mode: int, worktree_mode: int, manifest_mode: str
+) -> None:
+    _set_tracked_mode_with_filemode_disabled(
+        repo, baseline_mode=baseline_mode, worktree_mode=worktree_mode
+    )
+
+    manifest = collect_sources(str(repo), ["base.txt"])
+
+    assert manifest["paths"] == ["base.txt"]
+    assert manifest["sources"] == [
+        {
+            "change": "modify",
+            "mode": manifest_mode,
+            "path": "base.txt",
+            "sha256": "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac",
+        }
+    ]
+    assert _git(repo, "config", "--get", "core.fileMode") == b"false\n"
+
+
+@pytest.mark.parametrize(
+    ("baseline_mode", "worktree_mode"), [(0o644, 0o755), (0o755, 0o644)]
+)
+def test_empty_allowlist_rejects_mode_only_change_when_core_filemode_is_disabled(
+    repo: Path, baseline_mode: int, worktree_mode: int
+) -> None:
+    _set_tracked_mode_with_filemode_disabled(
+        repo, baseline_mode=baseline_mode, worktree_mode=worktree_mode
+    )
+
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        collect_sources(str(repo), [])
+
+    assert _git(repo, "config", "--get", "core.fileMode") == b"false\n"
+
+
+def test_collect_rejects_unallowed_mode_change_when_core_filemode_is_disabled(
+    repo: Path,
+) -> None:
+    _write(repo, "selected.txt", b"before\n")
+    _commit_all(repo, "selected baseline")
+    _git(repo, "config", "core.fileMode", "false")
+    _write(repo, "selected.txt", b"after\n")
+    (repo / "base.txt").chmod(0o755)
+
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        collect_sources(str(repo), ["selected.txt"])
+
+    assert _git(repo, "config", "--get", "core.fileMode") == b"false\n"
+
+
 @pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
 @pytest.mark.parametrize("modified", [False, True])
 def test_clean_start_rejects_index_flags_that_can_hide_tracked_changes(
@@ -367,6 +433,23 @@ def test_bind_rejects_index_flags_hiding_post_commit_changes(
         bind_commit(str(repo), manifest["parent_head"], manifest, committed)
 
     assert (repo / "base.txt").read_bytes() == b"hidden after commit\n"
+
+
+def test_bind_rejects_unrelated_mode_change_when_core_filemode_is_disabled(
+    repo: Path,
+) -> None:
+    _write(repo, "reviewed.txt", b"before\n")
+    _commit_all(repo, "reviewed baseline")
+    _write(repo, "reviewed.txt", b"after\n")
+    manifest = collect_sources(str(repo), ["reviewed.txt"])
+    committed = _commit_all(repo)
+    _git(repo, "config", "core.fileMode", "false")
+    (repo / "base.txt").chmod(0o755)
+
+    with pytest.raises(CheckpointError, match="outside the source allowlist"):
+        bind_commit(str(repo), manifest["parent_head"], manifest, committed)
+
+    assert _git(repo, "config", "--get", "core.fileMode") == b"false\n"
 
 
 @pytest.mark.parametrize("dirty_kind", ["staged", "unstaged", "untracked"])

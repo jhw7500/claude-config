@@ -47,6 +47,8 @@ def _git(root: str, *arguments: str) -> bytes:
         "-c",
         "core.fsmonitor=false",
         "-c",
+        "core.fileMode=true",
+        "-c",
         "core.untrackedCache=false",
         "-c",
         "diff.external=",
