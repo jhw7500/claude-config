@@ -187,17 +187,17 @@ act of memory.
 
    ```bash
    # GNU grep:
-   grep -oP '### Observation \K\d+' log.md | sort -n | tail -1
+   cat log.md archive/log-*.md 2>/dev/null | grep -oP '### Observation \K\d+' | sort -n | tail -1
    # macOS / POSIX:
-   grep -o '### Observation [0-9]*' log.md | grep -o '[0-9]*' | sort -n | tail -1
+   cat log.md archive/log-*.md 2>/dev/null | grep -o '### Observation [0-9]*' | grep -o '[0-9]*' | sort -n | tail -1
    ```
 
 2. *Pre-write assertion:* immediately before appending, confirm the proposed
    number doesn't already exist:
 
    ```bash
-   PROPOSED=$(( $(grep -oP '### Observation \K\d+' log.md | sort -n | tail -1) + 1 ))
-   grep -qE "^### Observation ${PROPOSED}:" log.md && {
+   PROPOSED=$(( $(cat log.md archive/log-*.md 2>/dev/null | grep -oP '### Observation \K\d+' | sort -n | tail -1) + 1 ))
+   [ "$(cat log.md archive/log-*.md 2>/dev/null | grep -cE "^### Observation ${PROPOSED}:")" -eq 0 ] || {
      echo "COLLISION on #${PROPOSED}"; exit 1; }
    ```
 
@@ -367,6 +367,9 @@ across parallel and subsequent sessions. A resolved entry with no readable
 date gets today's date added instead of being archived. The active log
 keeps its header, status key, all unresolved entries (including STAGED), and the same-day-resolved
 ones.
+Archived observation numbers are never reused: the numbering pre-check,
+collision assertion and post-write count span `log.md` and every
+`archive/log-*.md`.
 
 Archival is a read-filter-rewrite — the highest-risk mutation the log
 undergoes, and the one that has destroyed concurrent appends in production.
