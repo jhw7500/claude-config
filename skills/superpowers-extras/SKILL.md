@@ -163,6 +163,9 @@ must distinguish old from new behavior. A preservation guard checks an
 invariant that should hold in both; keep useful guards and report their count
 separately, not as evidence that the new behavior was detected. A suite with
 only preservation guards has not yet demonstrated the change.
+If the old code cannot host the new tests because the same change added the
+injection point they use, build the control from the old behavior plus only
+that injection point, so the arms differ in behavior alone.
 
 **Probing a third-party extension point?** Exercise every declared variant of
 it — the argument-taking form and the no-argument form, each registration shape
@@ -559,6 +562,12 @@ find it there), run the target operation alone, and compare before and after.
 Running against a system already in the expected state cannot distinguish
 success from no-op, and a diagnosis built on that reading will survive review
 and merge before anything contradicts it.
+
+**Current location is not provenance.** Ref containment or file presence says
+where an artifact is now, not how it got there; before stating
+"X came from / was pushed via Y", read each candidate source's event log
+(git reflog commit/reset/fetch entries, audit logs), and mark the route as an
+estimate until you have.
 
 **Then wait for the consumer, not for the command.** After reverting or
 changing a setting, the evidence is not the file's contents — it is the
@@ -982,6 +991,11 @@ investigation early. Ask first whether a single cause produces all of them.
   client-side fix can be necessary and still not sufficient. Isolating a CLI's
   configuration for this can need an isolated home directory, not only an
   alternate config directory — legacy dot-directories still load.
+- **Inherited state starts at a boundary, not where it is held.** For a
+  variable inherited down a process tree, list every holder
+  (`/proc/*/environ`), keep those whose parent lacks it — an unreadable parent
+  environ is "unknown", not a boundary — and group them by start time and
+  top-most holding ancestor before scanning configuration files.
 
 **No window into internal state? Use the subject's own diagnostic paths.** When
 the usual inspection points are unavailable (no kernel stack, memory or register
