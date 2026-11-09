@@ -1,5 +1,5 @@
 {
-  "automation_commit": "0c1e9b3930569f38344dfa1b3c4103a248401ef3",
+  "automation_commit": "ac73b3308e29ef80d9cb01a92da376732978ba6c",
   "rules_version": "1",
   "files": {
     "validate_change_evidence.py": "43ee3633f5dd2c1febd39635c815d678c5b1cc8c7be4bc9f09c47d7defc7460a",
