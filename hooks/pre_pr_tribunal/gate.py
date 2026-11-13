@@ -328,6 +328,34 @@ def _evaluate_direct_pr_create(
     return _decision(False, GateCode.PASS)
 
 
+_CD_PATH = r"(?:/[A-Za-z0-9._-]+)+"
+_CD_PREFIX = re.compile(
+    rf"cd (?:(?P<bare>{_CD_PATH})|'(?P<single>{_CD_PATH})'|\"(?P<double>{_CD_PATH})\") && "
+    r"(?=PATH=/usr/bin:/bin /usr/bin/gh pr create )"
+)
+_BACKGROUND_TAIL = re.compile(r"&\s*(?:#[^\n]*)?\s*\Z")
+_MAX_CD_PATH_BYTES = 4095
+
+
+def _split_cd_prefix(command: str) -> tuple[str, str] | None:
+    """Split one literal ``cd <abs> && `` prefix from the canonical command."""
+
+    match = _CD_PREFIX.match(command)
+    if match is None:
+        return None
+    target = match.group("bare") or match.group("single") or match.group("double")
+    if len(target) > _MAX_CD_PATH_BYTES or any(
+        part in {".", ".."} for part in target.split("/")[1:]
+    ):
+        return None
+    remainder = command[match.end():]
+    if "\n" in remainder or "\r" in remainder:
+        return None
+    if _BACKGROUND_TAIL.search(remainder) is not None:
+        return None
+    return target, remainder
+
+
 def evaluate_gate(
     cwd: Path, command: str, *, runtime: str | None = None
 ) -> GateDecision:
@@ -340,7 +368,31 @@ def evaluate_gate(
     if scan.kind is ScanKind.NO_MATCH:
         return _decision(False, GateCode.NOT_PR_CREATE)
     if scan.kind is ScanKind.AMBIGUOUS_CANDIDATE:
-        return _decision(True, GateCode.COMMAND_AMBIGUOUS, scan.reason)
+        split = (
+            _split_cd_prefix(command)
+            if scan.reason == "UNSAFE_PR_CONTEXT"
+            else None
+        )
+        if split is None:
+            return _decision(True, GateCode.COMMAND_AMBIGUOUS, scan.reason)
+        # Remaining trust: the cd form is safe only when the runtime shell's
+        # ``cd`` is the builtin (for example ``type -t cd`` prints ``builtin``).
+        # The hook can see only an exported ``BASH_FUNC_cd%%`` and BASH_ENV/ENV;
+        # a non-exported cd function or a cd alias (Claude Code's shell snapshot
+        # re-defines user functions and enables aliases; Codex uses a login
+        # shell) is invisible here. Check that before using the prefix.
+        if "BASH_FUNC_cd%%" in os.environ or any(
+            os.environ.get(name) for name in ("BASH_ENV", "ENV")
+        ):
+            return _decision(True, GateCode.COMMAND_AMBIGUOUS, "TARGET_ENVIRONMENT")
+        target, remainder = split
+        try:
+            inner = scan_pr_create(remainder)
+        except Exception:
+            return _decision(True, GateCode.COMMAND_AMBIGUOUS, scan.reason)
+        if inner.kind is not ScanKind.PR_CREATE:
+            return _decision(True, GateCode.COMMAND_AMBIGUOUS, scan.reason)
+        cwd, command = Path(target), remainder
     try:
         return _evaluate_direct_pr_create(cwd, command, runtime=runtime)
     except Exception:

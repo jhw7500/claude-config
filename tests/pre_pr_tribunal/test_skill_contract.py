@@ -1197,3 +1197,24 @@ def test_every_reviewer_role_says_command_is_one_line():
         assert "Every report text field except" in body, name
         assert "claim `statement`" in body, name
         assert "scratch file" not in body, name
+
+
+def test_reviewer_b_states_honesty_rules_for_unverified_reasons():
+    reviewer_b = " ".join(text("references/reviewer-b.md").split())
+    assert "prose-only documentation" in reviewer_b
+    assert "is not a primary entry path by itself" in reviewer_b
+    assert "Use `BUDGET_EXHAUSTED:` only after you actually reached the soft time stop" in reviewer_b
+    assert "state the real counts" in reviewer_b
+    assert "an existing in-repository test that you did not run is never `UNAVAILABLE:`" in reviewer_b
+    schema = " ".join(text("references/report-schema.md").split())
+    assert "never for an in-repository test the reviewer did not run" in schema
+
+
+def test_cd_prefix_documents_remaining_runtime_shell_trust():
+    gate_source = (REPOSITORY_ROOT / "hooks" / "pre_pr_tribunal" / "gate.py").read_text(encoding="utf-8")
+    for body in (text("SKILL.md"), gate_source):
+        flat = " ".join(body.replace("#", " ").replace("`", "").split())
+        assert "Remaining trust: the cd form is safe only when the runtime shell's cd is the builtin" in flat
+        assert "type -t cd" in flat
+        assert "non-exported cd" in flat
+        assert "cd alias" in flat

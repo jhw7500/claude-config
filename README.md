@@ -12,7 +12,7 @@
 | `slack-bridge/` | Slack 비공개 채널 ↔ Claude Code 세션 헤드리스 브릿지. `setup-slack-bridge.sh`로 systemd `--user` 서비스 설치. 상세는 `slack-bridge/README.md` |
 | `shell/plug.sh` | `plug on\|off <key>` 셸 함수 (bkit/docs/pw/pyright/compound) |
 | `scripts/` | 개인 hook/toggle과 **jhw-control-host.py** secure launcher: stop-text-required.py, timestamp-hook.py, bg-hud-complete.py, context-bar.sh, apex-toggle.sh, setup-mcp.sh, artifact-outbox.py |
-| `hooks/` | 커스텀 훅 6개: carl·notion-continuous·general-continuation·post-info·post-action·bg-task. install.sh가 env-aware **자동 배선** |
+| `hooks/` | 커스텀 훅 6개: carl·notion-continuous·general-continuation·post-info·post-action·bg-task. install.sh가 env-aware **자동 배선**(notion-continuous·post-info·bg-task는 소음으로 배선하지 않음, 스크립트 파일만 유지) |
 | `commands/` | session-handoff 사용자 커맨드: `/handoff [세션명]`, `/resume [세션명]` |
 | `manifest/` | `mcp.json` — MCP 서버 정의(공개 6 + 사내 4). `setup-mcp.sh`가 사용 |
 | `claude-md/` | 글로벌 지침: **global-guidance.md**(공통·항상) + CLAUDE-notion.md(notion 환경) + RTK.md(rtk 환경) |
@@ -32,8 +32,9 @@ source ~/.bashrc
 - **Backlog drain (Claude/Codex)**: 이미 승인된 단일 Task Claim을 durable checkpoint로 진행하는 공통 Skill이다. 전체 설치는 양쪽 runtime의 `skills/backlog-drain`과 `scripts/backlog-checkpoint.py`를 같은 저장소 소스에 연결한다. helper는 명시 argv와 JSON 파일 또는 stdin만 받고 `next_action`이나 임의 shell을 실행하지 않는다. 설치 검증은 임시 HOME에서 수행하며 `--launcher-only`에는 이 자산이 포함되지 않는다.
 - **CLAUDE.md 전역지침 (env-aware)**: `~/.claude/CLAUDE.md`의 `claude-config:START/END` 블록만 관리 — 항상 `@global-guidance.md`, **notion MCP 있으면** `@CLAUDE-notion.md`, **`rtk` 있으면** `@RTK.md`를 자동 추가. **OMC 블록은 미변경**(inline/file-split 무관), 실행 전 `.bak` 백업
 - **훅 자동 배선**: `settings.json`에 멱등 추가 — `.bak` 백업, `statusLine`·기존 훅 보존
-  - **항상**: `timestamp`(프롬프트/완료) · `stop-text-required`(조기종료 방지·한국어 최종 답변 검사) · `general-continuation` · `bg-task-progress`(Pre/Post/SubagentStop, `Agent|Bash`) · `post-info-tool-continuation`
-  - **notion 환경**: `notion-continuous-exec` · `post-action-tool-report`
+  - **항상**: `timestamp`(프롬프트/완료) · `stop-text-required`(조기종료 방지·한국어 최종 답변 검사) · `general-continuation`
+  - **notion 환경**: `post-action-tool-report`
+  - **배선 해제(소음)**: `bg-task-progress` · `post-info-tool-continuation` · `notion-continuous-exec` — 신규 배선하지 않고, 재실행 시 `settings.json`에서 명령이 정확히 일치하는 기존 항목을 제거(스크립트 파일은 유지). `env.OMC_SKIP_HOOKS`는 키가 없을 때만 `pre-tool-use,post-tool-use`로 설정(사용자 값은 보존). 이 값은 리마인더뿐 아니라 oh-my-claudecode의 pre-tool-use·post-tool-use 훅 전체를 꺼서 persistent-mode Stop 훅이 의존하는 skill-active-state 기록, ultragoal deny 검사, `<remember>` 태그 저장도 함께 꺼진다. 되돌리려면 `settings.json`의 `env`에 `"OMC_SKIP_HOOKS": ""`를 둔다. 빈 값은 어떤 OMC 훅도 끄지 않고, 키가 있으므로 재설치가 덮어쓰지 않는다(키를 지우면 다음 설치가 기본값을 다시 넣는다)
   - `carl-hook`은 파일만 동기화하고 자동 배선하지 않음(APEX/CARL 사용 시 수동 배선)
 - **한국어 최종 답변 검사 (Claude Code Stop)**: 기존 `stop-text-required.py`의 같은 링크·Stop 명령으로 배포됩니다.
   코드 블록·인라인 코드·URL·경로와 명확한 `snake_case`·`camelCase`·여러 단어의 kebab 식별자,

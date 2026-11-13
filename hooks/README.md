@@ -51,9 +51,9 @@ fi
 | 파일 | 트리거 | 역할 |
 |------|--------|------|
 | `carl-hook.py` | UserPromptSubmit | CARL 컨텍스트 브래킷, 도메인 규칙, 결정 기록을 주입 (외부 도구 유지) |
-| `notion-continuous-exec-hook.py` | UserPromptSubmit | Notion 저장/불러오기 스킬 승인 응답 감지 시 "연속 실행" reminder 주입 |
+| `notion-continuous-exec-hook.py` | UserPromptSubmit (배선 해제됨) | Notion 저장/불러오기 스킬 승인 응답 감지 시 "연속 실행" reminder 주입 |
 | `general-continuation-hook.py` | UserPromptSubmit | "한번에/끝까지/연속으로" 등 사용자의 연속 실행 의도 감지 시 reminder 주입 |
-| `bg-task-progress-hook.py` | PreToolUse + PostToolUse | Agent / Bash `run_in_background=true` 시작·완료 알림 강제 + statusLine 카운터 관리 |
+| `bg-task-progress-hook.py` | PreToolUse + PostToolUse (배선 해제됨) | Agent / Bash `run_in_background=true` 시작·완료 알림 강제 + statusLine 카운터 관리 |
 | `control-char-guard-hook.py` | PostToolUse | Edit/Write/MultiEdit/NotebookEdit 로 **기록한 내용**에 raw 제어문자(C0/DEL)가 섞이면 위치와 함께 경고 |
 | `verification-command-hygiene-hook.py` | PreToolUse: `Bash` | 실제 `|| echo` fallback에 결론 연결 표지(`→`/`뿐`)가 있으면 중립 출력으로 바꾸도록 경고 |
 | `task_nudge.py` | Claude/Codex 공통 core | GitHub slug와 secure launcher의 등록 상태를 분류하고, 경계가 있는 정책 메시지와 세션당 1회 state를 관리 |
@@ -454,6 +454,8 @@ rm ~/.claude/logs/hook-debug.on   # 또는 unset CLAUDE_HOOK_DEBUG
 로깅은 기본 OFF. 활성화 시 overhead는 무시 가능 (append 한 줄).
 
 ## 백그라운드 작업 카운터
+
+`install.sh`는 `env.OMC_SKIP_HOOKS`가 없을 때만 `pre-tool-use,post-tool-use`로 설정한다. 이 값은 oh-my-claudecode의 리마인더만 끄는 것이 아니라 pre-tool-use·post-tool-use 훅 전체를 끈다: persistent-mode Stop 훅이 의존하는 skill-active-state 기록, ultragoal deny 검사, `<remember>` 태그 저장이 함께 꺼진다. 되돌리려면 `settings.json`의 `env`에 `"OMC_SKIP_HOOKS": ""`를 둔다. 빈 값은 어떤 OMC 훅도 끄지 않고, 키가 있으므로 재설치가 덮어쓰지 않는다(키를 지우면 다음 설치가 기본값을 다시 넣는다).
 
 `bg-task-progress-hook.py`는 statusLine이 `🔄 BG:N` 표시를 할 수 있도록 세션별 파일을 관리한다.
 

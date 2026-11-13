@@ -86,11 +86,7 @@ def test_fresh_install_creates_private_settings_with_all_non_notion_hooks(home: 
         ("Stop", "python3 $HOME/.claude/scripts/timestamp-hook.py stop"),
         ("Stop", "python3 $HOME/.claude/scripts/stop-text-required.py"),
         ("UserPromptSubmit", "python3 $HOME/.claude/hooks/general-continuation-hook.py"),
-        ("PreToolUse", "python3 $HOME/.claude/hooks/bg-task-progress-hook.py"),
-        ("PostToolUse", "python3 $HOME/.claude/hooks/bg-task-progress-hook.py"),
-        ("SubagentStop", "python3 $HOME/.claude/hooks/bg-task-progress-hook.py"),
         ("UserPromptSubmit", "python3 $HOME/.claude/hooks/delegate-nudge-hook.py"),
-        ("PostToolUse", "python3 $HOME/.claude/hooks/post-info-tool-continuation-hook.py"),
         ("PreToolUse", "python3 $HOME/.claude/hooks/agent-name-delivery-hook.py"),
         ("PreToolUse", "python3 $HOME/.claude/hooks/verification-command-hygiene-hook.py"),
         ("UserPromptSubmit", "python3 $HOME/.claude/hooks/handoff-checkpoint-hook.py"),
@@ -113,7 +109,7 @@ def test_fresh_install_creates_private_settings_with_all_non_notion_hooks(home: 
             ),
             ("PreCompact", "$HOME/.claude/hooks/precompact-handoff.sh"),
         }
-    assert len(wired) == 18
+    assert len(wired) == 14
     assert set(wired) == expected
 
     hygiene_groups = [
@@ -171,6 +167,63 @@ def test_hook_wiring_stays_idempotent(home: Path) -> None:
 
     assert entry_count() == first
     assert first > 0
+
+
+def test_install_removes_retired_noisy_hooks_and_keeps_unrelated_settings(home: Path) -> None:
+    claude = home / ".claude"
+    claude.mkdir()
+    settings = claude / "settings.json"
+    hooks_dir = "python3 $HOME/.claude/hooks"
+    unrelated = "python3 /opt/user/custom-hook.py"
+    settings.write_text(json.dumps({
+        "env": {"OMC_SKIP_HOOKS": "user-value", "KEEP": "1"},
+        "hooks": {
+            "PreToolUse": [
+                {"matcher": "Agent|Bash", "hooks": [
+                    {"type": "command", "command": f"{hooks_dir}/bg-task-progress-hook.py"}]},
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": unrelated}]},
+            ],
+            "PostToolUse": [
+                {"matcher": "Agent|Bash", "hooks": [
+                    {"type": "command", "command": f"python3 {home}/.claude/hooks/bg-task-progress-hook.py"},
+                    {"type": "command", "command": unrelated}]},
+                {"matcher": "ToolSearch", "hooks": [
+                    {"type": "command", "command": f"{hooks_dir}/post-info-tool-continuation-hook.py"}]},
+            ],
+            "SubagentStop": [
+                {"matcher": "*", "hooks": [
+                    {"type": "command", "command": f"{hooks_dir}/bg-task-progress-hook.py"}]},
+            ],
+            "UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": f"{hooks_dir}/notion-continuous-exec-hook.py"}]},
+            ],
+        },
+    }) + "\n", encoding="utf-8")
+
+    result = run_install(home)
+    assert result.returncode == 0, result.stderr
+
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    commands = [
+        h["command"] for gs in data["hooks"].values() for g in gs for h in g["hooks"]
+    ]
+    for retired in ("bg-task-progress-hook.py", "post-info-tool-continuation-hook.py",
+                    "notion-continuous-exec-hook.py"):
+        assert not [c for c in commands if retired in c], retired
+    assert "SubagentStop" not in data["hooks"]
+    assert commands.count(unrelated) == 2
+    assert data["env"] == {"OMC_SKIP_HOOKS": "user-value", "KEEP": "1"}
+
+    result = run_install(home)                              # 재실행도 안정적이다
+    assert result.returncode == 0, result.stderr
+    assert json.loads(settings.read_text(encoding="utf-8")) == data
+
+
+def test_install_sets_omc_skip_hooks_only_when_absent(home: Path) -> None:
+    result = run_install(home)
+    assert result.returncode == 0, result.stderr
+    data = json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert data["env"]["OMC_SKIP_HOOKS"] == "pre-tool-use,post-tool-use"
 
 
 def test_installed_stop_command_checks_korean_without_duplicate_hooks(home: Path) -> None:
@@ -553,3 +606,18 @@ def test_launcher_install_backs_up_existing_file_once_and_is_idempotent(home: Pa
     assert second.returncode == 0, second.stderr
     assert launcher.is_symlink()
     assert sorted(binary_dir.glob("jhw-control-host.replaced.*")) == backups_after_first
+
+
+def test_empty_omc_skip_hooks_is_documented_and_kept_by_install(home: Path) -> None:
+    claude = home / ".claude"
+    claude.mkdir()
+    settings = claude / "settings.json"
+    settings.write_text(json.dumps({"env": {"OMC_SKIP_HOOKS": ""}}), encoding="utf-8")
+    for _ in range(2):
+        result = run_install(home)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(settings.read_text(encoding="utf-8"))["env"]["OMC_SKIP_HOOKS"] == ""
+    for readme in (REPO / "README.md", REPO / "hooks" / "README.md"):
+        body = readme.read_text(encoding="utf-8")
+        assert '`"OMC_SKIP_HOOKS": ""`' in body
+        assert "ultragoal deny" in body and "<remember>" in body
