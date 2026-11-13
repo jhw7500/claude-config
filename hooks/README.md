@@ -455,6 +455,8 @@ rm ~/.claude/logs/hook-debug.on   # 또는 unset CLAUDE_HOOK_DEBUG
 
 ## 백그라운드 작업 카운터
 
+`install.sh`는 `env.OMC_SKIP_HOOKS`가 없을 때만 `pre-tool-use,post-tool-use`로 설정한다. 이 값은 oh-my-claudecode의 리마인더만 끄는 것이 아니라 pre-tool-use·post-tool-use 훅 전체를 끈다: persistent-mode Stop 훅이 의존하는 skill-active-state 기록, ultragoal deny 검사, `<remember>` 태그 저장이 함께 꺼진다. 되돌리려면 `settings.json`의 `env`에 `"OMC_SKIP_HOOKS": ""`를 둔다. 빈 값은 어떤 OMC 훅도 끄지 않고, 키가 있으므로 재설치가 덮어쓰지 않는다(키를 지우면 다음 설치가 기본값을 다시 넣는다).
+
 `bg-task-progress-hook.py`는 statusLine이 `🔄 BG:N` 표시를 할 수 있도록 세션별 파일을 관리한다.
 
 | 경로 | 내용 |

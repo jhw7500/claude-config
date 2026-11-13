@@ -338,6 +338,9 @@ for event in list(hooks):
     else:
         del hooks[event]
 # oh-my-claudecode 의 일반 리마인더 훅 끄기 — 키가 없을 때만 기본값을 넣고 사용자 값은 덮어쓰지 않는다.
+# 주의: 리마인더만 꺼지지 않는다. OMC 의 pre-tool-use·post-tool-use 훅 전체가 서므로 skill-active-state 기록
+# (persistent-mode Stop 훅이 읽는다), ultragoal deny 검사, <remember> 태그 저장도 함께 꺼진다.
+# 되돌리기: settings.json 에 "OMC_SKIP_HOOKS": "" 를 두면 OMC 훅이 모두 돌고, 키가 있으므로 재설치도 덮어쓰지 않는다.
 d.setdefault("env", {}).setdefault("OMC_SKIP_HOOKS", "pre-tool-use,post-tool-use")
 # 기존 (항상)
 if ensure("UserPromptSubmit", ts + " prompt"): added.append("UPS<-timestamp")

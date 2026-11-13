@@ -606,3 +606,18 @@ def test_launcher_install_backs_up_existing_file_once_and_is_idempotent(home: Pa
     assert second.returncode == 0, second.stderr
     assert launcher.is_symlink()
     assert sorted(binary_dir.glob("jhw-control-host.replaced.*")) == backups_after_first
+
+
+def test_empty_omc_skip_hooks_is_documented_and_kept_by_install(home: Path) -> None:
+    claude = home / ".claude"
+    claude.mkdir()
+    settings = claude / "settings.json"
+    settings.write_text(json.dumps({"env": {"OMC_SKIP_HOOKS": ""}}), encoding="utf-8")
+    for _ in range(2):
+        result = run_install(home)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(settings.read_text(encoding="utf-8"))["env"]["OMC_SKIP_HOOKS"] == ""
+    for readme in (REPO / "README.md", REPO / "hooks" / "README.md"):
+        body = readme.read_text(encoding="utf-8")
+        assert '`"OMC_SKIP_HOOKS": ""`' in body
+        assert "ultragoal deny" in body and "<remember>" in body

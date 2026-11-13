@@ -34,7 +34,7 @@ source ~/.bashrc
 - **훅 자동 배선**: `settings.json`에 멱등 추가 — `.bak` 백업, `statusLine`·기존 훅 보존
   - **항상**: `timestamp`(프롬프트/완료) · `stop-text-required`(조기종료 방지·한국어 최종 답변 검사) · `general-continuation`
   - **notion 환경**: `post-action-tool-report`
-  - **배선 해제(소음)**: `bg-task-progress` · `post-info-tool-continuation` · `notion-continuous-exec` — 신규 배선하지 않고, 재실행 시 `settings.json`에서 명령이 정확히 일치하는 기존 항목을 제거(스크립트 파일은 유지). `env.OMC_SKIP_HOOKS`는 키가 없을 때만 `pre-tool-use,post-tool-use`로 설정(사용자 값은 보존)
+  - **배선 해제(소음)**: `bg-task-progress` · `post-info-tool-continuation` · `notion-continuous-exec` — 신규 배선하지 않고, 재실행 시 `settings.json`에서 명령이 정확히 일치하는 기존 항목을 제거(스크립트 파일은 유지). `env.OMC_SKIP_HOOKS`는 키가 없을 때만 `pre-tool-use,post-tool-use`로 설정(사용자 값은 보존). 이 값은 리마인더뿐 아니라 oh-my-claudecode의 pre-tool-use·post-tool-use 훅 전체를 꺼서 persistent-mode Stop 훅이 의존하는 skill-active-state 기록, ultragoal deny 검사, `<remember>` 태그 저장도 함께 꺼진다. 되돌리려면 `settings.json`의 `env`에 `"OMC_SKIP_HOOKS": ""`를 둔다. 빈 값은 어떤 OMC 훅도 끄지 않고, 키가 있으므로 재설치가 덮어쓰지 않는다(키를 지우면 다음 설치가 기본값을 다시 넣는다)
   - `carl-hook`은 파일만 동기화하고 자동 배선하지 않음(APEX/CARL 사용 시 수동 배선)
 - **한국어 최종 답변 검사 (Claude Code Stop)**: 기존 `stop-text-required.py`의 같은 링크·Stop 명령으로 배포됩니다.
   코드 블록·인라인 코드·URL·경로와 명확한 `snake_case`·`camelCase`·여러 단어의 kebab 식별자,

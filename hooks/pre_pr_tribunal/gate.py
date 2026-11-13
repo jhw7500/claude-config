@@ -375,6 +375,12 @@ def evaluate_gate(
         )
         if split is None:
             return _decision(True, GateCode.COMMAND_AMBIGUOUS, scan.reason)
+        # Remaining trust: the cd form is safe only when the runtime shell's
+        # ``cd`` is the builtin (for example ``type -t cd`` prints ``builtin``).
+        # The hook can see only an exported ``BASH_FUNC_cd%%`` and BASH_ENV/ENV;
+        # a non-exported cd function or a cd alias (Claude Code's shell snapshot
+        # re-defines user functions and enables aliases; Codex uses a login
+        # shell) is invisible here. Check that before using the prefix.
         if "BASH_FUNC_cd%%" in os.environ or any(
             os.environ.get(name) for name in ("BASH_ENV", "ENV")
         ):
