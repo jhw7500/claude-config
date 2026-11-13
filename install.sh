@@ -307,27 +307,45 @@ nr = "python3 %s/notion-recall-trigger-hook.py" % H
 hc = "python3 %s/handoff-checkpoint-hook.py" % H
 cg = "python3 %s/control-char-guard-hook.py" % H
 ph = "%s/precompact-handoff.sh" % H
-PI_MATCH = ("ToolSearch|WebSearch|WebFetch|mcp__notion__notion-search|mcp__notion__notion-fetch|"
-            "mcp__notion__notion-get-comments|mcp__jhw-notion__jhw_search|mcp__jhw-notion__jhw_context|"
-            "mcp__jhw-notion__jhw_history|mcp__jhw-notion__jhw_status|mcp__jhw-notion__jhw_retrieve|"
-            "mcp__plugin_context7_context7__query-docs|mcp__plugin_context7_context7__resolve-library-id")
 CG_MATCH = "Edit|Write|MultiEdit|NotebookEdit"
 PA_MATCH = ("mcp__jhw-notion__jhw_(record|note|delete|start|close|report_export)|"
             "mcp__notion__notion-(create-pages|update-page|create-database|update-data-source|"
             "create-comment|duplicate-page|move-pages)")
 added = []
 changed = []
+removed = []
+# 더 이상 배선하지 않는 훅(소음) — 기존 settings.json 에서 정확히 일치하는 명령만 제거한다.
+# 스크립트 파일은 그대로 두고 배선만 끊는다. 무관한 훅과 같은 그룹의 다른 훅은 보존한다.
+RETIRED = {norm(bt), norm(pi), norm(nc)}
+for event in list(hooks):
+    groups = hooks[event]
+    if not isinstance(groups, list):
+        continue
+    kept_groups = []
+    for g in groups:
+        if not isinstance(g, dict) or not isinstance(g.get("hooks"), list):
+            kept_groups.append(g)
+            continue
+        kept = [h for h in g["hooks"] if norm(h.get("command") if isinstance(h, dict) else None) not in RETIRED]
+        if len(kept) != len(g["hooks"]):
+            removed.append(event)
+            if not kept:
+                continue
+            g["hooks"] = kept
+        kept_groups.append(g)
+    if kept_groups:
+        hooks[event] = kept_groups
+    else:
+        del hooks[event]
+# oh-my-claudecode 의 일반 리마인더 훅 끄기 — 키가 없을 때만 기본값을 넣고 사용자 값은 덮어쓰지 않는다.
+d.setdefault("env", {}).setdefault("OMC_SKIP_HOOKS", "pre-tool-use,post-tool-use")
 # 기존 (항상)
 if ensure("UserPromptSubmit", ts + " prompt"): added.append("UPS<-timestamp")
 if ensure("Stop", ts + " stop"): added.append("Stop<-timestamp")
 if ensure("Stop", st): added.append("Stop<-stop-text")
 # 흡수 — 항상 배선 (환경 무관하게 안전)
 if ensure("UserPromptSubmit", gc): added.append("UPS<-general-continuation")
-if ensure("PreToolUse", bt, "Agent|Bash"): added.append("Pre<-bg-task")
-if ensure("PostToolUse", bt, "Agent|Bash"): added.append("Post<-bg-task")
-if ensure("SubagentStop", bt, "*"): added.append("SubagentStop<-bg-task")
 if ensure("UserPromptSubmit", dn): added.append("UPS<-delegate-nudge")
-if ensure("PostToolUse", pi, PI_MATCH): added.append("Post<-post-info")
 if ensure("PreToolUse", an, "Agent"): added.append("Pre<-agent-name-delivery")
 if ensure("PreToolUse", vh, "Bash"): added.append("Pre<-verification-command-hygiene")
 if ensure("UserPromptSubmit", hc): added.append("UPS<-handoff-checkpoint")
@@ -335,7 +353,6 @@ if ensure("PostToolUse", cg, CG_MATCH): added.append("Post<-ctrl-char-guard")
 if ensure("PreCompact", ph, "*"): added.append("PreCompact<-handoff-gate")
 # 흡수 — notion 환경만
 if notion:
-    if ensure("UserPromptSubmit", nc): added.append("UPS<-notion-continuous")
     if ensure("PostToolUse", pa, PA_MATCH): added.append("Post<-post-action")
     if ensure("UserPromptSubmit", nr): added.append("UPS<-notion-recall")
 # 주: carl-hook 은 파일만 동기화하고 자동 배선하지 않음 (APEX/CARL 사용 시 수동 배선)
@@ -345,6 +362,8 @@ if state == "created":
     print("[install] settings.json 신규 생성 (0600, 백업 없음)")
 elif state == "unchanged":
     print("[install] settings.json 변경 없음 — 백업 생성 안 함")
+if removed:
+    print("[install] 소음 훅 배선 제거:", ", ".join(removed))
 if changed:
     print("[install] 훅 matcher 갱신:", ", ".join(changed))
 PY

@@ -174,7 +174,8 @@ fi
 # PS1-style: user@host
 user_host="$(whoami)@$(hostname -s)"
 
-# Count active background tasks (managed by bg-task-progress-hook.py)
+# Count active background tasks (managed by bg-task-progress-hook.py; install.sh 가 더는 배선하지 않으므로
+# 상태 디렉토리가 없으면 아래 블록은 건너뛰고 카운터를 표시하지 않는다)
 # Location: ~/.claude/state/bg-tasks/ (user-scoped; avoids /tmp world-writable issue)
 # Only count tasks for the CURRENT session (derived from session_id in input JSON),
 # falling back to transcript filename if session_id absent.

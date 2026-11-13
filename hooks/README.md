@@ -51,9 +51,9 @@ fi
 | 파일 | 트리거 | 역할 |
 |------|--------|------|
 | `carl-hook.py` | UserPromptSubmit | CARL 컨텍스트 브래킷, 도메인 규칙, 결정 기록을 주입 (외부 도구 유지) |
-| `notion-continuous-exec-hook.py` | UserPromptSubmit | Notion 저장/불러오기 스킬 승인 응답 감지 시 "연속 실행" reminder 주입 |
+| `notion-continuous-exec-hook.py` | UserPromptSubmit (배선 해제됨) | Notion 저장/불러오기 스킬 승인 응답 감지 시 "연속 실행" reminder 주입 |
 | `general-continuation-hook.py` | UserPromptSubmit | "한번에/끝까지/연속으로" 등 사용자의 연속 실행 의도 감지 시 reminder 주입 |
-| `bg-task-progress-hook.py` | PreToolUse + PostToolUse | Agent / Bash `run_in_background=true` 시작·완료 알림 강제 + statusLine 카운터 관리 |
+| `bg-task-progress-hook.py` | PreToolUse + PostToolUse (배선 해제됨) | Agent / Bash `run_in_background=true` 시작·완료 알림 강제 + statusLine 카운터 관리 |
 | `control-char-guard-hook.py` | PostToolUse | Edit/Write/MultiEdit/NotebookEdit 로 **기록한 내용**에 raw 제어문자(C0/DEL)가 섞이면 위치와 함께 경고 |
 | `verification-command-hygiene-hook.py` | PreToolUse: `Bash` | 실제 `|| echo` fallback에 결론 연결 표지(`→`/`뿐`)가 있으면 중립 출력으로 바꾸도록 경고 |
 | `task_nudge.py` | Claude/Codex 공통 core | GitHub slug와 secure launcher의 등록 상태를 분류하고, 경계가 있는 정책 메시지와 세션당 1회 state를 관리 |
